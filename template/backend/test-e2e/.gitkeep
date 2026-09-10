@@ -1,0 +1,7 @@
+# ARC-Bench backend Playwright E2E tests will be created here by the agent.
+
+This directory exists because ``template/template.yaml`` advertises
+``backend/test-e2e`` as the canonical ``e2e_test_root`` and Playwright's
+``playwright.config.js`` resolves ``testDir`` against the backend working
+directory. Removing this directory would break ``npm run test:e2e`` from
+finding any test files.
