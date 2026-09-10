@@ -17,6 +17,7 @@ from core.commits import build_commit_message
 from core.config import load_project_env, set_app_type, set_web_port, set_workspace_root
 from core.files import load_requirements, read_json_file, write_json_file
 from core.logging import append_debug_log, write_terminal_log
+from core.tdd_retry import build_tdd_reprompt, scan_test_failures
 
 
 load_project_env()
@@ -264,6 +265,23 @@ class ARCWorkflowManager:
             f"Loaded processing queue with {len(queue_state['tasks'])} task(s) for root node {root_id}.",
         )
 
+        await self._drain_runnable_tasks(queue_state)
+
+        # Post-run auto TDD re-prompt: after a full pass over the queue, scan the
+        # runner events the agents emitted for `test/failed` requirement states and
+        # re-prompt each unique still-failing node once with a TDD-first follow-up,
+        # then drain the queue a second time. This mirrors the reference agent's
+        # post-run re-prompt, adapted to ARC's per-node implement-phase retry. It
+        # runs at most once per compilation; disable with ARC_AUTO_TDD_RETRY=0.
+        if self._auto_tdd_retry_enabled():
+            retry_node_ids = await self._prepare_auto_tdd_retry(queue_state)
+            if retry_node_ids:
+                await self._drain_runnable_tasks(queue_state)
+
+        return self._build_compile_result(queue_state)
+
+    async def _drain_runnable_tasks(self, queue_state: dict[str, Any]) -> None:
+        """Run every PENDING task in order until the queue has none left."""
         while True:
             task = self._next_runnable_task(queue_state)
             if task is None:
@@ -308,7 +326,59 @@ class ARCWorkflowManager:
             await self._commit_phase_checkpoint(node_id, f"{phase}-FAILED", requirement_data)
             await self._log("Compiler", f"{phase} failed for node {node_id}.", "error", node_id)
 
-        return self._build_compile_result(queue_state)
+    async def _prepare_auto_tdd_retry(self, queue_state: dict[str, Any]) -> list[str]:
+        """Queue a single TDD-first retry for every node that ended the run in FAILED.
+
+        Reads ``.arc/runner-events.jsonl`` for ``test/failed`` requirement states,
+        keeps only nodes whose current queue state is still ``FAILED``, resets them
+        for an implement-only retry (design artefacts are preserved), and injects the
+        TDD follow-up into each node session so ``TestDrivenDeveloper`` receives it as
+        ``previous_failure_summary``. Returns the node ids queued for retry.
+        """
+        failures = scan_test_failures(self.runtime.paths.runner_events_path)
+        eligible = [
+            (node_id, message)
+            for node_id, message in failures
+            if str(queue_state.get("node_states", {}).get(node_id, "") or "").strip().upper() == NODE_FAILED
+        ]
+        if not eligible:
+            return []
+
+        retry_node_ids: list[str] = []
+        for node_id, _message in eligible:
+            try:
+                self._reset_node_for_retry(queue_state, node_id)
+            except ValueError:
+                continue
+            retry_node_ids.append(node_id)
+        if not retry_node_ids:
+            return []
+        self._save_processing_queue(queue_state)
+
+        # Inject the follow-up AFTER the reset so it survives into the implement
+        # phase, which reads recent_failure_summary as previous_failure_summary.
+        for node_id, message in eligible:
+            if node_id not in retry_node_ids:
+                continue
+            reprompt = build_tdd_reprompt(node_id, message)
+            sessions.merge_node_session(
+                node_id,
+                {
+                    "recent_failure_summary": reprompt,
+                    "resume_context": {"tdd_reprompt": reprompt, "instruction": reprompt},
+                },
+            )
+            await self._log(
+                "Compiler",
+                f"[tdd-retry] {node_id} reported test/failed during the run; re-prompting with a TDD-first follow-up.",
+                status="warning",
+                node_id=node_id,
+            )
+        return retry_node_ids
+
+    @staticmethod
+    def _auto_tdd_retry_enabled() -> bool:
+        return os.environ.get("ARC_AUTO_TDD_RETRY", "1").strip().lower() not in {"0", "false", "no", "off"}
 
     def _load_or_create_processing_queue(
         self,
