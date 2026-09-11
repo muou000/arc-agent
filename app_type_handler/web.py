@@ -8,6 +8,7 @@ import signal
 import hashlib
 import inspect
 
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from .base import AppTypeHandler
@@ -598,16 +599,89 @@ def _build_e2e_runtime_env(workspace_path: str, targets: list[str]) -> dict[str,
     }
 
 
+FRONTEND_BUILD_FINGERPRINT_FILENAME = ".arc-build-fingerprint.json"
+
+# Directories that never contribute to `npm run build` output. `dist` is
+# excluded so the recorded fingerprint does not hash itself.
+_FRONTEND_FINGERPRINT_SKIPPED_DIRS = frozenset(
+    {"node_modules", "dist", "dist-ssr", "coverage", ".git", ".vite"}
+)
+
+
+def _frontend_source_fingerprint(frontend_path: str) -> str | None:
+    """Content hash of the frontend sources that feed ``npm run build``.
+
+    Returns ``None`` when the frontend directory is missing, which makes the
+    caller fall back to always building.
+    """
+
+    root = Path(frontend_path)
+    if not root.is_dir():
+        return None
+    digest = hashlib.sha256()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in _FRONTEND_FINGERPRINT_SKIPPED_DIRS)
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b"<unreadable>")
+    return digest.hexdigest()
+
+
+def _frontend_build_fingerprint_path(frontend_path: str) -> str:
+    # Stored inside `dist` so it shares the build artefact's lifetime: deleting
+    # the output also discards the fingerprint and forces a rebuild.
+    return os.path.join(frontend_path, "dist", FRONTEND_BUILD_FINGERPRINT_FILENAME)
+
+
+def _read_recorded_frontend_fingerprint(frontend_path: str) -> str | None:
+    try:
+        with open(_frontend_build_fingerprint_path(frontend_path), "r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return str(payload.get("fingerprint", "") or "").strip() or None
+
+
+def _record_frontend_fingerprint(frontend_path: str, fingerprint: str) -> None:
+    try:
+        with open(_frontend_build_fingerprint_path(frontend_path), "w", encoding="utf-8") as file:
+            json.dump({"fingerprint": fingerprint}, file)
+            file.write("\n")
+    except OSError:
+        # Best effort: losing the fingerprint only costs one extra build.
+        return
+
+
 async def _build_frontend_dist(workspace_path: str) -> tuple[bool, str]:
     frontend_path = os.path.join(workspace_path, "frontend")
+    dist_index_path = os.path.join(frontend_path, "dist", "index.html")
+    fingerprint = _frontend_source_fingerprint(frontend_path)
+
+    # Every E2E attempt rebuilt the frontend from scratch (~tens of seconds),
+    # even when the previous attempt already produced a `dist` for the same
+    # sources. Reuse it when the tree is byte-for-byte unchanged.
+    if fingerprint is not None and os.path.exists(dist_index_path):
+        if _read_recorded_frontend_fingerprint(frontend_path) == fingerprint:
+            return True, (
+                "Reused the existing `frontend/dist` because the frontend sources are unchanged "
+                f"since the last successful build (fingerprint {fingerprint[:12]}).\n"
+            )
+
     frontend_build_output = await _execute_web_test_command(
         "npm run build",
         cwd=frontend_path,
         timeout=120.0,
     )
-    dist_index_path = os.path.join(frontend_path, "dist", "index.html")
     build_ok = _extract_exit_code(frontend_build_output) == 0 and os.path.exists(dist_index_path)
     if build_ok:
+        if fingerprint is not None:
+            _record_frontend_fingerprint(frontend_path, fingerprint)
         return True, frontend_build_output
 
     if os.path.exists(dist_index_path):
