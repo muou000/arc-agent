@@ -35,6 +35,9 @@ _READ_FILE_FORMAT_PATCHED = False
 # while omitting the argument still resolves the process-wide shared saver.
 _UNSET: Any = object()
 
+# Provider keys whose ARC harness profile has already been registered.
+_REGISTERED_HARNESS_PROFILES: set[str] = set()
+
 class OpenAIGlobSchema(BaseModel):
     """OpenAI-compatible schema for the glob tool."""
 
@@ -301,7 +304,11 @@ def _expand_write_permission_paths(path: str, root: Path) -> list[str]:
 
 
 def _register_arc_tool_exclusions(*, model: Any, resolved_model: Any) -> None:
-    """Remove built-in agent tools that ARC does not want to expose."""
+    """Remove built-in agent tools that ARC does not want to expose.
+
+    The profile is a constant, so re-registering it for every agent build is
+    pure overhead; remember which provider keys have already been registered.
+    """
 
     profile = HarnessProfile(
         excluded_tools=DISABLED_BUILTIN_TOOLS,
@@ -312,11 +319,14 @@ def _register_arc_tool_exclusions(*, model: Any, resolved_model: Any) -> None:
         provider, model_name = _split_model_name(model)
         if provider:
             for key in (provider, f"{provider}:{model_name}"):
-                register_harness_profile(key, profile)
                 registered.add(key)
     provider = get_model_provider(resolved_model)
-    if provider and provider not in registered:
-        register_harness_profile(provider, profile)
+    if provider:
+        registered.add(provider)
+
+    for key in registered - _REGISTERED_HARNESS_PROFILES:
+        register_harness_profile(key, profile)
+    _REGISTERED_HARNESS_PROFILES.update(registered)
 
 
 def _resolve_response_format(response_format: object | None) -> object | None:
