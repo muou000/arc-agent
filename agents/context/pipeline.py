@@ -65,6 +65,11 @@ class ContextPipeline:
         self.runtime: Any | None = None
         self.max_related_interfaces = 30
         self.cache = NodeContextCache()
+        # (table signature, req_id -> interfaces, all interfaces) for the
+        # interfaces table, so per-node lookups do not re-read and re-parse it.
+        self._interface_index: (
+            tuple[tuple[int, int, int], dict[str, list[dict[str, Any]]], list[dict[str, Any]]] | None
+        ) = None
 
     def configure(
         self,
@@ -74,19 +79,30 @@ class ContextPipeline:
         web_port: int | None = None,
         android_package: str | None = None,
     ) -> None:
-        if workspace_dir is not None:
+        # Stage agents call configure() on every run. Only drop the cache when a
+        # setting actually changes, otherwise every TDD retry would throw away
+        # all memoised context and re-read the traceability tables from disk.
+        changed = False
+        if workspace_dir is not None and self.config.workspace_dir != workspace_dir:
             self.config.workspace_dir = workspace_dir
-        if app_type is not None:
+            changed = True
+        if app_type is not None and self.config.app_type != app_type:
             self.config.app_type = app_type
-        if web_port is not None:
+            changed = True
+        if web_port is not None and self.config.web_port != int(web_port):
             self.config.web_port = int(web_port)
-        if android_package is not None:
+            changed = True
+        if android_package is not None and self.config.android_package != android_package:
             self.config.android_package = android_package
-        self.cache.clear()
+            changed = True
+        if changed:
+            self.cache.clear()
+            self._interface_index = None
 
     def set_runtime(self, runtime: Any | None) -> None:
         self.runtime = runtime
         self.cache.clear()
+        self._interface_index = None
 
     def _store(self):
         return getattr(self.runtime, "traceability", None)
@@ -288,11 +304,60 @@ class ContextPipeline:
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
+    @staticmethod
+    def _normalize_req_ids(record: dict[str, Any]) -> list[str]:
+        return [
+            str(item or "").strip()
+            for item in (record.get("req_ids") or [])
+            if str(item or "").strip()
+        ]
+
+    def _interface_table_signature(self, store: Any) -> tuple[int, int, int] | None:
+        table_path = getattr(store, "table_path", None)
+        if not callable(table_path):
+            return None
+        try:
+            stat = table_path("interfaces").stat()
+        except (OSError, ValueError):
+            return None
+        return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+
+    def _load_interface_index(self) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+        """Return (req_id -> interfaces, all interfaces) for the interfaces table.
+
+        The whole table is a single JSON document, so every ``list_interfaces``
+        call re-reads and re-parses it. Building the index once and validating it
+        against the table's file signature keeps per-node lookups cheap while
+        still picking up interfaces written by other nodes.
+        """
+
+        store = self._store()
+        if store is None:
+            return {}, []
+        signature = self._interface_table_signature(store)
+        cached = self._interface_index
+        if cached is not None and signature is not None and cached[0] == signature:
+            return cached[1], cached[2]
+
+        rows = store.list_interfaces()
+        by_req: dict[str, list[dict[str, Any]]] = {}
+        for iface in rows:
+            for req_id in self._normalize_req_ids(iface):
+                by_req.setdefault(req_id, []).append(iface)
+        self._interface_index = None if signature is None else (signature, by_req, rows)
+        return by_req, rows
+
+    def _interfaces_for_req(self, req_id: str) -> list[dict[str, Any]]:
+        if not req_id:
+            return []
+        by_req, _ = self._load_interface_index()
+        return by_req.get(req_id, [])
+
     def _get_source_file_cards(self, node_id: str, max_files: int | None = None) -> str:
         store = self._store()
         if store is None:
             return ""
-        interfaces = store.list_interfaces(req_id=node_id)
+        interfaces = self._interfaces_for_req(node_id)
         if not interfaces:
             return ""
         interfaces = self._dedupe_records_by_file_path_keep_latest(interfaces)
@@ -397,12 +462,9 @@ class ContextPipeline:
             if str(item or "").strip()
         }
         cards: list[dict[str, Any]] = []
-        for iface in store.list_interfaces():
-            req_ids = [
-                str(item or "").strip()
-                for item in (iface.get("req_ids") or [])
-                if str(item or "").strip()
-            ]
+        _, interface_rows = self._load_interface_index()
+        for iface in interface_rows:
+            req_ids = self._normalize_req_ids(iface)
             if not req_ids:
                 continue
             relation = ""
