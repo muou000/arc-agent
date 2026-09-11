@@ -141,10 +141,10 @@ def test_implementation_repeated_write_blocked_until_file_error_unlocks_path() -
         ToolMessage(content="Error: anchor not found", name="edit_file", tool_call_id="e1", status="error"),
     )
     assert run(middleware, make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c2")).content == "ok"
-    other_blocked = run(
+    other = run(
         middleware, make_request("write_file", {"file_path": "/workspace/src/other.py", "content": "x\n"}, call_id="c3")
     )
-    assert other_blocked.content == "ok"  # untouched path was never locked
+    assert other.content == "ok"  # untouched path was never locked
 
 
 def test_run_tests_exit_code_zero_does_not_unlock() -> None:

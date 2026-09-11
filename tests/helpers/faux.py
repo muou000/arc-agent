@@ -19,7 +19,6 @@ Both raise loudly when a script is exhausted, so tests fail instead of looping.
 
 from __future__ import annotations
 
-import json
 from collections import deque
 from typing import Any
 
@@ -41,7 +40,7 @@ def faux_tool_call(name: str, args: dict[str, Any], *, id: str | None = None) ->
     return faux_tool_calls((name, args, id))
 
 
-def faux_tool_calls(*calls: tuple[str, dict[str, Any], ...]) -> AIMessage:
+def faux_tool_calls(*calls: Any) -> AIMessage:
     """A scripted assistant turn issuing one or more tool calls.
 
     Each entry is either ``(name, args)`` or ``(name, args, id)``.
@@ -102,6 +101,10 @@ class FauxChatModel(BaseChatModel):
         del tools, kwargs
         return self
 
+    def bind(self, **kwargs: Any) -> "FauxChatModel":
+        del kwargs
+        return self
+
     def _generate(
         self,
         messages: list[BaseMessage],
@@ -143,7 +146,7 @@ class FakeAppHandler:
         return "Exit Code: 0\nSTDERR:\n(fake build ok)\n"
 
     def validate_test_path(self, test_type: str, file_path: str) -> str:
-        del test_type
+        del test_type, file_path
         return ""
 
 
@@ -162,9 +165,3 @@ def failing_test_output(detail: str = "AssertionError: expected 2 got 1") -> str
 
 def passing_test_output(detail: str = "1 passed") -> str:
     return test_result(0, detail)
-
-
-def format_script(model: FauxChatModel) -> str:
-    """Debug helper rendering the remaining faux script."""
-
-    return json.dumps([str(item.content or item.tool_calls) for item in model._queue], ensure_ascii=False)

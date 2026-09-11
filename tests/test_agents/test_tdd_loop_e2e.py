@@ -120,7 +120,8 @@ def test_tdd_loop_fail_then_fix_then_pass(tmp_project_dir: Path, arc_runtime) ->
     assert final_ok is True
     assert model.call_count == 5
     assert model.get_pending_response_count() == 0
-    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * 2  # fail run + passing run
+    # The failing run + the passing run both reach the fake app handler.
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE]), ("Unit", [UNIT_TEST_FILE])]
 
     # The agent's fix really landed in the workspace.
     assert "return a + b" in (tmp_project_dir / "src" / "calc.py").read_text(encoding="utf-8")
