@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
+import random
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
 
@@ -12,9 +17,16 @@ from pydantic import PrivateAttr
 from agents.model.compatible_openai import CompatibleChatOpenAI
 
 
+logger = logging.getLogger(__name__)
+
 OpenAIAPIMode = Literal["responses", "chat_completions"]
 _TRUTHY = {"1", "true", "yes", "on", "responses", "response", "responses_api"}
 _FALSY = {"0", "false", "no", "off", "chat", "chat_completion", "chat_completions", "chat/completions"}
+
+_DEFAULT_MAX_RETRIES = 3
+_DEFAULT_RETRY_INITIAL_DELAY = 2.0
+_DEFAULT_RETRY_MAX_DELAY = 30.0
+_RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
 
 
 @dataclass(frozen=True)
@@ -24,6 +36,42 @@ class OpenAIAdapterConfig:
     base_url: str = ""
     api_key: str = ""
     sse_text_compat: bool = False
+
+
+@dataclass(frozen=True)
+class _ModelRetryPolicy:
+    max_retries: int
+    initial_delay: float
+    max_delay: float
+
+
+def _resolve_retry_policy() -> _ModelRetryPolicy:
+    return _ModelRetryPolicy(
+        max_retries=_env_int("ARC_MODEL_MAX_RETRIES", _DEFAULT_MAX_RETRIES),
+        initial_delay=_env_float("ARC_MODEL_RETRY_INITIAL_DELAY", _DEFAULT_RETRY_INITIAL_DELAY),
+        max_delay=_env_float("ARC_MODEL_RETRY_MAX_DELAY", _DEFAULT_RETRY_MAX_DELAY),
+    )
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
 
 
 class ARCModelAPIError(RuntimeError):
@@ -48,7 +96,7 @@ class ARCModelAPIError(RuntimeError):
 
 
 class ARCChatOpenAI(ChatOpenAI):
-    """ChatOpenAI with ARC-level API error normalization."""
+    """ChatOpenAI with ARC-level API error normalization and transient-failure retries."""
 
     _arc_api_mode: OpenAIAPIMode = PrivateAttr(default="chat_completions")
     _arc_model_name: str = PrivateAttr(default="")
@@ -59,20 +107,24 @@ class ARCChatOpenAI(ChatOpenAI):
         self._arc_model_name = arc_model_name
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
-        try:
-            return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        except Exception as exc:
-            _raise_model_api_exception(exc, api_mode=self._arc_api_mode, model=self._arc_model_name)
+        parent = super()
+        return await _acall_model_with_retries(
+            lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
+            api_mode=self._arc_api_mode,
+            model=self._arc_model_name,
+        )
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
-        try:
-            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        except Exception as exc:
-            _raise_model_api_exception(exc, api_mode=self._arc_api_mode, model=self._arc_model_name)
+        parent = super()
+        return _call_model_with_retries(
+            lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
+            api_mode=self._arc_api_mode,
+            model=self._arc_model_name,
+        )
 
 
 class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
-    """Responses-compatible ChatOpenAI with ARC-level API error normalization."""
+    """Responses-compatible ChatOpenAI with ARC-level API error normalization and transient-failure retries."""
 
     _arc_api_mode: OpenAIAPIMode = PrivateAttr(default="responses")
     _arc_model_name: str = PrivateAttr(default="")
@@ -83,16 +135,20 @@ class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
         self._arc_model_name = arc_model_name
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
-        try:
-            return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        except Exception as exc:
-            _raise_model_api_exception(exc, api_mode=self._arc_api_mode, model=self._arc_model_name)
+        parent = super()
+        return await _acall_model_with_retries(
+            lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
+            api_mode=self._arc_api_mode,
+            model=self._arc_model_name,
+        )
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
-        try:
-            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        except Exception as exc:
-            _raise_model_api_exception(exc, api_mode=self._arc_api_mode, model=self._arc_model_name)
+        parent = super()
+        return _call_model_with_retries(
+            lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
+            api_mode=self._arc_api_mode,
+            model=self._arc_model_name,
+        )
 
 
 def build_openai_chat_model(
@@ -182,6 +238,111 @@ def _raise_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model
     if wrapped is exc:
         raise exc
     raise wrapped from exc
+
+
+def _call_model_with_retries(call: Callable[[], Any], *, api_mode: OpenAIAPIMode, model: str) -> Any:
+    """Invoke a model call, retrying transient failures with exponential backoff."""
+
+    policy = _resolve_retry_policy()
+    failed_attempts = 0
+    while True:
+        try:
+            return call()
+        except Exception as exc:
+            failed_attempts += 1
+            if not _should_retry_model_exception(exc, failed_attempts=failed_attempts, policy=policy):
+                _raise_model_api_exception(exc, api_mode=api_mode, model=model)
+            delay = _compute_retry_delay(policy, failed_attempts - 1, exc)
+            _log_model_retry(exc, failed_attempts=failed_attempts, policy=policy, delay=delay)
+            _sleep(delay)
+
+
+async def _acall_model_with_retries(call: Callable[[], Any], *, api_mode: OpenAIAPIMode, model: str) -> Any:
+    """Async variant of ``_call_model_with_retries``."""
+
+    policy = _resolve_retry_policy()
+    failed_attempts = 0
+    while True:
+        try:
+            return await call()
+        except Exception as exc:
+            failed_attempts += 1
+            if not _should_retry_model_exception(exc, failed_attempts=failed_attempts, policy=policy):
+                _raise_model_api_exception(exc, api_mode=api_mode, model=model)
+            delay = _compute_retry_delay(policy, failed_attempts - 1, exc)
+            _log_model_retry(exc, failed_attempts=failed_attempts, policy=policy, delay=delay)
+            await _asleep(delay)
+
+
+def _should_retry_model_exception(
+    exc: Exception,
+    *,
+    failed_attempts: int,
+    policy: _ModelRetryPolicy,
+) -> bool:
+    if not _is_model_api_exception(exc):
+        return False
+    if not _is_retryable_model_api_exception(exc):
+        return False
+    return failed_attempts <= policy.max_retries
+
+
+def _is_retryable_model_api_exception(exc: Exception) -> bool:
+    if isinstance(exc, (APIConnectionError, APITimeoutError, httpx.TransportError)):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in _RETRYABLE_STATUS_CODES or status_code >= 500
+    return False
+
+
+def _compute_retry_delay(policy: _ModelRetryPolicy, failed_attempt: int, exc: Exception) -> float:
+    retry_after = _parse_retry_after_header(exc)
+    if retry_after is not None:
+        return min(retry_after, policy.max_delay)
+    delay = policy.initial_delay * (2 ** failed_attempt)
+    return min(delay, policy.max_delay) * random.uniform(0.75, 1.0)
+
+
+def _parse_retry_after_header(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = str(headers.get("retry-after") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _log_model_retry(
+    exc: Exception,
+    *,
+    failed_attempts: int,
+    policy: _ModelRetryPolicy,
+    delay: float,
+) -> None:
+    logger.warning(
+        "Transient model API failure (attempt %d of %d); retrying in %.1fs: %s",
+        failed_attempts,
+        1 + policy.max_retries,
+        delay,
+        _short_error_text(exc, limit=300),
+    )
+
+
+def _sleep(seconds: float) -> None:
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+async def _asleep(seconds: float) -> None:
+    if seconds > 0:
+        await asyncio.sleep(seconds)
 
 
 def _wrap_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model: str) -> Exception:

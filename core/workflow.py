@@ -297,7 +297,16 @@ class ARCWorkflowManager:
             self._save_processing_queue(queue_state)
 
             await self._log("Compiler", f"Running {phase} for node {node_id}...", node_id=node_id)
-            task_ok = await self._run_task(task)
+            try:
+                task_ok = await self._run_task(task)
+            except Exception as exc:
+                await self._log(
+                    "Compiler",
+                    f"{phase} task for node {node_id} crashed: {type(exc).__name__}: {exc}",
+                    "error",
+                    node_id,
+                )
+                task_ok = False
 
             if task_ok:
                 task["status"] = TASK_COMPLETED
