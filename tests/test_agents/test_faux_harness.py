@@ -42,9 +42,9 @@ def test_scripted_tool_calls_drive_real_agent_loop(tmp_project_dir: Path) -> Non
             faux_tool_call(
                 "write_file",
                 {"file_path": "/workspace/src/hello.py", "content": "print('hi')\n"},
-                id="call-1",
+                call_id="call-1",
             ),
-            faux_tool_call("echo", {"text": "loop-ok"}, id="call-2"),
+            faux_tool_call("echo", {"text": "loop-ok"}, call_id="call-2"),
             faux_text("DONE"),
         ]
     )

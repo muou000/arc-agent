@@ -93,16 +93,16 @@ def test_tdd_loop_fail_then_fix_then_pass(tmp_project_dir: Path, arc_runtime) ->
             faux_tool_call(
                 "write_file",
                 {"file_path": "/workspace/src/calc.py", "content": "def add(a, b):\n    return a - b\n"},
-                id="c1",
+                call_id="c1",
             ),
-            faux_tool_call("run_tests", {"test_type": "Unit"}, id="c2"),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="c2"),
             # The failed run unlocked the written path, so the fix may rewrite it.
             faux_tool_call(
                 "write_file",
                 {"file_path": "/workspace/src/calc.py", "content": "def add(a, b):\n    return a + b\n"},
-                id="c3",
+                call_id="c3",
             ),
-            faux_tool_call("run_tests", {"test_type": "Unit"}, id="c4"),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="c4"),
             faux_text("IMPLEMENTED"),
         ]
     )
@@ -153,12 +153,12 @@ def test_tdd_layer_order_and_cross_layer_rejection(tmp_project_dir: Path, arc_ru
     model = FauxChatModel(
         responses=[
             # Unit layer session.
-            faux_tool_call("run_tests", {"test_type": "Unit"}, id="u1"),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="u1"),
             faux_text("unit layer passed"),
             # Integration layer session: first an out-of-layer call (rejected),
             # then the integration run, then the final answer.
-            faux_tool_call("run_tests", {"test_type": "Unit"}, id="i0"),
-            faux_tool_call("run_tests", {"test_type": "Integration"}, id="i1"),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="i0"),
+            faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="i1"),
             faux_text("IMPLEMENTED"),
         ]
     )
@@ -198,7 +198,7 @@ def test_tdd_budget_exhaustion_fails_node(tmp_project_dir: Path, arc_runtime) ->
     node_id = "REQ-TDD-3"
     seed_node(arc_runtime, node_id, [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}])
 
-    script = [faux_tool_call("run_tests", {}, id=f"c{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
+    script = [faux_tool_call("run_tests", {}, call_id=f"c{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
     script.append(faux_text("STILL FAILING"))
     model = FauxChatModel(responses=script)
     fake = FakeAppHandler([failing_test_output(detail=f"failure {i}") for i in range(TDD_RUN_TESTS_BUDGET)])
@@ -271,9 +271,9 @@ def test_run_implement_phase_marks_node_completed(tmp_project_dir: Path, arc_run
             faux_tool_call(
                 "write_file",
                 {"file_path": "/workspace/src/calc.py", "content": "def add(a, b):\n    return a + b\n"},
-                id="c1",
+                call_id="c1",
             ),
-            faux_tool_call("run_tests", {}, id="c2"),
+            faux_tool_call("run_tests", {}, call_id="c2"),
             faux_text("IMPLEMENTED"),
         ]
     )

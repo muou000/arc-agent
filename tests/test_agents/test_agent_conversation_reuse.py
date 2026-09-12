@@ -110,7 +110,7 @@ def test_resume_does_not_leak_stale_structured_response(tmp_project_dir: Path) -
             faux_tool_call(
                 "ProbeResponse",
                 {"summary": "structured from run one", "items": []},
-                id="c1",
+                call_id="c1",
             ),
             faux_text("plain answer from run two"),
         ]

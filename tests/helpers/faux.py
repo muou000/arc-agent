@@ -25,7 +25,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 
 
 def faux_text(text: str) -> AIMessage:
@@ -34,16 +34,16 @@ def faux_text(text: str) -> AIMessage:
     return AIMessage(content=text)
 
 
-def faux_tool_call(name: str, args: dict[str, Any], *, id: str | None = None) -> AIMessage:
+def faux_tool_call(name: str, args: dict[str, Any], *, call_id: str | None = None) -> AIMessage:
     """A scripted assistant turn issuing exactly one tool call."""
 
-    return faux_tool_calls((name, args, id))
+    return faux_tool_calls((name, args, call_id))
 
 
 def faux_tool_calls(*calls: Any) -> AIMessage:
     """A scripted assistant turn issuing one or more tool calls.
 
-    Each entry is either ``(name, args)`` or ``(name, args, id)``.
+    Each entry is either ``(name, args)`` or ``(name, args, call_id)``.
     """
 
     normalized = []
@@ -57,7 +57,7 @@ def faux_tool_calls(*calls: Any) -> AIMessage:
 class FauxChatModel(BaseChatModel):
     """Scripted chat model: each model call consumes the next queued response."""
 
-    responses: list[BaseMessage] = []
+    responses: list[BaseMessage] = Field(default_factory=list)
     _queue: deque = PrivateAttr(default_factory=deque)
     _calls: list = PrivateAttr(default_factory=list)
 
