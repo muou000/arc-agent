@@ -53,7 +53,11 @@ def parse_test_results(test_output: str) -> dict[str, Any]:
 
 
 def _extract_overall_exit_code(output: str) -> int:
-    """Prefer an explicit aggregate status, otherwise combine nested commands."""
+    """Prefer an explicit aggregate status, otherwise combine nested commands.
+
+    When several nested stages fail, the first failing stage's code wins so the
+    reported cause matches the earliest failure in execution order.
+    """
 
     lines = (output or "").splitlines()
     exit_codes: list[tuple[int, int]] = []
@@ -80,7 +84,7 @@ def _extract_overall_exit_code(output: str) -> int:
 
     nested_codes = [code for _, code in exit_codes]
     return 0 if all(code == 0 for code in nested_codes) else next(
-        code for code in reversed(nested_codes) if code != 0
+        code for code in nested_codes if code != 0
     )
 
 

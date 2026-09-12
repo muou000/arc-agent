@@ -44,3 +44,16 @@ def test_parse_test_results_prefers_explicit_batch_exit_code() -> None:
     parsed = parse_test_results(output)
 
     assert parsed["exit_code"] == 1
+
+
+def test_parse_test_results_reports_the_first_failing_nested_stage() -> None:
+    """Several nested stages failed: the earliest failure in execution order wins."""
+    output = (
+        "=== Frontend Build ===\nExit Code: 0\n"
+        "=== Database Prepare ===\nExit Code: 2\n"
+        "=== Playwright Result ===\nExit Code: 1\nFAIL renders home\n"
+    )
+
+    parsed = parse_test_results(output)
+
+    assert parsed["exit_code"] == 2
