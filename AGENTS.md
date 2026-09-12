@@ -15,7 +15,6 @@
 ## 规则范围
 
 - 根目录规则适用于 Python 编译器、agent 适配器、运行时 SDK、app-type handler、模板和测试。
-- 修改 `pi/` 时，先阅读并遵守 [`pi/AGENTS.md`](pi/AGENTS.md)。这是独立 TypeScript 子项目的更具体规则。
 - 修改 `skills/vercel-react-best-practices/` 或 `skills/vercel-composition-patterns/` 时，遵守对应目录下的 `AGENTS.md`。
 - 开始工作前运行 `git status --short`。保留其他会话或用户已有的修改，只处理当前任务相关文件。
 
@@ -41,7 +40,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 - `tests/`：SDK、agent、workflow、app-type 和模板契约测试。
 - `records/`：诊断和运行证据；除非任务明确要求，不要重写历史记录。
 - `.workbuddy-ai/`：工作区辅助记忆；不是产品源码，不要把它当作运行时契约来源。
-- `pi/`：独立 TypeScript 项目，按其目录内的 `AGENTS.md` 开发。
+- `pi/`：独立 TypeScript 项目，通常只存在于本地工作区、未纳入本仓库；若存在，按其目录内的 `AGENTS.md` 开发。
 
 `.arc/` 通常是编译输出工作区中的运行时产物，包括 `processing_queue.json`、`node_sessions/`、`runner-events.jsonl` 和 `traceability/`；不要把手工修改 `.arc/` 当作修复源码的方式。
 
