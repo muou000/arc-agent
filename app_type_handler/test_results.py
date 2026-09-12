@@ -9,11 +9,7 @@ def parse_test_results(test_output: str) -> dict[str, Any]:
 
     result: dict[str, Any] = {"passed": [], "failed": [], "exit_code": -1, "sub_batches": []}
     output = test_output or ""
-    for line in output.splitlines():
-        exit_code = _parse_exit_code_line(line)
-        if exit_code is not None:
-            result["exit_code"] = exit_code
-            break
+    result["exit_code"] = _extract_overall_exit_code(output)
 
     test_file_sections = re.findall(
         r"Test File:\s*(.+?)\r?\nTest Results:\r?\n(.*?)(?=\r?\nTest File: |\Z)",
@@ -54,6 +50,38 @@ def parse_test_results(test_output: str) -> dict[str, Any]:
         elif stripped.startswith(("FAIL ", "✗", "×", "✕")) or " FAILED" in stripped:
             result["failed"].append(stripped)
     return result
+
+
+def _extract_overall_exit_code(output: str) -> int:
+    """Prefer an explicit aggregate status, otherwise combine nested commands."""
+
+    lines = (output or "").splitlines()
+    exit_codes: list[tuple[int, int]] = []
+    first_section_index: int | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if first_section_index is None and (
+            stripped.startswith("=== ") or stripped.startswith("Test File:")
+        ):
+            first_section_index = index
+        exit_code = _parse_exit_code_line(line)
+        if exit_code is not None:
+            exit_codes.append((index, exit_code))
+
+    if not exit_codes:
+        return -1
+
+    if first_section_index is None:
+        return exit_codes[0][1]
+
+    aggregate_codes = [code for index, code in exit_codes if index < first_section_index]
+    if aggregate_codes:
+        return aggregate_codes[0]
+
+    nested_codes = [code for _, code in exit_codes]
+    return 0 if all(code == 0 for code in nested_codes) else next(
+        code for code in reversed(nested_codes) if code != 0
+    )
 
 
 def _extract_exit_code(output: str) -> int:
