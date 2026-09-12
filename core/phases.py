@@ -10,7 +10,7 @@ from core import sessions
 from core.service import get_runtime
 from core.path_compat import normalize_windows_extended_prefix_text
 from core.visual_analysis import analyze_and_attach_visual_references
-from app_type_handler.test_results import parse_test_results
+from app_type_handler.test_results import classify_test_failure, parse_test_results
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -306,6 +306,7 @@ class WorkflowPhaseRunner:
 
         usage_by_type = {test_type: 0 for test_type in ordered_types}
         result_by_type: dict[str, str] = {}
+        environment_failure: str | None = None
         await self._log(
             "TestDrivenDeveloper",
             "Running leaf TDD sessions in ordered layers with independent budgets: " + " -> ".join(ordered_types) + ".",
@@ -314,6 +315,7 @@ class WorkflowPhaseRunner:
         active_test_type: str | None = None
 
         async def run_requested_tests(requested_type: str | None = None, requested_files: list[str] | None = None) -> str:
+            nonlocal environment_failure
             requested = str(requested_type or "").strip()
             if active_test_type is None:
                 return (
@@ -407,6 +409,22 @@ class WorkflowPhaseRunner:
                 node_id=node_id,
             )
             result_by_type[selected_type] = output
+            if not passed and environment_failure is None:
+                environment_failure = classify_test_failure(output) or None
+                if environment_failure:
+                    await self._log(
+                        "TestDrivenDeveloper",
+                        (
+                            f"`run_tests` {selected_type} failed for an environmental reason "
+                            f"({environment_failure}); the workspace is broken, not the "
+                            "implementation. Stopping the TDD loop instead of retrying."
+                        ),
+                        status="error",
+                        node_id=node_id,
+                    )
+                    # Spend the rest of this layer's budget up front so the outer
+                    # loop breaks instead of re-running a doomed command.
+                    usage_by_type[selected_type] = TDD_RUN_TESTS_BUDGET
             next_index = ordered_types.index(selected_type) + 1
             next_type = ordered_types[next_index] if next_index < len(ordered_types) else None
             if passed and next_type:
@@ -422,15 +440,37 @@ class WorkflowPhaseRunner:
                     f"- {selected_type} passed.\n"
                     "- This is the last scheduled test layer. You may return IMPLEMENTED only if all earlier scheduled layers also passed.\n"
                 )
+            elif environment_failure:
+                output += (
+                    "\n\nARC_TEST_LAYER_STATUS:\n"
+                    f"- {selected_type} could not run: {environment_failure}.\n"
+                    "- This is an environment failure (a missing dependency or a broken "
+                    "install), not an assertion failure.\n"
+                    "- Do not retry run_tests and do not edit the tests to work around it. "
+                    "Return a short report naming the missing dependency instead.\n"
+                )
             return output
 
         output = ""
         session_count = 0
         max_sessions = max(1, TDD_RUN_TESTS_BUDGET * len(ordered_types))
         for ordered_type in ordered_types:
+            if environment_failure:
+                # The workspace is broken; every remaining layer would fail the
+                # same way. Do not spend their budgets too.
+                await self._log(
+                    "TestDrivenDeveloper",
+                    f"Skipping `{ordered_type}`: the workspace failed for environmental reasons "
+                    f"({environment_failure}).",
+                    status="error",
+                    node_id=node_id,
+                )
+                break
             active_test_type = ordered_type
             previous_failure_summary = str(sessions.load_node_session(node_id).get("recent_failure_summary", "") or "")
             while parse_test_results(result_by_type.get(ordered_type, "")).get("exit_code") != 0:
+                if environment_failure:
+                    break
                 used_before = usage_by_type.get(ordered_type, 0)
                 if used_before >= TDD_RUN_TESTS_BUDGET:
                     break
@@ -486,7 +526,10 @@ class WorkflowPhaseRunner:
                     )
                     break
             active_test_type = None
-            if parse_test_results(result_by_type.get(ordered_type, "")).get("exit_code") != 0:
+            if (
+                parse_test_results(result_by_type.get(ordered_type, "")).get("exit_code") != 0
+                and not environment_failure
+            ):
                 await self._log(
                     "TestDrivenDeveloper",
                     f"Advancing past `{ordered_type}` without a passing result; the next scheduled layer will start with its own budget.",
@@ -515,15 +558,33 @@ class WorkflowPhaseRunner:
                 continue
             final_ok = False
             failed_types.append(test_type)
-            failure_summary = (
-                summarize_batch_output(latest_result)
-                if latest_result
-                else self.test_driven_developer.get_last_verifier_report()
-                or summarize_batch_output(output)
-            )
-            failure_summaries.append(f"{test_type}: {failure_summary}")
+            if environment_failure and not latest_result:
+                # This layer was never attempted: the workspace was already known
+                # to be broken, so reporting stale verifier output here would be
+                # misleading.
+                failure_summaries.append(
+                    f"{test_type}: not attempted - the workspace failed for environmental "
+                    f"reasons ({environment_failure})."
+                )
+            else:
+                failure_summary = (
+                    summarize_batch_output(latest_result)
+                    if latest_result
+                    else self.test_driven_developer.get_last_verifier_report()
+                    or summarize_batch_output(output)
+                )
+                if environment_failure:
+                    failure_summary = (
+                        f"[environment failure] {environment_failure}\n{failure_summary}"
+                    )
+                failure_summaries.append(f"{test_type}: {failure_summary}")
             used = usage_by_type.get(test_type, 0)
-            detail = "budget exhausted" if used >= TDD_RUN_TESTS_BUDGET else "agent session ended before this layer passed"
+            if environment_failure:
+                detail = f"environment failure ({environment_failure})"
+            elif used >= TDD_RUN_TESTS_BUDGET:
+                detail = "budget exhausted"
+            else:
+                detail = "agent session ended before this layer passed"
             await self._log(
                 "TestDrivenDeveloper",
                 f"TDD batch `{test_type}` did not pass after {used}/{TDD_RUN_TESTS_BUDGET} run_tests call(s); {detail}.",

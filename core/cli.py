@@ -480,6 +480,20 @@ class _CliProgressView:
         if agent == "System" and message.startswith("NPM install success in"):
             target = os.path.basename(message.rsplit(" ", 1)[-1].replace("\\", "/").rstrip("/")) or "target"
             return self._emit_once(stage_line("Deps", f"{target} packages ready", "ok"))
+        if agent == "System" and message.startswith("NPM install failed in"):
+            target = message.split(" in ", 1)[-1].split(":", 1)[0].replace("\\", "/").rstrip("/")
+            target = os.path.basename(target) or "target"
+            return self._emit_once(
+                stage_line("Deps", f"{target} packages FAILED (see .arc/debug.log)", "fail")
+            )
+        if agent == "System" and message.startswith("NPM install error"):
+            return self._emit_once(stage_line("Deps", "dependency installation errored (see .arc/debug.log)", "fail"))
+        if agent == "System" and message.startswith("Verifying workspace:"):
+            return self._emit_once(stage_line("Verify", "Smoke check: building frontend"))
+        if agent == "System" and message.startswith("Workspace verification passed"):
+            return self._emit_once(stage_line("Verify", "Smoke check passed", "ok"))
+        if agent == "System" and message.startswith("Workspace verification failed"):
+            return self._emit_once(stage_line("Verify", "Smoke check FAILED (see .arc/debug.log)", "fail"))
         if agent == "System" and message == "Initializing Git repository...":
             return self._emit_once(stage_line("Checkpoint", "Initializing git history"))
         if "Prerequisite check passed" in message:
@@ -544,6 +558,16 @@ class _CliProgressView:
             return self._emit_once(stage_line("Verify", message))
         if agent == "TestDrivenDeveloper" and message.startswith("`run_tests`") and " passed " in message:
             return self._emit_once(stage_line("Verify", message, "ok"))
+        if agent == "TestDrivenDeveloper" and "environmental reason" in message:
+            reason = message.split("(", 1)[-1].split(")", 1)[0]
+            return self._emit_once(
+                stage_line("Verify", f"environment failure ({reason}); TDD loop stopped", "fail")
+            )
+        if agent == "TestDrivenDeveloper" and message.startswith("Skipping `"):
+            layer = message.split("`")[1] if message.count("`") >= 2 else "layer"
+            return self._emit_once(
+                stage_line("Verify", f"skipped {layer}: workspace already broken", "fail")
+            )
         if agent == "TestDrivenDeveloper" and message.startswith("`run_tests`") and " failed " in message:
             return self._emit_once(stage_line("Verify", message, "fail"))
         if agent == "TestDrivenDeveloper" and message.startswith("TDD batch") and "passed" in message:

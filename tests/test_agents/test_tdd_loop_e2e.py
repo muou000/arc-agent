@@ -320,3 +320,75 @@ def test_tdd_run_rejects_implemented_without_passing_run_tests(tmp_project_dir: 
 
     assert executor_calls == []
     assert final_text.startswith("Error: latest run_tests result did not pass")
+
+
+# ---------------------------------------------------------------------------
+# Environment failures short-circuit the loop; assertion failures do not
+# ---------------------------------------------------------------------------
+
+MISSING_DEP_OUTPUT = "Error: Cannot find module '@testing-library/dom'"
+
+
+def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Path, arc_runtime) -> None:
+    """A broken workspace must not burn the budget on every layer.
+
+    The agent cannot install a missing dependency mid-compile, so retrying the
+    same doomed command is pure waste. Before the short-circuit, one such node
+    cost TDD_RUN_TESTS_BUDGET run_tests calls per layer, on every leaf.
+    """
+
+    node_id = "REQ-TDD-ENV"
+    tests = [
+        {"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T2", "type": "Integration", "file_path": INTEGRATION_TEST_FILE},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    # The script *allows* the full budget; the short-circuit must stop sooner.
+    script = [faux_tool_call("run_tests", {}, call_id=f"c{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
+    script.append(faux_text("BLOCKED"))
+    model = FauxChatModel(responses=script)
+    fake = FakeAppHandler([failing_test_output(detail=MISSING_DEP_OUTPUT) for _ in range(3)])
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is False
+    # One Unit attempt, then the loop stops - Integration is never reached.
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])]
+    # NOTE: the agent *session* still runs to the end of its script. Ending the
+    # LangGraph loop early needs a runtime hook that does not exist yet, so the
+    # model keeps polling `run_tests` and getting "budget exhausted". Those
+    # turns are cheap (~seconds) next to the test executions they no longer
+    # trigger (~a minute each), which is what this guard is about.
+    assert model.call_count <= TDD_RUN_TESTS_BUDGET + 1
+    node_session = sessions.load_node_session(node_id)
+    assert "environment failure" in node_session["recent_failure_summary"]
+    assert "missing dependency" in node_session["recent_failure_summary"]
+
+
+def test_assertion_failure_still_consumes_the_full_budget(tmp_project_dir: Path, arc_runtime) -> None:
+    """Control: the short-circuit must not fire on ordinary test failures.
+
+    An assertion failure is something the agent can fix by editing the
+    implementation, so it keeps its full retry budget.
+    """
+
+    node_id = "REQ-TDD-ASSERT"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+
+    script = [faux_tool_call("run_tests", {}, call_id=f"c{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
+    script.append(faux_text("STILL FAILING"))
+    model = FauxChatModel(responses=script)
+    fake = FakeAppHandler(
+        [failing_test_output(detail="AssertionError: expected 'Login' to equal 'Log in'") for _ in range(TDD_RUN_TESTS_BUDGET)]
+    )
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is False
+    assert len(fake.calls) == TDD_RUN_TESTS_BUDGET
+    node_session = sessions.load_node_session(node_id)
+    assert "environment failure" not in node_session["recent_failure_summary"]

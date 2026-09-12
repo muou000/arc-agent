@@ -75,3 +75,67 @@ def _extract_labeled_section(output: str, label: str) -> str:
     pattern = rf"=== {re.escape(label)} ===\r?\n(.*?)(?=\r?\n=== |\Z)"
     match = re.search(pattern, output or "", re.DOTALL)
     return match.group(1).strip() if match else ""
+
+
+# --------------------------------------------------------------------------
+# environment vs. assertion failures
+# --------------------------------------------------------------------------
+
+_TEST_RUNNER_BINARIES = ("vite", "vitest", "playwright", "jest", "tsc", "eslint")
+
+#: Ordered ``(reason, pattern)`` pairs describing failures that come from a
+#: broken workspace rather than from the implementation under test.
+_ENVIRONMENT_FAILURE_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "missing dependency",
+        re.compile(r"(?:Cannot find module|Cannot find package)\s+'([^']+)'"),
+    ),
+    ("missing dependency", re.compile(r"ERR_MODULE_NOT_FOUND")),
+    (
+        "unresolved import",
+        re.compile(r"(?:Failed to resolve import|Could not resolve)\s+\"?([^\"\s]+)\"?"),
+    ),
+    (
+        "test runner not installed",
+        re.compile(
+            r"'(" + "|".join(_TEST_RUNNER_BINARIES) + r")' is not recognized",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "test runner not installed",
+        re.compile(
+            r"(?:(" + "|".join(_TEST_RUNNER_BINARIES) + r"):\s*not found"
+            r"|command not found:?\s*(" + "|".join(_TEST_RUNNER_BINARIES) + r"))",
+            re.IGNORECASE,
+        ),
+    ),
+    ("missing npm script", re.compile(r"Missing script:\s*\"([^\"]+)\"")),
+    (
+        "dependencies not installed",
+        re.compile(
+            r"node_modules[^\n]{0,80}?\b(?:does not exist|not found|missing)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def classify_test_failure(test_output: str) -> str:
+    """Return a short reason when a failed run is environmental, else ``""``.
+
+    Some failures are not the implementation's fault: a dependency is missing,
+    the test runner was never installed, or ``node_modules`` is empty. The agent
+    cannot fix any of these - it has no way to install packages mid-compile - so
+    retrying only burns the TDD budget. Callers use this to stop the loop early
+    instead of spending every attempt on an un-fixable failure.
+    """
+
+    output = test_output or ""
+    for reason, pattern in _ENVIRONMENT_FAILURE_MARKERS:
+        match = pattern.search(output)
+        if not match:
+            continue
+        detail = next((group for group in match.groups() if group), "")
+        return f"{reason}: {detail}" if detail else reason
+    return ""
