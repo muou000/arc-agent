@@ -24,7 +24,9 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE_BACKEND = REPO_ROOT / "template" / "backend"
+TEMPLATE_BACKEND = (
+    REPO_ROOT / "arc-template" / "templates" / "web-react-express" / "backend"
+)
 
 
 def _resolve(binary: str) -> str:

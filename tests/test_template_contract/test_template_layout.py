@@ -1,8 +1,8 @@
-"""Tests for the static layout of ``template/``.
+"""Tests for the static layout of the web template.
 
 These tests do not require Node.js; they verify that the manifest
-``template/template.yaml`` agrees with the on-disk project structure and that
-every documented command in ``template/README.md`` is actually wired up in
+``template.yaml`` agrees with the on-disk project structure and that
+every documented command in ``README.md`` is actually wired up in
 ``package.json`` files.
 """
 
@@ -16,7 +16,7 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE_ROOT = REPO_ROOT / "template"
+TEMPLATE_ROOT = REPO_ROOT / "arc-template" / "templates" / "web-react-express"
 
 
 @pytest.fixture(scope="module")

@@ -32,13 +32,13 @@ coverage.xml
 .pyright-cache/
 
 # Node / frontend (template)
-template/backend/node_modules/
-template/backend/coverage/
-template/backend/.arc-test-db/
-template/backend/*.db
-template/frontend/node_modules/
-template/frontend/dist/
-template/frontend/dist-ssr/
+arc-template/templates/*/backend/node_modules/
+arc-template/templates/*/backend/coverage/
+arc-template/templates/*/backend/.arc-test-db/
+arc-template/templates/*/backend/*.db
+arc-template/templates/*/frontend/node_modules/
+arc-template/templates/*/frontend/dist/
+arc-template/templates/*/frontend/dist-ssr/
 
 # Editor / OS
 .vscode/
