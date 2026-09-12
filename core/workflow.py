@@ -488,7 +488,8 @@ class ARCWorkflowManager:
             return queue_state
         if require_compatible_existing_queue:
             raise ValueError(
-                "Retry requested, but the existing processing queue is missing or incompatible with the current requirement tree."
+                "Resume or retry requested, but the existing processing queue is missing or "
+                "incompatible with the current requirement tree."
             )
         queue_state = {
             "root_id": root_id,
