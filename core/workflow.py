@@ -608,7 +608,7 @@ class ARCWorkflowManager:
                     return False
                 break
         return all(
-            other["status"] == TASK_COMPLETED
+            other["status"] in {TASK_COMPLETED, TASK_FAILED}
             for other in queue_state["tasks"]
             if other["phase"] == PHASE_IMPLEMENT and other["order"] < task["order"]
         )

@@ -19,6 +19,7 @@ from core.workflow import (
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
     TASK_COMPLETED,
+    TASK_FAILED,
     TASK_PENDING,
 )
 
@@ -196,6 +197,39 @@ def test_implement_tasks_keep_their_generated_order(tmp_path, monkeypatch) -> No
 
     assert probe.started == ["R2:IMPLEMENT", "R3:IMPLEMENT", "R1:IMPLEMENT"]
     assert probe.peak == 1
+
+
+def test_failed_implement_predecessor_releases_later_implements(tmp_path, monkeypatch) -> None:
+    # The serial drain continued past a failed task; the dependency check must
+    # likewise let later IMPLEMENT tasks start once an earlier one is FAILED.
+    monkeypatch.delenv("ARC_MAX_CONCURRENT_TASKS", raising=False)
+    manager = _make_manager(tmp_path, ["R1", "R2", "R3"])
+    probe = _Probe(delay=0.01)
+
+    async def run_implement(node_id: str, requirement_data: dict[str, Any]) -> bool:
+        await probe.run(f"{node_id}:IMPLEMENT")
+        # The first IMPLEMENT (R2) fails; the rest succeed.
+        return node_id != "R2"
+
+    monkeypatch.setattr(manager.phase_runner, "run_implement_phase", run_implement)
+
+    tasks = [
+        _task("R1", PHASE_DESIGN, 0, TASK_COMPLETED),
+        _task("R2", PHASE_DESIGN, 1, TASK_COMPLETED),
+        _task("R3", PHASE_DESIGN, 2, TASK_COMPLETED),
+        _task("R2", PHASE_IMPLEMENT, 3),
+        _task("R3", PHASE_IMPLEMENT, 4),
+        _task("R1", PHASE_IMPLEMENT, 5),
+    ]
+    queue_state = _queue("R1", tasks, ["R1", "R2", "R3"])
+
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert probe.started == ["R2:IMPLEMENT", "R3:IMPLEMENT", "R1:IMPLEMENT"]
+    statuses = {task["node_id"]: task["status"] for task in tasks if task["phase"] == PHASE_IMPLEMENT}
+    assert statuses["R2"] == TASK_FAILED
+    assert statuses["R3"] == TASK_COMPLETED
+    assert statuses["R1"] == TASK_COMPLETED
 
 
 def test_concurrency_setting_is_parsed_defensively(monkeypatch) -> None:
