@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .base import AppTypeHandler
+from .path_validation import is_scoped_test_path, normalize_safe_relative_path
 from core.config import build_web_runtime_env, get_web_base_url, get_web_port
 from core.processes import finalize_subprocess
 
@@ -192,20 +193,31 @@ def _normalize_backend_test_path(file_path: str) -> str:
 
 
 def _is_valid_web_e2e_test_path(file_path: str) -> bool:
-    normalized = (file_path or "").strip().replace("\\", "/").lstrip("./")
-    return normalized.startswith("backend/test-e2e/") and normalized.endswith((".js", ".jsx", ".ts", ".tsx"))
+    return is_scoped_test_path(
+        file_path,
+        prefixes=("backend/test-e2e/",),
+        suffixes=(".js", ".jsx", ".ts", ".tsx"),
+    )
 
 
 def _is_valid_web_vitest_test_path(file_path: str) -> bool:
-    normalized = (file_path or "").strip().replace("\\", "/").lstrip("./")
-    valid_prefix = normalized.startswith("frontend/tests/") or normalized.startswith("backend/tests/")
-    valid_suffix = normalized.endswith(
-        (
+    return is_scoped_test_path(
+        file_path,
+        prefixes=("frontend/tests/", "backend/tests/"),
+        suffixes=(
             ".test.js", ".test.jsx", ".test.ts", ".test.tsx",
             ".spec.js", ".spec.jsx", ".spec.ts", ".spec.tsx",
-        )
+        ),
     )
-    return valid_prefix and valid_suffix
+
+
+def _validate_web_test_path(test_type: str, file_path: str) -> str | None:
+    normalized_type = (test_type or "").strip().lower()
+    if normalized_type in {"unit", "integration"} and _is_valid_web_vitest_test_path(file_path):
+        return normalize_safe_relative_path(file_path)
+    if normalized_type == "e2e" and _is_valid_web_e2e_test_path(file_path):
+        return normalize_safe_relative_path(file_path)
+    return None
 
 
 def _resolve_web_test_target(file_path: str, workspace_path: str) -> tuple[str, str]:
@@ -228,7 +240,10 @@ def _resolve_web_test_target(file_path: str, workspace_path: str) -> tuple[str, 
 
 def _build_web_test_execution(test_type: str, file_path: str, workspace_path: str) -> dict[str, str]:
     normalized_type = (test_type or "").strip().lower()
-    working_directory, resolved_file_path = _resolve_web_test_target(file_path, workspace_path)
+    safe_file_path = _validate_web_test_path(normalized_type, file_path)
+    if safe_file_path is None:
+        raise ValueError(f"Invalid web test path for type {test_type!r}: {file_path!r}")
+    working_directory, resolved_file_path = _resolve_web_test_target(safe_file_path, workspace_path)
     web_port = str(get_web_port())
     base_url = get_web_base_url()
 
@@ -238,7 +253,7 @@ def _build_web_test_execution(test_type: str, file_path: str, workspace_path: st
     elif normalized_type == "e2e":
         runner = "Playwright"
         working_directory = os.path.join(workspace_path, "backend")
-        resolved_file_path = _normalize_backend_test_path(file_path)
+        resolved_file_path = _normalize_backend_test_path(safe_file_path)
         command = f"npx playwright test {resolved_file_path}" if resolved_file_path else "npx playwright test"
     else:
         raise ValueError("Unknown test type. Must be 'unit', 'integration', or 'e2e'.")
@@ -262,7 +277,10 @@ def _build_web_group_execution(test_type: str, file_paths: list[str], workspace_
         backend_targets: list[str] = []
         frontend_targets: list[str] = []
         for file_path in requested_files:
-            working_directory, resolved_file_path = _resolve_web_test_target(file_path, workspace_path)
+            safe_file_path = _validate_web_test_path(normalized_type, file_path)
+            if safe_file_path is None:
+                raise ValueError(f"Invalid web test path for type {test_type!r}: {file_path!r}")
+            working_directory, resolved_file_path = _resolve_web_test_target(safe_file_path, workspace_path)
             normalized_resolved = resolved_file_path.replace("\\", "/")
             if working_directory == os.path.join(workspace_path, "frontend"):
                 frontend_targets.append(normalized_resolved)
@@ -288,7 +306,13 @@ def _build_web_group_execution(test_type: str, file_paths: list[str], workspace_
         }
 
     if normalized_type == "e2e":
-        resolved_targets = [_normalize_backend_test_path(file_path) for file_path in requested_files]
+        safe_paths = []
+        for file_path in requested_files:
+            safe_file_path = _validate_web_test_path(normalized_type, file_path)
+            if safe_file_path is None:
+                raise ValueError(f"Invalid web test path for type {test_type!r}: {file_path!r}")
+            safe_paths.append(safe_file_path)
+        resolved_targets = [_normalize_backend_test_path(file_path) for file_path in safe_paths]
         return {
             "runner": "Playwright",
             "test_type": test_type,
@@ -297,7 +321,7 @@ def _build_web_group_execution(test_type: str, file_paths: list[str], workspace_
             "resolved_targets": resolved_targets,
             "requested_resolved_pairs": [
                 {"requested_file": file_path, "resolved_target": _normalize_backend_test_path(file_path)}
-                for file_path in requested_files
+                for file_path in safe_paths
             ],
             "web_port": str(get_web_port()),
             "base_url": get_web_base_url(),

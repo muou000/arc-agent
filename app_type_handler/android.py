@@ -9,6 +9,7 @@ from core.config import get_android_package, set_android_package
 from core.processes import finalize_subprocess
 
 from .base import AppTypeHandler
+from .path_validation import normalize_safe_relative_path
 
 
 def _android_file_to_test_class(file_path: str) -> str:
@@ -26,6 +27,24 @@ def _gradlew_cmd() -> str:
     if os.name == "nt":
         return "cmd /c gradlew.bat"
     return "./gradlew"
+
+
+def _android_test_path_error(test_type: str, file_path: str) -> str | None:
+    normalized_type = (test_type or "").strip().lower()
+    if normalized_type not in {"unit", "integration", "e2e"}:
+        return "Android test type must be one of Unit, Integration, or E2E."
+    normalized_path = normalize_safe_relative_path(file_path)
+    expected_prefix = "app/src/test/java/"
+    if normalized_path is None or not normalized_path.startswith(expected_prefix):
+        return (
+            f"Android {test_type} tests must live under {expected_prefix} with a safe relative path. "
+            f"Received: {file_path}"
+        )
+    if f"/{normalized_type}/" not in normalized_path[len(expected_prefix):]:
+        return f"Android {test_type} tests must include the {normalized_type} test directory. Received: {file_path}"
+    if not normalized_path.endswith((".java", ".kt")):
+        return f"Android test files must use a .java or .kt filename. Received: {file_path}"
+    return None
 
 
 def _filter_android_gradle_output(output: str, error: str, exit_code: int) -> str:
@@ -75,11 +94,18 @@ def _filter_android_gradle_output(output: str, error: str, exit_code: int) -> st
 
 
 async def _run_android_gradle_test(workspace_path: str, file_path: str) -> str:
-    command = f'{_gradlew_cmd()} testDebugUnitTest --info --tests "{_android_file_to_test_class(file_path)}"'
+    test_class = _android_file_to_test_class(file_path)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", test_class):
+        return "Exit Code: 1\nSTDERR:\nUnsafe Android test class name.\n"
+    command = (
+        ["cmd", "/c", "gradlew.bat", "testDebugUnitTest", "--info", "--tests", test_class]
+        if os.name == "nt"
+        else ["./gradlew", "testDebugUnitTest", "--info", "--tests", test_class]
+    )
     process = None
     try:
-        process = await asyncio.create_subprocess_shell(
-            command,
+        process = await asyncio.create_subprocess_exec(
+            *command,
             cwd=workspace_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -180,6 +206,9 @@ class AndroidAppType(AppTypeHandler):
 
     async def run_test_file(self, test_type: str, file_path: str) -> str:
         await self._log("System", f"System test execution ({test_type}): {file_path}")
+        validation_error = _android_test_path_error(test_type, file_path)
+        if validation_error:
+            return f"Exit Code: 1\nSTDERR:\n{validation_error}\n"
         return await _run_android_gradle_test(self.workspace_path, file_path)
 
     async def run_test_group(self, test_type: str, file_paths: list[str]) -> str:
