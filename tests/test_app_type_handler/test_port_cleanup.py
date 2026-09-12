@@ -64,6 +64,48 @@ def test_cleanup_only_terminates_explicitly_owned_processes(monkeypatch) -> None
     assert "5252" not in result
 
 
+def test_cleanup_kills_orphaned_child_whose_ppid_changed(monkeypatch) -> None:
+    """The launcher died and POSIX re-parented the backend child.
+
+    Its ppid no longer matches the capture-time fingerprint, but the identity
+    keys (name/exe/command/cwd) still do - force-release must proceed instead of
+    refusing, otherwise the orphan wedges the port for every later E2E run.
+    """
+    killed: list[int] = []
+    shutdown_checks = iter([False, True])
+    captured = {
+        "pid": "4242",
+        "ppid": "3131",
+        "name": "node.exe",
+        "exe": "C:/node.exe",
+        "command": "node server.js",
+        "cwd": "C:/workspace/backend",
+    }
+    orphaned = {**captured, "ppid": "1"}
+
+    async def server_shutdown(*_args, **_kwargs):
+        return next(shutdown_checks)
+
+    async def record_kill(pid: int):
+        killed.append(pid)
+
+    monkeypatch.setattr(web, "_wait_for_tcp_server_shutdown", server_shutdown)
+    monkeypatch.setattr(web, "_list_port_owner_pids", lambda _port: [4242])
+    monkeypatch.setattr(web, "_get_process_fingerprint", lambda _pid: orphaned)
+    monkeypatch.setattr(web, "_force_kill_pid", record_kill)
+
+    result = asyncio.run(
+        web._ensure_port_released(
+            3301,
+            context="Backend runtime cleanup",
+            allowed_processes={4242: captured},
+        )
+    )
+
+    assert killed == [4242]
+    assert "4242" in result
+
+
 def test_cleanup_refuses_reused_pid_with_different_fingerprint(monkeypatch) -> None:
     killed: list[int] = []
 

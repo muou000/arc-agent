@@ -660,7 +660,12 @@ def _capture_owned_port_processes(port: int, launcher_pid: int) -> dict[int, dic
 
 
 def _process_fingerprint_matches(expected: dict[str, str], current: dict[str, str]) -> bool:
-    identity_keys = ("ppid", "name", "exe", "command", "cwd")
+    # `ppid` is deliberately excluded. Force-release is only needed when graceful
+    # termination failed to kill the backend child, and in exactly that scenario
+    # the launcher is dead - on POSIX the surviving child is re-parented, so its
+    # ppid no longer matches the capture-time value. name/exe/command/cwd still
+    # pin the identity against PID reuse.
+    identity_keys = ("name", "exe", "command", "cwd")
     comparable_keys = [key for key in identity_keys if expected.get(key)]
     return bool(comparable_keys) and all(current.get(key) == expected[key] for key in comparable_keys)
 
