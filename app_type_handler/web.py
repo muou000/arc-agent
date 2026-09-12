@@ -629,20 +629,33 @@ async def _force_kill_pid(pid: int) -> None:
         return
 
 
-async def _force_release_port(port: int) -> list[int]:
+async def _force_release_port(port: int, *, allowed_pids: set[int]) -> list[int]:
     killed_pids: list[int] = []
     for pid in _list_port_owner_pids(port):
+        if pid not in allowed_pids:
+            continue
         await _force_kill_pid(pid)
         killed_pids.append(pid)
     return killed_pids
 
 
-async def _ensure_port_released(port: int, *, context: str, timeout: float = 5.0) -> str:
+async def _ensure_port_released(
+    port: int,
+    *,
+    context: str,
+    timeout: float = 5.0,
+    allowed_pids: set[int] | None = None,
+) -> str:
     if await _wait_for_tcp_server_shutdown("127.0.0.1", port, timeout=timeout):
         return f"{context}: port {port} is released."
 
     owners_before_force = _list_port_owner_pids(port)
-    killed_pids = await _force_release_port(port)
+    if not allowed_pids:
+        raise RuntimeError(
+            f"{context}: port {port} is still occupied; refusing to terminate unknown "
+            f"owner PID(s): {owners_before_force or 'unknown'}."
+        )
+    killed_pids = await _force_release_port(port, allowed_pids=allowed_pids)
 
     if await _wait_for_tcp_server_shutdown("127.0.0.1", port, timeout=10.0):
         if killed_pids:
@@ -662,12 +675,17 @@ async def _ensure_port_released(port: int, *, context: str, timeout: float = 5.0
 
 
 async def _terminate_process(process: asyncio.subprocess.Process | None, *, port: int | None = None) -> str:
+    owned_pids = set(_list_port_owner_pids(port)) if process is not None and port is not None else set()
     await finalize_subprocess(process, force_kill=False)
 
     if port is None:
         return "No port cleanup required."
 
-    return await _ensure_port_released(port, context="Backend runtime cleanup")
+    return await _ensure_port_released(
+        port,
+        context="Backend runtime cleanup",
+        allowed_pids=owned_pids,
+    )
 
 
 def _read_package_scripts(package_dir: str) -> dict[str, str]:
