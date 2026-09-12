@@ -299,23 +299,32 @@ class ARCWorkflowManager:
         max_concurrency = self._max_concurrent_tasks()
         in_flight: dict[asyncio.Task[None], dict[str, Any]] = {}
 
-        while True:
-            while len(in_flight) < max_concurrency:
-                task = self._next_runnable_task(queue_state, in_flight.values())
-                if task is None:
+        try:
+            while True:
+                while len(in_flight) < max_concurrency:
+                    task = self._next_runnable_task(queue_state, in_flight.values())
+                    if task is None:
+                        break
+                    self._begin_task(task, queue_state)
+                    in_flight[asyncio.create_task(self._execute_task(task, queue_state))] = task
+
+                if not in_flight:
                     break
-                self._begin_task(task, queue_state)
-                in_flight[asyncio.create_task(self._execute_task(task, queue_state))] = task
 
-            if not in_flight:
-                break
-
-            await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
-            for finished in [pending for pending in in_flight if pending.done()]:
-                in_flight.pop(finished, None)
-                # _execute_task turns phase failures into task state, so an
-                # exception escaping here can only be a scheduler bug.
-                finished.result()
+                await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
+                for finished in [pending for pending in in_flight if pending.done()]:
+                    in_flight.pop(finished, None)
+                    # _execute_task turns phase failures into task state, so an
+                    # exception escaping here can only be a scheduler bug.
+                    finished.result()
+        finally:
+            # Cancellation or an escaping scheduler exception must not leave
+            # child tasks mutating shared queue/Git state after the drain exits.
+            for pending in in_flight:
+                if not pending.done():
+                    pending.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
 
     @staticmethod
     def _max_concurrent_tasks() -> int:
