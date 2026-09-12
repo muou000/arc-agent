@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -53,5 +55,26 @@ def test_compile_requirement_tree_rejects_invalid_tree_before_runtime_setup(tmp_
     result = asyncio.run(
         manager.compile_requirement_tree({"id": "ROOT", "children": [{"id": "R1"}, {"id": "R1"}]})
     )
+
+    assert result == {"ok": False, "failed_nodes": []}
+
+
+def test_compile_resume_requires_an_existing_compatible_queue(tmp_path: Path) -> None:
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_path),
+        log_cb=lambda *args, **kwargs: None,
+    )
+    manager.runtime = SimpleNamespace(traceability=SimpleNamespace(store_requirement_tree=lambda tree: None))
+
+    result = asyncio.run(manager.compile_requirement_tree({"id": "ROOT"}, resume_from_queue=True))
+
+    assert result == {"ok": False, "failed_nodes": []}
+
+    manager.arc_dir = str(tmp_path / ".arc")
+    manager.queue_path = str(tmp_path / ".arc" / "processing_queue.json")
+    Path(manager.queue_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(manager.queue_path).write_text(json.dumps({"root_id": "OTHER", "tasks": []}), encoding="utf-8")
+
+    result = asyncio.run(manager.compile_requirement_tree({"id": "ROOT"}, resume_from_queue=True))
 
     assert result == {"ok": False, "failed_nodes": []}

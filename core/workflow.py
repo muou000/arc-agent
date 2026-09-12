@@ -217,6 +217,7 @@ class ARCWorkflowManager:
 
         result = await self.compile_requirement_tree(
             requirement_tree,
+            resume_from_queue=resume_from_queue,
             retry_failed=retry_failed,
             retry_node_ids=retry_node_ids,
         )
@@ -237,6 +238,7 @@ class ARCWorkflowManager:
         self,
         requirement_tree: dict[str, Any],
         *,
+        resume_from_queue: bool = False,
         retry_failed: bool = False,
         retry_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -252,10 +254,14 @@ class ARCWorkflowManager:
 
         self.runtime.traceability.store_requirement_tree(requirement_tree)
         retry_requested = retry_failed or bool(retry_node_ids)
-        queue_state = self._load_or_create_processing_queue(
-            requirement_tree,
-            require_compatible_existing_queue=retry_requested,
-        )
+        try:
+            queue_state = self._load_or_create_processing_queue(
+                requirement_tree,
+                require_compatible_existing_queue=resume_from_queue or retry_requested,
+            )
+        except ValueError as exc:
+            await self._log("Compiler", str(exc), "error")
+            return {"ok": False, "failed_nodes": []}
         self._sync_queue_node_states(queue_state)
         recovered_tasks = self._recover_interrupted_queue(queue_state)
         retry_plan = self._apply_retry_plan(
