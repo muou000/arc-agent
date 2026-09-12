@@ -209,7 +209,11 @@ def _save_visual_cache(workspace_path: str, cache: dict[str, Any]) -> None:
 
 def _build_visual_cache_key(full_path: Path) -> str:
     stat = full_path.stat()
-    raw_key = f"{full_path}::{int(stat.st_mtime_ns)}::{stat.st_size}::{VISUAL_ANALYSIS_PROMPT_VERSION}"
+    model_name = _normalize_openai_model_name(os.environ.get("VISUAL_MODEL") or os.environ.get("MODEL", ""))
+    raw_key = (
+        f"{full_path}::{int(stat.st_mtime_ns)}::{stat.st_size}::{VISUAL_ANALYSIS_PROMPT_VERSION}"
+        f"::{_resolve_visual_base_url()}::{model_name}"
+    )
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
