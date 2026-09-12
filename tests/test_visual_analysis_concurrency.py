@@ -177,14 +177,17 @@ def test_visual_analysis_preserves_order_and_isolates_failures(
 
 
 def test_visual_client_is_reused_across_concurrent_requests(
-    visual_workspace: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    visual_workspace: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     names = ["a.png", "b.png", "c.png"]
     for name in names:
         _write_image(visual_workspace["requirements_dir"], name)
     monkeypatch.setenv("VISUAL_BASE_URL", "https://vision.example/v1")
     monkeypatch.setenv("VISUAL_API_KEY", "key")
-    monkeypatch.setattr(visual_analysis, "_VISUAL_CLIENT_CACHE", {})
+    visual_analysis.reset_visual_client_cache_for_tests()
+    request.addfinalizer(visual_analysis.reset_visual_client_cache_for_tests)
 
     lock = threading.Lock()
     create_calls = {"count": 0}

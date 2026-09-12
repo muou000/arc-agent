@@ -60,6 +60,13 @@ def _get_visual_client() -> OpenAI:
         return client
 
 
+def reset_visual_client_cache_for_tests() -> None:
+    """Drop cached visual clients so a test can assert construction behaviour."""
+
+    with _VISUAL_CLIENT_LOCK:
+        _VISUAL_CLIENT_CACHE.clear()
+
+
 def build_visual_analysis_prompt() -> str:
     return """
 **ROLE:** You extract frontend style requirements from an input UI image.
