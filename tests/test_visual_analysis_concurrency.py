@@ -85,6 +85,7 @@ async def _analyze(
 def test_visual_analyses_fan_out_by_default(
     visual_workspace: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv("ARC_VISUAL_ANALYSIS_CONCURRENCY", raising=False)
     names = ["a.png", "b.png", "c.png", "d.png"]
     for name in names:
         _write_image(visual_workspace["requirements_dir"], name)
