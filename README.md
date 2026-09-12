@@ -91,6 +91,7 @@ ARC_OPENAI_API_MODE=chat_completions   # responses 或 chat_completions
 VISUAL_API_KEY=...          # 视觉模型（分析需求截图）
 VISUAL_MODEL=...
 ARC_DEBUG=1                 # 调试日志
+ARC_SKIP_BROWSER_INSTALL=1  # 跳过编译前检查的 Playwright 浏览器安装（无外网环境）
 ```
 
 运行健康检查验证配置：

@@ -301,6 +301,25 @@ def test_verify_workspace_skips_the_browser_gate_without_a_backend(tmp_path, mon
     assert asyncio.run(handler.verify_workspace()) is True
 
 
+def test_verify_workspace_skips_the_browser_gate_when_opted_out(tmp_path, monkeypatch) -> None:
+    """`ARC_SKIP_BROWSER_INSTALL` is the escape hatch for hosts that cannot
+    (or should not) download the browser binaries; compilation proceeds and
+    only E2E runs will fail on a missing browser."""
+    workspace = _make_runnable_workspace(tmp_path)
+    handler = _make_handler(workspace)
+    commands: list[str] = []
+
+    async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
+        commands.append(command)
+        return "Exit Code: 0\nSTDOUT:\nbuilt\n"
+
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
+    monkeypatch.setenv("ARC_SKIP_BROWSER_INSTALL", "1")
+
+    assert asyncio.run(handler.verify_workspace()) is True
+    assert commands == ["npm run build"]
+
+
 # --------------------------------------------------------------------------
 # post_template_setup verifies the port contract
 # --------------------------------------------------------------------------

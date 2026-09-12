@@ -31,6 +31,13 @@ LEGACY_PEER_DEPS_FLAG = "--legacy-peer-deps"
 # Generous because a cold machine downloads ~150 MB of browser binaries. Once
 # the machine-wide Playwright cache is warm the command exits in seconds.
 PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
+# Escape hatch for machines that intentionally run without browser binaries or
+# without the network access the download requires.
+_BROWSER_INSTALL_SKIP_VALUES = {"1", "true", "yes", "on"}
+
+
+def _browser_install_skipped() -> bool:
+    return os.environ.get("ARC_SKIP_BROWSER_INSTALL", "").strip().lower() in _BROWSER_INSTALL_SKIP_VALUES
 
 
 def node_modules_ready(target_dir: str) -> bool:
@@ -1154,10 +1161,22 @@ class WebAppType(AppTypeHandler):
         Installing here is idempotent and the browser cache is machine-wide, so
         this costs seconds once the browsers exist and is paid once per machine
         rather than once per node.
+
+        Set `ARC_SKIP_BROWSER_INSTALL=1` to bypass the download on machines that
+        intentionally run without browser binaries (or without network); E2E
+        tests will then fail on a missing browser until they are provided
+        another way.
         """
 
         backend_dir = os.path.join(self.workspace_path, "backend")
         if not os.path.isdir(backend_dir):
+            return True
+        if _browser_install_skipped():
+            await self._log(
+                "System",
+                "Skipping Playwright browser install (ARC_SKIP_BROWSER_INSTALL is set). "
+                "E2E tests will fail on a missing browser until the binaries are installed.",
+            )
             return True
 
         await self._log("System", "Verifying workspace: installing Playwright browsers...")
