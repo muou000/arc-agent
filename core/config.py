@@ -17,10 +17,17 @@ _web_port = int(os.environ.get("ARC_WEB_PORT", "3301") or 3301)
 _android_package = os.environ.get("ARC_ANDROID_PACKAGE", "com.example.template").strip() or "com.example.template"
 
 
+def get_project_env_path() -> Path:
+    custom_env = os.environ.get("ARC_ENV_FILE", "").strip()
+    if custom_env:
+        return Path(custom_env).expanduser().resolve()
+    return Path(__file__).resolve().parent.parent / ".env"
+
+
 def load_project_env(env_path: str | os.PathLike[str] | None = None) -> None:
     """Load a simple KEY=VALUE .env file without overriding existing variables."""
 
-    path = Path(env_path) if env_path else Path.cwd() / ".env"
+    path = Path(env_path).expanduser() if env_path else get_project_env_path()
     if path.exists():
         for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = raw_line.strip()
@@ -160,7 +167,7 @@ def check_config() -> dict[str, Any]:
         warnings.append(f"ARC_STRUCTURED_OUTPUT_RETRY_COUNT must be an integer, got: {retry_count}")
 
     # Check .env file presence
-    env_file = Path(".env")
+    env_file = get_project_env_path()
     if not env_file.exists():
         warnings.append("No .env file found in current directory (copy .env_example to .env)")
     else:
