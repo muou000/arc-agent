@@ -22,12 +22,30 @@ carries state across ``--resume`` process restarts. Set
 
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import Any
 
 _FALSE_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
 
 _checkpointer: Any | None = None
+
+
+def get_project_thread_namespace() -> str:
+    """Return a stable short identifier for the active project.
+
+    ARC's stage ``thread_id`` values are keyed only by ``(node, phase, stage)``.
+    Because the checkpoint saver is process-wide, switching projects via
+    ``configure_runtime`` would otherwise let a matching node/stage id resume
+    another project's conversation. Prefixing every ``thread_id`` with this
+    project-derived namespace keeps each project's checkpoints isolated while
+    preserving stable ids within the same project.
+    """
+
+    from core.config import get_workspace_root
+
+    root = get_workspace_root()
+    return hashlib.sha256(root.encode("utf-8")).hexdigest()[:12]
 
 
 def checkpointer_enabled() -> bool:
