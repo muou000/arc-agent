@@ -106,6 +106,14 @@ class ARCWorkflowManager:
     async def cleanup_workspace(self) -> bool:
         await self._log("Compiler", "Clear-and-recompile requested. Cleaning workspace...")
         try:
+            # The overlap guard below refuses layouts where the requirement
+            # directory lives inside the workspace, even though the deletion
+            # loop preserves a `requirements` entry by name. That is
+            # deliberate: the gate also protects requirement assets stored
+            # under any other name inside the workspace. The CLI's --clean
+            # performs its own validate_clean_target check against the
+            # caller-supplied requirement directory before rmtree, and never
+            # routes through here (clear_all is only set by direct API use).
             clean_error = validate_clean_target(
                 self.workspace_path,
                 str(Path(self.requirement_path).parent),
