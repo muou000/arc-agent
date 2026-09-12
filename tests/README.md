@@ -7,7 +7,7 @@
 
 1. Python 包 [`arcbench_agent_runtime`](../arcbench_agent_runtime) 负责写出 runner 事件
    （`.arc/runner-events.jsonl`）并管理 traceability 数据（`.arc/traceability/*.json`）。
-2. Web 模板 [`template/`](../template) 保持其运行契约（Express `/api/health`、Vite 构建、
+2. Web 模板 [`arc-template/templates/web-react-express/`](../arc-template/templates/web-react-express) 保持其运行契约（Express `/api/health`、Vite 构建、
    Vitest/Playwright 入口、`template.yaml` 清单与文件系统一致）。
 3. 运行结束后的 **auto TDD re-prompt** 纯函数（`core/tdd_retry.py`）：扫描 runner 事件中的
    `test/failed` 节点并构造 TDD 优先的修复提示。
@@ -90,7 +90,7 @@ make clean       # 清理 pytest 缓存与 __pycache__
 
 - `template.yaml` 中 `agent_guidance` 声明的路径在磁盘上存在。
 - `template.yaml` 声明的技术栈与 `package.json` 依赖一致。
-- `template/README.md` 中提到的每个 `npm run X` 都在某个 `package.json` 中声明。
+- `arc-template/templates/web-react-express/README.md` 中提到的每个 `npm run X` 都在某个 `package.json` 中声明。
 - （slow）后端启动并对 `GET /api/health` 返回 `{"code":200,"message":"Backend Ready"}`。
 - （slow）前端 Vite 构建产出 `frontend/dist/index.html`。
 

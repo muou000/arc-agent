@@ -57,7 +57,7 @@ arc-agent/
 ├── arcbench_agent_runtime/   # ARC-Bench Python SDK（事件、追溯、Git）
 ├── core/                     # 编译工作流、阶段调度、配置、日志
 ├── skills/                   # 技能库（Markdown 形式的阶段指导）
-├── template/                 # Web 应用模板（React + Vite + Express + SQLite）
+├── arc-template/templates/   # Web 应用模板（React + Vite + Express + SQLite）
 └── tests/                    # 契约测试套件（见 tests/README.md）
 ```
 
@@ -137,4 +137,4 @@ make test-slow   # 完整套件（需要 Node.js + npm，含模板集成测试�
 - 比赛官网：[create.gosim.org/factory26](https://create.gosim.org/factory26/)
 - 评测平台：[arc-bench.com](http://arc-bench.com/)
 - 测试套件说明：[tests/README.md](tests/README.md)
-- Web 模板说明：[template/README.md](template/README.md)
+- Web 模板说明：[arc-template/templates/web-react-express/README.md](arc-template/templates/web-react-express/README.md)
