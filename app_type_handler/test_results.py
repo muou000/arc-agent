@@ -10,13 +10,10 @@ def parse_test_results(test_output: str) -> dict[str, Any]:
     result: dict[str, Any] = {"passed": [], "failed": [], "exit_code": -1, "sub_batches": []}
     output = test_output or ""
     for line in output.splitlines():
-        if "Exit Code:" not in line:
-            continue
-        try:
-            result["exit_code"] = int(line.split("Exit Code:", 1)[1].strip())
-        except ValueError:
-            result["exit_code"] = -1
-        break
+        exit_code = _parse_exit_code_line(line)
+        if exit_code is not None:
+            result["exit_code"] = exit_code
+            break
 
     test_file_sections = re.findall(
         r"Test File:\s*(.+?)\r?\nTest Results:\r?\n(.*?)(?=\r?\nTest File: |\Z)",
@@ -61,14 +58,20 @@ def parse_test_results(test_output: str) -> dict[str, Any]:
 
 def _extract_exit_code(output: str) -> int:
     for line in (output or "").splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("Exit Code:"):
-            continue
-        try:
-            return int(stripped.split("Exit Code:", 1)[1].strip())
-        except ValueError:
-            return -1
+        exit_code = _parse_exit_code_line(line)
+        if exit_code is not None:
+            return exit_code
     return -1
+
+
+def _parse_exit_code_line(line: str) -> int | None:
+    stripped = (line or "").strip()
+    if not stripped.startswith("Exit Code:"):
+        return None
+    try:
+        return int(stripped.split("Exit Code:", 1)[1].strip())
+    except ValueError:
+        return None
 
 
 def _extract_labeled_section(output: str, label: str) -> str:
