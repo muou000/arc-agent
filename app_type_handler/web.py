@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .base import AppTypeHandler
+from .path_validation import is_scoped_test_path, normalize_safe_relative_path
 from core.config import build_web_runtime_env, get_web_base_url, get_web_port
 from core.processes import finalize_subprocess
 
@@ -27,6 +28,16 @@ NPM_INSTALL_TIMEOUT_SECONDS = 900.0
 # the full budget before trying the fallback wastes minutes on every install.
 NPM_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 240.0
 LEGACY_PEER_DEPS_FLAG = "--legacy-peer-deps"
+# Generous because a cold machine downloads ~150 MB of browser binaries. Once
+# the machine-wide Playwright cache is warm the command exits in seconds.
+PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
+# Escape hatch for machines that intentionally run without browser binaries or
+# without the network access the download requires.
+_BROWSER_INSTALL_SKIP_VALUES = {"1", "true", "yes", "on"}
+
+
+def _browser_install_skipped() -> bool:
+    return os.environ.get("ARC_SKIP_BROWSER_INSTALL", "").strip().lower() in _BROWSER_INSTALL_SKIP_VALUES
 
 
 def node_modules_ready(target_dir: str) -> bool:
@@ -192,20 +203,31 @@ def _normalize_backend_test_path(file_path: str) -> str:
 
 
 def _is_valid_web_e2e_test_path(file_path: str) -> bool:
-    normalized = (file_path or "").strip().replace("\\", "/").lstrip("./")
-    return normalized.startswith("backend/test-e2e/") and normalized.endswith((".js", ".jsx", ".ts", ".tsx"))
+    return is_scoped_test_path(
+        file_path,
+        prefixes=("backend/test-e2e/",),
+        suffixes=(".js", ".jsx", ".ts", ".tsx"),
+    )
 
 
 def _is_valid_web_vitest_test_path(file_path: str) -> bool:
-    normalized = (file_path or "").strip().replace("\\", "/").lstrip("./")
-    valid_prefix = normalized.startswith("frontend/tests/") or normalized.startswith("backend/tests/")
-    valid_suffix = normalized.endswith(
-        (
+    return is_scoped_test_path(
+        file_path,
+        prefixes=("frontend/tests/", "backend/tests/"),
+        suffixes=(
             ".test.js", ".test.jsx", ".test.ts", ".test.tsx",
             ".spec.js", ".spec.jsx", ".spec.ts", ".spec.tsx",
-        )
+        ),
     )
-    return valid_prefix and valid_suffix
+
+
+def _validate_web_test_path(test_type: str, file_path: str) -> str | None:
+    normalized_type = (test_type or "").strip().lower()
+    if normalized_type in {"unit", "integration"} and _is_valid_web_vitest_test_path(file_path):
+        return normalize_safe_relative_path(file_path)
+    if normalized_type == "e2e" and _is_valid_web_e2e_test_path(file_path):
+        return normalize_safe_relative_path(file_path)
+    return None
 
 
 def _resolve_web_test_target(file_path: str, workspace_path: str) -> tuple[str, str]:
@@ -228,7 +250,10 @@ def _resolve_web_test_target(file_path: str, workspace_path: str) -> tuple[str, 
 
 def _build_web_test_execution(test_type: str, file_path: str, workspace_path: str) -> dict[str, str]:
     normalized_type = (test_type or "").strip().lower()
-    working_directory, resolved_file_path = _resolve_web_test_target(file_path, workspace_path)
+    safe_file_path = _validate_web_test_path(normalized_type, file_path)
+    if safe_file_path is None:
+        raise ValueError(f"Invalid web test path for type {test_type!r}: {file_path!r}")
+    working_directory, resolved_file_path = _resolve_web_test_target(safe_file_path, workspace_path)
     web_port = str(get_web_port())
     base_url = get_web_base_url()
 
@@ -238,7 +263,7 @@ def _build_web_test_execution(test_type: str, file_path: str, workspace_path: st
     elif normalized_type == "e2e":
         runner = "Playwright"
         working_directory = os.path.join(workspace_path, "backend")
-        resolved_file_path = _normalize_backend_test_path(file_path)
+        resolved_file_path = _normalize_backend_test_path(safe_file_path)
         command = f"npx playwright test {resolved_file_path}" if resolved_file_path else "npx playwright test"
     else:
         raise ValueError("Unknown test type. Must be 'unit', 'integration', or 'e2e'.")
@@ -262,7 +287,10 @@ def _build_web_group_execution(test_type: str, file_paths: list[str], workspace_
         backend_targets: list[str] = []
         frontend_targets: list[str] = []
         for file_path in requested_files:
-            working_directory, resolved_file_path = _resolve_web_test_target(file_path, workspace_path)
+            safe_file_path = _validate_web_test_path(normalized_type, file_path)
+            if safe_file_path is None:
+                raise ValueError(f"Invalid web test path for type {test_type!r}: {file_path!r}")
+            working_directory, resolved_file_path = _resolve_web_test_target(safe_file_path, workspace_path)
             normalized_resolved = resolved_file_path.replace("\\", "/")
             if working_directory == os.path.join(workspace_path, "frontend"):
                 frontend_targets.append(normalized_resolved)
@@ -288,7 +316,13 @@ def _build_web_group_execution(test_type: str, file_paths: list[str], workspace_
         }
 
     if normalized_type == "e2e":
-        resolved_targets = [_normalize_backend_test_path(file_path) for file_path in requested_files]
+        safe_paths = []
+        for file_path in requested_files:
+            safe_file_path = _validate_web_test_path(normalized_type, file_path)
+            if safe_file_path is None:
+                raise ValueError(f"Invalid web test path for type {test_type!r}: {file_path!r}")
+            safe_paths.append(safe_file_path)
+        resolved_targets = [_normalize_backend_test_path(file_path) for file_path in safe_paths]
         return {
             "runner": "Playwright",
             "test_type": test_type,
@@ -297,7 +331,7 @@ def _build_web_group_execution(test_type: str, file_paths: list[str], workspace_
             "resolved_targets": resolved_targets,
             "requested_resolved_pairs": [
                 {"requested_file": file_path, "resolved_target": _normalize_backend_test_path(file_path)}
-                for file_path in requested_files
+                for file_path in safe_paths
             ],
             "web_port": str(get_web_port()),
             "base_url": get_web_base_url(),
@@ -605,20 +639,79 @@ async def _force_kill_pid(pid: int) -> None:
         return
 
 
-async def _force_release_port(port: int) -> list[int]:
+def _is_process_descendant(pid: int, ancestor_pid: int) -> bool:
+    if pid == ancestor_pid:
+        return True
+
+    seen: set[int] = set()
+    current_pid = pid
+    while current_pid > 0 and current_pid not in seen:
+        seen.add(current_pid)
+        raw_parent_pid = _get_process_fingerprint(current_pid).get("ppid", "")
+        try:
+            parent_pid = int(raw_parent_pid)
+        except (TypeError, ValueError):
+            return False
+        if parent_pid == ancestor_pid:
+            return True
+        current_pid = parent_pid
+    return False
+
+
+def _capture_owned_port_processes(port: int, launcher_pid: int) -> dict[int, dict[str, str]]:
+    return {
+        pid: _get_process_fingerprint(pid)
+        for pid in _list_port_owner_pids(port)
+        if _is_process_descendant(pid, launcher_pid)
+    }
+
+
+def _process_fingerprint_matches(expected: dict[str, str], current: dict[str, str]) -> bool:
+    # `ppid` is deliberately excluded. Force-release is only needed when graceful
+    # termination failed to kill the backend child, and in exactly that scenario
+    # the launcher is dead - on POSIX the surviving child is re-parented, so its
+    # ppid no longer matches the capture-time value. name/exe/command/cwd still
+    # pin the identity against PID reuse.
+    identity_keys = ("name", "exe", "command", "cwd")
+    comparable_keys = [key for key in identity_keys if expected.get(key)]
+    return bool(comparable_keys) and all(current.get(key) == expected[key] for key in comparable_keys)
+
+
+async def _force_release_port(
+    port: int,
+    *,
+    allowed_processes: dict[int, dict[str, str]],
+) -> list[int]:
     killed_pids: list[int] = []
     for pid in _list_port_owner_pids(port):
+        expected_fingerprint = allowed_processes.get(pid)
+        if expected_fingerprint is None:
+            continue
+        current_fingerprint = _get_process_fingerprint(pid)
+        if not _process_fingerprint_matches(expected_fingerprint, current_fingerprint):
+            continue
         await _force_kill_pid(pid)
         killed_pids.append(pid)
     return killed_pids
 
 
-async def _ensure_port_released(port: int, *, context: str, timeout: float = 5.0) -> str:
+async def _ensure_port_released(
+    port: int,
+    *,
+    context: str,
+    timeout: float = 5.0,
+    allowed_processes: dict[int, dict[str, str]] | None = None,
+) -> str:
     if await _wait_for_tcp_server_shutdown("127.0.0.1", port, timeout=timeout):
         return f"{context}: port {port} is released."
 
     owners_before_force = _list_port_owner_pids(port)
-    killed_pids = await _force_release_port(port)
+    if not allowed_processes:
+        raise RuntimeError(
+            f"{context}: port {port} is still occupied; refusing to terminate unknown "
+            f"owner PID(s): {owners_before_force or 'unknown'}."
+        )
+    killed_pids = await _force_release_port(port, allowed_processes=allowed_processes)
 
     if await _wait_for_tcp_server_shutdown("127.0.0.1", port, timeout=10.0):
         if killed_pids:
@@ -638,12 +731,21 @@ async def _ensure_port_released(port: int, *, context: str, timeout: float = 5.0
 
 
 async def _terminate_process(process: asyncio.subprocess.Process | None, *, port: int | None = None) -> str:
+    owned_processes = (
+        _capture_owned_port_processes(port, process.pid)
+        if process is not None and port is not None
+        else {}
+    )
     await finalize_subprocess(process, force_kill=False)
 
     if port is None:
         return "No port cleanup required."
 
-    return await _ensure_port_released(port, context="Backend runtime cleanup")
+    return await _ensure_port_released(
+        port,
+        context="Backend runtime cleanup",
+        allowed_processes=owned_processes,
+    )
 
 
 def _read_package_scripts(package_dir: str) -> dict[str, str]:
@@ -682,6 +784,11 @@ def _build_e2e_runtime_env(workspace_path: str, targets: list[str]) -> dict[str,
     e2e_db_path = os.path.abspath(os.path.join(e2e_db_root, f"{suite_label}-{suite_hash}.sqlite"))
     return {
         **build_web_runtime_env(),
+        # The template's `playwright.config.js` and the agent-facing stack notes
+        # both document `PLAYWRIGHT_BASE_URL` as the origin under test. Nothing
+        # used to set it, so Playwright fell back to its own default port and
+        # every E2E run navigated to a dead origin.
+        "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{get_web_port()}",
         "ARC_DB_FILE": e2e_db_path,
         "ARC_E2E_DB_PATH": e2e_db_path,
         "ARC_E2E_DB_LABEL": suite_label,
@@ -713,6 +820,11 @@ def _frontend_source_fingerprint(frontend_path: str) -> str | None:
     if not root.is_dir():
         return None
     digest = hashlib.sha256()
+    for key, value in sorted(build_web_runtime_env().items()):
+        digest.update(key.encode("utf-8"))
+        digest.update(b"=")
+        digest.update(str(value).encode("utf-8"))
+        digest.update(b"\0")
     visited_real_dirs: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         real_dir = os.path.realpath(dirpath)
@@ -941,33 +1053,53 @@ class WebAppType(AppTypeHandler):
         return None
 
     async def post_template_setup(self) -> bool:
-        replacements = {
-            "__ARC_WEB_PORT__": str(get_web_port()),
-        }
-        target_files = [
-            os.path.join(self.workspace_path, "backend", "src", "index.js"),
-            os.path.join(self.workspace_path, "backend", "playwright.config.js"),
-            os.path.join(self.workspace_path, "frontend", "vite.config.js"),
-        ]
+        """Assert the scaffolded runtime files resolve the web port from the environment.
 
-        try:
-            for file_path in target_files:
-                if not os.path.exists(file_path):
-                    continue
+        There is deliberately no placeholder substitution here. Every runtime
+        entry point reads the port from an environment variable at process
+        start, which keeps a resumed compile on a different ``--port`` working.
+        The previous implementation replaced ``__ARC_WEB_PORT__`` in three files,
+        but no template file ever contained that token, so it silently did
+        nothing - and ``playwright.config.js`` was free to drift to a hardcoded
+        port that no E2E run could reach. Verifying the contract turns that
+        silent no-op into a gate.
+        """
+
+        port_contract = (
+            ("backend/src/index.js", "process.env.PORT"),
+            ("frontend/vite.config.js", "process.env.ARC_WEB_PORT"),
+            ("backend/playwright.config.js", "process.env.ARC_WEB_PORT"),
+        )
+        unconfigured: list[str] = []
+        for relative_path, marker in port_contract:
+            file_path = os.path.join(self.workspace_path, *relative_path.split("/"))
+            if not os.path.exists(file_path):
+                continue
+            try:
                 with open(file_path, "r", encoding="utf-8") as file:
                     content = file.read()
-                for old_value, new_value in replacements.items():
-                    content = content.replace(old_value, new_value)
-                with open(file_path, "w", encoding="utf-8") as file:
-                    file.write(content)
+            except OSError as exc:
+                await self._log("System", f"Failed to read {relative_path}: {exc}", "error")
+                return False
+            if marker not in content:
+                unconfigured.append(relative_path)
+
+        if unconfigured:
             await self._log(
                 "System",
-                f"Configured web template for single-port backend hosting on port {get_web_port()}.",
+                "Web template port configuration is broken in "
+                + ", ".join(unconfigured)
+                + f": these files must resolve the web port from the environment, otherwise the "
+                f"workspace does not honour port {get_web_port()}.",
+                "error",
             )
-            return True
-        except Exception as exc:
-            await self._log("System", f"Failed to configure web template: {str(exc)}")
             return False
+
+        await self._log(
+            "System",
+            f"Configured web template for single-port backend hosting on port {get_web_port()}.",
+        )
+        return True
 
     async def install_dependencies(self) -> bool:
         targets = (
@@ -987,7 +1119,7 @@ class WebAppType(AppTypeHandler):
         return all_ok
 
     async def verify_workspace(self) -> bool:
-        """Fail fast when the scaffolded workspace cannot build.
+        """Fail fast when the scaffolded workspace cannot build or cannot run E2E.
 
         Without this gate a broken template or a half-finished install only
         shows up per node, where it burns the entire TDD retry budget of every
@@ -1003,14 +1135,64 @@ class WebAppType(AppTypeHandler):
             cwd=frontend_dir,
             timeout=180.0,
         )
+        if _extract_exit_code(result) != 0:
+            await self._log(
+                "System",
+                "Workspace verification failed: frontend build did not succeed. "
+                "Aborting before the node loop. " + _tail(result),
+                "error",
+                None,
+            )
+            return False
+        await self._log("System", "Workspace verification passed: frontend build succeeded.")
+
+        return await self._verify_e2e_runner()
+
+    async def _verify_e2e_runner(self) -> bool:
+        """Provision the Playwright browsers before the node loop starts.
+
+        The template declares `@playwright/test`, but npm only installs the
+        runner - the browser binaries are downloaded separately. Without this
+        step the first E2E run fails with "Executable doesn't exist", and the
+        agent cannot recover on its own: `execute` is disabled, so it has no way
+        to run `playwright install` and ends up patching the generated
+        `package.json` to smuggle the install into another npm script.
+
+        Installing here is idempotent and the browser cache is machine-wide, so
+        this costs seconds once the browsers exist and is paid once per machine
+        rather than once per node.
+
+        Set `ARC_SKIP_BROWSER_INSTALL=1` to bypass the download on machines that
+        intentionally run without browser binaries (or without network); E2E
+        tests will then fail on a missing browser until they are provided
+        another way.
+        """
+
+        backend_dir = os.path.join(self.workspace_path, "backend")
+        if not os.path.isdir(backend_dir):
+            return True
+        if _browser_install_skipped():
+            await self._log(
+                "System",
+                "Skipping Playwright browser install (ARC_SKIP_BROWSER_INSTALL is set). "
+                "E2E tests will fail on a missing browser until the binaries are installed.",
+            )
+            return True
+
+        await self._log("System", "Verifying workspace: installing Playwright browsers...")
+        result = await _execute_web_test_command(
+            "npm run e2e:install-browsers",
+            cwd=backend_dir,
+            timeout=PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS,
+        )
         if _extract_exit_code(result) == 0:
-            await self._log("System", "Workspace verification passed: frontend build succeeded.")
+            await self._log("System", "Workspace verification passed: Playwright browsers ready.")
             return True
 
         await self._log(
             "System",
-            "Workspace verification failed: frontend build did not succeed. "
-            "Aborting before the node loop. " + _tail(result),
+            "Workspace verification failed: Playwright browsers could not be installed, so every "
+            "E2E test would fail on a missing browser. Aborting before the node loop. " + _tail(result),
             "error",
             None,
         )

@@ -16,8 +16,9 @@ from core.phases import WorkflowPhaseRunner
 from core.service import configure_runtime
 from core.commits import build_commit_message
 from core.config import load_project_env, set_app_type, set_web_port, set_workspace_root
-from core.files import load_requirements, read_json_file, write_json_file
+from core.files import load_requirements, read_json_file, validate_requirement_tree, write_json_file
 from core.logging import append_debug_log, write_terminal_log
+from core.path_safety import validate_clean_target
 from core.tdd_retry import build_tdd_reprompt, scan_test_failures
 
 
@@ -105,6 +106,22 @@ class ARCWorkflowManager:
     async def cleanup_workspace(self) -> bool:
         await self._log("Compiler", "Clear-and-recompile requested. Cleaning workspace...")
         try:
+            # The overlap guard below refuses layouts where the requirement
+            # directory lives inside the workspace, even though the deletion
+            # loop preserves a `requirements` entry by name. That is
+            # deliberate: the gate also protects requirement assets stored
+            # under any other name inside the workspace. The CLI's --clean
+            # performs its own validate_clean_target check against the
+            # caller-supplied requirement directory before rmtree, and never
+            # routes through here (clear_all is only set by direct API use).
+            clean_error = validate_clean_target(
+                self.workspace_path,
+                str(Path(self.requirement_path).parent),
+                repo_root=Path(__file__).resolve().parent.parent,
+            )
+            if clean_error:
+                await self._log("Compiler", f"Refusing to clean workspace: {clean_error}", "error")
+                return False
             Path(self.workspace_path).mkdir(parents=True, exist_ok=True)
             for item in os.listdir(self.workspace_path):
                 if item == "requirements":
@@ -208,6 +225,7 @@ class ARCWorkflowManager:
 
         result = await self.compile_requirement_tree(
             requirement_tree,
+            resume_from_queue=resume_from_queue,
             retry_failed=retry_failed,
             retry_node_ids=retry_node_ids,
         )
@@ -228,6 +246,7 @@ class ARCWorkflowManager:
         self,
         requirement_tree: dict[str, Any],
         *,
+        resume_from_queue: bool = False,
         retry_failed: bool = False,
         retry_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -235,13 +254,22 @@ class ARCWorkflowManager:
         if not root_id:
             await self._log("Compiler", "Requirement root node id is missing.", "error")
             return {"ok": False, "failed_nodes": []}
+        try:
+            validate_requirement_tree(requirement_tree)
+        except ValueError as exc:
+            await self._log("Compiler", f"Invalid requirement tree: {exc}", "error")
+            return {"ok": False, "failed_nodes": []}
 
         self.runtime.traceability.store_requirement_tree(requirement_tree)
         retry_requested = retry_failed or bool(retry_node_ids)
-        queue_state = self._load_or_create_processing_queue(
-            requirement_tree,
-            require_compatible_existing_queue=retry_requested,
-        )
+        try:
+            queue_state = self._load_or_create_processing_queue(
+                requirement_tree,
+                require_compatible_existing_queue=resume_from_queue or retry_requested,
+            )
+        except ValueError as exc:
+            await self._log("Compiler", str(exc), "error")
+            return {"ok": False, "failed_nodes": []}
         self._sync_queue_node_states(queue_state)
         recovered_tasks = self._recover_interrupted_queue(queue_state)
         retry_plan = self._apply_retry_plan(
@@ -468,7 +496,8 @@ class ARCWorkflowManager:
             return queue_state
         if require_compatible_existing_queue:
             raise ValueError(
-                "Retry requested, but the existing processing queue is missing or incompatible with the current requirement tree."
+                "Resume or retry requested, but the existing processing queue is missing or "
+                "incompatible with the current requirement tree."
             )
         queue_state = {
             "root_id": root_id,

@@ -48,14 +48,24 @@ def _make_workspace(tmp_path: Path) -> Path:
 
 
 def _try_symlink_to(link: Path, target: Path) -> None:
-    """Create a directory symlink or skip the test if the OS forbids it."""
+    """Create a directory symlink or skip the test if the host cannot provide one.
+
+    Creating the link is not enough: some sandboxes accept ``symlink_to`` without
+    raising yet silently drop the entry, leaving ``link`` non-existent. Asserting
+    on the result instead of on the absence of an exception keeps the test honest
+    - otherwise it runs against a missing directory and fails for the wrong
+    reason.
+    """
+
+    import pytest
 
     try:
         link.symlink_to(target, target_is_directory=True)
     except OSError:
-        import pytest
-
         pytest.skip("directory symlinks require elevated privileges on this host")
+
+    if not link.is_symlink() or not link.exists():
+        pytest.skip("this host silently drops directory symlinks")
 
 
 def _build(workspace_root: Path) -> tuple[bool, str]:

@@ -19,7 +19,7 @@ from core.cli import (
     stop_cli_spinner,
 )
 from core.config import set_web_port
-from core.workflow import ARCWorkflowManager
+from core.path_safety import validate_clean_target
 
 
 @dataclass(slots=True)
@@ -37,22 +37,23 @@ class CompilationConfig:
 
 
 def _get_repo_root() -> str:
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    return str(Path(__file__).resolve().parent)
 
 
 def _ensure_dotenv_loaded() -> None:
     """Load .env file if present, respecting ARC_ENV_FILE override."""
-    from dotenv import load_dotenv
+    from core.config import load_project_env
 
     custom_env = os.environ.get("ARC_ENV_FILE", "").strip()
-    if custom_env and os.path.isfile(custom_env):
-        load_dotenv(custom_env, override=False)
+    if custom_env:
+        if not os.path.isfile(custom_env):
+            raise FileNotFoundError(f"ARC_ENV_FILE does not exist: {custom_env}")
+        load_project_env(custom_env)
         return
 
     repo_root = _get_repo_root()
     default_env = os.path.join(repo_root, ".env")
-    if os.path.isfile(default_env):
-        load_dotenv(default_env, override=False)
+    load_project_env(default_env)
 
 
 def _locate_requirement_file(input_path: str) -> tuple[str, str, str]:
@@ -140,7 +141,12 @@ def build_compile_parser(subparsers) -> None:
 
 async def cmd_compile(args: argparse.Namespace) -> int:
     """Execute compile subcommand."""
-    _ensure_dotenv_loaded()
+    try:
+        _ensure_dotenv_loaded()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
+        return 2
+    from core.workflow import ARCWorkflowManager
     
     # Validate mutual exclusivity
     if args.clean and args.resume:
@@ -159,6 +165,14 @@ async def cmd_compile(args: argparse.Namespace) -> int:
     
     # Handle --clean
     if args.clean and os.path.exists(output_dir):
+        clean_error = validate_clean_target(
+            output_dir,
+            requirement_dir,
+            repo_root=_get_repo_root(),
+        )
+        if clean_error:
+            print(f"Error: --clean {clean_error}.")
+            return 2
         shutil.rmtree(output_dir)
     
     # Normalize app type
@@ -239,7 +253,11 @@ def build_doctor_parser(subparsers) -> None:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Execute doctor subcommand."""
-    _ensure_dotenv_loaded()
+    try:
+        _ensure_dotenv_loaded()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
+        return 2
     from core.config import print_health_check
     return print_health_check()
 

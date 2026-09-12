@@ -7,10 +7,11 @@ import sys
 from pathlib import Path
 
 from .base import AppTypeHandler
+from .path_validation import normalize_safe_relative_path
 
 
 def _normalize_cli_test_path(file_path: str) -> str:
-    return str(file_path or "").strip().replace("\\", "/").lstrip("./")
+    return normalize_safe_relative_path(file_path) or ""
 
 
 def _is_valid_cli_test_filename(file_path: str) -> bool:
@@ -149,6 +150,8 @@ class CliAppType(AppTypeHandler):
         if normalized_type not in {"unit", "integration", "e2e"}:
             return "CLI test `type` must be one of `Unit`, `Integration`, or `E2E`."
         expected_prefix = f"tests/{normalized_type}/"
+        # `_normalize_cli_test_path` already returns "" for unsafe paths, so the
+        # prefix check rejects them.
         if not normalized_path.startswith(expected_prefix):
             return (
                 f"CLI {test_type} tests must live under `{expected_prefix}...`. "

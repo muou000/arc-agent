@@ -238,6 +238,176 @@ def test_verify_workspace_fails_when_the_frontend_build_fails(tmp_path, monkeypa
     assert asyncio.run(handler.verify_workspace()) is False
 
 
+# --------------------------------------------------------------------------
+# verify_workspace provisions the E2E runner
+# --------------------------------------------------------------------------
+
+
+def _make_runnable_workspace(tmp_path) -> Path:
+    workspace = tmp_path / "workspace"
+    (workspace / "frontend").mkdir(parents=True)
+    (workspace / "backend").mkdir(parents=True)
+    return workspace
+
+
+def test_verify_workspace_installs_playwright_browsers(tmp_path, monkeypatch) -> None:
+    """`npm install` never downloads the browser binaries.
+
+    Without this step the first E2E run of the first leaf node fails with
+    "Executable doesn't exist", and the agent cannot recover on its own:
+    `execute` is disabled, so it has no way to run `playwright install`.
+    """
+
+    workspace = _make_runnable_workspace(tmp_path)
+    handler = _make_handler(workspace)
+    commands: list[str] = []
+
+    async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
+        commands.append(command)
+        return "Exit Code: 0\nSTDOUT:\nok\n"
+
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
+
+    assert asyncio.run(handler.verify_workspace()) is True
+    assert commands[0] == "npm run build"
+    assert "e2e:install-browsers" in commands[1]
+
+
+def test_verify_workspace_aborts_when_browsers_cannot_be_installed(tmp_path, monkeypatch) -> None:
+    workspace = _make_runnable_workspace(tmp_path)
+    handler = _make_handler(workspace)
+
+    async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
+        if "e2e:install-browsers" in command:
+            return "Exit Code: 1\nSTDERR:\nnpm error Missing script: \"e2e:install-browsers\"\n"
+        return "Exit Code: 0\nSTDOUT:\nbuilt\n"
+
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
+
+    assert asyncio.run(handler.verify_workspace()) is False
+
+
+def test_verify_workspace_skips_the_browser_gate_without_a_backend(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "frontend").mkdir(parents=True)
+    handler = _make_handler(workspace)
+
+    async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
+        assert command == "npm run build"
+        return "Exit Code: 0\nSTDOUT:\nbuilt\n"
+
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
+
+    assert asyncio.run(handler.verify_workspace()) is True
+
+
+def test_verify_workspace_skips_the_browser_gate_when_opted_out(tmp_path, monkeypatch) -> None:
+    """`ARC_SKIP_BROWSER_INSTALL` is the escape hatch for hosts that cannot
+    (or should not) download the browser binaries; compilation proceeds and
+    only E2E runs will fail on a missing browser."""
+    workspace = _make_runnable_workspace(tmp_path)
+    handler = _make_handler(workspace)
+    commands: list[str] = []
+
+    async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
+        commands.append(command)
+        return "Exit Code: 0\nSTDOUT:\nbuilt\n"
+
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
+    monkeypatch.setenv("ARC_SKIP_BROWSER_INSTALL", "1")
+
+    assert asyncio.run(handler.verify_workspace()) is True
+    assert commands == ["npm run build"]
+
+
+# --------------------------------------------------------------------------
+# post_template_setup verifies the port contract
+# --------------------------------------------------------------------------
+
+
+def _write_runtime_port_files(workspace: Path, *, playwright_port: str) -> None:
+    (workspace / "backend" / "src").mkdir(parents=True, exist_ok=True)
+    (workspace / "frontend").mkdir(parents=True, exist_ok=True)
+    (workspace / "backend" / "src" / "index.js").write_text(
+        "const port = Number(process.env.PORT || 3000);\n", encoding="utf-8"
+    )
+    (workspace / "frontend" / "vite.config.js").write_text(
+        "const backendPort = Number(process.env.ARC_WEB_PORT || 3000)\n", encoding="utf-8"
+    )
+    (workspace / "backend" / "playwright.config.js").write_text(
+        playwright_port, encoding="utf-8"
+    )
+
+
+def test_post_template_setup_accepts_environment_driven_ports(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    _write_runtime_port_files(
+        workspace,
+        playwright_port=(
+            "const baseURL = process.env.PLAYWRIGHT_BASE_URL\n"
+            "  || `http://127.0.0.1:${process.env.ARC_WEB_PORT || 3000}`;\n"
+        ),
+    )
+    handler = _make_handler(workspace)
+
+    assert asyncio.run(handler.post_template_setup()) is True
+
+
+def test_post_template_setup_rejects_a_hardcoded_playwright_port(tmp_path) -> None:
+    """The exact drift that made every E2E run navigate to a dead origin.
+
+    The old implementation substituted a `__ARC_WEB_PORT__` token that no
+    template file contained, so it reported success while `playwright.config.js`
+    kept its own hardcoded port.
+    """
+
+    workspace = tmp_path / "workspace"
+    _write_runtime_port_files(
+        workspace,
+        playwright_port=(
+            "const baseURL = process.env.PLAYWRIGHT_BASE_URL\n"
+            "  || 'http://127.0.0.1:3000';\n"
+        ),
+    )
+    handler = _make_handler(workspace)
+    messages: list[tuple] = []
+
+    def recording_log(agent_name, message, status=None, node_id=None):
+        messages.append((agent_name, message, status))
+
+    handler.log_cb = recording_log
+
+    assert asyncio.run(handler.post_template_setup()) is False
+    failures = [m for m in messages if m[2] == "error"]
+    assert len(failures) == 1
+    assert "playwright.config.js" in failures[0][1]
+
+
+def test_post_template_setup_tolerates_absent_runtime_files(tmp_path) -> None:
+    """A partial template must not fail the gate on files it never shipped."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    handler = _make_handler(workspace)
+
+    assert asyncio.run(handler.post_template_setup()) is True
+
+
+# --------------------------------------------------------------------------
+# E2E runtime environment
+# --------------------------------------------------------------------------
+
+
+def test_e2e_runtime_env_points_playwright_at_the_workspace_port(tmp_path) -> None:
+    """`PLAYWRIGHT_BASE_URL` is documented to the agent but was never set."""
+
+    env = web_handler._build_e2e_runtime_env(str(tmp_path), ["backend/test-e2e/home.spec.js"])
+
+    assert env["PLAYWRIGHT_BASE_URL"] == f"http://127.0.0.1:{web_handler.get_web_port()}"
+    assert env["ARC_WEB_PORT"] == str(web_handler.get_web_port())
+    assert env["ARC_E2E_DB_PATH"].endswith(".sqlite")
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -341,3 +511,50 @@ def test_shipped_template_declares_testing_library_dom() -> None:
     declared = set(package.get("dependencies") or {}) | set(package.get("devDependencies") or {})
 
     assert "@testing-library/dom" in declared
+
+
+def test_shipped_template_declares_a_browser_install_script() -> None:
+    """The workspace gate runs this script, so it must exist and cover both
+    Playwright browser artefacts.
+
+    `playwright install chromium` alone is not enough on Playwright 1.57: the
+    default headless mode launches `chromium_headless_shell`, which is a separate
+    download. Installing only `chromium` left every E2E run failing with
+    "Executable doesn't exist at ...chromium_headless_shell-<build>".
+    """
+
+    template = Path(web_handler.WebAppType.template_dir())
+    package = json.loads((template / "backend" / "package.json").read_text(encoding="utf-8"))
+    script = package["scripts"].get("e2e:install-browsers", "")
+
+    assert script, "the template must expose `e2e:install-browsers`"
+    assert "playwright install" in script
+    assert "chromium" in script
+    assert "chromium-headless-shell" in script
+
+
+def test_shipped_template_playwright_versions_agree() -> None:
+    """The CLI that installs browsers must match the runner that launches them.
+
+    `playwright` (CLI) and `@playwright/test` (runner) pin the browser build
+    revision. When they disagree, `playwright install` downloads a build the
+    runner does not look for - the same "Executable doesn't exist" failure.
+    """
+
+    template = Path(web_handler.WebAppType.template_dir())
+    package = json.loads((template / "backend" / "package.json").read_text(encoding="utf-8"))
+    dependencies = package.get("devDependencies") or {}
+
+    assert dependencies.get("playwright") == dependencies.get("@playwright/test")
+
+
+def test_shipped_template_playwright_config_reads_the_web_port() -> None:
+    """`web.py` tells the agent the config uses `PLAYWRIGHT_BASE_URL`; the
+    fallback must not be a port the workspace never serves on.
+    """
+
+    template = Path(web_handler.WebAppType.template_dir())
+    config = (template / "backend" / "playwright.config.js").read_text(encoding="utf-8")
+
+    assert "process.env.PLAYWRIGHT_BASE_URL" in config
+    assert "process.env.ARC_WEB_PORT" in config

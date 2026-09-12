@@ -26,14 +26,13 @@ def arc_runtime(tmp_project_dir: Path, monkeypatch: pytest.MonkeyPatch):
     ``tmp_project_dir`` doubles as the agent workspace, so ``/workspace/...``
     virtual paths inside the deep-agents filesystem map to this directory.
 
-    OpenAI env vars are scrubbed because ``core.workflow`` runs
-    ``load_project_env()`` at import time: a host ``.env`` leaking
-    ``OPENAI_BASE_URL`` would make ``build_stage_agent`` silently drop
-    ``response_format`` and change agent behaviour mid-suite.
+    Provider env vars (``OPENAI_BASE_URL`` and friends) are scrubbed by the
+    autouse ``isolate_model_env`` fixture in ``tests/conftest.py``, because
+    ``core.workflow`` runs ``load_project_env()`` at import time and a host
+    ``.env`` leaking ``OPENAI_BASE_URL`` would make ``build_stage_agent``
+    silently drop ``response_format`` and change agent behaviour mid-suite.
     """
 
-    for key in ("OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENAI_API_KEY", "MODEL"):
-        monkeypatch.delenv(key, raising=False)
     root = tmp_project_dir.resolve()
     monkeypatch.setattr(core_config, "_workspace_root", root)
     monkeypatch.setenv("ARC_WORKSPACE_ROOT", str(root))

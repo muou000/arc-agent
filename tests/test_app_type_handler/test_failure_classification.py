@@ -52,6 +52,19 @@ from app_type_handler.test_results import classify_test_failure
         # Broken package.json / empty install
         ('npm error Missing script: "build"', "missing npm script"),
         ("Error: node_modules does not exist", "dependencies not installed"),
+        # Playwright runner present but its browser binaries were never downloaded
+        (
+            "  1) test-e2e\\home.spec.js:22:3 › Display the default home page \n"
+            "    Error: browserType.launch: Executable doesn't exist at "
+            "C:\\Users\\u\\AppData\\Local\\ms-playwright\\chromium_headless_shell-1200"
+            "\\chrome-headless-shell-win64\\chrome-headless-shell.exe",
+            "browser binaries not installed",
+        ),
+        (
+            "║ Looks like Playwright Test or Playwright was just installed or updated. ║\n"
+            "║ Please run the following command to download new browsers:              ║",
+            "browser binaries not installed",
+        ),
     ],
 )
 def test_environment_failures_are_detected(output: str, expected_reason: str) -> None:
@@ -86,3 +99,16 @@ def test_reason_names_the_offending_module() -> None:
 
 def test_reason_falls_back_to_the_bare_label_without_a_capture() -> None:
     assert classify_test_failure("Error [ERR_MODULE_NOT_FOUND]: ...") == "missing dependency"
+
+
+def test_long_environment_detail_is_truncated() -> None:
+    """The reason is surfaced in the CLI, so a runaway path must not flood it."""
+
+    reason = classify_test_failure(
+        "Error: browserType.launch: Executable doesn't exist at "
+        + "C:\\very\\long\\segment\\" * 40
+        + "chrome-headless-shell.exe"
+    )
+
+    assert reason.startswith("browser binaries not installed: ")
+    assert len(reason) <= 160
