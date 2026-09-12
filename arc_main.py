@@ -19,6 +19,7 @@ from core.cli import (
     stop_cli_spinner,
 )
 from core.config import set_web_port
+from core.path_safety import validate_clean_target
 
 
 @dataclass(slots=True)
@@ -160,6 +161,14 @@ async def cmd_compile(args: argparse.Namespace) -> int:
     
     # Handle --clean
     if args.clean and os.path.exists(output_dir):
+        clean_error = validate_clean_target(
+            output_dir,
+            requirement_dir,
+            repo_root=_get_repo_root(),
+        )
+        if clean_error:
+            print(f"Error: --clean {clean_error}.")
+            return 2
         shutil.rmtree(output_dir)
     
     # Normalize app type

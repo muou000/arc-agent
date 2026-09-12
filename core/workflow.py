@@ -18,6 +18,7 @@ from core.commits import build_commit_message
 from core.config import load_project_env, set_app_type, set_web_port, set_workspace_root
 from core.files import load_requirements, read_json_file, write_json_file
 from core.logging import append_debug_log, write_terminal_log
+from core.path_safety import validate_clean_target
 from core.tdd_retry import build_tdd_reprompt, scan_test_failures
 
 
@@ -105,6 +106,14 @@ class ARCWorkflowManager:
     async def cleanup_workspace(self) -> bool:
         await self._log("Compiler", "Clear-and-recompile requested. Cleaning workspace...")
         try:
+            clean_error = validate_clean_target(
+                self.workspace_path,
+                str(Path(self.requirement_path).parent),
+                repo_root=Path(__file__).resolve().parent.parent,
+            )
+            if clean_error:
+                await self._log("Compiler", f"Refusing to clean workspace: {clean_error}", "error")
+                return False
             Path(self.workspace_path).mkdir(parents=True, exist_ok=True)
             for item in os.listdir(self.workspace_path):
                 if item == "requirements":
