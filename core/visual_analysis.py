@@ -6,7 +6,7 @@ import hashlib
 import mimetypes
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Awaitable, Callable
 
 from openai import OpenAI
@@ -18,6 +18,7 @@ from core.service import get_runtime
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
 VISUAL_ANALYSIS_PROMPT_VERSION = "frontend-style-requirements"
+MAX_VISUAL_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 def build_visual_analysis_prompt() -> str:
@@ -109,7 +110,11 @@ async def analyze_and_attach_visual_references(
             visual_references.append(_reference_payload(image_path, existing_analysis, item.get("resolved_image_path")))
             continue
 
-        full_path = _resolve_image_path(image_path, workspace_path, requirements_dir)
+        try:
+            full_path = _resolve_image_path(image_path, workspace_path, requirements_dir)
+        except ValueError as exc:
+            await _log(log_cb, "System", f"Rejected image path {image_path}: {exc}", "warning", req_id)
+            continue
         if not full_path.exists():
             await _log(log_cb, "System", f"Image not found: {full_path}", "warning", req_id)
             continue
@@ -169,10 +174,18 @@ def _collect_visual_candidates(requirement_data: dict[str, Any]) -> list[dict[st
 
 
 def _resolve_image_path(image_path: str, workspace_path: str, requirements_dir: str) -> Path:
-    normalized = os.path.normpath(image_path)
-    normalized = normalized.lstrip(os.sep)
-    base_dir = Path(requirements_dir or workspace_path)
-    return (base_dir / normalized).resolve()
+    raw_path = str(image_path or "").strip().replace("\\", "/")
+    windows_path = PureWindowsPath(raw_path)
+    if not raw_path or raw_path.startswith("/") or windows_path.is_absolute() or windows_path.drive:
+        raise ValueError("Image path must stay inside the requirements directory.")
+
+    base_dir = Path(requirements_dir or workspace_path).expanduser().resolve()
+    resolved_path = (base_dir / raw_path).resolve()
+    try:
+        resolved_path.relative_to(base_dir)
+    except ValueError as exc:
+        raise ValueError("Image path must stay inside the requirements directory.") from exc
+    return resolved_path
 
 
 def _reference_payload(image_path: str, analysis: str, resolved_image_path: Any = None) -> dict[str, Any]:
@@ -201,6 +214,15 @@ def _build_visual_cache_key(full_path: Path) -> str:
 
 
 async def _request_visual_analysis(full_path: Path) -> str:
+    try:
+        image_size = full_path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"Unable to inspect visual image: {full_path}") from exc
+    if image_size > MAX_VISUAL_IMAGE_BYTES:
+        raise ValueError(
+            f"Visual image is too large ({image_size} bytes; maximum {MAX_VISUAL_IMAGE_BYTES} bytes)."
+        )
+
     visual_base_url = _resolve_visual_base_url()
     visual_api_key = _resolve_visual_api_key()
     if not visual_base_url:
