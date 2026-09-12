@@ -629,10 +629,51 @@ async def _force_kill_pid(pid: int) -> None:
         return
 
 
-async def _force_release_port(port: int, *, allowed_pids: set[int]) -> list[int]:
+def _is_process_descendant(pid: int, ancestor_pid: int) -> bool:
+    if pid == ancestor_pid:
+        return True
+
+    seen: set[int] = set()
+    current_pid = pid
+    while current_pid > 0 and current_pid not in seen:
+        seen.add(current_pid)
+        raw_parent_pid = _get_process_fingerprint(current_pid).get("ppid", "")
+        try:
+            parent_pid = int(raw_parent_pid)
+        except (TypeError, ValueError):
+            return False
+        if parent_pid == ancestor_pid:
+            return True
+        current_pid = parent_pid
+    return False
+
+
+def _capture_owned_port_processes(port: int, launcher_pid: int) -> dict[int, dict[str, str]]:
+    return {
+        pid: _get_process_fingerprint(pid)
+        for pid in _list_port_owner_pids(port)
+        if _is_process_descendant(pid, launcher_pid)
+    }
+
+
+def _process_fingerprint_matches(expected: dict[str, str], current: dict[str, str]) -> bool:
+    identity_keys = ("ppid", "name", "exe", "command", "cwd")
+    comparable_keys = [key for key in identity_keys if expected.get(key)]
+    return bool(comparable_keys) and all(current.get(key) == expected[key] for key in comparable_keys)
+
+
+async def _force_release_port(
+    port: int,
+    *,
+    allowed_processes: dict[int, dict[str, str]],
+) -> list[int]:
     killed_pids: list[int] = []
     for pid in _list_port_owner_pids(port):
-        if pid not in allowed_pids:
+        expected_fingerprint = allowed_processes.get(pid)
+        if expected_fingerprint is None:
+            continue
+        current_fingerprint = _get_process_fingerprint(pid)
+        if not _process_fingerprint_matches(expected_fingerprint, current_fingerprint):
             continue
         await _force_kill_pid(pid)
         killed_pids.append(pid)
@@ -644,18 +685,18 @@ async def _ensure_port_released(
     *,
     context: str,
     timeout: float = 5.0,
-    allowed_pids: set[int] | None = None,
+    allowed_processes: dict[int, dict[str, str]] | None = None,
 ) -> str:
     if await _wait_for_tcp_server_shutdown("127.0.0.1", port, timeout=timeout):
         return f"{context}: port {port} is released."
 
     owners_before_force = _list_port_owner_pids(port)
-    if not allowed_pids:
+    if not allowed_processes:
         raise RuntimeError(
             f"{context}: port {port} is still occupied; refusing to terminate unknown "
             f"owner PID(s): {owners_before_force or 'unknown'}."
         )
-    killed_pids = await _force_release_port(port, allowed_pids=allowed_pids)
+    killed_pids = await _force_release_port(port, allowed_processes=allowed_processes)
 
     if await _wait_for_tcp_server_shutdown("127.0.0.1", port, timeout=10.0):
         if killed_pids:
@@ -675,7 +716,11 @@ async def _ensure_port_released(
 
 
 async def _terminate_process(process: asyncio.subprocess.Process | None, *, port: int | None = None) -> str:
-    owned_pids = set(_list_port_owner_pids(port)) if process is not None and port is not None else set()
+    owned_processes = (
+        _capture_owned_port_processes(port, process.pid)
+        if process is not None and port is not None
+        else {}
+    )
     await finalize_subprocess(process, force_kill=False)
 
     if port is None:
@@ -684,7 +729,7 @@ async def _terminate_process(process: asyncio.subprocess.Process | None, *, port
     return await _ensure_port_released(
         port,
         context="Backend runtime cleanup",
-        allowed_pids=owned_pids,
+        allowed_processes=owned_processes,
     )
 
 
