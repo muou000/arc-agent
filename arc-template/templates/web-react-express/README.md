@@ -87,6 +87,18 @@ cd backend
 npm run test:e2e
 ```
 
+Before the first E2E run the Playwright browser binaries must be downloaded
+(`npm install` only installs the runner):
+
+```bash
+cd backend
+npm run e2e:install-browsers
+```
+
+This installs both `chromium` and `chromium-headless-shell` (Playwright 1.5x
+launches the headless shell in default headless mode), and the download is
+machine-wide, so it is paid once per machine.
+
 Run backend Vitest tests followed by E2E tests:
 
 ```bash
