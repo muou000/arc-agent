@@ -28,6 +28,9 @@ NPM_INSTALL_TIMEOUT_SECONDS = 900.0
 # the full budget before trying the fallback wastes minutes on every install.
 NPM_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 240.0
 LEGACY_PEER_DEPS_FLAG = "--legacy-peer-deps"
+# Generous because a cold machine downloads ~150 MB of browser binaries. Once
+# the machine-wide Playwright cache is warm the command exits in seconds.
+PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
 
 
 def node_modules_ready(target_dir: str) -> bool:
@@ -769,6 +772,11 @@ def _build_e2e_runtime_env(workspace_path: str, targets: list[str]) -> dict[str,
     e2e_db_path = os.path.abspath(os.path.join(e2e_db_root, f"{suite_label}-{suite_hash}.sqlite"))
     return {
         **build_web_runtime_env(),
+        # The template's `playwright.config.js` and the agent-facing stack notes
+        # both document `PLAYWRIGHT_BASE_URL` as the origin under test. Nothing
+        # used to set it, so Playwright fell back to its own default port and
+        # every E2E run navigated to a dead origin.
+        "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{get_web_port()}",
         "ARC_DB_FILE": e2e_db_path,
         "ARC_E2E_DB_PATH": e2e_db_path,
         "ARC_E2E_DB_LABEL": suite_label,
@@ -1033,33 +1041,53 @@ class WebAppType(AppTypeHandler):
         return None
 
     async def post_template_setup(self) -> bool:
-        replacements = {
-            "__ARC_WEB_PORT__": str(get_web_port()),
-        }
-        target_files = [
-            os.path.join(self.workspace_path, "backend", "src", "index.js"),
-            os.path.join(self.workspace_path, "backend", "playwright.config.js"),
-            os.path.join(self.workspace_path, "frontend", "vite.config.js"),
-        ]
+        """Assert the scaffolded runtime files resolve the web port from the environment.
 
-        try:
-            for file_path in target_files:
-                if not os.path.exists(file_path):
-                    continue
+        There is deliberately no placeholder substitution here. Every runtime
+        entry point reads the port from an environment variable at process
+        start, which keeps a resumed compile on a different ``--port`` working.
+        The previous implementation replaced ``__ARC_WEB_PORT__`` in three files,
+        but no template file ever contained that token, so it silently did
+        nothing - and ``playwright.config.js`` was free to drift to a hardcoded
+        port that no E2E run could reach. Verifying the contract turns that
+        silent no-op into a gate.
+        """
+
+        port_contract = (
+            ("backend/src/index.js", "process.env.PORT"),
+            ("frontend/vite.config.js", "process.env.ARC_WEB_PORT"),
+            ("backend/playwright.config.js", "process.env.ARC_WEB_PORT"),
+        )
+        unconfigured: list[str] = []
+        for relative_path, marker in port_contract:
+            file_path = os.path.join(self.workspace_path, *relative_path.split("/"))
+            if not os.path.exists(file_path):
+                continue
+            try:
                 with open(file_path, "r", encoding="utf-8") as file:
                     content = file.read()
-                for old_value, new_value in replacements.items():
-                    content = content.replace(old_value, new_value)
-                with open(file_path, "w", encoding="utf-8") as file:
-                    file.write(content)
+            except OSError as exc:
+                await self._log("System", f"Failed to read {relative_path}: {exc}", "error")
+                return False
+            if marker not in content:
+                unconfigured.append(relative_path)
+
+        if unconfigured:
             await self._log(
                 "System",
-                f"Configured web template for single-port backend hosting on port {get_web_port()}.",
+                "Web template port configuration is broken in "
+                + ", ".join(unconfigured)
+                + f": these files must resolve the web port from the environment, otherwise the "
+                f"workspace does not honour port {get_web_port()}.",
+                "error",
             )
-            return True
-        except Exception as exc:
-            await self._log("System", f"Failed to configure web template: {str(exc)}")
             return False
+
+        await self._log(
+            "System",
+            f"Configured web template for single-port backend hosting on port {get_web_port()}.",
+        )
+        return True
 
     async def install_dependencies(self) -> bool:
         targets = (
@@ -1079,7 +1107,7 @@ class WebAppType(AppTypeHandler):
         return all_ok
 
     async def verify_workspace(self) -> bool:
-        """Fail fast when the scaffolded workspace cannot build.
+        """Fail fast when the scaffolded workspace cannot build or cannot run E2E.
 
         Without this gate a broken template or a half-finished install only
         shows up per node, where it burns the entire TDD retry budget of every
@@ -1095,14 +1123,52 @@ class WebAppType(AppTypeHandler):
             cwd=frontend_dir,
             timeout=180.0,
         )
+        if _extract_exit_code(result) != 0:
+            await self._log(
+                "System",
+                "Workspace verification failed: frontend build did not succeed. "
+                "Aborting before the node loop. " + _tail(result),
+                "error",
+                None,
+            )
+            return False
+        await self._log("System", "Workspace verification passed: frontend build succeeded.")
+
+        return await self._verify_e2e_runner()
+
+    async def _verify_e2e_runner(self) -> bool:
+        """Provision the Playwright browsers before the node loop starts.
+
+        The template declares `@playwright/test`, but npm only installs the
+        runner - the browser binaries are downloaded separately. Without this
+        step the first E2E run fails with "Executable doesn't exist", and the
+        agent cannot recover on its own: `execute` is disabled, so it has no way
+        to run `playwright install` and ends up patching the generated
+        `package.json` to smuggle the install into another npm script.
+
+        Installing here is idempotent and the browser cache is machine-wide, so
+        this costs seconds once the browsers exist and is paid once per machine
+        rather than once per node.
+        """
+
+        backend_dir = os.path.join(self.workspace_path, "backend")
+        if not os.path.isdir(backend_dir):
+            return True
+
+        await self._log("System", "Verifying workspace: installing Playwright browsers...")
+        result = await _execute_web_test_command(
+            "npm run e2e:install-browsers",
+            cwd=backend_dir,
+            timeout=PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS,
+        )
         if _extract_exit_code(result) == 0:
-            await self._log("System", "Workspace verification passed: frontend build succeeded.")
+            await self._log("System", "Workspace verification passed: Playwright browsers ready.")
             return True
 
         await self._log(
             "System",
-            "Workspace verification failed: frontend build did not succeed. "
-            "Aborting before the node loop. " + _tail(result),
+            "Workspace verification failed: Playwright browsers could not be installed, so every "
+            "E2E test would fail on a missing browser. Aborting before the node loop. " + _tail(result),
             "error",
             None,
         )

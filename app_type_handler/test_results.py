@@ -149,7 +149,22 @@ _ENVIRONMENT_FAILURE_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
+    (
+        "browser binaries not installed",
+        re.compile(r"Executable doesn't exist at\s+([^\r\n]+)"),
+    ),
+    (
+        "browser binaries not installed",
+        re.compile(r"Please run the following command to download new browsers"),
+    ),
+    (
+        "browser launch failed",
+        re.compile(r"browserType\.launch[^\r\n]*"),
+    ),
 )
+
+
+_DETAIL_LIMIT = 120
 
 
 def classify_test_failure(test_output: str) -> str:
@@ -168,5 +183,6 @@ def classify_test_failure(test_output: str) -> str:
         if not match:
             continue
         detail = next((group for group in match.groups() if group), "")
+        detail = " ".join(detail.split())[:_DETAIL_LIMIT].strip()
         return f"{reason}: {detail}" if detail else reason
     return ""
