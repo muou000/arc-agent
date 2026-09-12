@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,6 +28,16 @@ _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_RETRY_INITIAL_DELAY = 2.0
 _DEFAULT_RETRY_MAX_DELAY = 30.0
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
+
+# ARC builds one agent per stage invocation, so ``build_openai_chat_model`` used
+# to construct a brand-new ChatOpenAI (and therefore a brand-new httpx client)
+# for every node, phase and TDD retry. Each new client discarded the previous
+# connection pool, so every model call paid a fresh TCP/TLS handshake. Caching
+# the client by its construction inputs lets one pool serve the whole run;
+# ``bind_tools`` returns a new bound runnable and never mutates the cached
+# instance, so sharing it across agents is safe.
+_MODEL_CACHE: dict[tuple[str, str, str, str, bool], ChatOpenAI] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -164,6 +175,17 @@ def build_openai_chat_model(
         base_url=base_url,
         api_key=api_key,
     )
+    cache_key = (
+        config.model_name,
+        config.api_mode,
+        config.base_url,
+        config.api_key,
+        config.sse_text_compat,
+    )
+    cached = _MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     kwargs: dict[str, Any] = {
         "model": config.model_name,
         "disable_streaming": True,
@@ -179,7 +201,17 @@ def build_openai_chat_model(
         kwargs["api_key"] = config.api_key
 
     model_class = ARCCompatibleChatOpenAI if config.sse_text_compat else ARCChatOpenAI
-    return model_class(**kwargs)
+    model = model_class(**kwargs)
+    with _MODEL_CACHE_LOCK:
+        # Another thread may have built the same client while we were constructing.
+        return _MODEL_CACHE.setdefault(cache_key, model)
+
+
+def reset_model_cache_for_tests() -> None:
+    """Drop cached model clients so a test can assert construction behaviour."""
+
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE.clear()
 
 
 def resolve_openai_adapter_config(

@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
+from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
@@ -219,7 +220,7 @@ class TestDrivenDeveloper:
                 requirement_path=self.requirement_path,
                 test_type=self._current_test_type,
             ),
-            thread_id=f"{node_id}:IMPLEMENT:TestDrivenDeveloper:{self._current_test_type or 'batch'}",
+            thread_id=f"{get_project_thread_namespace()}:{node_id}:IMPLEMENT:TestDrivenDeveloper:{self._current_test_type or 'batch'}",
             label=self.agent_name,
             log_cb=self.log_cb,
         )

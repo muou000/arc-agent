@@ -54,7 +54,7 @@ def test_interface_designer_writes_skeleton_and_returns_structured_bundle(
             faux_tool_call(
                 "write_file",
                 {"file_path": "/workspace/src/contracts/calc.py", "content": skeleton},
-                id="c1",
+                call_id="c1",
             ),
             faux_tool_call(
                 "InterfaceDesignResponse",
@@ -74,7 +74,7 @@ def test_interface_designer_writes_skeleton_and_returns_structured_bundle(
                     ],
                     "files_written": ["/workspace/src/contracts/calc.py"],
                 },
-                id="c2",
+                call_id="c2",
             ),
         ]
     )
@@ -109,7 +109,7 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
             faux_tool_call(
                 "write_file",
                 {"file_path": "/workspace/tests/unit/test_calc.py", "content": test_code},
-                id="c1",
+                call_id="c1",
             ),
             faux_tool_call(
                 "TestGenerationResponse",
@@ -127,7 +127,7 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
                     ],
                     "files_written": ["tests/unit/test_calc.py"],
                 },
-                id="c2",
+                call_id="c2",
             ),
         ]
     )

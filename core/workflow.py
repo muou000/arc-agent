@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from agents.interface_designer import InterfaceDesigner
 from agents.test_driven_developer import TestDrivenDeveloper
@@ -25,6 +26,12 @@ load_project_env()
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
 QUEUE_FILENAME = "processing_queue.json"
+
+# Number of queue tasks allowed to be in flight at once. The stage agents, the
+# git checkpoints and the test runners all work on one shared workspace, so the
+# default keeps the historical strictly-serial drain; raise ARC_MAX_CONCURRENT_TASKS
+# only when each node gets its own workspace.
+DEFAULT_MAX_CONCURRENT_TASKS = 1
 
 PHASE_DESIGN = "DESIGN"
 PHASE_IMPLEMENT = "IMPLEMENT"
@@ -281,59 +288,110 @@ class ARCWorkflowManager:
         return self._build_compile_result(queue_state)
 
     async def _drain_runnable_tasks(self, queue_state: dict[str, Any]) -> None:
-        """Run every PENDING task in order until the queue has none left."""
-        while True:
-            task = self._next_runnable_task(queue_state)
-            if task is None:
-                break
+        """Run every PENDING task until the queue has none left.
 
-            node_id = task["node_id"]
-            phase = task["phase"]
-            requirement_data = self.runtime.traceability.get_requirement(node_id) or {}
+        Tasks are independent units of work, so up to ``ARC_MAX_CONCURRENT_TASKS``
+        of them may be in flight at once. The queue's ordering constraints are
+        still honoured: a node never runs two tasks at the same time, and an
+        IMPLEMENT task waits for its node's DESIGN plus every earlier IMPLEMENT.
+        """
 
-            task["status"] = TASK_RUNNING
-            self._mark_task_running(queue_state["node_states"], node_id, phase)
-            queue_state["last_task_id"] = task["task_id"]
-            self._save_processing_queue(queue_state)
+        max_concurrency = self._max_concurrent_tasks()
+        in_flight: dict[asyncio.Task[None], dict[str, Any]] = {}
 
-            await self._log("Compiler", f"Running {phase} for node {node_id}...", node_id=node_id)
-            try:
-                task_ok = await self._run_task(task)
-            except Exception as exc:
-                await self._log(
-                    "Compiler",
-                    f"{phase} task for node {node_id} crashed: {type(exc).__name__}: {exc}",
-                    "error",
-                    node_id,
-                )
-                task_ok = False
+        try:
+            while True:
+                while len(in_flight) < max_concurrency:
+                    task = self._next_runnable_task(queue_state, in_flight.values())
+                    if task is None:
+                        break
+                    self._begin_task(task, queue_state)
+                    in_flight[asyncio.create_task(self._execute_task(task, queue_state))] = task
 
-            if task_ok:
-                task["status"] = TASK_COMPLETED
-                sessions.merge_node_session(node_id, {"resume_context": {}})
-                new_state = self._resolve_completed_node_state(node_id, phase)
-                self._set_node_state(queue_state["node_states"], node_id, new_state)
-                self._save_processing_queue(queue_state)
-                if phase == PHASE_DESIGN:
-                    self.runtime.events.mark_design_done(node_id)
-                else:
-                    self.runtime.events.mark_implementation_done(node_id)
-                    self.runtime.events.mark_test_passed(node_id)
-                await self._commit_phase_checkpoint(node_id, phase, requirement_data)
-                await self._log("Compiler", f"{phase} completed for node {node_id}.", node_id=node_id)
-                continue
+                if not in_flight:
+                    break
 
-            task["status"] = TASK_FAILED
-            self._set_node_state(queue_state["node_states"], node_id, NODE_FAILED)
-            self._mark_remaining_node_tasks_failed(queue_state, node_id)
+                await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
+                for finished in [pending for pending in in_flight if pending.done()]:
+                    in_flight.pop(finished, None)
+                    # _execute_task turns phase failures into task state, so an
+                    # exception escaping here can only be a scheduler bug.
+                    finished.result()
+        finally:
+            # Cancellation or an escaping scheduler exception must not leave
+            # child tasks mutating shared queue/Git state after the drain exits.
+            for pending in in_flight:
+                if not pending.done():
+                    pending.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
+
+    @staticmethod
+    def _max_concurrent_tasks() -> int:
+        raw = os.environ.get("ARC_MAX_CONCURRENT_TASKS", str(DEFAULT_MAX_CONCURRENT_TASKS)).strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            return DEFAULT_MAX_CONCURRENT_TASKS
+        # Hard cap at 1 until _execute_task runs each node in an isolated
+        # workspace. Concurrent tasks currently share the phase runner,
+        # workspace, test environment, Git repository, and checkpoint state;
+        # GitClient.commit() runs `git add .`, so a checkpoint could capture
+        # another node's uncommitted changes. Remove the min(..., 1) clamp once
+        # per-node worktrees exist and shared checkpoint ops are synchronized.
+        return min(max(1, value), 1)
+
+    def _begin_task(self, task: dict[str, Any], queue_state: dict[str, Any]) -> None:
+        node_id = task["node_id"]
+        phase = task["phase"]
+        task["status"] = TASK_RUNNING
+        self._mark_task_running(queue_state["node_states"], node_id, phase)
+        queue_state["last_task_id"] = task["task_id"]
+        self._save_processing_queue(queue_state)
+
+    async def _execute_task(self, task: dict[str, Any], queue_state: dict[str, Any]) -> None:
+        node_id = task["node_id"]
+        phase = task["phase"]
+        requirement_data = self.runtime.traceability.get_requirement(node_id) or {}
+
+        await self._log("Compiler", f"Running {phase} for node {node_id}...", node_id=node_id)
+        try:
+            task_ok = await self._run_task(task)
+        except Exception as exc:
+            await self._log(
+                "Compiler",
+                f"{phase} task for node {node_id} crashed: {type(exc).__name__}: {exc}",
+                "error",
+                node_id,
+            )
+            task_ok = False
+
+        if task_ok:
+            task["status"] = TASK_COMPLETED
+            sessions.merge_node_session(node_id, {"resume_context": {}})
+            new_state = self._resolve_completed_node_state(node_id, phase)
+            self._set_node_state(queue_state["node_states"], node_id, new_state)
             self._save_processing_queue(queue_state)
             if phase == PHASE_DESIGN:
-                self.runtime.events.mark_design_failed(node_id)
+                self.runtime.events.mark_design_done(node_id)
             else:
-                self.runtime.events.mark_implementation_failed(node_id)
-                self.runtime.events.mark_test_failed(node_id)
-            await self._commit_phase_checkpoint(node_id, f"{phase}-FAILED", requirement_data)
-            await self._log("Compiler", f"{phase} failed for node {node_id}.", "error", node_id)
+                self.runtime.events.mark_implementation_done(node_id)
+                self.runtime.events.mark_test_passed(node_id)
+            await self._commit_phase_checkpoint(node_id, phase, requirement_data)
+            await self._log("Compiler", f"{phase} completed for node {node_id}.", node_id=node_id)
+            return
+
+        task["status"] = TASK_FAILED
+        self._set_node_state(queue_state["node_states"], node_id, NODE_FAILED)
+        self._mark_remaining_node_tasks_failed(queue_state, node_id)
+        self._save_processing_queue(queue_state)
+        if phase == PHASE_DESIGN:
+            self.runtime.events.mark_design_failed(node_id)
+        else:
+            self.runtime.events.mark_implementation_failed(node_id)
+            self.runtime.events.mark_test_failed(node_id)
+        await self._commit_phase_checkpoint(node_id, f"{phase}-FAILED", requirement_data)
+        await self._log("Compiler", f"{phase} failed for node {node_id}.", "error", node_id)
 
     async def _prepare_auto_tdd_retry(self, queue_state: dict[str, Any]) -> list[str]:
         """Queue a single TDD-first retry for every node that ended the run in FAILED.
@@ -514,12 +572,46 @@ class ARCWorkflowManager:
         queue_state["recovered_interrupted_tasks"] = recovered
         return recovered
 
-    @staticmethod
-    def _next_runnable_task(queue_state: dict[str, Any]) -> dict[str, Any] | None:
+    def _next_runnable_task(
+        self,
+        queue_state: dict[str, Any],
+        in_flight: Iterable[dict[str, Any]] = (),
+    ) -> dict[str, Any] | None:
+        busy_nodes = {str(task.get("node_id", "")) for task in in_flight}
         for task in queue_state["tasks"]:
-            if task["status"] == TASK_PENDING:
-                return task
+            if task["status"] != TASK_PENDING:
+                continue
+            if str(task.get("node_id", "")) in busy_nodes:
+                continue
+            if not self._task_dependencies_met(queue_state, task):
+                continue
+            return task
         return None
+
+    @staticmethod
+    def _task_dependencies_met(queue_state: dict[str, Any], task: dict[str, Any]) -> bool:
+        """Guard the ordering the queue relies on but never encoded as edges.
+
+        A node's DESIGN has to complete before its IMPLEMENT, and IMPLEMENT
+        tasks are generated in the order they must run (children before their
+        parent), so an IMPLEMENT may not start while an earlier one is still
+        unfinished. With the default concurrency of 1 the first PENDING task
+        already satisfies both, so selection is unchanged.
+        """
+
+        if task["phase"] != PHASE_IMPLEMENT:
+            return True
+        node_id = task["node_id"]
+        for other in queue_state["tasks"]:
+            if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
+                if other["status"] != TASK_COMPLETED:
+                    return False
+                break
+        return all(
+            other["status"] in {TASK_COMPLETED, TASK_FAILED}
+            for other in queue_state["tasks"]
+            if other["phase"] == PHASE_IMPLEMENT and other["order"] < task["order"]
+        )
 
     @staticmethod
     def _mark_remaining_node_tasks_failed(queue_state: dict[str, Any], node_id: str) -> None:

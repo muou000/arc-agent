@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from agents.context.pipeline import context_pipeline
+from agents.runtime.checkpointer import reset_checkpointer
 from core import config as core_config
 from core.service import configure_runtime, reset_runtime_for_tests
 
@@ -36,7 +37,9 @@ def arc_runtime(tmp_project_dir: Path, monkeypatch: pytest.MonkeyPatch):
     root = tmp_project_dir.resolve()
     monkeypatch.setattr(core_config, "_workspace_root", root)
     monkeypatch.setenv("ARC_WORKSPACE_ROOT", str(root))
+    reset_checkpointer()
     runtime = configure_runtime(project_dir=str(root))
     yield runtime
     reset_runtime_for_tests()
+    reset_checkpointer()
     context_pipeline.cache.clear()

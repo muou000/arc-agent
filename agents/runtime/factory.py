@@ -13,6 +13,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from pydantic import BaseModel, Field, create_model
 
 from agents.model.factory import create_arc_chat_model
+from agents.runtime.checkpointer import get_checkpointer
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.stage_discipline import StageDisciplineMiddleware
 from core.path_compat import normalize_windows_extended_prefix_path, normalize_windows_extended_prefix_text
@@ -29,6 +30,13 @@ SKILLS_PREFIX = "/skills"
 DISABLED_BUILTIN_TOOLS = frozenset({"execute", "write_todos"})
 _WINDOWS_PATH_COMPAT_APPLIED = False
 _READ_FILE_FORMAT_PATCHED = False
+
+# Sentinel so callers can explicitly pass ``checkpointer=None`` (cold start)
+# while omitting the argument still resolves the process-wide shared saver.
+_UNSET: Any = object()
+
+# Provider keys whose ARC harness profile has already been registered.
+_REGISTERED_HARNESS_PROFILES: set[str] = set()
 
 class OpenAIGlobSchema(BaseModel):
     """OpenAI-compatible schema for the glob tool."""
@@ -90,11 +98,18 @@ def build_stage_agent(
     permitted_skill_names: list[str] | None = None,
     memory: list[str] | None = None,
     tools: list[object] | None = None,
+    checkpointer: Any = _UNSET,
 ):
-    """Create an agent instance with ARC's first-batch filesystem policy."""
+    """Create an agent instance with ARC's first-batch filesystem policy.
+
+    ``checkpointer`` defaults to the process-wide shared saver so that rebuilding
+    an agent for the same ``thread_id`` resumes the previous conversation rather
+    than starting cold. Pass ``checkpointer=None`` to opt a single agent out.
+    """
 
     _apply_windows_filesystem_path_compat()
     _apply_unambiguous_read_file_format()
+    resolved_checkpointer = get_checkpointer() if checkpointer is _UNSET else checkpointer
     root = Path(workspace_root).expanduser().resolve()
     routes = {
         f"{WORKSPACE_PREFIX}/": FilesystemBackend(
@@ -137,6 +152,7 @@ def build_stage_agent(
         ),
         context_schema=AgentRuntimeContext,
         response_format=_resolve_response_format(response_format),
+        checkpointer=resolved_checkpointer,
     )
 
 
@@ -288,7 +304,11 @@ def _expand_write_permission_paths(path: str, root: Path) -> list[str]:
 
 
 def _register_arc_tool_exclusions(*, model: Any, resolved_model: Any) -> None:
-    """Remove built-in agent tools that ARC does not want to expose."""
+    """Remove built-in agent tools that ARC does not want to expose.
+
+    The profile is a constant, so re-registering it for every agent build is
+    pure overhead; remember which provider keys have already been registered.
+    """
 
     profile = HarnessProfile(
         excluded_tools=DISABLED_BUILTIN_TOOLS,
@@ -299,11 +319,14 @@ def _register_arc_tool_exclusions(*, model: Any, resolved_model: Any) -> None:
         provider, model_name = _split_model_name(model)
         if provider:
             for key in (provider, f"{provider}:{model_name}"):
-                register_harness_profile(key, profile)
                 registered.add(key)
     provider = get_model_provider(resolved_model)
-    if provider and provider not in registered:
-        register_harness_profile(provider, profile)
+    if provider:
+        registered.add(provider)
+
+    for key in registered - _REGISTERED_HARNESS_PROFILES:
+        register_harness_profile(key, profile)
+    _REGISTERED_HARNESS_PROFILES.update(registered)
 
 
 def _resolve_response_format(response_format: object | None) -> object | None:
