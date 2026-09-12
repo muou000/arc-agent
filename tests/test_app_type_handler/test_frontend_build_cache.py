@@ -47,6 +47,17 @@ def _make_workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _try_symlink_to(link: Path, target: Path) -> None:
+    """Create a directory symlink or skip the test if the OS forbids it."""
+
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        import pytest
+
+        pytest.skip("directory symlinks require elevated privileges on this host")
+
+
 def _build(workspace_root: Path) -> tuple[bool, str]:
     return asyncio.run(web_handler._build_frontend_dist(str(workspace_root)))
 
@@ -136,3 +147,54 @@ def test_fingerprint_ignores_build_output_and_dependencies(tmp_path) -> None:
 
 def test_missing_frontend_directory_has_no_fingerprint(tmp_path) -> None:
     assert web_handler._frontend_source_fingerprint(str(tmp_path / "absent")) is None
+
+
+def test_linked_source_directory_is_included_in_fingerprint(tmp_path) -> None:
+    """A symlinked frontend/src must contribute to the build fingerprint.
+
+    Default os.walk skips directory symlinks, so a linked source tree could
+    leave E2E tests reusing a stale dist. The fingerprint must hash the linked
+    contents and change when they change.
+    """
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    shared_src = tmp_path / "shared-src"
+    (shared_src).mkdir()
+    (shared_src / "main.js").write_text("console.log('v1')\n", encoding="utf-8")
+    _try_symlink_to(frontend / "src", shared_src)
+    (frontend / "package.json").write_text('{"name": "frontend"}\n', encoding="utf-8")
+
+    before = web_handler._frontend_source_fingerprint(str(frontend))
+    assert before is not None
+
+    # Editing the file behind the symlink must change the fingerprint.
+    (shared_src / "main.js").write_text("console.log('v2')\n", encoding="utf-8")
+    after = web_handler._frontend_source_fingerprint(str(frontend))
+
+    assert after is not None
+    assert after != before
+
+
+def test_build_rebuilds_when_linked_source_changes(tmp_path, monkeypatch) -> None:
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    shared_src = tmp_path / "shared-src"
+    (shared_src).mkdir()
+    (shared_src / "main.js").write_text("console.log('v1')\n", encoding="utf-8")
+    _try_symlink_to(frontend / "src", shared_src)
+    (frontend / "package.json").write_text('{"name": "frontend"}\n', encoding="utf-8")
+
+    recorder = _BuildRecorder()
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+
+    first_ok, _ = _build(tmp_path)
+    assert first_ok
+    assert recorder.calls == ["npm run build"]
+
+    (shared_src / "main.js").write_text("console.log('v2')\n", encoding="utf-8")
+    second_ok, second_output = _build(tmp_path)
+
+    assert second_ok
+    assert recorder.calls == ["npm run build", "npm run build"]
+    assert "Reused the existing" not in second_output

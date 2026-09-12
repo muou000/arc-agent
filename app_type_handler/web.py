@@ -613,13 +613,24 @@ def _frontend_source_fingerprint(frontend_path: str) -> str | None:
 
     Returns ``None`` when the frontend directory is missing, which makes the
     caller fall back to always building.
+
+    Directory symlinks are followed so a linked ``frontend/src`` directory
+    contributes to the fingerprint (otherwise edits behind the link could leave
+    E2E tests on a stale ``dist``). Cycles are broken by tracking the real path
+    of every visited directory.
     """
 
     root = Path(frontend_path)
     if not root.is_dir():
         return None
     digest = hashlib.sha256()
-    for dirpath, dirnames, filenames in os.walk(root):
+    visited_real_dirs: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        real_dir = os.path.realpath(dirpath)
+        if real_dir in visited_real_dirs:
+            dirnames[:] = []
+            continue
+        visited_real_dirs.add(real_dir)
         dirnames[:] = sorted(name for name in dirnames if name not in _FRONTEND_FINGERPRINT_SKIPPED_DIRS)
         for filename in sorted(filenames):
             path = Path(dirpath) / filename
