@@ -141,7 +141,11 @@ def build_compile_parser(subparsers) -> None:
 
 async def cmd_compile(args: argparse.Namespace) -> int:
     """Execute compile subcommand."""
-    _ensure_dotenv_loaded()
+    try:
+        _ensure_dotenv_loaded()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
+        return 2
     from core.workflow import ARCWorkflowManager
     
     # Validate mutual exclusivity
@@ -249,7 +253,11 @@ def build_doctor_parser(subparsers) -> None:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Execute doctor subcommand."""
-    _ensure_dotenv_loaded()
+    try:
+        _ensure_dotenv_loaded()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
+        return 2
     from core.config import print_health_check
     return print_health_check()
 

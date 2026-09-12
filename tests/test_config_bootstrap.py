@@ -63,3 +63,23 @@ def test_check_config_reports_the_explicit_env_file(tmp_path: Path, monkeypatch)
 
     assert any(str(custom_env.resolve()) in item for item in result["info"])
     assert not any("No .env file found" in item for item in result["warnings"])
+
+
+def test_missing_explicit_env_file_fails_with_a_clean_cli_error(tmp_path: Path) -> None:
+    missing_env = tmp_path / "absent.env"
+    child_env = os.environ.copy()
+    child_env["ARC_ENV_FILE"] = str(missing_env)
+
+    result = subprocess.run(
+        [sys.executable, "arc_main.py", "doctor"],
+        cwd=REPO_ROOT,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert f"ARC_ENV_FILE does not exist: {missing_env}" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
