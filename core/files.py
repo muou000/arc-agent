@@ -24,6 +24,9 @@ def load_requirements(requirement_path: str | os.PathLike[str]) -> dict[str, Any
     return payload
 
 
+MAX_REQUIREMENT_TREE_DEPTH = 64
+
+
 def validate_requirement_tree(requirement_tree: dict[str, Any]) -> None:
     """Reject malformed, cyclic, or ambiguous nested requirement trees."""
 
@@ -33,7 +36,12 @@ def validate_requirement_tree(requirement_tree: dict[str, Any]) -> None:
     seen_ids: set[str] = set()
     active_nodes: set[int] = set()
 
-    def visit(node: object, location: str) -> None:
+    def visit(node: object, location: str, depth: int) -> None:
+        if depth > MAX_REQUIREMENT_TREE_DEPTH:
+            raise ValueError(
+                f"Requirement tree nesting exceeds the maximum depth of "
+                f"{MAX_REQUIREMENT_TREE_DEPTH} ({location})."
+            )
         if not isinstance(node, dict):
             raise ValueError(f"Requirement children must contain mappings ({location}).")
 
@@ -55,11 +63,11 @@ def validate_requirement_tree(requirement_tree: dict[str, Any]) -> None:
             if not isinstance(children, list):
                 raise ValueError(f"Requirement children must be a list ({req_id}).")
             for index, child in enumerate(children):
-                visit(child, f"{req_id}.children[{index}]")
+                visit(child, f"{req_id}.children[{index}]", depth + 1)
         finally:
             active_nodes.remove(node_identity)
 
-    visit(requirement_tree, "root")
+    visit(requirement_tree, "root", 1)
 
 
 def read_json_file(path: str | os.PathLike[str]) -> dict[str, Any] | None:

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from core.files import load_requirements
+from core.files import load_requirements, validate_requirement_tree
 from core.workflow import ARCWorkflowManager
 
 
@@ -44,6 +44,16 @@ def test_load_requirements_rejects_recursive_yaml_alias(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="cycle"):
         load_requirements(path)
+
+
+def test_validate_requirement_tree_rejects_pathological_nesting() -> None:
+    """A pathologically deep tree must fail validation, not blow the recursion limit."""
+    deep_tree: dict = {"id": "LEAF"}
+    for index in range(200):
+        deep_tree = {"id": f"L{index}", "children": [deep_tree]}
+
+    with pytest.raises(ValueError, match="maximum depth"):
+        validate_requirement_tree(deep_tree)
 
 
 def test_compile_requirement_tree_rejects_invalid_tree_before_runtime_setup(tmp_path: Path) -> None:
