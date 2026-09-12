@@ -16,7 +16,7 @@ from core.phases import WorkflowPhaseRunner
 from core.service import configure_runtime
 from core.commits import build_commit_message
 from core.config import load_project_env, set_app_type, set_web_port, set_workspace_root
-from core.files import load_requirements, read_json_file, write_json_file
+from core.files import load_requirements, read_json_file, validate_requirement_tree, write_json_file
 from core.logging import append_debug_log, write_terminal_log
 from core.path_safety import validate_clean_target
 from core.tdd_retry import build_tdd_reprompt, scan_test_failures
@@ -243,6 +243,11 @@ class ARCWorkflowManager:
         root_id = str(requirement_tree.get("id") or "").strip()
         if not root_id:
             await self._log("Compiler", "Requirement root node id is missing.", "error")
+            return {"ok": False, "failed_nodes": []}
+        try:
+            validate_requirement_tree(requirement_tree)
+        except ValueError as exc:
+            await self._log("Compiler", f"Invalid requirement tree: {exc}", "error")
             return {"ok": False, "failed_nodes": []}
 
         self.runtime.traceability.store_requirement_tree(requirement_tree)
