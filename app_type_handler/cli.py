@@ -150,7 +150,9 @@ class CliAppType(AppTypeHandler):
         if normalized_type not in {"unit", "integration", "e2e"}:
             return "CLI test `type` must be one of `Unit`, `Integration`, or `E2E`."
         expected_prefix = f"tests/{normalized_type}/"
-        if not normalized_path.startswith(expected_prefix) or normalize_safe_relative_path(file_path) is None:
+        # `_normalize_cli_test_path` already returns "" for unsafe paths, so the
+        # prefix check rejects them.
+        if not normalized_path.startswith(expected_prefix):
             return (
                 f"CLI {test_type} tests must live under `{expected_prefix}...`. "
                 f"Received: {file_path}"
