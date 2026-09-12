@@ -123,7 +123,9 @@ def test_default_concurrency_runs_tasks_serially(tmp_path, monkeypatch) -> None:
     assert [task["status"] for task in tasks] == [TASK_COMPLETED, TASK_COMPLETED]
 
 
-def test_opt_in_concurrency_overlaps_independent_nodes(tmp_path, monkeypatch) -> None:
+def test_concurrency_is_capped_at_one_until_isolated_workspaces(tmp_path, monkeypatch) -> None:
+    # Independent nodes share one workspace/Git repo, so the cap keeps tasks
+    # serial even when the env var requests more. See _max_concurrent_tasks.
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
     manager = _make_manager(tmp_path, ["R1", "R2"])
     probe = _Probe()
@@ -138,8 +140,8 @@ def test_opt_in_concurrency_overlaps_independent_nodes(tmp_path, monkeypatch) ->
 
     asyncio.run(manager._drain_runnable_tasks(queue_state))
 
-    assert probe.peak == 2
-    assert sorted(probe.started) == ["R1:DESIGN", "R2:DESIGN"]
+    assert probe.peak == 1
+    assert probe.started == ["R1:DESIGN", "R2:DESIGN"]
     assert [task["status"] for task in tasks] == [TASK_COMPLETED, TASK_COMPLETED]
 
 
@@ -203,5 +205,6 @@ def test_concurrency_setting_is_parsed_defensively(monkeypatch) -> None:
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "0")
     assert ARCWorkflowManager._max_concurrent_tasks() == 1
 
+    # Capped at 1 until each node runs in an isolated workspace.
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "4")
-    assert ARCWorkflowManager._max_concurrent_tasks() == 4
+    assert ARCWorkflowManager._max_concurrent_tasks() == 1

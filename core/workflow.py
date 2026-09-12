@@ -333,7 +333,13 @@ class ARCWorkflowManager:
             value = int(raw)
         except ValueError:
             return DEFAULT_MAX_CONCURRENT_TASKS
-        return max(1, value)
+        # Hard cap at 1 until _execute_task runs each node in an isolated
+        # workspace. Concurrent tasks currently share the phase runner,
+        # workspace, test environment, Git repository, and checkpoint state;
+        # GitClient.commit() runs `git add .`, so a checkpoint could capture
+        # another node's uncommitted changes. Remove the min(..., 1) clamp once
+        # per-node worktrees exist and shared checkpoint ops are synchronized.
+        return min(max(1, value), 1)
 
     def _begin_task(self, task: dict[str, Any], queue_state: dict[str, Any]) -> None:
         node_id = task["node_id"]
