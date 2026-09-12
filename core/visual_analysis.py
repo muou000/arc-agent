@@ -304,6 +304,14 @@ def _build_visual_cache_key(full_path: Path) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
+def _build_image_data_url(full_path: Path) -> str:
+    mime_type, _ = mimetypes.guess_type(str(full_path))
+    if not mime_type:
+        mime_type = "image/png"
+    base64_image = base64.b64encode(full_path.read_bytes()).decode("utf-8")
+    return f"data:{mime_type};base64,{base64_image}"
+
+
 async def _request_visual_analysis(full_path: Path) -> str:
     try:
         image_size = full_path.stat().st_size
@@ -316,11 +324,9 @@ async def _request_visual_analysis(full_path: Path) -> str:
 
     client = _get_visual_client()
 
-    mime_type, _ = mimetypes.guess_type(str(full_path))
-    if not mime_type:
-        mime_type = "image/png"
-    base64_image = base64.b64encode(full_path.read_bytes()).decode("utf-8")
-    data_url = f"data:{mime_type};base64,{base64_image}"
+    # Reading and encoding a 10 MB image can stall the event loop; keeping it
+    # on a worker thread lets concurrent analyses keep making progress.
+    data_url = await asyncio.to_thread(_build_image_data_url, full_path)
     response = await asyncio.to_thread(
         client.chat.completions.create,
         model=_normalize_openai_model_name(os.environ.get("VISUAL_MODEL") or os.environ.get("MODEL", "")),
