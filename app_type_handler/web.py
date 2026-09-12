@@ -21,21 +21,110 @@ async def _emit_log(log_cb: Callable[..., Awaitable[None] | None], *args) -> Non
         await result
 
 
-async def run_npm_install(target_dir: str, log_cb: Callable[..., Awaitable[None] | None]):
+NPM_INSTALL_TIMEOUT_SECONDS = 900.0
+# The plain attempt is capped tighter on purpose: on npm 10.x the optional-peer
+# resolution for vitest can wedge arborist instead of failing fast, and waiting
+# the full budget before trying the fallback wastes minutes on every install.
+NPM_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 240.0
+LEGACY_PEER_DEPS_FLAG = "--legacy-peer-deps"
+
+
+def node_modules_ready(target_dir: str) -> bool:
+    """Return True only when an install actually produced packages.
+
+    A zero exit code is not proof of success: when ``package.json`` declares no
+    dependencies (for example because the template never got copied), npm exits
+    0 without installing anything. Treating that as success used to let a
+    broken workspace through, after which every build and test step failed and
+    the TDD loop burned its whole retry budget on every requirement.
+    """
+    node_modules = os.path.join(target_dir, "node_modules")
+    if not os.path.isdir(node_modules):
+        return False
     try:
-        process = await asyncio.create_subprocess_shell(
-            "npm install",
-            cwd=target_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        return any(not name.startswith(".") for name in os.listdir(node_modules))
+    except OSError:
+        return False
+
+
+def _tail(text: str, limit: int = 1500) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return "...[truncated]...\n" + text[-limit:]
+
+
+async def _run_npm_command(
+    command: str,
+    target_dir: str,
+    timeout: float = NPM_INSTALL_TIMEOUT_SECONDS,
+) -> tuple[int, str, str]:
+    process = await asyncio.create_subprocess_shell(
+        command,
+        cwd=target_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=timeout,
         )
-        _, stderr = await process.communicate()
-        if process.returncode == 0:
+    except asyncio.TimeoutError:
+        await finalize_subprocess(process, force_kill=True)
+        return 124, "", f"command timed out after {timeout:.0f}s"
+    return (
+        process.returncode if process.returncode is not None else -1,
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+    )
+
+
+async def run_npm_install(
+    target_dir: str,
+    log_cb: Callable[..., Awaitable[None] | None],
+) -> bool:
+    """Install dependencies in ``target_dir`` and verify the outcome.
+
+    Tries a plain ``npm install`` first, then falls back to
+    ``--legacy-peer-deps``. The fallback is required on npm 10.x, where the
+    optional-peer resolution for vitest makes arborist crash with
+    ``Cannot read properties of null (reading 'edgesOut')``.
+
+    Returns True only when npm succeeded *and* ``node_modules`` is non-empty.
+    """
+    failures: list[str] = []
+    attempts = (
+        ("npm install", NPM_PRIMARY_ATTEMPT_TIMEOUT_SECONDS),
+        (f"npm install {LEGACY_PEER_DEPS_FLAG}", NPM_INSTALL_TIMEOUT_SECONDS),
+    )
+    for command, timeout in attempts:
+        try:
+            returncode, stdout, stderr = await _run_npm_command(command, target_dir, timeout)
+        except Exception as exc:
+            failures.append(f"{command} raised {type(exc).__name__}: {exc}")
+            continue
+
+        if returncode == 0 and node_modules_ready(target_dir):
             await _emit_log(log_cb, "System", f"NPM install success in {target_dir}")
+            return True
+
+        if returncode == 0:
+            failures.append(
+                f"{command} exited 0 but node_modules is empty "
+                "(nothing was installed; check the template and package.json)"
+            )
         else:
-            await _emit_log(log_cb, "System", f"NPM install failed in {target_dir}: dependency installation returned a non-zero exit code.")
-    except Exception as exc:
-        await _emit_log(log_cb, "System", f"NPM install error: {str(exc)}")
+            failures.append(f"{command} exited {returncode}: {_tail(stderr) or _tail(stdout)}")
+
+    await _emit_log(
+        log_cb,
+        "System",
+        f"NPM install failed in {target_dir}: " + " | ".join(failures),
+        "error",
+        None,
+    )
+    return False
 
 
 async def _execute_web_test_command(
@@ -880,16 +969,52 @@ class WebAppType(AppTypeHandler):
             await self._log("System", f"Failed to configure web template: {str(exc)}")
             return False
 
-    async def install_dependencies(self) -> None:
-        backend_path = os.path.join(self.workspace_path, "backend")
-        if os.path.exists(backend_path):
-            await self._log("System", "Installing backend dependencies. This might take a moment...")
-            await run_npm_install(backend_path, self.log_cb)
+    async def install_dependencies(self) -> bool:
+        targets = (
+            ("backend", os.path.join(self.workspace_path, "backend")),
+            ("frontend", os.path.join(self.workspace_path, "frontend")),
+        )
+        all_ok = True
+        for label, target_path in targets:
+            if not os.path.exists(target_path):
+                continue
+            await self._log(
+                "System",
+                f"Installing {label} dependencies. This might take a moment...",
+            )
+            if not await run_npm_install(target_path, self.log_cb):
+                all_ok = False
+        return all_ok
 
-        frontend_path = os.path.join(self.workspace_path, "frontend")
-        if os.path.exists(frontend_path):
-            await self._log("System", "Installing frontend dependencies. This might take a moment...")
-            await run_npm_install(frontend_path, self.log_cb)
+    async def verify_workspace(self) -> bool:
+        """Fail fast when the scaffolded workspace cannot build.
+
+        Without this gate a broken template or a half-finished install only
+        shows up per node, where it burns the entire TDD retry budget of every
+        single requirement.
+        """
+        frontend_dir = os.path.join(self.workspace_path, "frontend")
+        if not os.path.isdir(frontend_dir):
+            return True
+
+        await self._log("System", "Verifying workspace: building frontend...")
+        result = await _execute_web_test_command(
+            "npm run build",
+            cwd=frontend_dir,
+            timeout=180.0,
+        )
+        if _extract_exit_code(result) == 0:
+            await self._log("System", "Workspace verification passed: frontend build succeeded.")
+            return True
+
+        await self._log(
+            "System",
+            "Workspace verification failed: frontend build did not succeed. "
+            "Aborting before the node loop. " + _tail(result),
+            "error",
+            None,
+        )
+        return False
 
     async def run_build(self) -> str:
         frontend_result = await _execute_web_test_command(

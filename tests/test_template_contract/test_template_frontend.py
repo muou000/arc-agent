@@ -14,7 +14,9 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE_FRONTEND = REPO_ROOT / "template" / "frontend"
+TEMPLATE_FRONTEND = (
+    REPO_ROOT / "arc-template" / "templates" / "web-react-express" / "frontend"
+)
 
 
 def _has_node() -> bool:
@@ -35,16 +37,38 @@ pytestmark = [
 def installed_frontend(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
     scratch = tmp_path_factory.mktemp("template-frontend-")
     shutil.copytree(TEMPLATE_FRONTEND, scratch / "frontend")
+    # Match the production install path: npm 10's arborist crashes while
+    # resolving vitest's optional peers, so the handler falls back to
+    # --legacy-peer-deps. This fixture must exercise the same flags.
     proc = subprocess.run(
-        [_NPM_BIN, "install", "--no-audit", "--no-fund", "--prefer-offline"],
+        [_NPM_BIN, "install", "--legacy-peer-deps", "--no-audit", "--no-fund", "--prefer-offline"],
         cwd=str(scratch / "frontend"),
         capture_output=True,
         text=True,
         timeout=300,
     )
     if proc.returncode != 0:
-        pytest.skip(f"npm install failed: {proc.stderr or proc.stdout}")
+        # Fail loudly. Skipping here is how the npm 10 arborist crash - and the
+        # missing @testing-library/dom peer it exposed - stayed invisible.
+        # `_has_node()` already skips genuinely node-less environments above.
+        pytest.fail(f"npm install failed: {proc.stderr or proc.stdout}")
     yield scratch / "frontend"
+
+
+class TestFrontendDependencies:
+    """Peers that `--legacy-peer-deps` does not install for us."""
+
+    def test_testing_library_dom_is_a_real_install(self, installed_frontend: Path) -> None:
+        """`@testing-library/react` 16 peers on `@testing-library/dom`.
+
+        `--legacy-peer-deps` skips peer installation, so the template must
+        declare it directly. Without it every component test fails to import,
+        and the agent has no way to install a dependency mid-compile.
+        """
+
+        dom = installed_frontend / "node_modules" / "@testing-library" / "dom"
+        assert dom.is_dir(), "@testing-library/dom is missing; component tests cannot import it"
+        assert (dom / "dist").is_dir(), "@testing-library/dom looks like a stub, not a real install"
 
 
 class TestFrontendBuild:

@@ -15,13 +15,24 @@ TEMPLATE_ID_BY_APP_TYPE = {
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
 
+REPO_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
+
+
 def _resolve_templates_root() -> str:
     env_root = os.environ.get("ARC_AGENT_TEMPLATES_ROOT", "").strip()
     if env_root:
         return os.path.abspath(env_root)
-    return os.path.abspath(
-        os.path.join(BASE_DIR, "..", "arc-template", "templates")
-    )
+    return os.path.join(REPO_ROOT, "arc-template", "templates")
+
+
+def template_candidates(template_id: str) -> list[str]:
+    """Template directory for an app type.
+
+    ``ARC_AGENT_TEMPLATES_ROOT`` overrides the in-repo location, which is how
+    tests point the compiler at a scratch tree. A list is returned so
+    ``template_dir`` keeps its "first usable candidate wins" shape.
+    """
+    return [os.path.join(_resolve_templates_root(), template_id)]
 
 
 class AppTypeHandler(ABC):
@@ -46,7 +57,13 @@ class AppTypeHandler(ABC):
             raise ValueError(
                 f"No external template mapping is configured for app_type={cls.name!r}."
             )
-        return os.path.join(_resolve_templates_root(), template_id)
+        candidates = template_candidates(template_id)
+        for candidate in candidates:
+            if cls._template_looks_usable(candidate):
+                return candidate
+        # Nothing usable found: return the primary path so the caller's error
+        # message points at the location we expected the template to live in.
+        return candidates[0]
 
     async def initialize_workspace(self) -> bool:
         prereqs_ok = await self.check_prerequisites()
@@ -61,7 +78,22 @@ class AppTypeHandler(ABC):
         if not setup_ok:
             return False
 
-        await self.install_dependencies()
+        deps_ok = await self.install_dependencies()
+        if not deps_ok:
+            return False
+
+        verified = await self.verify_workspace()
+        if not verified:
+            return False
+        return True
+
+    async def verify_workspace(self) -> bool:
+        """Post-install gate. Returning False aborts the compilation.
+
+        Runs before any node is scheduled, so a broken template or a
+        half-finished dependency install fails once instead of poisoning every
+        requirement's build and test steps.
+        """
         return True
 
     async def check_prerequisites(self) -> bool:
@@ -73,6 +105,17 @@ class AppTypeHandler(ABC):
         template_dir = self.template_dir()
         if not os.path.exists(template_dir):
             await self._log("System", f"Error: Template directory not found at {template_dir}", "error", None)
+            return False
+
+        if not self._template_looks_usable(template_dir):
+            await self._log(
+                "System",
+                "Error: Template directory is empty or incomplete at "
+                f"{template_dir}. Expected at least a template.yaml and one source "
+                "tree; refusing to continue with a blank workspace.",
+                "error",
+                None,
+            )
             return False
 
         await self._log("System", f"Using app_type={self.name}, template={template_dir}")
@@ -90,6 +133,27 @@ class AppTypeHandler(ABC):
             await self._log("System", f"Error copying template: {str(exc)}", "error", None)
             return False
 
+    @staticmethod
+    def _template_looks_usable(template_dir: str) -> bool:
+        """A usable template has a manifest plus at least one file to copy.
+
+        Guards against the failure mode where the templates root exists but is
+        an empty directory tree: ``shutil.copytree`` would happily succeed and
+        leave the agents to hand-roll the whole project from scratch. The
+        manifest alone does not count, since on its own it still yields a blank
+        workspace.
+        """
+        manifest = os.path.join(template_dir, "template.yaml")
+        if not os.path.isfile(manifest):
+            return False
+
+        manifest_path = os.path.abspath(manifest)
+        for root, _dirs, files in os.walk(template_dir):
+            for name in files:
+                if os.path.abspath(os.path.join(root, name)) != manifest_path:
+                    return True
+        return False
+
     async def _log(
         self,
         agent_name: str,
@@ -104,8 +168,8 @@ class AppTypeHandler(ABC):
     async def post_template_setup(self) -> bool:
         return True
 
-    async def install_dependencies(self) -> None:
-        return None
+    async def install_dependencies(self) -> bool:
+        return True
 
     async def run_build(self) -> str:
         return (
