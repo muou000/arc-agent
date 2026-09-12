@@ -817,7 +817,7 @@ def _frontend_source_fingerprint(frontend_path: str) -> str | None:
         digest.update(key.encode("utf-8"))
         digest.update(b"=")
         digest.update(str(value).encode("utf-8"))
-        digest.update(b"\\0")
+        digest.update(b"\0")
     visited_real_dirs: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         real_dir = os.path.realpath(dirpath)
