@@ -362,6 +362,12 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
     # turns are cheap (~seconds) next to the test executions they no longer
     # trigger (~a minute each), which is what this guard is about.
     assert model.call_count <= TDD_RUN_TESTS_BUDGET + 1
+    # A broken workspace must not advance the layer either: every later layer
+    # would fail the same way, and the environment-failure gate stops the loop.
+    all_tool_results = "\n".join(
+        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
+    )
+    assert "has advanced the active layer" not in all_tool_results
     node_session = sessions.load_node_session(node_id)
     assert "environment failure" in node_session["recent_failure_summary"]
     assert "missing dependency" in node_session["recent_failure_summary"]
@@ -392,3 +398,112 @@ def test_assertion_failure_still_consumes_the_full_budget(tmp_project_dir: Path,
     assert len(fake.calls) == TDD_RUN_TESTS_BUDGET
     node_session = sessions.load_node_session(node_id)
     assert "environment failure" not in node_session["recent_failure_summary"]
+
+
+# ---------------------------------------------------------------------------
+# Hard layer state machine: a passing layer advances immediately and can no
+# longer be re-run; the next layer runs in the same session.
+# ---------------------------------------------------------------------------
+
+
+def test_tdd_pass_advances_active_layer_immediately(tmp_project_dir: Path, arc_runtime) -> None:
+    """A passed layer must be closed at the moment the pass is reported.
+
+    Before the in-session advance, a model that kept polling `run_tests`
+    re-ran the passing batch until its budget was gone and then deadlocked on
+    rejected next-layer requests (observed on the 12306 benchmark: attempts
+    6-10 of an already-passing Unit batch, then minutes of stuck turns).
+    """
+
+    node_id = "REQ-TDD-ADV"
+    tests = [
+        {"test_id": "T-U", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T-I", "type": "Integration", "file_path": INTEGRATION_TEST_FILE},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="u1"),
+            # Re-running the closed layer must be rejected without a test run.
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="u2"),
+            # The next layer is immediately runnable in the same session.
+            faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="i1"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    fake = FakeAppHandler([passing_test_output(), passing_test_output()])
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    # Exactly one run per layer: the re-run request never reached the handler.
+    assert fake.calls == [
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Integration", [INTEGRATION_TEST_FILE]),
+    ]
+    assert model.call_count == 4
+    all_tool_results = "\n".join(
+        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
+    )
+    assert "has advanced the active layer to `Integration`" in all_tool_results
+    assert "The active TDD layer is `Integration`" in all_tool_results
+    assert arc_runtime.traceability.get_test("T-U")["passed"] is True
+    assert arc_runtime.traceability.get_test("T-I")["passed"] is True
+
+
+def test_tdd_budget_exhaustion_advances_to_next_layer(tmp_project_dir: Path, arc_runtime) -> None:
+    """An exhausted layer must hand the active layer to its successor.
+
+    The prompt promises "the system moves to later layers even if an earlier
+    layer fails or exhausts its budget"; the executor used to keep the active
+    layer pinned to the exhausted one, so in-session requests for the next
+    layer were rejected and the session deadlocked.
+    """
+
+    node_id = "REQ-TDD-EXH"
+    tests = [
+        {"test_id": "T-U", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T-I", "type": "Integration", "file_path": INTEGRATION_TEST_FILE},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    script = [faux_tool_call("run_tests", {}, call_id=f"u{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
+    script += [
+        # Hits the budget gate: returns the closed message and advances the
+        # active layer without running any test.
+        faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="closed"),
+        # The successor layer is immediately runnable in the same session.
+        faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="i1"),
+        faux_text("unit layer closed; integration still failing"),
+        # The outer loop opens the Integration session; second attempt passes.
+        faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="i2"),
+        faux_text("IMPLEMENTED"),
+    ]
+    model = FauxChatModel(responses=script)
+    outputs = [failing_test_output(detail=f"unit failure {i}") for i in range(TDD_RUN_TESTS_BUDGET)]
+    outputs += [
+        failing_test_output(detail="AssertionError: integration mismatch"),
+        passing_test_output(),
+    ]
+    fake = FakeAppHandler(outputs)
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    # Unit is failed and stays failed; Integration passed on its own budget.
+    assert final_ok is False
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * TDD_RUN_TESTS_BUDGET + [
+        ("Integration", [INTEGRATION_TEST_FILE]),
+        ("Integration", [INTEGRATION_TEST_FILE]),
+    ]
+    all_tool_results = "\n".join(
+        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
+    )
+    assert "The Unit layer is closed" in all_tool_results
+    assert "has advanced the active layer to `Integration`" in all_tool_results
+    assert arc_runtime.traceability.get_test("T-U")["passed"] is False
+    assert arc_runtime.traceability.get_test("T-I")["passed"] is True
+    node_session = sessions.load_node_session(node_id)
+    assert "Unit:" in node_session["recent_failure_summary"]
