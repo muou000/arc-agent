@@ -3,6 +3,7 @@ import os
 import json
 import sys
 import asyncio
+import shutil
 import subprocess
 import signal
 import hashlib
@@ -1106,6 +1107,48 @@ class WebAppType(AppTypeHandler):
             )
         return None
 
+    async def _copy_requirement_assets(self) -> None:
+        """Copy requirement-provided image assets into the served frontend.
+
+        Requirements reference images such as ``assets/logo.png`` in their
+        descriptions and agents render those paths into components. Without a
+        copy step the agent fabricates binary files with ``write_file``
+        (observed: 0-byte PNGs on the 12306 benchmark) and every image-bearing
+        acceptance check fails. Assets are static inputs, so a plain copy into
+        Vite's public directory is enough; existing files are never overwritten
+        and a missing or unreadable assets directory is not fatal.
+        """
+
+        requirements_dir = Path(self.requirement_path or "").expanduser().resolve().parent
+        assets_dir = requirements_dir / "assets"
+        if not assets_dir.is_dir():
+            return
+        public_assets = Path(self.workspace_path) / "frontend" / "public" / "assets"
+        copied = 0
+        try:
+            public_assets.mkdir(parents=True, exist_ok=True)
+            for item in sorted(assets_dir.iterdir()):
+                if not item.is_file():
+                    continue
+                target = public_assets / item.name
+                if target.exists():
+                    continue
+                await asyncio.to_thread(shutil.copy2, item, target)
+                copied += 1
+        except OSError as exc:
+            await self._log(
+                "System",
+                f"Failed to copy requirement assets from {assets_dir}: {exc}",
+                "warning",
+                None,
+            )
+            return
+        if copied:
+            await self._log(
+                "System",
+                f"Copied {copied} requirement asset(s) into frontend/public/assets.",
+            )
+
     async def post_template_setup(self) -> bool:
         """Assert the scaffolded runtime files resolve the web port from the environment.
 
@@ -1119,6 +1162,7 @@ class WebAppType(AppTypeHandler):
         silent no-op into a gate.
         """
 
+        await self._copy_requirement_assets()
         port_contract = (
             ("backend/src/index.js", "process.env.PORT"),
             ("frontend/vite.config.js", "process.env.ARC_WEB_PORT"),
