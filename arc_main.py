@@ -452,7 +452,11 @@ def build_eval_parser(subparsers) -> None:
         "--runner-script",
         dest="runner_script",
         default=None,
-        help="Run each arm with [python, SCRIPT] instead of the repository arc_main.py",
+        help=(
+            "Run each arm with [python, SCRIPT] instead of the repository "
+            "arc_main.py compile entry; SCRIPT receives '<requirement> -o "
+            "<workspace> -t <type> --port <port> [arm argv]'"
+        ),
     )
     parser.set_defaults(func=cmd_eval)
 

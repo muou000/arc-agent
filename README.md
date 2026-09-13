@@ -164,7 +164,10 @@ python arc_main.py eval path/to/requirements \
 
 - `--baseline-env` / `--candidate-env` 为各 arm 的环境变量覆盖（会盖过 `.env` 同名变量），
   `--baseline-arg` / `--candidate-arg` 为附加 compile 参数（追加在命令末尾，取值以 `=`
-  形式传入时可含 `--` 前缀）。每次运行都是干净子进程，与普通 `arc compile` 一致。
+  形式传入时可含 `--` 前缀）。每次运行都是干净子进程：runner 前缀之后由评测器统一追加
+  `<requirement> -o <workspace> -t <type> --port <port> <arm 参数>`，缺省 runner 是仓库
+  `arc_main.py` 的 `compile` 子命令；`--runner-script` 可换成任意脚本（接收上述纯运行
+  参数，不带 `compile` 子命令）。
 - 调试用 `--repetitions 1`，报告提升时建议 5 次；`--timeout` 给单次运行设置秒级上限，
   超时按失败运行计入报告。报告默认写入 `records/evals/<时间戳>-<名称>/`，`--out-dir` 可覆盖。
 

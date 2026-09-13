@@ -208,3 +208,50 @@ def test_eval_table_rejects_bad_inputs(tmp_path):
             requirement_path=_make_requirement(tmp_path),
             artifacts_dir=tmp_path / "a3",
         )
+
+
+def test_runner_script_receives_plain_run_arguments(tmp_path):
+    # runner contract: a custom runner gets "<requirement> -o <workspace> -t
+    # <type> --port <port> <arm argv>" — never the arc_main "compile" subcommand
+    import json as _json
+
+    argv_dump = tmp_path / "argv.json"
+    runner = tmp_path / "generic_runner.py"
+    runner.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['ARGV_DUMP']).write_text(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    work = tmp_path / "work"
+    eval_table(
+        "runner contract",
+        ArmConfig(label="b", env={"ARGV_DUMP": str(argv_dump)}, argv=["--flag"]),
+        ArmConfig(label="c", env={"ARGV_DUMP": str(tmp_path / "unused.json")}),
+        requirement_path=_make_requirement(tmp_path),
+        repetitions=1,
+        runner_command=[sys.executable, str(runner)],
+        artifacts_dir=tmp_path / "artifacts",
+        work_root=work,
+        keep_workspaces=True,
+        log=lambda _message: None,
+    )
+    assert _json.loads(argv_dump.read_text(encoding="utf-8")) == [
+        str(tmp_path / "req"),
+        "-o",
+        str(work / "baseline-rep001"),
+        "-t",
+        "web",
+        "--port",
+        "3301",
+        "--flag",
+    ]
+
+
+def test_default_runner_command_is_repo_compile_entry():
+    from core.evals import REPO_ROOT, default_runner_command
+
+    command = default_runner_command()
+    assert command[0] == sys.executable
+    assert command[1] == str(REPO_ROOT / "arc_main.py")
+    assert command[2] == "compile"

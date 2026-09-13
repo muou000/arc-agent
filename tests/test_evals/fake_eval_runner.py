@@ -1,7 +1,8 @@
 """Fake ARC runner for eval-harness tests.
 
-Invoked by ``core.evals`` exactly like the real runner:
-``python fake_eval_runner.py compile <requirement> -o <workspace> [extra argv]``
+Invoked by ``core.evals`` per the runner contract:
+``python fake_eval_runner.py <requirement> -o <workspace> [extra argv]``
+(no ``compile`` subcommand — custom runners receive plain run arguments).
 
 Behavior is driven by environment variables (applied per arm by the harness):
 

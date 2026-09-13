@@ -28,6 +28,13 @@ share of paired runs whose compilation succeeded, and token/latency/cost
 deltas are candidate-minus-baseline means over those pairs. Missing telemetry
 (one side has no ``llm_usage`` events) keeps the absolute values of the other
 side but reports the delta as unavailable instead of guessing.
+
+Runner contract: ``runner_command`` is the full command prefix of one run; the
+harness appends ``<requirement> -o <workspace> -t <app_type> --port <web_port>``
+plus the arm's extra argv. The default prefix runs the repository
+``arc_main.py`` ``compile`` subcommand; a custom runner (``--runner-script``)
+is an arbitrary script that receives those plain run arguments and must not
+expect the ``compile`` subcommand.
 """
 
 from __future__ import annotations
@@ -90,9 +97,14 @@ class EvalResult:
 
 
 def default_runner_command() -> list[str]:
-    """Runner prefix for each arm: this interpreter on the repo CLI."""
+    """Runner prefix for each arm: this interpreter on the repo ``compile`` CLI.
 
-    return [sys.executable, str(REPO_ROOT / "arc_main.py")]
+    The harness appends the plain run arguments
+    (``<requirement> -o <workspace> -t <app_type> --port <web_port> <arm argv>``)
+    after this prefix, so the ``compile`` subcommand belongs to the prefix.
+    """
+
+    return [sys.executable, str(REPO_ROOT / "arc_main.py"), "compile"]
 
 
 def parse_env_overrides(pairs: Sequence[str], *, flag: str) -> dict[str, str]:
@@ -401,7 +413,6 @@ def _run_once(
         raise ValueError(f"run workspace already exists: {workspace}")
     argv = [
         *runner_prefix,
-        "compile",
         str(requirement),
         "-o",
         str(workspace),
