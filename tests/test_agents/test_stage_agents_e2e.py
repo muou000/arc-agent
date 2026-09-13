@@ -147,3 +147,68 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
     assert "T-ADD" in output_text
     # The scripted test asset really landed in the workspace.
     assert (tmp_project_dir / "tests" / "unit" / "test_calc.py").read_text(encoding="utf-8") == test_code
+
+
+def test_interface_designer_glue_write_is_blocked_and_node_private_write_lands(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """The registration contract is enforced mechanically: a DESIGN write to a
+    shared glue file is rejected by stage discipline, the designer recovers by
+    materializing the contract into a node-private registration module, and the
+    glue file stays untouched in the workspace.
+    """
+
+    node_id = "REQ-DESIGN-GLUE"
+    seed_requirement(arc_runtime, node_id)
+
+    section = "function NavSection() {\n  return <nav />;\n}\n\nexport default NavSection;\n"
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/frontend/src/App.tsx", "content": "export {}"},
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/frontend/src/sections/home/NavSection.tsx", "content": section},
+                call_id="c2",
+            ),
+            faux_tool_call(
+                "InterfaceDesignResponse",
+                {
+                    "summary": "App.tsx write was rejected as shared glue; NavSection landed as a section module.",
+                    "interfaces": [
+                        {
+                            "interface_id": "IF-NAV",
+                            "type": "UI",
+                            "name": "NavSection",
+                            "responsibility": "Home navigation section",
+                            "file_path": "/workspace/frontend/src/sections/home/NavSection.tsx",
+                            "first_line": "function NavSection() {",
+                            "callers": [],
+                            "callees": [],
+                        }
+                    ],
+                    "files_written": ["/workspace/frontend/src/sections/home/NavSection.tsx"],
+                },
+                call_id="c3",
+            ),
+        ]
+    )
+
+    bundle = asyncio.run(
+        make_designer(tmp_project_dir, model).run(
+            node_id=node_id,
+            requirement_data={"name": "Navigation", "description": "Home navigation"},
+        )
+    )
+
+    assert model.call_count == 3
+    assert bundle["interfaces"][0]["interface_id"] == "IF-NAV"
+    # The node-private section module really landed.
+    assert (tmp_project_dir / "frontend" / "src" / "sections" / "home" / "NavSection.tsx").read_text(
+        encoding="utf-8"
+    ) == section
+    # The template-owned glue file was never created or modified.
+    assert not (tmp_project_dir / "frontend" / "src" / "App.tsx").exists()

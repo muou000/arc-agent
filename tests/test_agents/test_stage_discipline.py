@@ -289,3 +289,71 @@ def test_paths_without_file_path_are_not_validated() -> None:
     # A tool without file_path args (e.g. traceability queries) must pass.
     result = run(middleware, make_request("get_interface", {"interface_id": "IF-1"}))
     assert result.content == "ok"
+
+
+# ---------------------------------------------------------------------------
+# design-stage shared glue denylist (registration contract)
+# ---------------------------------------------------------------------------
+
+
+def make_design_with_glue_denylist(paths: list[str]) -> StageDisciplineMiddleware:
+    return StageDisciplineMiddleware(stage="interface_design", denied_write_paths=paths)
+
+
+def test_design_write_to_denied_glue_path_is_blocked() -> None:
+    middleware = make_design_with_glue_denylist(["frontend/src/App.tsx", "backend/src/app.js"])
+    for name in ("write_file", "edit_file"):
+        args = (
+            {"file_path": "/workspace/frontend/src/App.tsx", "content": "export {}"}
+            if name == "write_file"
+            else {"file_path": "/workspace/frontend/src/App.tsx", "old_string": "a", "new_string": "b"}
+        )
+        result = run(middleware, make_request(name, args))
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        assert "must not edit shared runtime glue" in result.content
+        assert "Registration Contract" in result.content
+
+
+def test_denied_glue_paths_normalize_workspace_relative_entries() -> None:
+    middleware = make_design_with_glue_denylist(["backend\\src\\app.js"])
+    result = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/backend/src/app.js", "content": "x"}),
+    )
+    assert isinstance(result, ToolMessage) and result.status == "error"
+
+
+def test_denied_glue_paths_do_not_block_other_stages() -> None:
+    for stage in ("test_generation", "implementation"):
+        middleware = StageDisciplineMiddleware(
+            stage=stage, denied_write_paths=["frontend/src/App.tsx"]  # type: ignore[arg-type]
+        )
+        args = (
+            {"file_path": "/workspace/frontend/src/App.tsx", "content": "x"}
+            if stage == "implementation"
+            else {"file_path": "/workspace/frontend/tests/app.test.tsx", "content": "x"}
+        )
+        result = run(middleware, make_request("write_file", args))
+        assert result.content == "ok"
+
+
+def test_design_writes_outside_the_denylist_are_still_allowed() -> None:
+    middleware = make_design_with_glue_denylist(["frontend/src/App.tsx"])
+    result = run(
+        middleware,
+        make_request(
+            "write_file",
+            {"file_path": "/workspace/frontend/src/sections/home/HeroSection.tsx", "content": "x"},
+        ),
+    )
+    assert result.content == "ok"
+
+
+def test_design_without_denylist_keeps_previous_behavior() -> None:
+    middleware = make("interface_design")
+    result = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/frontend/src/App.tsx", "content": "x"}),
+    )
+    assert result.content == "ok"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -327,12 +328,15 @@ def build_stage_agent(
     memory: list[str] | None = None,
     tools: list[object] | None = None,
     checkpointer: Any = _UNSET,
+    denied_write_paths: Sequence[str] | None = None,
 ):
     """Create an agent instance with ARC's first-batch filesystem policy.
 
     ``checkpointer`` defaults to the process-wide shared saver so that rebuilding
     an agent for the same ``thread_id`` resumes the previous conversation rather
     than starting cold. Pass ``checkpointer=None`` to opt a single agent out.
+    ``denied_write_paths`` lists workspace-relative glue paths (registration
+    contract) that the DESIGN stage must not write.
     """
 
     _apply_windows_filesystem_path_compat()
@@ -365,7 +369,10 @@ def build_stage_agent(
         middleware=[
             TruncatedToolCallGuardMiddleware(),
             ToolArgumentSanitizerMiddleware(),
-            StageDisciplineMiddleware(stage=stage),
+            StageDisciplineMiddleware(
+                stage=stage,
+                denied_write_paths=denied_write_paths or (),
+            ),
             DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
         ],
         tools=tools or [],

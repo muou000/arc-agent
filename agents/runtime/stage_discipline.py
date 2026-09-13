@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from typing import Any, Literal, NotRequired, TypedDict
 
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
@@ -26,8 +27,14 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
 
     state_schema = StageDisciplineState
 
-    def __init__(self, *, stage: Literal["interface_design", "test_generation", "implementation"]) -> None:
+    def __init__(
+        self,
+        *,
+        stage: Literal["interface_design", "test_generation", "implementation"],
+        denied_write_paths: Sequence[str] = (),
+    ) -> None:
         self._stage = stage
+        self._denied_write_paths = frozenset(_virtual_workspace_paths(denied_write_paths))
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._written_paths: set[str] = set()
         self._failed_paths: set[str] = set()
@@ -94,6 +101,12 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return (
                 f"Repeated write blocked: {path} was already changed in this stage. "
                 "Wait for a file-operation or system-validation error before changing it again."
+            )
+        if self._stage == "interface_design" and path in self._denied_write_paths:
+            return (
+                f"InterfaceDesigner must not edit shared runtime glue: {path}. Shared files are "
+                "assembled automatically from per-feature registration modules; add a new route, "
+                "section, schema, provider, or page module per the Registration Contract instead."
             )
         if self._stage == "test_generation" and not _is_test_asset(path):
             return (
@@ -181,6 +194,19 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
 def _discipline_path(args: dict[str, Any]) -> str:
     raw = str(args.get("file_path", "") or "").replace("\\", "/").strip()
     return raw if raw.startswith("/") else f"/{raw}" if raw else ""
+
+
+def _virtual_workspace_paths(paths: Iterable[str]) -> Iterable[str]:
+    """Normalize workspace-relative glue paths to the agent's virtual view.
+
+    The denylist is authored as workspace-relative paths (``frontend/src/App.tsx``);
+    agents address files under the virtual ``/workspace/`` root.
+    """
+
+    for raw in paths:
+        normalized = str(raw or "").strip().replace("\\", "/").strip("/")
+        if normalized:
+            yield f"/workspace/{normalized}"
 
 
 def _as_nonnegative_int(value: Any, *, default: int) -> int:

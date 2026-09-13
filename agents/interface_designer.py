@@ -16,6 +16,7 @@ from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
 from agents.tools.traceability import build_traceability_tools
+from app_type_handler import get_app_type_handler_class
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -91,6 +92,7 @@ class InterfaceDesigner:
             permitted_skill_names=selected_skill_names,
             memory=[],
             tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+            denied_write_paths=get_app_type_handler_class(app_type).design_denied_write_paths(),
         )
         message = get_user_prompt(
             node_id=node_id,
