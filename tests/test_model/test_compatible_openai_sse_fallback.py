@@ -78,6 +78,27 @@ def test_unparseable_truncated_arguments_still_land_in_invalid_tool_calls() -> N
     assert message.invalid_tool_calls[0]["id"] == "call-1"
 
 
+def test_later_completed_event_clears_stale_incomplete_details() -> None:
+    """incomplete_details must follow the latest terminal event.
+
+    A stream that first reports response.incomplete and then closes with
+    response.completed (e.g. a proxy replaying events) must not leave stale
+    truncation details behind: the guard would otherwise intercept a
+    response whose status says completed.
+    """
+
+    payload = _sse(
+        "response.incomplete",
+        {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+    ) + _sse("response.completed", {"status": "completed", "incomplete_details": None})
+
+    message = _chat_result_from_sse_text(payload).generations[0].message
+
+    assert message.response_metadata["status"] == "completed"
+    assert "incomplete_details" not in message.response_metadata
+    assert not _message_hit_output_limit(message)
+
+
 def test_fallback_result_feeds_the_truncation_guard() -> None:
     payload = _sse(
         "response.incomplete",

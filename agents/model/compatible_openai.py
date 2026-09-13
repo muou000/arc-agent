@@ -102,9 +102,11 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
             response = data.get("response")
             if isinstance(response, dict):
                 response_status = str(response.get("status") or "") or response_status
+                # Track the latest terminal event: a stale incomplete_details
+                # from an earlier event must not outlive a completed status,
+                # or the truncation guard would misfire on a finished response.
                 details = response.get("incomplete_details")
-                if isinstance(details, dict):
-                    incomplete_details = details
+                incomplete_details = details if isinstance(details, dict) else None
             continue
         if current_event != "response.output_item.done":
             continue
