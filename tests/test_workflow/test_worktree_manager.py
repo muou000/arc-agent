@@ -135,6 +135,43 @@ def test_discard_removes_worktree_keeps_branch_and_shared_node_modules(tmp_path:
     assert (shared / "pkg" / "index.js").exists(), "shared node_modules must survive junction cleanup"
 
 
+def test_discard_refuses_when_the_junction_cannot_be_disconnected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git worktree remove --force recurses through junctions and destroys the
+    shared node_modules (verified empirically), so discard() must never reach
+    it while a junction survives (PR #8 review)."""
+    repo, manager = _init_repo(tmp_path)
+    shared = repo / "frontend" / "node_modules"
+    (shared / "pkg").mkdir(parents=True)
+    (shared / "pkg" / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    handle = manager.prepare("REQ-1.1")
+
+    def broken_remove_link(link: Path) -> None:
+        raise PermissionError(f"stubbed failure: {link}")
+
+    monkeypatch.setattr("core.worktree._remove_link", broken_remove_link)
+
+    with pytest.raises(WorktreeError, match="refusing to delete the worktree"):
+        manager.discard(handle)
+
+    assert (shared / "pkg" / "index.js").exists(), "shared node_modules untouched"
+    assert manager._is_registered(Path(handle.path)), "worktree kept, git removal skipped"
+
+
+def test_integrate_commit_failure_names_the_branch(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-1.1")
+
+    def broken_commit(_handle: object, _message: str) -> bool:
+        raise WorktreeError("git commit failed: index.lock exists")
+
+    manager.commit = broken_commit
+
+    with pytest.raises(WorktreeError, match="commit on branch arc-node/REQ-1.1 failed"):
+        manager.integrate(handle, "REQ-1.1 (implement): boom")
+
+
 def test_worktree_is_invisible_to_the_parent_repository(tmp_path: Path) -> None:
     repo, manager = _init_repo(tmp_path)
     handle = manager.prepare("REQ-1.1")

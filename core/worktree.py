@@ -134,10 +134,19 @@ class NodeWorktreeManager:
 
         Returns ``(committed, detail)``. Raises ``MergeConflictError`` when the
         merge conflicts; the merge is aborted and the worktree left in place so
-        the operator (or ``--retry``) can inspect the overlap.
+        the operator (or ``--retry``) can inspect the overlap. A failed commit
+        raises ``WorktreeError`` naming the branch: the worktree keeps its
+        staged state, so the next retry of the node picks up exactly where the
+        commit stopped.
         """
 
-        committed = self.commit(handle, message)
+        try:
+            committed = self.commit(handle, message)
+        except WorktreeError as exc:
+            raise WorktreeError(
+                f"commit on branch {handle.branch} failed; the worktree keeps its "
+                f"staged state for retry: {exc}"
+            ) from exc
         current_branch = self._integration_branch()
         merge = self._git(
             ["merge", "--no-ff", handle.branch, "-m", f"merge {handle.branch} into {current_branch}"],
@@ -160,11 +169,16 @@ class NodeWorktreeManager:
         )
 
     def discard(self, handle: WorktreeHandle, *, preserve: bool = False) -> None:
-        """Remove the worktree directory, keeping the branch for audit."""
+        """Remove the worktree directory, keeping the branch for audit.
 
-        self._unlink_node_modules(handle)
+        A preserved worktree keeps its node_modules link so a retry can run
+        tests immediately; a deleted one must have the link disconnected first
+        (see ``_unlink_node_modules``).
+        """
+
         if preserve:
             return
+        self._unlink_node_modules(handle)
         if self._is_registered(Path(handle.path)):
             self._git(["worktree", "remove", "--force", handle.path], cwd=self.main_workspace, check=False)
         else:
@@ -215,15 +229,29 @@ class NodeWorktreeManager:
             _create_junction(str(target), str(link))
 
     def _unlink_node_modules(self, handle: WorktreeHandle) -> None:
-        # os.rmdir removes an NTFS junction / symlink without touching the
-        # target (verified); on a real non-empty directory it fails harmlessly
-        # and the worktree-local directory is deleted with the worktree.
+        """Disconnect the shared node_modules links before any worktree removal.
+
+        ``git worktree remove --force`` recurses through NTFS junctions and
+        directory symlinks (verified: it deletes the shared target's content),
+        so a surviving link must never reach it. Links are removed first and
+        the removal is verified; a link that cannot be disconnected is a hard
+        error - the worktree stays registered for retry instead of risking the
+        main workspace's node_modules. Real (worktree-local) directories are
+        left for the worktree deletion.
+        """
+
         for relative in ("frontend/node_modules", "backend/node_modules"):
             link = Path(handle.path) / relative
+            if not (link.exists() or link.is_symlink()):
+                continue
+            if not _is_link(link):
+                continue
             try:
-                os.rmdir(link)
-            except OSError:
-                pass
+                _remove_link(link)
+            except OSError as exc:
+                raise WorktreeError(_link_survival_error(link)) from exc
+            if link.exists() or link.is_symlink():
+                raise WorktreeError(_link_survival_error(link))
 
     def _seed_frontend_dist(self, handle: WorktreeHandle) -> None:
         """Copy the main workspace's built frontend into the worktree.
@@ -290,3 +318,30 @@ def _create_junction(target: str, link: str) -> None:
             )
         return
     os.symlink(target, link, target_is_directory=True)
+
+
+def _is_link(path: Path) -> bool:
+    """True for NTFS junctions and symlinks (Path.is_symlink() misses junctions)."""
+
+    try:
+        os.readlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def _remove_link(link: Path) -> None:
+    """Remove a junction or directory symlink without touching its target."""
+
+    try:
+        os.rmdir(link)
+    except NotADirectoryError:
+        # POSIX directory symlinks: rmdir refuses, unlink removes the link.
+        os.unlink(link)
+
+
+def _link_survival_error(link: Path) -> str:
+    return (
+        f"Failed to disconnect {link} from the shared node_modules; "
+        "refusing to delete the worktree while the link survives."
+    )
