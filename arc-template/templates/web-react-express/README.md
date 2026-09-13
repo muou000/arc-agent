@@ -6,8 +6,27 @@ This template is a single-port web application. The frontend is built with Vite 
 
 - `frontend/`: React, Vite, Tailwind, Vitest, and frontend tests.
 - `backend/`: Express, SQLite runtime helpers, backend Vitest tests, and Playwright E2E tests.
-- `backend/src/app.js`: Express app, `/api/health`, static frontend hosting, and SPA fallback.
+- `backend/src/app.js`: Express app, `/api/health`, static frontend hosting, and SPA fallback. It does not register feature APIs directly: those are auto-mounted from `backend/src/routes/`.
 - `backend/src/index.js`: Backend process entrypoint.
+
+## Registration-Based Shared Glue
+
+Shared composition files are assembled automatically from per-feature
+registration modules, so concurrent contributors only ever add new files and
+never edit the same glue file:
+
+| Concern | Add a new module | Auto-assembled by | Never edit |
+| --- | --- | --- | --- |
+| Backend API | `backend/src/routes/<feature>.routes.js` exporting `{ mountPath: '/api/<feature>', router }` | `backend/src/routes/index.js` (mounted in filename order) | `backend/src/app.js`, `backend/src/routes/index.js` |
+| Database schema & seed | `backend/src/database/schema/<feature>.schema.js` exporting an idempotent `async apply(db)` and an optional numeric `order` (default 100) | `backend/src/database/init_db.js` on every startup | `backend/src/database/init_db.js` |
+| Frontend page | `frontend/src/pages/<Page>.tsx` exporting the default component plus `export const route = '<path>'` | `frontend/src/App.tsx` (static segments before params before wildcards) | `frontend/src/App.tsx`, `frontend/src/main.tsx` |
+| Home page region | `frontend/src/sections/home/<Section>.tsx` exporting the default component plus an optional `export const sectionOrder` | `frontend/src/pages/HomePage.tsx` (lower `sectionOrder` renders first) | `frontend/src/pages/HomePage.tsx` |
+| Global provider | `frontend/src/providers/<Name>Provider.tsx` exporting a default provider component wrapping `children` | `frontend/src/App.tsx` (filename order, outermost first) | `frontend/src/main.tsx`, `frontend/src/App.tsx` |
+
+Per-feature API calls should import the shared axios client from
+`frontend/src/api/index.ts` inside a new module such as
+`frontend/src/api/<feature>.ts`; the client file itself stays template-owned,
+as does `frontend/src/index.css` for global styles.
 
 ## Prerequisites
 

@@ -85,6 +85,106 @@ class TestFrontendBuild:
         assert (dist / "index.html").is_file()
 
 
+class TestRegistrationGlue:
+    """Registration-based glue: pages, sections, and providers contributed
+    after install must be picked up by the template's glob loaders without
+    editing App.tsx, HomePage.tsx, or main.tsx.
+
+    These tests write modules into the shared ``installed_frontend`` scratch,
+    so they must run after the pristine-build test above (class definition
+    order).
+    """
+
+    _ABOUT_PAGE = """function AboutPage() {
+  return <main data-testid="about-page">About registration page</main>;
+}
+
+export const route = '/about';
+
+export default AboutPage;
+"""
+
+    _HERO_SECTION = """function HeroSection() {
+  return <section data-testid="hero-section">Hero section</section>;
+}
+
+export const sectionOrder = 1;
+
+export default HeroSection;
+"""
+
+    _TEST_PROVIDER = """import type { ReactNode } from 'react';
+
+function TestProvider({ children }: { children?: ReactNode }) {
+  return <div data-testid="provider-boundary">{children}</div>;
+}
+
+export default TestProvider;
+"""
+
+    _REGISTRATION_TEST = """import { describe, expect, it } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
+import App from '../src/App';
+
+describe('registration-based glue', () => {
+  it('mounts sections and providers on the home route', () => {
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <App />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('provider-boundary')).toBeTruthy();
+    expect(screen.getByTestId('hero-section')).toBeTruthy();
+  });
+
+  it('routes to pages registered through the route export', () => {
+    render(
+      <MemoryRouter initialEntries={['/about']}>
+        <App />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('about-page')).toBeTruthy();
+  });
+});
+"""
+
+    def _write_modules(self, installed_frontend: Path) -> None:
+        (installed_frontend / "src" / "pages" / "AboutPage.tsx").write_text(
+            self._ABOUT_PAGE, encoding="utf-8"
+        )
+        (installed_frontend / "src" / "sections" / "home" / "HeroSection.tsx").write_text(
+            self._HERO_SECTION, encoding="utf-8"
+        )
+        (installed_frontend / "src" / "providers" / "TestProvider.tsx").write_text(
+            self._TEST_PROVIDER, encoding="utf-8"
+        )
+        tests_dir = installed_frontend / "tests"
+        tests_dir.mkdir(exist_ok=True)
+        (tests_dir / "registration.test.tsx").write_text(self._REGISTRATION_TEST, encoding="utf-8")
+
+    def test_glob_registered_modules_build_and_render(self, installed_frontend: Path) -> None:
+        self._write_modules(installed_frontend)
+
+        build = subprocess.run(
+            [_NPM_BIN, "run", "build"],
+            cwd=str(installed_frontend),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert build.returncode == 0, build.stderr
+
+        vitest = subprocess.run(
+            [_NPM_BIN, "run", "test"],
+            cwd=str(installed_frontend),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert vitest.returncode == 0, vitest.stdout + vitest.stderr
+
+
 class TestFrontendStatic:
     """Pure static checks that do not require npm install."""
 

@@ -153,5 +153,112 @@ class TestBackendContract:
         assert "test-e2e" in text_for(TEMPLATE_BACKEND / "playwright.config.js")
 
 
+class TestRouteRegistry:
+    """Registration-based glue: route and schema modules contributed after
+    install must be mounted/loaded without touching app.js or init_db.js.
+
+    These tests write modules into the shared ``installed_backend`` scratch, so
+    they must run after the pristine-server tests above (class definition
+    order).
+    """
+
+    _SCHEMA_MODULE = """'use strict';
+
+module.exports = {
+  order: 10,
+  async apply(db) {
+    await new Promise((resolve, reject) => {
+      db.run(
+        'CREATE TABLE IF NOT EXISTS registry_probe (id INTEGER PRIMARY KEY, name TEXT)',
+        (err) => (err ? reject(err) : resolve()),
+      );
+    });
+  },
+};
+"""
+
+    _ROUTE_MODULE = """'use strict';
+
+const express = require('express');
+const { getDb, initializeDatabase } = require('../database/init_db');
+
+const router = express.Router();
+
+router.get('/probe', async (req, res) => {
+  try {
+    await initializeDatabase();
+    getDb().all(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'registry_probe'",
+      [],
+      (err, rows) => {
+        if (err) {
+          res.status(500).json({ error: String(err) });
+          return;
+        }
+        res.json({ tableRegistered: rows.length > 0 });
+      },
+    );
+  } catch (error) {
+    res.status(500).json({ error: String(error) });
+  }
+});
+
+module.exports = { mountPath: '/api/registry-probe', router };
+"""
+
+    def _write_modules(self, installed_backend: Path) -> None:
+        routes_dir = installed_backend / "src" / "routes"
+        routes_dir.mkdir(exist_ok=True)
+        (routes_dir / "registry_probe.routes.js").write_text(self._ROUTE_MODULE, encoding="utf-8")
+        schema_dir = installed_backend / "src" / "database" / "schema"
+        schema_dir.mkdir(exist_ok=True)
+        (schema_dir / "registry_probe.schema.js").write_text(self._SCHEMA_MODULE, encoding="utf-8")
+
+    def test_route_and_schema_modules_mount_and_load(self, installed_backend: Path) -> None:
+        self._write_modules(installed_backend)
+
+        port = _free_port()
+        proc = subprocess.Popen(
+            [_NODE_BIN, "src/index.js"],
+            cwd=str(installed_backend),
+            env={**os.environ, "PORT": str(port)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert _wait_for_health(port), "backend never responded to /api/health"
+            import urllib.request
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/registry-probe/probe", timeout=5
+            ) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            assert payload == {"tableRegistered": True}, (
+                "route module was not mounted or schema module was not applied"
+            )
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def test_register_routes_reports_mounted_paths(self, installed_backend: Path) -> None:
+        script = (
+            "const { registerRoutes } = require('./src/routes');"
+            "registerRoutes({ use: (p, r) => process.stdout.write(JSON.stringify(p)) });"
+        )
+        proc = subprocess.run(
+            [_NODE_BIN, "-e", script],
+            cwd=str(installed_backend),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == '"/api/registry-probe"'
+
+
 def text_for(path: Path) -> str:
     return path.read_text(encoding="utf-8")

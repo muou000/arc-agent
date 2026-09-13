@@ -3,9 +3,8 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
+const { registerRoutes } = require('./routes');
 const app = express();
-
-// route modules imports
 
 // middleware imports
 app.use(cors());
@@ -21,6 +20,10 @@ initializeDatabase().catch((error) => {
 app.get('/api/health', (req, res) => {
   res.json({ code: 200, message: 'Backend Ready' });
 });
+
+// Feature routers are mounted automatically from `src/routes/*.routes.js`.
+// Never edit this file to add an API: add a route module instead.
+registerRoutes(app);
 
 const frontendDistPath = path.resolve(__dirname, '../../frontend/dist');
 

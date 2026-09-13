@@ -119,6 +119,62 @@ class TestDatabaseLayer:
             assert symbol in text
 
 
+class TestRegistrationGlueStructure:
+    """Shared glue files must stay registration-based: agents contribute new
+    per-feature modules and the template assembles them, so concurrent nodes
+    never edit the same file (the DESIGN-stage denylist depends on this)."""
+
+    def test_app_js_mounts_route_registry(self) -> None:
+        text = (TEMPLATE_ROOT / "backend" / "src" / "app.js").read_text(encoding="utf-8")
+        assert "require('./routes')" in text
+        assert "registerRoutes(app)" in text
+        assert "/api/health" in text
+
+    def test_route_registry_loader_contract(self) -> None:
+        loader = TEMPLATE_ROOT / "backend" / "src" / "routes" / "index.js"
+        assert loader.is_file()
+        text = loader.read_text(encoding="utf-8")
+        assert ".routes.js" in text
+        assert "mountPath" in text
+        assert "registerRoutes" in text
+
+    def test_init_db_loads_schema_modules(self) -> None:
+        text = (TEMPLATE_ROOT / "backend" / "src" / "database" / "init_db.js").read_text(encoding="utf-8")
+        assert "schema" in text
+        assert ".schema.js" in text
+        assert "apply(db)" in text or "apply(database)" in text
+        # The old "centralize schema evolution in this file" guidance must stay
+        # gone: it is what drove concurrent nodes into init_db.js conflicts.
+        assert "centralized in this file" not in text
+
+    def test_schema_module_directory_exists(self) -> None:
+        assert (TEMPLATE_ROOT / "backend" / "src" / "database" / "schema").is_dir()
+
+    def test_app_tsx_registers_pages_and_providers_via_glob(self) -> None:
+        text = (TEMPLATE_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+        assert "import.meta.glob('./pages/**/*.tsx'" in text
+        assert "import.meta.glob('./providers/*.tsx'" in text
+        assert "<Routes>" in text
+
+    def test_home_page_composes_sections_via_glob(self) -> None:
+        text = (TEMPLATE_ROOT / "frontend" / "src" / "pages" / "HomePage.tsx").read_text(encoding="utf-8")
+        assert "import.meta.glob('../sections/home/*.tsx'" in text
+        assert "sectionOrder" in text
+        assert "export const route = '/'" in text
+
+    def test_registration_module_directories_exist(self) -> None:
+        for relative in (
+            "frontend/src/sections/home",
+            "frontend/src/providers",
+            "backend/src/routes",
+            "backend/src/database/schema",
+        ):
+            assert (TEMPLATE_ROOT / relative).is_dir(), f"missing registration directory: {relative}"
+
+    def test_agent_guidance_api_root_points_to_route_registry(self, manifest: dict) -> None:
+        assert manifest["agent_guidance"]["api_root"] == "backend/src/routes"
+
+
 class TestGitignoreSemantics:
     """Backend/frontend ignore patterns must keep ``node_modules`` out of git."""
 

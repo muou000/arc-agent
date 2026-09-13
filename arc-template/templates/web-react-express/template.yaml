@@ -30,7 +30,7 @@ preview:
   assets: frontend/dist/assets
 agent_guidance:
   ui_root: frontend/src
-  api_root: backend/src/app.js
+  api_root: backend/src/routes
   function_root: backend/src
   db_root: backend/src/database
   frontend_test_root: frontend/src
