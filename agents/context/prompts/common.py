@@ -102,6 +102,16 @@ def app_runtime_contract() -> str:
     return section("Runtime Contract", lines)
 
 
+def registration_contract() -> str:
+    from app_type_handler import get_app_type_handler_class
+
+    app_type = os.environ.get("ARC_APP_TYPE", "web").strip().lower() or "web"
+    lines = get_app_type_handler_class(app_type).registration_contract_lines()
+    if not lines:
+        return ""
+    return section("Registration Contract", lines)
+
+
 def workspace_tool_policy() -> str:
     return section(
         "Tool Policy",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents.context.prompts.common import app_runtime_contract, code_quality_policy, compiler_background, code_task_exploration_policy, reasoning_reflection_policy, requirement_data_policy, response_contract, section, task_context_block, whole_app_policy, workspace_tool_policy
+from agents.context.prompts.common import app_runtime_contract, code_quality_policy, compiler_background, code_task_exploration_policy, reasoning_reflection_policy, registration_contract, requirement_data_policy, response_contract, section, task_context_block, whole_app_policy, workspace_tool_policy
 
 
 def get_system_prompt() -> str:
@@ -43,6 +43,7 @@ def get_system_prompt() -> str:
                     "For a leaf with pre-existing data requirements, specify the seed/bootstrap contract in the DB interface: records to create, required ownership/visibility/status/relations, initialization timing, and idempotent behavior. Do not implement the seed logic in DESIGN.",
                     "If a parent-designed shell/header displays authentication state, include that reused UI interface in the leaf node's returned interfaces and connect it through callers/callees to leaf-owned auth/session interfaces.",
                     "Write or edit only a few lightweight interface skeletons. A skeleton may declare types, signatures, routes, exports, props, and explicit TODO/unsupported boundaries; it must not contain a feature-complete business flow. Leave complete implementation and every test repair for TestDrivenDeveloper.",
+                    "Materialize skeletons only into node-private files. Shared composition glue is registration-based: express the contract as a new route, section, schema, provider, or page module per the Registration Contract instead of editing app.js, App.tsx, main.tsx, page containers, or database bootstrap files; the workflow assembles those shared files automatically.",
                     "If an owned file is already roughly over 500 lines, do not place a new feature-sized skeleton inside it unless it is only a connector. Prefer a new cohesive component, hook, API client, service, repository, or route module wired from the large file.",
                     "Before returning, assess the interface graph using evidence already gathered: every new interface should have a clear caller/callee relation, owning file, downstream test target, and role in the eventual working app. Do not reread files just to self-review.",
                     "Return interface schemas with stable ids and enough specification for tests to target them.",
@@ -59,6 +60,7 @@ def get_system_prompt() -> str:
                 ],
             ),
             app_runtime_contract(),
+            registration_contract(),
             code_task_exploration_policy(),
             workspace_tool_policy(),
             response_contract(),

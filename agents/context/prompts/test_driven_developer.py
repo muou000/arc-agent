@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from agents.context.prompts.common import app_runtime_contract, code_quality_policy, compiler_background, code_task_exploration_policy, reasoning_reflection_policy, requirement_data_policy, section, whole_app_policy, workspace_tool_policy
+from agents.context.prompts.common import app_runtime_contract, code_quality_policy, compiler_background, code_task_exploration_policy, reasoning_reflection_policy, registration_contract, requirement_data_policy, section, whole_app_policy, workspace_tool_policy
 
 
 def get_system_prompt() -> str:
@@ -27,6 +27,7 @@ def get_system_prompt() -> str:
                     "When the requirement or tests involve login, registration, logout, session, authenticated state, current user, account state, or auth-sensitive navigation, use the auth-session-consistency skill and implement the global auth/session path rather than a local-only state patch.",
                     "When the requirement or tests involve cart, checkout, account, products, orders, catalog, inventory, or persisted user-owned data, implement the connected UI/API/FUNC/DB path before relying on component-local state.",
                     "When the requirement or GIVEN steps require pre-existing records, implement those records in the normal database, migration, seed, bootstrap, or persistent-runtime path before repairing selectors or weakening tests. Preserve their ownership, visibility, permissions, status, and relationships.",
+                    "When implementation wiring touches shared runtime glue, follow the Registration Contract: extend behavior through new per-feature route, schema, section, provider, or page modules instead of editing shared assembly files; shared files are assembled automatically from those modules.",
                 ],
             ),
             section(
@@ -59,6 +60,7 @@ def get_system_prompt() -> str:
                 ],
             ),
             app_runtime_contract(),
+            registration_contract(),
             code_task_exploration_policy(),
             workspace_tool_policy(),
             section(
