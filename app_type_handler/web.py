@@ -1160,17 +1160,26 @@ class WebAppType(AppTypeHandler):
             ("backend", os.path.join(self.workspace_path, "backend")),
             ("frontend", os.path.join(self.workspace_path, "frontend")),
         )
-        all_ok = True
-        for label, target_path in targets:
-            if not os.path.exists(target_path):
-                continue
+        installable = [
+            (label, target_path)
+            for label, target_path in targets
+            if os.path.exists(target_path)
+        ]
+        if not installable:
+            return True
+
+        # The two installs write disjoint trees (separate package.json /
+        # node_modules), so their npm processes run concurrently; a serial
+        # drain pays the slower package resolution twice on cold caches.
+        for label, _target_path in installable:
             await self._log(
                 "System",
                 f"Installing {label} dependencies. This might take a moment...",
             )
-            if not await run_npm_install(target_path, self.log_cb):
-                all_ok = False
-        return all_ok
+        results = await asyncio.gather(
+            *(run_npm_install(target_path, self.log_cb) for _label, target_path in installable)
+        )
+        return all(results)
 
     async def verify_workspace(self) -> bool:
         """Fail fast when the scaffolded workspace cannot build or cannot run E2E.
