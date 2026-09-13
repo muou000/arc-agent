@@ -31,7 +31,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 ## 代码布局
 
 - `arc_main.py`、`main.py`：本地 CLI 和 ARC-Bench 平台入口。
-- `core/`：编译队列、工作流、阶段调度、配置、日志、会话和失败重试。
+- `core/`：编译队列、工作流、阶段调度、配置、日志、会话、失败重试和 A/B 评测（`core/evals.py`）。
 - `agents/`：阶段 agent 适配器、上下文流水线、模型适配、运行时封装和工具。
 - `app_type_handler/`：应用类型注册、模板初始化、依赖安装、构建和测试执行。
 - `arcbench_agent_runtime/`：运行时路径、事件、追溯数据和 Git 操作的 Python SDK。
@@ -81,6 +81,11 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 - `app_type_handler` 的注册表、模板目录、`template.yaml`、package manifest、测试路径和运行命令必须保持一致。
 - 修改 Web 模板时，检查前端构建、后端健康端点、单端口运行、数据库测试隔离和 Playwright/Vitest 契约；修改 Android/CLI handler 时，确认对应模板和环境门禁真实存在，不要只增加注册表项。
 - 模板契约变更必须同步更新 `tests/test_template_contract/` 和模板 README。依赖或 lockfile 变更应说明原因，并确认不是无关版本漂移。
+
+### A/B 评测
+
+- `core/evals.py` 的四指标口径（pass rate、tokens、latency、est. cost）、`runs.jsonl` / `report.json` 字段和报告版式是评测工作流契约；修改时同步 `tests/test_evals/` 与 README 的「A/B 评测」一节。
+- 评测通过子进程调用 compile（缺省 runner 为仓库 `arc_main.py` 的 `compile` 入口；`--runner-script` 注入的通用脚本只接收 `<requirement> -o <workspace> -t <type> --port <port> [arm 参数]` 纯运行参数），只读取运行工作区的 `.arc/` 产物（runner 事件、队列）聚合指标；不要为取指标绕过 runtime SDK 直接改写工作区。测试一律使用注入的 runner（如 `tests/test_evals/fake_eval_runner.py`），不得消耗真实模型调用。报告默认写入 `records/evals/`，属于新增运行证据，不要改动已有评测目录。
 
 ## 测试和验证
 
