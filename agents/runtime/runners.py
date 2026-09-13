@@ -14,7 +14,16 @@ from core.logging import format_json_for_log, log_to_logger
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
-DEFAULT_RECURSION_LIMIT = 5000
+
+# Empirical ceiling for one stage-agent session (one ``ainvoke`` call). Healthy
+# sessions on the 12306 benchmark stay under ~150 graph steps; a runaway repair
+# loop (the model re-editing a file it just corrupted) blew past 450 steps and
+# kept going under the previous limit of 5000, burning ~20 minutes of model
+# calls on one node. When the limit trips, LangGraph raises GraphRecursionError;
+# the workflow marks the node failed and the queue moves on, so the node stays
+# recoverable via ``--resume``/``--retry``.
+DEFAULT_RECURSION_LIMIT = 300
+_MIN_RECURSION_LIMIT = 20
 
 
 async def ainvoke_stage_agent(
@@ -750,10 +759,21 @@ def _should_use_sync_stream_v3() -> bool:
     return False
 
 
+def _resolve_recursion_limit() -> int:
+    raw = os.environ.get("ARC_AGENT_RECURSION_LIMIT", "").strip()
+    if not raw:
+        return DEFAULT_RECURSION_LIMIT
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_RECURSION_LIMIT
+    return max(_MIN_RECURSION_LIMIT, value)
+
+
 def build_agent_config(thread_id: str) -> dict[str, Any]:
     return {
         "configurable": {"thread_id": thread_id},
-        "recursion_limit": DEFAULT_RECURSION_LIMIT,
+        "recursion_limit": _resolve_recursion_limit(),
     }
 
 
