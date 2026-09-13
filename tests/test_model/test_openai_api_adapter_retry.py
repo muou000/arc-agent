@@ -152,6 +152,9 @@ def test_is_retryable_model_api_exception(exc: Exception, retryable: bool) -> No
         "Insufficient Balance: please top up your account",
         "Request failed: out of budget",
         "Quota exceeded for this subscription",
+        # Explicit billing-limit/payment phrases, not generic billing mentions.
+        "Billing hard limit reached: usage is blocked until the cycle resets",
+        "Payment required to continue usage this month",
     ],
 )
 def test_quota_exhaustion_429_is_not_retryable(message: str) -> None:
@@ -163,6 +166,23 @@ def test_quota_error_code_in_body_is_not_retryable() -> None:
         "Error code: 429",
         body={"error": {"message": "request failed", "code": "insufficient_quota"}},
     )
+    assert adapter._is_retryable_model_api_exception(exc) is False
+
+
+def test_error_as_string_in_body_is_not_retryable() -> None:
+    exc = _rate_limit_error("Error code: 429", body={"error": "insufficient_quota"})
+    assert adapter._is_retryable_model_api_exception(exc) is False
+
+
+def test_error_as_list_in_body_is_not_retryable() -> None:
+    exc = _rate_limit_error(
+        "Error code: 429", body={"error": [{"message": "insufficient quota remaining"}]}
+    )
+    assert adapter._is_retryable_model_api_exception(exc) is False
+
+
+def test_string_body_is_not_retryable() -> None:
+    exc = _rate_limit_error("Error code: 429", body="insufficient_quota")
     assert adapter._is_retryable_model_api_exception(exc) is False
 
 
@@ -182,6 +202,23 @@ def test_quota_text_wins_over_retryable_status() -> None:
 )
 def test_transient_throttle_429_stays_retryable(message: str) -> None:
     assert adapter._is_retryable_model_api_exception(_rate_limit_error(message)) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Generic billing mentions are not quota exhaustion.
+        "Please update your billing email on file",
+        "Billing details verified, no action needed",
+    ],
+)
+def test_generic_billing_mention_stays_retryable(message: str) -> None:
+    assert adapter._is_retryable_model_api_exception(_rate_limit_error(message)) is True
+
+
+def test_throttle_language_wins_over_quota_text() -> None:
+    exc = _rate_limit_error("Quota exceeded for requests per minute under your rate limit")
+    assert adapter._is_retryable_model_api_exception(exc) is True
 
 
 # ---------------------------------------------------------------------------
