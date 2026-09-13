@@ -158,6 +158,7 @@ async def _execute_web_test_command(
     cwd: str,
     timeout: float = 60.0,
     extra_env: dict[str, str] | None = None,
+    web_port: int | None = None,
 ) -> str:
     process = None
     try:
@@ -170,7 +171,7 @@ async def _execute_web_test_command(
                 **os.environ,
                 "PYTHONIOENCODING": "utf-8",
                 "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8",
-                **build_web_runtime_env(),
+                **build_web_runtime_env(web_port=web_port),
                 **(extra_env or {}),
             },
         )
@@ -263,14 +264,19 @@ def _resolve_web_test_target(file_path: str, workspace_path: str) -> tuple[str, 
     return backend_path, normalized
 
 
-def _build_web_test_execution(test_type: str, file_path: str, workspace_path: str) -> dict[str, str]:
+def _build_web_test_execution(
+    test_type: str,
+    file_path: str,
+    workspace_path: str,
+    web_port: int | None = None,
+) -> dict[str, str]:
     normalized_type = (test_type or "").strip().lower()
     safe_file_path = _validate_web_test_path(normalized_type, file_path)
     if safe_file_path is None:
         raise ValueError(f"Invalid web test path for type {test_type!r}: {file_path!r}")
     working_directory, resolved_file_path = _resolve_web_test_target(safe_file_path, workspace_path)
-    web_port = str(get_web_port())
-    base_url = get_web_base_url()
+    resolved_port = int(web_port) if web_port is not None else get_web_port()
+    base_url = get_web_base_url(resolved_port)
 
     if normalized_type in {"unit", "integration"}:
         runner = "Vitest"
@@ -289,14 +295,20 @@ def _build_web_test_execution(test_type: str, file_path: str, workspace_path: st
         "working_directory": working_directory,
         "requested_test_file": file_path or "",
         "resolved_test_file": resolved_file_path,
-        "web_port": web_port,
+        "web_port": str(resolved_port),
         "base_url": base_url,
     }
 
 
-def _build_web_group_execution(test_type: str, file_paths: list[str], workspace_path: str) -> dict[str, str]:
+def _build_web_group_execution(
+    test_type: str,
+    file_paths: list[str],
+    workspace_path: str,
+    web_port: int | None = None,
+) -> dict[str, str]:
     normalized_type = (test_type or "").strip().lower()
     requested_files = [str(path or "").strip() for path in file_paths if str(path or "").strip()]
+    resolved_port = int(web_port) if web_port is not None else get_web_port()
 
     if normalized_type in {"unit", "integration"}:
         backend_targets: list[str] = []
@@ -326,8 +338,8 @@ def _build_web_group_execution(test_type: str, file_paths: list[str], workspace_
             "frontend_requested_files": [
                 file_path for file_path in requested_files if _resolve_web_test_target(file_path, workspace_path)[0] == os.path.join(workspace_path, "frontend")
             ],
-            "web_port": str(get_web_port()),
-            "base_url": get_web_base_url(),
+            "web_port": str(resolved_port),
+            "base_url": get_web_base_url(resolved_port),
         }
 
     if normalized_type == "e2e":
@@ -348,8 +360,8 @@ def _build_web_group_execution(test_type: str, file_paths: list[str], workspace_
                 {"requested_file": file_path, "resolved_target": _normalize_backend_test_path(file_path)}
                 for file_path in safe_paths
             ],
-            "web_port": str(get_web_port()),
-            "base_url": get_web_base_url(),
+            "web_port": str(resolved_port),
+            "base_url": get_web_base_url(resolved_port),
         }
 
     raise ValueError("Unknown test type. Must be 'unit', 'integration', or 'e2e'.")
@@ -790,20 +802,21 @@ def _slugify_identifier(value: str) -> str:
     return normalized or "playwright-e2e"
 
 
-def _build_e2e_runtime_env(workspace_path: str, targets: list[str]) -> dict[str, str]:
+def _build_e2e_runtime_env(workspace_path: str, targets: list[str], web_port: int | None = None) -> dict[str, str]:
     normalized_targets = [target.replace("\\", "/").strip() for target in targets if target and str(target).strip()]
     suite_label = _slugify_identifier("-".join(normalized_targets) or "playwright-e2e")
     suite_hash = hashlib.sha1("\n".join(normalized_targets or ["playwright-e2e"]).encode("utf-8")).hexdigest()[:10]
     backend_path = os.path.join(workspace_path, "backend")
     e2e_db_root = os.path.join(backend_path, ".arc-test-db")
     e2e_db_path = os.path.abspath(os.path.join(e2e_db_root, f"{suite_label}-{suite_hash}.sqlite"))
+    resolved_port = int(web_port) if web_port is not None else get_web_port()
     return {
-        **build_web_runtime_env(),
+        **build_web_runtime_env(web_port=resolved_port),
         # The template's `playwright.config.js` and the agent-facing stack notes
         # both document `PLAYWRIGHT_BASE_URL` as the origin under test. Nothing
         # used to set it, so Playwright fell back to its own default port and
         # every E2E run navigated to a dead origin.
-        "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{get_web_port()}",
+        "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{resolved_port}",
         "ARC_DB_FILE": e2e_db_path,
         "ARC_E2E_DB_PATH": e2e_db_path,
         "ARC_E2E_DB_LABEL": suite_label,
@@ -935,8 +948,10 @@ async def _prepare_e2e_database(workspace_path: str, runtime_env: dict[str, str]
 async def _start_backend_runtime(
     workspace_path: str,
     runtime_env: dict[str, str],
+    web_port: int | None = None,
 ) -> tuple[asyncio.subprocess.Process | None, str, str, str]:
     backend_path = os.path.join(workspace_path, "backend")
+    resolved_port = int(web_port) if web_port is not None else get_web_port()
     start_command = _resolve_backend_start_command(backend_path)
     if not start_command:
         return None, "", (
@@ -945,7 +960,7 @@ async def _start_backend_runtime(
 
     try:
         startup_cleanup_note = await _ensure_port_released(
-            get_web_port(),
+            resolved_port,
             context="Pre-start port cleanup",
             timeout=1.0,
         )
@@ -966,15 +981,15 @@ async def _start_backend_runtime(
     except Exception as exc:
         return None, start_command, f"Failed to start backend runtime with `{start_command}`: {str(exc)}", ""
 
-    server_ready = await _wait_for_tcp_server("127.0.0.1", get_web_port(), timeout=20.0)
+    server_ready = await _wait_for_tcp_server("127.0.0.1", resolved_port, timeout=20.0)
     if not server_ready:
         cleanup_note = ""
         try:
-            cleanup_note = await _terminate_process(backend_process, port=get_web_port())
+            cleanup_note = await _terminate_process(backend_process, port=resolved_port)
         except Exception as cleanup_exc:
             cleanup_note = f"Backend runtime cleanup after failed startup also failed: {cleanup_exc}"
         return None, start_command, (
-            f"Failed to start backend runtime with `{start_command}` on port {get_web_port()} "
+            f"Failed to start backend runtime with `{start_command}` on port {resolved_port} "
             "within 20 seconds.\n"
             f"{startup_cleanup_note}\n"
             f"{cleanup_note}"
@@ -982,7 +997,7 @@ async def _start_backend_runtime(
 
     instance_fingerprint = _format_backend_instance_fingerprint(
         launcher_pid=backend_process.pid,
-        port=get_web_port(),
+        port=resolved_port,
     )
     return backend_process, start_command, startup_cleanup_note, instance_fingerprint
 
@@ -1322,14 +1337,15 @@ class WebAppType(AppTypeHandler):
         )
         return f"=== Frontend Build Result ===\n{frontend_result}\n\n=== Backend Build Result ===\n{backend_result}"
 
-    async def run_test_file(self, test_type: str, file_path: str) -> str:
+    async def run_test_file(self, test_type: str, file_path: str, web_port: int | None = None) -> str:
+        resolved_port = int(web_port) if web_port is not None else get_web_port()
         await self._log("System", f"System test execution ({test_type}): {file_path}")
         normalized_type = test_type.lower()
         validation_error = self.validate_test_path(test_type, file_path)
         if validation_error:
             return f"Exit Code: 1\nSTDERR:\n{validation_error}\n"
         try:
-            execution = _build_web_test_execution(test_type, file_path, self.workspace_path)
+            execution = _build_web_test_execution(test_type, file_path, self.workspace_path, web_port=resolved_port)
         except ValueError as exc:
             return str(exc)
         backend_process = None
@@ -1346,6 +1362,7 @@ class WebAppType(AppTypeHandler):
             e2e_runtime_env = _build_e2e_runtime_env(
                 self.workspace_path,
                 [execution.get("resolved_test_file", "")],
+                web_port=resolved_port,
             )
             build_ok, frontend_build_output = await _build_frontend_dist(self.workspace_path)
             if not build_ok:
@@ -1373,7 +1390,7 @@ class WebAppType(AppTypeHandler):
                 backend_start_command,
                 backend_startup_detail,
                 backend_instance_fingerprint,
-            ) = await _start_backend_runtime(self.workspace_path, e2e_runtime_env)
+            ) = await _start_backend_runtime(self.workspace_path, e2e_runtime_env, web_port=resolved_port)
             if backend_process is None:
                 return _prepend_test_execution_header(
                     execution,
@@ -1390,6 +1407,7 @@ class WebAppType(AppTypeHandler):
                 execution["command"],
                 cwd=execution["working_directory"],
                 extra_env=e2e_runtime_env if normalized_type == "e2e" else None,
+                web_port=resolved_port,
             )
             if normalized_type == "e2e":
                 result_body = (
@@ -1398,7 +1416,7 @@ class WebAppType(AppTypeHandler):
                     f"DB Label: {e2e_runtime_env.get('ARC_E2E_DB_LABEL', 'unknown')}\n\n"
                     f"=== Database Prepare ===\n{database_prepare_output}\n\n"
                     f"=== Backend Runtime ===\nCommand: {backend_start_command}\n"
-                    f"Port: {get_web_port()}\n"
+                    f"Port: {resolved_port}\n"
                     f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}\n\n"
                     f"=== Backend Instance Fingerprint ===\n{backend_instance_fingerprint or 'No backend instance fingerprint recorded.'}\n\n"
                     f"{result_body}"
@@ -1406,7 +1424,7 @@ class WebAppType(AppTypeHandler):
         finally:
             if normalized_type == "e2e":
                 try:
-                    backend_cleanup_note = await _terminate_process(backend_process, port=get_web_port())
+                    backend_cleanup_note = await _terminate_process(backend_process, port=resolved_port)
                 except Exception as cleanup_exc:
                     backend_cleanup_note = f"Backend runtime cleanup failed: {cleanup_exc}"
 
@@ -1420,7 +1438,8 @@ class WebAppType(AppTypeHandler):
 
         return _prepend_test_execution_header(execution, result_body)
 
-    async def run_test_group(self, test_type: str, file_paths: list[str]) -> str:
+    async def run_test_group(self, test_type: str, file_paths: list[str], web_port: int | None = None) -> str:
+        resolved_port = int(web_port) if web_port is not None else get_web_port()
         normalized_type = (test_type or "").strip().lower()
         if not file_paths:
             return (
@@ -1440,7 +1459,7 @@ class WebAppType(AppTypeHandler):
             return "\n".join(error_lines) + "\n"
 
         try:
-            execution = _build_web_group_execution(test_type, file_paths, self.workspace_path)
+            execution = _build_web_group_execution(test_type, file_paths, self.workspace_path, web_port=resolved_port)
         except ValueError as exc:
             return str(exc)
 
@@ -1453,6 +1472,7 @@ class WebAppType(AppTypeHandler):
                 backend_result = await _execute_web_test_command(
                     backend_command,
                     cwd=execution["backend_working_directory"],
+                    web_port=resolved_port,
                 )
                 sections.append(f"=== Backend Vitest Batch ===\n{backend_result}")
                 backend_exit_code = _extract_exit_code(backend_result)
@@ -1465,6 +1485,7 @@ class WebAppType(AppTypeHandler):
                 frontend_result = await _execute_web_test_command(
                     frontend_command,
                     cwd=execution["frontend_working_directory"],
+                    web_port=resolved_port,
                 )
                 sections.append(f"=== Frontend Vitest Batch ===\n{frontend_result}")
                 frontend_exit_code = _extract_exit_code(frontend_result)
@@ -1493,6 +1514,7 @@ class WebAppType(AppTypeHandler):
         e2e_runtime_env = _build_e2e_runtime_env(
             self.workspace_path,
             execution.get("resolved_targets", []),
+            web_port=resolved_port,
         )
         database_ready, database_prepare_output = await _prepare_e2e_database(
             self.workspace_path,
@@ -1519,7 +1541,7 @@ class WebAppType(AppTypeHandler):
                 backend_start_command,
                 backend_startup_detail,
                 backend_instance_fingerprint,
-            ) = await _start_backend_runtime(self.workspace_path, e2e_runtime_env)
+            ) = await _start_backend_runtime(self.workspace_path, e2e_runtime_env, web_port=resolved_port)
             if backend_process is None:
                 return _prepend_group_execution_header(
                     execution,
@@ -1539,6 +1561,7 @@ class WebAppType(AppTypeHandler):
                 cwd=execution["working_directory"],
                 timeout=120.0,
                 extra_env=e2e_runtime_env,
+                web_port=resolved_port,
             )
             playwright_exit_code = _extract_exit_code(playwright_result)
             if playwright_exit_code is None:
@@ -1550,7 +1573,7 @@ class WebAppType(AppTypeHandler):
                 f"DB Label: {e2e_runtime_env.get('ARC_E2E_DB_LABEL', 'unknown')}\n\n"
                 f"=== Database Prepare ===\n{database_prepare_output}\n\n"
                 f"=== Backend Runtime ===\nCommand: {backend_start_command}\n"
-                f"Port: {get_web_port()}\n\n"
+                f"Port: {resolved_port}\n\n"
                 f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}\n\n"
                 f"=== Backend Instance Fingerprint ===\n{backend_instance_fingerprint or 'No backend instance fingerprint recorded.'}\n\n"
                 f"{playwright_result}"
@@ -1559,7 +1582,7 @@ class WebAppType(AppTypeHandler):
             return f"Failed to start grouped E2E execution: {str(exc)}"
         finally:
             try:
-                backend_cleanup_note = await _terminate_process(backend_process, port=get_web_port())
+                backend_cleanup_note = await _terminate_process(backend_process, port=resolved_port)
             except Exception as cleanup_exc:
                 backend_cleanup_note = f"Backend runtime cleanup failed: {cleanup_exc}"
 
