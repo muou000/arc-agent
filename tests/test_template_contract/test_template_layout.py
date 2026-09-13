@@ -46,6 +46,10 @@ class TestManifestSelfConsistency:
 
     def test_agent_guidance_paths_exist(self, manifest: dict) -> None:
         guidance = manifest["agent_guidance"]
+        # `e2e_test_root` is created on demand during generation; the officially
+        # provisioned template does not ship it. Every other declared root must
+        # already exist in the scaffold.
+        agent_created_roots = {"e2e_test_root"}
         for key in (
             "ui_root",
             "api_root",
@@ -57,7 +61,12 @@ class TestManifestSelfConsistency:
         ):
             assert key in guidance, f"missing agent_guidance key: {key}"
             path = TEMPLATE_ROOT / guidance[key]
-            assert path.exists(), f"declared path does not exist: {guidance[key]} -> {path}"
+            if key in agent_created_roots:
+                assert path.parent.exists(), (
+                    f"parent of declared path does not exist: {guidance[key]} -> {path}"
+                )
+            else:
+                assert path.exists(), f"declared path does not exist: {guidance[key]} -> {path}"
 
     def test_stack_matches_package_json(
         self, manifest: dict, backend_package: dict, frontend_package: dict
