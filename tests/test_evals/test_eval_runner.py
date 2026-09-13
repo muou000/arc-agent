@@ -133,6 +133,44 @@ def test_eval_table_keep_workspaces(tmp_path):
     assert (work / "candidate-rep001" / ".arc" / "runner-events.jsonl").exists()
 
 
+def _work_root_from_log(logs: list[str]) -> Path:
+    return Path(next(line.removeprefix("Workspaces: ") for line in logs if line.startswith("Workspaces: ")))
+
+
+def test_eval_table_cleans_auto_created_temp_work_root(tmp_path):
+    logs: list[str] = []
+    eval_table(
+        "auto root",
+        ArmConfig(label="b"),
+        ArmConfig(label="c"),
+        requirement_path=_make_requirement(tmp_path),
+        repetitions=1,
+        runner_command=[sys.executable, str(FAKE_RUNNER)],
+        artifacts_dir=tmp_path / "artifacts",
+        log=logs.append,
+    )
+    work_root = _work_root_from_log(logs)
+    assert "arc-eval-" in work_root.name
+    assert not work_root.exists()  # auto-created temp root removed with its workspaces
+
+
+def test_eval_table_keeps_auto_created_temp_work_root_when_requested(tmp_path):
+    logs: list[str] = []
+    eval_table(
+        "auto root kept",
+        ArmConfig(label="b"),
+        ArmConfig(label="c"),
+        requirement_path=_make_requirement(tmp_path),
+        repetitions=1,
+        runner_command=[sys.executable, str(FAKE_RUNNER)],
+        artifacts_dir=tmp_path / "artifacts",
+        keep_workspaces=True,
+        log=logs.append,
+    )
+    work_root = _work_root_from_log(logs)
+    assert (work_root / "baseline-rep001" / ".arc" / "runner-events.jsonl").exists()
+
+
 def test_eval_table_survives_runner_launch_failure(tmp_path):
     result = eval_table(
         "broken runner",

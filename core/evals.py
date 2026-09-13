@@ -17,7 +17,8 @@ One invocation writes a self-contained artifacts directory (by default under
 
 Run workspaces are throwaway: they live under a work root (system temp by
 default) and are deleted after their evidence is snapshotted unless
-``keep_workspaces`` is set. The harness never calls the model provider itself;
+``keep_workspaces`` is set, and an auto-created temp work root is removed
+with them. The harness never calls the model provider itself;
 each run is launched as a subprocess so an arm sees the same clean process
 environment and module state as a normal ``arc compile`` invocation. The
 baseline/candidate difference is expressed purely as environment overrides and
@@ -321,7 +322,12 @@ def eval_table(
     artifacts = _prepare_artifacts_dir(artifacts_dir, name)
     sessions_dir = artifacts / "sessions"
     runs_jsonl = artifacts / "runs.jsonl"
-    workspace_root = Path(work_root) if work_root else Path(tempfile.mkdtemp(prefix="arc-eval-"))
+    auto_created_root = False
+    if work_root:
+        workspace_root = Path(work_root)
+    else:
+        workspace_root = Path(tempfile.mkdtemp(prefix="arc-eval-"))
+        auto_created_root = True
     workspace_root.mkdir(parents=True, exist_ok=True)
 
     log(f"Eval artifacts: {artifacts}")
@@ -374,6 +380,10 @@ def eval_table(
     }
     write_json_atomic(artifacts / "report.json", report)
     (artifacts / "report.txt").write_text(render_report_text(report) + "\n", encoding="utf-8")
+    # an auto-created work root is harness-owned litter once its run
+    # workspaces are gone; an explicit --work-root is the caller's territory
+    if auto_created_root and not keep_workspaces:
+        shutil.rmtree(workspace_root, ignore_errors=True)
     return EvalResult(report=report, runs=runs, artifacts_dir=artifacts)
 
 
