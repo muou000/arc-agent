@@ -42,7 +42,7 @@ flowchart LR
 
 ```
 arc-agent/
-├── arc_main.py               # CLI 入口（compile / doctor / config 子命令）
+├── arc_main.py               # CLI 入口（compile / doctor / config / usage 子命令）
 ├── main.py                   # ARC-Bench 平台适配入口
 ├── agents/                   # 三个舞台智能体
 │   ├── interface_designer.py #   接口设计
@@ -124,6 +124,23 @@ python arc_main.py compile path/to/requirements -o out --resume --retry R1.2 R1.
 ```
 
 ARC-Bench 平台入口为 `main.py`，会自动附加 `compile` 子命令并读取 `ARCBENCH_TASK_TYPE` 环境变量。
+
+### Token 用量统计
+
+每次模型调用的 token 用量与成本会在编译过程中写入 `.arc/runner-events.jsonl`（`llm_usage`
+事件，pi 风格语义：`input` 不含缓存读写，`reasoning` 是 `output` 的子集；provider 未返回
+usage 时以 tiktoken 估算并标记 `source: estimated`）。编译结束后可聚合查看每节点 / 每阶段 /
+每模型的用量与成本：
+
+```bash
+python arc_main.py usage --project-dir path/to/output          # 汇总报表
+python arc_main.py usage --project-dir path/to/output --json   # 机读 JSON
+```
+
+内置单价取自基准评测模型目录（DeepSeek / Z.AI / Moonshot / MiniMax / Qwen，CNY 每百万
+token，2026-09，见 `agents/model/costing.py`）。目录是封闭集合：模型名匹配不区分大小写
+（`MiniMax-M3` 与 `minimax-m3` 同价），表外模型一律不计成本（报表中显示为 unpriced），
+目录调整时直接更新 `costing.py` 中的 `_BUILTIN_MODEL_COSTS` 表。
 
 ### 测试
 

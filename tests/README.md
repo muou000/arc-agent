@@ -22,7 +22,8 @@ tests/
 ├── test_python_sdk/             # 第 1 层：arcbench_agent_runtime SDK 单测
 │   ├── test_context.py          # RuntimePaths
 │   ├── test_jsonio.py           # jsonio 辅助函数
-│   ├── test_events.py           # EventClient
+│   ├── test_events.py           # EventClient（含 llm_usage 事件契约）
+│   ├── test_usage_aggregate.py  # llm_usage 聚合（每节点/阶段/模型/Run 汇总）
 │   ├── test_traceability.py     # TraceabilityStore + 7 张表
 │   ├── test_gitops.py           # GitClient（使用真实 git）
 │   └── test_runtime.py          # AgentRuntime + 端到端流程
