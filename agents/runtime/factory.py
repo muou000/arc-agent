@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
@@ -10,7 +11,7 @@ from deepagents.backends import CompositeBackend, FilesystemBackend, StateBacken
 from deepagents._models import get_model_provider
 from deepagents.backends.filesystem import _raise_if_symlink_loop
 from langchain.agents.middleware.types import AgentMiddleware
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel, Field, create_model
 
 from agents.model.factory import create_arc_chat_model
@@ -20,7 +21,7 @@ from agents.runtime.stage_discipline import StageDisciplineMiddleware
 from core.path_compat import normalize_windows_extended_prefix_path, normalize_windows_extended_prefix_text
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Mapping
 
     from langchain.agents.middleware.types import ModelRequest, ModelResponse, ResponseT, ToolCallRequest
     from langchain_core.tools import BaseTool
@@ -152,6 +153,102 @@ class ToolArgumentSanitizerMiddleware(AgentMiddleware[Any, Any, Any]):
         return request.override(tool_call={**call, "args": {**args, **patch}})
 
 
+_LENGTH_FINISH_REASONS = frozenset({"length"})
+
+
+def _message_hit_output_limit(message: Any) -> bool:
+    """Return True when the provider cut this response short of completion.
+
+    Chat-completions responses carry ``finish_reason="length"`` in
+    ``response_metadata``; Responses-API responses carry ``status="incomplete"``
+    (``incomplete_details.reason="max_output_tokens"``). Either way the payload
+    may end mid-argument.
+    """
+
+    metadata = getattr(message, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("finish_reason") in _LENGTH_FINISH_REASONS:
+        return True
+    return metadata.get("status") == "incomplete"
+
+
+def _truncation_rejection_tool_message(call: "Mapping[str, Any]") -> ToolMessage:
+    """Error tool result for a tool call issued inside a truncated response."""
+
+    reason = call.get("error")
+    detail = f" Its arguments could not be parsed ({reason})." if reason else ""
+    return ToolMessage(
+        content=(
+            f"Error: tool call `{call.get('name') or '<unknown>'}` was not executed: "
+            "the assistant response hit the output token limit, so its arguments may "
+            f"be truncated.{detail} Re-issue the tool call with complete arguments."
+        ),
+        tool_call_id=str(call.get("id") or ""),
+        status="error",
+    )
+
+
+class TruncatedToolCallGuardMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Fail every tool call carried by an output-truncated model response.
+
+    A response cut off by the output token limit can end mid-argument, and a
+    truncated tool-call payload may still parse and pass schema validation,
+    silently corrupting the workspace (pi's ``failToolCallsFromTruncatedMessage``
+    lesson). Rewrite the response so every unanswered tool call in the truncated
+    message gets an explicit error tool result; the router then hands control
+    back to the model, which re-issues the calls with complete arguments.
+    """
+
+    def wrap_model_call(
+        self,
+        request: "ModelRequest[Any]",
+        handler: "Callable[[ModelRequest[Any]], ModelResponse[Any]]",
+    ) -> "ModelResponse[Any]":
+        return self._fail_truncated_tool_calls(handler(request))
+
+    async def awrap_model_call(
+        self,
+        request: "ModelRequest[Any]",
+        handler: "Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]]",
+    ) -> "ModelResponse[Any]":
+        return self._fail_truncated_tool_calls(await handler(request))
+
+    def _fail_truncated_tool_calls(self, response: Any) -> Any:
+        result = getattr(response, "result", None)
+        if not isinstance(result, list) or not result:
+            return response
+        answered = {
+            str(message.tool_call_id)
+            for message in result
+            if isinstance(message, ToolMessage) and message.tool_call_id
+        }
+        guarded: list[Any] = []
+        truncated = False
+        for message in result:
+            guarded.append(message)
+            if not isinstance(message, AIMessage) or not _message_hit_output_limit(message):
+                continue
+            rejections = self._rejections_for(message, answered)
+            if not rejections:
+                continue
+            guarded.extend(rejections)
+            truncated = True
+        if not truncated:
+            return response
+        return replace(response, result=guarded)
+
+    def _rejections_for(self, message: AIMessage, answered: set[str]) -> list[ToolMessage]:
+        rejections: list[ToolMessage] = []
+        for call in (*message.tool_calls, *message.invalid_tool_calls):
+            call_id = str(call.get("id") or "")
+            if not call_id or call_id in answered:
+                continue
+            answered.add(call_id)
+            rejections.append(_truncation_rejection_tool_message(call))
+        return rejections
+
+
 class DisableToolsMiddleware(AgentMiddleware[Any, Any, Any]):
     """Hide selected tools from model requests."""
 
@@ -230,6 +327,7 @@ def build_stage_agent(
         backend=backend,
         system_prompt=system_prompt,
         middleware=[
+            TruncatedToolCallGuardMiddleware(),
             ToolArgumentSanitizerMiddleware(),
             StageDisciplineMiddleware(stage=stage),
             DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
