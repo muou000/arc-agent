@@ -87,3 +87,62 @@ def test_scripted_tool_calls_drive_real_agent_loop(tmp_project_dir: Path) -> Non
     assert any(
         getattr(m, "type", "") == "tool" and "loop-ok" in str(m.content) for m in third_call_messages
     )
+
+
+def test_length_truncated_tool_call_is_failed_and_reissued(tmp_project_dir: Path) -> None:
+    """A length-truncated tool call must not execute; the model re-issues it.
+
+    Mirrors pi's ``failToolCallsFromTruncatedMessage`` contract: every call in a
+    truncated message gets an error tool result instead of running, and the loop
+    hands those errors back to the model for a clean re-issue.
+    """
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/src/truncated.py", "content": "print('hi"},
+                call_id="call-truncated",
+                response_metadata={"finish_reason": "length"},
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/src/hello.py", "content": "print('hi')\n"},
+                call_id="call-reissued",
+            ),
+            faux_text("DONE"),
+        ]
+    )
+
+    agent = build_stage_agent(
+        name="faux_harness",
+        stage="implementation",
+        model=model,
+        system_prompt="You are a test agent.",
+        response_format=None,
+        workspace_root=str(tmp_project_dir),
+        writable_roots=[str(tmp_project_dir)],
+        skills=[],
+        memory=[],
+        tools=[],
+    )
+
+    payload = _invoke(agent, "run the script", tmp_project_dir)
+
+    assert model.call_count == 3
+    assert payload["summary"] == "DONE"
+
+    # The truncated call never touched the workspace; the re-issued one did.
+    assert not (tmp_project_dir / "src" / "truncated.py").exists()
+    written = tmp_project_dir / "src" / "hello.py"
+    assert written.read_text(encoding="utf-8") == "print('hi')\n"
+
+    # The model was told explicitly why the truncated call did not run.
+    second_call_messages = model.calls[1]
+    errors = [
+        m
+        for m in second_call_messages
+        if getattr(m, "type", "") == "tool" and m.tool_call_id == "call-truncated"
+    ]
+    assert errors, "the truncated call must be answered with an error tool result"
+    assert "output token limit" in str(errors[0].content)
