@@ -323,7 +323,9 @@ class ARCWorkflowManager:
 
         Each image-bearing node otherwise blocks its DESIGN phase on a serial
         vision call; the persisted analysis makes this pass a cache hit for
-        every later design phase (and a no-op on ``--resume``).
+        every later design phase. On ``--resume`` persisted analysis is reused
+        directly, and images lacking it are re-attached from the per-image
+        cache without another vision API call.
         """
 
         if not visual_precompute_enabled() or self.runtime is None:
