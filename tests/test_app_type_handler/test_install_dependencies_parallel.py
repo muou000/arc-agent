@@ -31,11 +31,12 @@ async def _noop_log(*args) -> None:
 def test_installs_run_concurrently(tmp_path, monkeypatch) -> None:
     running: set[str] = set()
     overlapped = False
+    started: list[str] = []
 
     async def fake_install(target_dir: str, log_cb=None) -> bool:
         nonlocal overlapped
         label = "backend" if target_dir.endswith("backend") else "frontend"
-        assert running.isdisjoint({label}) or overlapped or True
+        started.append(label)
         if running:
             overlapped = True
         running.add(label)
@@ -46,6 +47,7 @@ def test_installs_run_concurrently(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(web_module, "run_npm_install", fake_install)
     assert asyncio.run(_handler(tmp_path).install_dependencies()) is True
     assert overlapped, "backend and frontend installs must overlap"
+    assert sorted(started) == ["backend", "frontend"]
 
 
 def test_failed_frontend_install_fails_the_batch(tmp_path, monkeypatch) -> None:
