@@ -10,6 +10,7 @@ from deepagents.backends import CompositeBackend, FilesystemBackend, StateBacken
 from deepagents._models import get_model_provider
 from deepagents.backends.filesystem import _raise_if_symlink_loop
 from langchain.agents.middleware.types import AgentMiddleware
+from langchain_core.messages import ToolMessage
 from pydantic import BaseModel, Field, create_model
 
 from agents.model.factory import create_arc_chat_model
@@ -21,7 +22,7 @@ from core.path_compat import normalize_windows_extended_prefix_path, normalize_w
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from langchain.agents.middleware.types import ModelRequest, ModelResponse, ResponseT
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse, ResponseT, ToolCallRequest
     from langchain_core.tools import BaseTool
 
 
@@ -49,12 +50,106 @@ class OpenAIGrepSchema(BaseModel):
     """OpenAI-compatible schema for the grep tool."""
 
     pattern: str = Field(description="Text pattern to search for (literal string, not regex).")
-    path: str = Field(default=None, description="Directory to search in. Defaults to current working directory.")
-    glob: str = Field(default=None, description="Glob pattern to filter which files to search (e.g., '*.py').")
+    path: str = Field(default=None, description="Base directory to search from. Defaults to the backend's default root.")
+    glob: str = Field(
+        default=None,
+        description="Glob pattern to filter which files to search (e.g., '*.py').",
+    )
     output_mode: Literal["files_with_matches", "content", "count"] = Field(
         default="files_with_matches",
         description="Output format: 'files_with_matches' (file paths only, default), 'content' (matching lines with context), 'count' (match counts per file).",
     )
+
+
+_TEXT_ENVELOPE_KEYS = frozenset({"$text", "text", "content"})
+
+
+def _unwrap_text_envelope(value: Any) -> Any:
+    """Undo a single-key text envelope such as ``{"$text": "..."}``.
+
+    Models occasionally wrap long file payloads in an object instead of passing
+    the string directly. Only the unambiguous single-string-key shape is
+    unwrapped; anything else is left for the caller to reject.
+    """
+
+    if not isinstance(value, dict) or len(value) != 1:
+        return value
+    (key, inner), = value.items()
+    if key in _TEXT_ENVELOPE_KEYS and isinstance(inner, str):
+        return inner
+    return value
+
+
+class ToolArgumentSanitizerMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Fail fast when a model submits non-string payloads to file tools.
+
+    Some models occasionally wrap file content in an envelope object
+    (``content={"$text": "..."}`` was observed on the 12306 benchmark). The
+    filesystem tool accepted the envelope, wrote it to disk, and the model then
+    spent dozens of turns repairing the file it had just corrupted. Unwrap
+    single-key text envelopes here, and reject anything else with an explicit
+    tool message instead of silently stringifying garbage into the workspace.
+    """
+
+    _TEXT_ARGS_BY_TOOL = {
+        "write_file": ("content",),
+        "edit_file": ("old_string", "new_string"),
+    }
+
+    def wrap_tool_call(
+        self,
+        request: "ToolCallRequest",
+        handler: "Callable[[ToolCallRequest], Any]",
+    ) -> Any:
+        prepared = self._prepare(request)
+        if isinstance(prepared, ToolMessage):
+            return prepared
+        return handler(prepared)
+
+    async def awrap_tool_call(
+        self,
+        request: "ToolCallRequest",
+        handler: "Callable[[ToolCallRequest], Awaitable[Any]]",
+    ) -> Any:
+        prepared = self._prepare(request)
+        if isinstance(prepared, ToolMessage):
+            return prepared
+        return await handler(prepared)
+
+    def _prepare(self, request: "ToolCallRequest") -> Any:
+        """Return the request to execute (sanitized) or a rejection message."""
+
+        call = request.tool_call
+        tool_name = str(call.get("name") or "")
+        arg_names = self._TEXT_ARGS_BY_TOOL.get(tool_name)
+        if not arg_names:
+            return request
+        args = call.get("args")
+        if not isinstance(args, dict):
+            return request
+
+        patch: dict[str, Any] = {}
+        for arg_name in arg_names:
+            if arg_name not in args:
+                continue
+            value = args[arg_name]
+            if isinstance(value, str):
+                continue
+            unwrapped = _unwrap_text_envelope(value)
+            if isinstance(unwrapped, str):
+                patch[arg_name] = unwrapped
+            else:
+                return ToolMessage(
+                    content=(
+                        f"Error: `{tool_name}` argument `{arg_name}` must be a plain string, "
+                        f"but a {type(value).__name__} was received. Re-send the tool call and "
+                        "pass the file text directly as the argument value."
+                    ),
+                    tool_call_id=str(call.get("id") or ""),
+                )
+        if not patch:
+            return request
+        return request.override(tool_call={**call, "args": {**args, **patch}})
 
 
 class DisableToolsMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -135,6 +230,7 @@ def build_stage_agent(
         backend=backend,
         system_prompt=system_prompt,
         middleware=[
+            ToolArgumentSanitizerMiddleware(),
             StageDisciplineMiddleware(stage=stage),
             DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
         ],
