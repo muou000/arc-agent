@@ -16,6 +16,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import PrivateAttr
 
 from agents.model.compatible_openai import CompatibleChatOpenAI
+from agents.model.usage_capture import record_chat_result_usage
 
 
 logger = logging.getLogger(__name__)
@@ -119,19 +120,27 @@ class ARCChatOpenAI(ChatOpenAI):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
-        return await _acall_model_with_retries(
+        result = await _acall_model_with_retries(
             lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
         )
+        record_chat_result_usage(
+            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
+        )
+        return result
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
-        return _call_model_with_retries(
+        result = _call_model_with_retries(
             lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
         )
+        record_chat_result_usage(
+            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
+        )
+        return result
 
 
 class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
@@ -147,19 +156,27 @@ class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
-        return await _acall_model_with_retries(
+        result = await _acall_model_with_retries(
             lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
         )
+        record_chat_result_usage(
+            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
+        )
+        return result
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
-        return _call_model_with_retries(
+        result = _call_model_with_retries(
             lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
         )
+        record_chat_result_usage(
+            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
+        )
+        return result
 
 
 def build_openai_chat_model(

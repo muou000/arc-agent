@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -16,6 +17,7 @@ from core.cli import (
     print_cli_banner,
     print_cli_startup,
     print_compilation_summary,
+    print_usage_report,
     stop_cli_spinner,
 )
 from core.config import set_web_port
@@ -285,6 +287,62 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 # ============================================================
+# Subcommand: usage
+# ============================================================
+def build_usage_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "usage",
+        help="Report LLM token usage and cost from runner events",
+        description="Aggregate llm_usage events from .arc/runner-events.jsonl into per-node, per-phase, per-model and run totals.",
+    )
+    parser.add_argument(
+        "--project-dir",
+        dest="project_dir",
+        default="",
+        help="Compiled workspace directory (default: ARCBENCH_OUTPUT_DIR/ARCBENCH_PROJECT_DIR or the current directory)",
+    )
+    parser.add_argument(
+        "--events",
+        dest="events_path",
+        default="",
+        help="Explicit path to a runner-events.jsonl file (overrides --project-dir)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Print the full aggregation as JSON",
+    )
+    parser.set_defaults(func=cmd_usage)
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    """Execute usage subcommand."""
+    try:
+        _ensure_dotenv_loaded()
+    except FileNotFoundError:
+        pass  # usage reporting works without provider configuration
+
+    from arcbench_agent_runtime.context import RuntimePaths
+    from arcbench_agent_runtime.usage import aggregate_llm_usage
+
+    if args.events_path:
+        events_path = Path(args.events_path).expanduser().resolve()
+    else:
+        events_path = RuntimePaths.from_env(project_dir=args.project_dir or None).runner_events_path
+    if not events_path.exists():
+        print(f"Error: runner events file not found: {events_path}")
+        return 2
+
+    summary = aggregate_llm_usage(events_path)
+    if args.as_json:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+    print_usage_report(summary, events_path)
+    return 0
+
+
+# ============================================================
 # Main CLI entry
 # ============================================================
 def build_parser() -> argparse.ArgumentParser:
@@ -306,7 +364,8 @@ def build_parser() -> argparse.ArgumentParser:
     
     build_compile_parser(subparsers)
     build_doctor_parser(subparsers)
-    
+    build_usage_parser(subparsers)
+
     return parser
 
 

@@ -5,6 +5,7 @@ from typing import Any
 
 from arcbench_agent_runtime.runtime import AgentRuntime
 from agents.context.pipeline import set_context_config, set_context_runtime
+from agents.model.usage_capture import LLMUsageRecord, set_llm_usage_sink
 
 
 _runtime: AgentRuntime | None = None
@@ -29,6 +30,7 @@ def configure_runtime(
         traceability_dir=traceability_dir,
     )
     set_context_runtime(_runtime)
+    set_llm_usage_sink(_make_llm_usage_sink(_runtime))
     set_context_config(
         workspace_dir=resolved_project_dir,
         app_type=app_type,
@@ -36,6 +38,29 @@ def configure_runtime(
         android_package=android_package,
     )
     return _runtime
+
+
+def _make_llm_usage_sink(runtime: AgentRuntime) -> Any:
+    """Persist every captured model-call usage as an ``llm_usage`` runner event."""
+
+    def sink(record: LLMUsageRecord) -> None:
+        runtime.events.record_llm_usage(
+            node_id=record.node_id,
+            phase=record.phase,
+            model=record.model,
+            api_mode=record.api_mode,
+            source=record.source,
+            input_tokens=record.input_tokens,
+            output_tokens=record.output_tokens,
+            cache_read_tokens=record.cache_read_tokens,
+            cache_write_tokens=record.cache_write_tokens,
+            cache_write_1h_tokens=record.cache_write_1h_tokens,
+            reasoning_tokens=record.reasoning_tokens,
+            total_tokens=record.total_tokens,
+            cost=record.cost,
+        )
+
+    return sink
 
 
 def get_runtime() -> AgentRuntime:
@@ -52,3 +77,4 @@ def reset_runtime_for_tests() -> None:
     global _runtime
     _runtime = None
     set_context_runtime(None)
+    set_llm_usage_sink(None)

@@ -11,6 +11,25 @@ def utc_timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
 
+def _nonneg_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _nullable_nonneg_int(value: Any) -> int | None:
+    """Normalize an optional breakdown: absent or invalid means "not reported"."""
+
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 class EventClient:
     def __init__(self, paths: RuntimePaths) -> None:
         self.paths = paths
@@ -71,6 +90,55 @@ class EventClient:
 
     def mark_test_failed(self, node_id: str, message: str | None = None) -> None:
         self._emit_requirement_state(node_id, "test", "failed", message)
+
+    def record_llm_usage(
+        self,
+        *,
+        node_id: str = "",
+        phase: str = "",
+        model: str = "",
+        api_mode: str = "",
+        source: str = "reported",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        cache_write_1h_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        total_tokens: int = 0,
+        cost: dict[str, Any] | None = None,
+    ) -> None:
+        """Append one ``llm_usage`` event for a single model call.
+
+        Token semantics mirror the ARC-Bench reference (pi) ``Usage`` type:
+        ``input`` excludes cache reads/writes (they are separate fields and a
+        subset of the provider prompt total), ``reasoning`` is a subset of
+        ``output``. ``source`` distinguishes provider-reported usage from a
+        local token estimate. An empty ``node_id`` attributes the call to the
+        run as a whole (e.g. planning-time model calls outside any node).
+        """
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "llm_usage",
+                "node_id": str(node_id or "").strip(),
+                "phase": str(phase or "").strip(),
+                "model": str(model or "").strip(),
+                "api_mode": str(api_mode or "").strip(),
+                "source": str(source or "").strip() or "reported",
+                "usage": {
+                    "input": _nonneg_int(input_tokens),
+                    "output": _nonneg_int(output_tokens),
+                    "cache_read": _nonneg_int(cache_read_tokens),
+                    "cache_write": _nonneg_int(cache_write_tokens),
+                    "cache_write_1h": _nullable_nonneg_int(cache_write_1h_tokens),
+                    "reasoning": _nullable_nonneg_int(reasoning_tokens),
+                    "total": _nonneg_int(total_tokens),
+                },
+                "cost": cost if isinstance(cost, dict) else None,
+                "timestamp": utc_timestamp(),
+            },
+        )
 
     def _emit_runner_state(self, state: str, message: str | None = None) -> None:
         append_jsonl(

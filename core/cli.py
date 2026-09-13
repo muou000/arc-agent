@@ -775,3 +775,77 @@ def print_compilation_summary(
         # TODO: Add app-specific run instructions
     
     print(f"{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}\n")
+
+
+_CNY = "¥"
+
+
+def _format_cost_detail(cost: dict) -> str:
+    """Format the totals cost bucket as ``¥0.0101 (input ¥0.0045, ...)``."""
+
+    detail = ", ".join(
+        f"{key} {_CNY}{cost.get(key, 0.0):.4f}"
+        for key in ("input", "output", "cache_read", "cache_write")
+    )
+    return f"{_CNY}{cost.get('total', 0.0):.4f} ({detail})"
+
+
+def _format_bucket_cost(cost: dict, *, priced_calls: int) -> str:
+    """Per-row cost; ``-`` when every call in the bucket was unpriced."""
+
+    if not priced_calls:
+        return "-"
+    return f"{_CNY}{cost.get('total', 0.0):.4f}"
+
+
+def print_usage_report(summary: dict, events_path) -> None:
+    """Print the aggregated LLM token usage and cost from runner events."""
+    print(f"\n{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}LLM Token Usage{Style.RESET_ALL}")
+    print(f"{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}\n")
+    print(f"{Fore.WHITE}Events:{Style.RESET_ALL}   {events_path}")
+
+    totals = summary.get("totals", {})
+    if not totals.get("calls"):
+        print(f"\n{Fore.YELLOW}No llm_usage events recorded yet.{Style.RESET_ALL}")
+        print(f"{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}\n")
+        return
+
+    estimated = totals.get("estimated_calls", 0)
+    unpriced = totals.get("unpriced_calls", 0)
+    notes = []
+    if estimated:
+        notes.append(f"{estimated} estimated")
+    if unpriced:
+        notes.append(f"{unpriced} unpriced")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
+    print(f"{Fore.WHITE}Calls:{Style.RESET_ALL}     {totals['calls']}{suffix}")
+
+    usage = {key: totals.get(key, 0) for key in ("input", "output", "cache_read", "cache_write", "reasoning", "total")}
+    print(
+        f"{Fore.WHITE}Tokens:{Style.RESET_ALL}    input {usage['input']:,} | output {usage['output']:,}"
+        f" | cache read {usage['cache_read']:,} | cache write {usage['cache_write']:,} | total {usage['total']:,}"
+    )
+    if usage["reasoning"]:
+        print(f"{Fore.WHITE}Reasoning:{Style.RESET_ALL} {usage['reasoning']:,} (subset of output)")
+
+    if totals["calls"] > totals.get("unpriced_calls", 0):
+        print(f"{Fore.WHITE}Cost:{Style.RESET_ALL}      {_format_cost_detail(totals.get('cost', {}))}")
+
+    for title, section_key in (("By phase", "by_phase"), ("By node", "by_node"), ("By model", "by_model")):
+        section = summary.get(section_key, {})
+        if not section:
+            continue
+        print(f"\n{Fore.CYAN}{title}{Style.RESET_ALL}")
+        rows = sorted(section.items(), key=lambda item: item[1].get("total", 0), reverse=True)
+        for name, bucket in rows:
+            label = name or "(run)"
+            display = label if len(label) <= 40 else label[:37] + "..."
+            priced_calls = bucket["calls"] - bucket.get("unpriced_calls", 0)
+            print(
+                f"  {display:<42} calls {bucket['calls']:>3}"
+                f"  tokens {bucket.get('total', 0):>9,}"
+                f"  {_format_bucket_cost(bucket.get('cost', {}), priced_calls=priced_calls)}"
+            )
+
+    print(f"{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}\n")

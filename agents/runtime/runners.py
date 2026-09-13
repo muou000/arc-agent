@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel
 
+from agents.model.usage_capture import llm_usage_context
 from agents.runtime.contracts import AgentRuntimeContext
 from core.logging import format_json_for_log, log_to_logger
 from langgraph.errors import GraphRecursionError
@@ -28,6 +29,31 @@ _MIN_RECURSION_LIMIT = 20
 
 
 async def ainvoke_stage_agent(
+    agent: Any,
+    *,
+    message: str,
+    context: AgentRuntimeContext,
+    thread_id: str,
+    logger: Any | None = None,
+    label: str = "",
+    log_cb: LogCallback | None = None,
+    stream: bool | None = None,
+) -> dict[str, Any]:
+    """Invoke one stage-agent session, attributing model token usage to its node/phase."""
+    with llm_usage_context(node_id=context.node_id, phase=context.phase):
+        return await _ainvoke_stage_agent(
+            agent,
+            message=message,
+            context=context,
+            thread_id=thread_id,
+            logger=logger,
+            label=label,
+            log_cb=log_cb,
+            stream=stream,
+        )
+
+
+async def _ainvoke_stage_agent(
     agent: Any,
     *,
     message: str,
