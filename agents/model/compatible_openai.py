@@ -56,11 +56,18 @@ def _is_responses_sse_attribute_error(exc: AttributeError) -> bool:
 
 def _chat_result_from_sse_text(payload: str) -> ChatResult:
     parsed = _parse_responses_sse(payload)
+    metadata: dict[str, Any] = {"model_provider": "openai", "sse_text_fallback": True}
+    # Keep the terminal response status so length truncation stays observable
+    # downstream (TruncatedToolCallGuardMiddleware reads status/incomplete_details).
+    if parsed["response_status"]:
+        metadata["status"] = parsed["response_status"]
+    if parsed["incomplete_details"] is not None:
+        metadata["incomplete_details"] = parsed["incomplete_details"]
     message = AIMessage(
         content=parsed["content"],
         tool_calls=parsed["tool_calls"],
         invalid_tool_calls=parsed["invalid_tool_calls"],
-        response_metadata={"model_provider": "openai", "sse_text_fallback": True},
+        response_metadata=metadata,
     )
     return ChatResult(generations=[ChatGeneration(message=message)])
 
@@ -69,6 +76,8 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
     text_by_output_index: dict[int, list[str]] = {}
     tool_calls: list[dict[str, Any]] = []
     invalid_tool_calls: list[dict[str, Any]] = []
+    response_status = ""
+    incomplete_details: dict[str, Any] | None = None
     current_event = ""
 
     for raw_line in str(payload or "").splitlines():
@@ -89,6 +98,14 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
                     output_index = 0
                 text_by_output_index.setdefault(output_index, []).append(text)
             continue
+        if current_event in ("response.completed", "response.incomplete"):
+            response = data.get("response")
+            if isinstance(response, dict):
+                response_status = str(response.get("status") or "") or response_status
+                details = response.get("incomplete_details")
+                if isinstance(details, dict):
+                    incomplete_details = details
+            continue
         if current_event != "response.output_item.done":
             continue
         item = data.get("item")
@@ -103,6 +120,8 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
         "content": content,
         "tool_calls": tool_calls,
         "invalid_tool_calls": invalid_tool_calls,
+        "response_status": response_status,
+        "incomplete_details": incomplete_details,
     }
 
 
