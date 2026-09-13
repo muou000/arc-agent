@@ -35,23 +35,41 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def installed_frontend(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """Copy the frontend template and install the way production does.
+
+    ``run_npm_install`` tries a plain ``npm install`` first and falls back to
+    ``--legacy-peer-deps`` (npm 10's arborist crashes while resolving vitest's
+    optional peers). The fallback skips peer installation, and the officially
+    provisioned template does not declare ``@testing-library/dom`` - so the
+    fixture ends with the same ``--no-save --no-package-lock`` patch the
+    handler applies in ``_ensure_testing_library_dom``. Failures fail loudly:
+    skipping is how the arborist crash once stayed invisible.
+    """
     scratch = tmp_path_factory.mktemp("template-frontend-")
     shutil.copytree(TEMPLATE_FRONTEND, scratch / "frontend")
-    # Match the production install path: npm 10's arborist crashes while
-    # resolving vitest's optional peers, so the handler falls back to
-    # --legacy-peer-deps. This fixture must exercise the same flags.
-    proc = subprocess.run(
-        [_NPM_BIN, "install", "--legacy-peer-deps", "--no-audit", "--no-fund", "--prefer-offline"],
-        cwd=str(scratch / "frontend"),
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
+
+    def _npm(args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [_NPM_BIN, "install", *args, "--no-audit", "--no-fund", "--prefer-offline"],
+            cwd=str(scratch / "frontend"),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+    proc = _npm([])
     if proc.returncode != 0:
-        # Fail loudly. Skipping here is how the npm 10 arborist crash - and the
-        # missing @testing-library/dom peer it exposed - stayed invisible.
-        # `_has_node()` already skips genuinely node-less environments above.
+        proc = _npm(["--legacy-peer-deps"])
+    if proc.returncode != 0:
         pytest.fail(f"npm install failed: {proc.stderr or proc.stdout}")
+
+    dom = scratch / "frontend" / "node_modules" / "@testing-library" / "dom"
+    if not dom.is_dir():
+        patch = _npm(["--no-save", "--no-package-lock", "@testing-library/dom@^10.4.0"])
+        if patch.returncode != 0:
+            pytest.fail(
+                f"@testing-library/dom patch install failed: {patch.stderr or patch.stdout}"
+            )
     yield scratch / "frontend"
 
 
@@ -61,8 +79,10 @@ class TestFrontendDependencies:
     def test_testing_library_dom_is_a_real_install(self, installed_frontend: Path) -> None:
         """`@testing-library/react` 16 peers on `@testing-library/dom`.
 
-        `--legacy-peer-deps` skips peer installation, so the template must
-        declare it directly. Without it every component test fails to import,
+        The officially provisioned template does not declare the peer, and the
+        `--legacy-peer-deps` fallback skips peer installation - production
+        recovers through the handler's `--no-save` patch, which this fixture
+        mirrors. Without that guarantee every component test fails to import,
         and the agent has no way to install a dependency mid-compile.
         """
 

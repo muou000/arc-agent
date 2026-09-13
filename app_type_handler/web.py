@@ -50,9 +50,49 @@ PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
 # without the network access the download requires.
 _BROWSER_INSTALL_SKIP_VALUES = {"1", "true", "yes", "on"}
 
+# Files every web workspace must keep resolving the runtime origin from; the
+# post-template gate asserts them on the scaffolded workspace. The officially
+# provisioned template (baked into the ARC-Bench runner image) reads the
+# Playwright origin from ``PLAYWRIGHT_BASE_URL``, which the E2E runner exports,
+# so any env-driven origin satisfies the contract - only a config that
+# hardcodes the port with no environment escape hatch fails it.
+PORT_TEMPLATE_CONTRACT: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("backend/src/index.js", ("process.env.PORT",)),
+    ("frontend/vite.config.js", ("process.env.ARC_WEB_PORT",)),
+    (
+        "backend/playwright.config.js",
+        (
+            "process.env.PLAYWRIGHT_BASE_URL",
+            "process.env.ARC_WEB_BASE_URL",
+            "process.env.ARC_WEB_PORT",
+        ),
+    ),
+)
+
 
 def _browser_install_skipped() -> bool:
     return os.environ.get("ARC_SKIP_BROWSER_INSTALL", "").strip().lower() in _BROWSER_INSTALL_SKIP_VALUES
+
+
+def _browser_install_command(backend_dir: str) -> str:
+    """Browser install command that works with either template flavour.
+
+    The bundled template exposes an ``e2e:install-browsers`` script; the
+    officially provisioned one (ARC-Bench runner image) does not, so fall back
+    to the equivalent ``npx`` invocation - the CLI resolves from the locally
+    installed ``playwright`` package, whose browser build matches the
+    ``@playwright/test`` runner because both dependency ranges float to the
+    same latest 1.x release.
+    """
+    manifest = os.path.join(backend_dir, "package.json")
+    try:
+        with open(manifest, "r", encoding="utf-8") as file:
+            scripts = json.loads(file.read()).get("scripts") or {}
+    except (OSError, ValueError):
+        return "npm run e2e:install-browsers"
+    if scripts.get("e2e:install-browsers"):
+        return "npm run e2e:install-browsers"
+    return "npx playwright install chromium chromium-headless-shell"
 
 
 def node_modules_ready(target_dir: str) -> bool:
@@ -1168,6 +1208,30 @@ class WebAppType(AppTypeHandler):
                 f"Copied {copied} requirement asset(s) into frontend/public/assets.",
             )
 
+    @classmethod
+    def template_contract_violations(cls, template_dir: str) -> list[str]:
+        """Report template files that would fail the post-template port gate.
+
+        Runs at template-selection time (see ``AppTypeHandler._select_template``)
+        so a usable but stale external template is swapped for the bundled one
+        instead of scaffolding a workspace that initialization then aborts on.
+        """
+
+        violations: list[str] = []
+        for relative_path, marker in PORT_TEMPLATE_CONTRACT:
+            file_path = os.path.join(template_dir, *relative_path.split("/"))
+            if not os.path.exists(file_path):
+                continue
+            try:
+                with open(file_path, "r", encoding="utf-8") as file:
+                    content = file.read()
+            except OSError:
+                violations.append(relative_path)
+                continue
+            if marker not in content:
+                violations.append(relative_path)
+        return violations
+
     async def post_template_setup(self) -> bool:
         """Assert the scaffolded runtime files resolve the web port from the environment.
 
@@ -1182,13 +1246,8 @@ class WebAppType(AppTypeHandler):
         """
 
         await self._copy_requirement_assets()
-        port_contract = (
-            ("backend/src/index.js", "process.env.PORT"),
-            ("frontend/vite.config.js", "process.env.ARC_WEB_PORT"),
-            ("backend/playwright.config.js", "process.env.ARC_WEB_PORT"),
-        )
         unconfigured: list[str] = []
-        for relative_path, marker in port_contract:
+        for relative_path, markers in PORT_TEMPLATE_CONTRACT:
             file_path = os.path.join(self.workspace_path, *relative_path.split("/"))
             if not os.path.exists(file_path):
                 continue
@@ -1198,7 +1257,7 @@ class WebAppType(AppTypeHandler):
             except OSError as exc:
                 await self._log("System", f"Failed to read {relative_path}: {exc}", "error")
                 return False
-            if marker not in content:
+            if not any(marker in content for marker in markers):
                 unconfigured.append(relative_path)
 
         if unconfigured:
@@ -1242,7 +1301,43 @@ class WebAppType(AppTypeHandler):
         results = await asyncio.gather(
             *(run_npm_install(target_path, self.log_cb) for _label, target_path in installable)
         )
+        if all(results):
+            for label, target_path in installable:
+                if label == "frontend":
+                    await self._ensure_testing_library_dom(target_path)
         return all(results)
+
+    async def _ensure_testing_library_dom(self, frontend_dir: str) -> None:
+        """Install the missing ``@testing-library/dom`` peer without editing files.
+
+        ``@testing-library/react`` 16 lists ``@testing-library/dom`` as a peer,
+        but the officially provisioned template does not declare it. A primary
+        ``npm install`` auto-installs peers, while the ``--legacy-peer-deps``
+        fallback (needed when arborist crashes on vitest's optional peers) does
+        not - and every generated component test then fails to import it with
+        no way for the agent to recover. ``--no-save --no-package-lock`` keeps
+        the provided template files untouched.
+        """
+        dom_package = os.path.join(frontend_dir, "node_modules", "@testing-library", "dom")
+        if os.path.isdir(dom_package):
+            return
+        await self._log(
+            "System",
+            "Installing missing @testing-library/dom peer (required by "
+            "@testing-library/react 16, not declared by the provided template)...",
+        )
+        returncode, _stdout, stderr = await _run_npm_command(
+            'npm install --no-save --no-package-lock "@testing-library/dom@^10.4.0"',
+            frontend_dir,
+            NPM_INSTALL_TIMEOUT_SECONDS,
+        )
+        if returncode != 0:
+            await self._log(
+                "System",
+                "Could not install @testing-library/dom; generated component tests "
+                "may fail to import it. " + _tail(stderr),
+                "warning",
+            )
 
     async def verify_workspace(self) -> bool:
         """Fail fast when the scaffolded workspace cannot build or cannot run E2E.
@@ -1307,7 +1402,7 @@ class WebAppType(AppTypeHandler):
 
         await self._log("System", "Verifying workspace: installing Playwright browsers...")
         result = await _execute_web_test_command(
-            "npm run e2e:install-browsers",
+            _browser_install_command(backend_dir),
             cwd=backend_dir,
             timeout=PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS,
         )

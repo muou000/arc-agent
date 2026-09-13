@@ -208,6 +208,64 @@ def test_copy_template_accepts_a_complete_template(tmp_path, monkeypatch) -> Non
 
 
 # --------------------------------------------------------------------------
+# install_dependencies patches the missing testing-library peer
+# --------------------------------------------------------------------------
+
+
+def test_install_dependencies_installs_the_missing_dom_peer(tmp_path, monkeypatch) -> None:
+    """`@testing-library/react` 16 needs the `@testing-library/dom` peer, the
+    provided template does not declare it, and the `--legacy-peer-deps`
+    fallback skips peer installation - so the runtime patches it in with
+    `--no-save --no-package-lock`, leaving the provided template files
+    untouched."""
+
+    workspace = tmp_path / "workspace"
+    (workspace / "frontend").mkdir(parents=True)
+    (workspace / "backend").mkdir()
+    handler = _make_handler(workspace)
+
+    async def fake_run_npm_install(target_dir, log_cb):
+        return True
+
+    npm_commands: list[str] = []
+
+    async def fake_run_npm_command(command, target_dir, timeout=0.0):
+        npm_commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(web_handler, "run_npm_install", fake_run_npm_install)
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run_npm_command)
+
+    assert asyncio.run(handler.install_dependencies()) is True
+    assert len(npm_commands) == 1
+    assert "--no-save --no-package-lock" in npm_commands[0]
+    assert "@testing-library/dom" in npm_commands[0]
+
+
+def test_install_dependencies_skips_the_dom_peer_when_installed(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    frontend = workspace / "frontend"
+    (frontend / "node_modules" / "@testing-library" / "dom").mkdir(parents=True)
+    (workspace / "backend").mkdir()
+    handler = _make_handler(workspace)
+
+    async def fake_run_npm_install(target_dir, log_cb):
+        return True
+
+    npm_commands: list[str] = []
+
+    async def fake_run_npm_command(command, target_dir, timeout=0.0):
+        npm_commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(web_handler, "run_npm_install", fake_run_npm_install)
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run_npm_command)
+
+    assert asyncio.run(handler.install_dependencies()) is True
+    assert npm_commands == []
+
+
+# --------------------------------------------------------------------------
 # verify_workspace smoke check
 # --------------------------------------------------------------------------
 
@@ -320,6 +378,54 @@ def test_verify_workspace_skips_the_browser_gate_when_opted_out(tmp_path, monkey
     assert commands == ["npm run build"]
 
 
+def test_verify_workspace_falls_back_to_npx_without_an_install_script(tmp_path, monkeypatch) -> None:
+    """The officially provisioned template does not declare an
+    `e2e:install-browsers` script; the equivalent `npx` invocation keeps browser
+    provisioning working without requiring any template file to change."""
+
+    workspace = _make_runnable_workspace(tmp_path)
+    (workspace / "backend" / "package.json").write_text(
+        json.dumps({"name": "backend", "scripts": {"start": "node src/index.js"}}),
+        encoding="utf-8",
+    )
+    handler = _make_handler(workspace)
+    commands: list[str] = []
+
+    async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
+        commands.append(command)
+        return "Exit Code: 0\nSTDOUT:\nok\n"
+
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
+
+    assert asyncio.run(handler.verify_workspace()) is True
+    assert commands[0] == "npm run build"
+    assert commands[1] == "npx playwright install chromium chromium-headless-shell"
+
+
+def test_verify_workspace_uses_the_install_script_when_declared(tmp_path, monkeypatch) -> None:
+    workspace = _make_runnable_workspace(tmp_path)
+    (workspace / "backend" / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "backend",
+                "scripts": {"e2e:install-browsers": "playwright install chromium"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    handler = _make_handler(workspace)
+    commands: list[str] = []
+
+    async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
+        commands.append(command)
+        return "Exit Code: 0\nSTDOUT:\nok\n"
+
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
+
+    assert asyncio.run(handler.verify_workspace()) is True
+    assert commands[1] == "npm run e2e:install-browsers"
+
+
 # --------------------------------------------------------------------------
 # post_template_setup verifies the port contract
 # --------------------------------------------------------------------------
@@ -353,6 +459,27 @@ def test_post_template_setup_accepts_environment_driven_ports(tmp_path) -> None:
     assert asyncio.run(handler.post_template_setup()) is True
 
 
+def test_post_template_setup_accepts_the_official_playwright_origin_env(tmp_path) -> None:
+    """The officially provisioned template (ARC-Bench runner image) resolves the
+    Playwright origin from `PLAYWRIGHT_BASE_URL`/`ARC_WEB_BASE_URL`, which the
+    E2E runner always exports. Only a config with no env-driven origin at all
+    fails the gate.
+    """
+
+    workspace = tmp_path / "workspace"
+    _write_runtime_port_files(
+        workspace,
+        playwright_port=(
+            "const baseURL = process.env.PLAYWRIGHT_BASE_URL\n"
+            "  || process.env.ARC_WEB_BASE_URL\n"
+            "  || 'http://127.0.0.1:3000';\n"
+        ),
+    )
+    handler = _make_handler(workspace)
+
+    assert asyncio.run(handler.post_template_setup()) is True
+
+
 def test_post_template_setup_rejects_a_hardcoded_playwright_port(tmp_path) -> None:
     """The exact drift that made every E2E run navigate to a dead origin.
 
@@ -364,10 +491,7 @@ def test_post_template_setup_rejects_a_hardcoded_playwright_port(tmp_path) -> No
     workspace = tmp_path / "workspace"
     _write_runtime_port_files(
         workspace,
-        playwright_port=(
-            "const baseURL = process.env.PLAYWRIGHT_BASE_URL\n"
-            "  || 'http://127.0.0.1:3000';\n"
-        ),
+        playwright_port="const baseURL = 'http://127.0.0.1:3000';\n",
     )
     handler = _make_handler(workspace)
     messages: list[tuple] = []
@@ -495,66 +619,72 @@ def test_template_dir_reports_the_primary_path_when_nothing_is_usable(tmp_path, 
 # --------------------------------------------------------------------------
 
 
-def test_shipped_template_declares_testing_library_dom() -> None:
+def test_shipped_template_declares_testing_library_react() -> None:
     """`@testing-library/react` 16 lists `@testing-library/dom` as a peer.
 
-    The install path falls back to `--legacy-peer-deps` (npm 10 arborist crashes
-    while resolving vitest's optional peers), and that flag skips peer
-    installation. Unless the template declares the peer directly, every
-    component test fails to import `@testing-library/dom`, the agent has no way
-    to install it, and the node burns its whole retry budget on an
-    un-fixable-by-design failure.
+    The officially provisioned template does not declare the peer, and the
+    `--legacy-peer-deps` install fallback skips peer installation - so
+    `install_dependencies` patches `@testing-library/dom` in with
+    `--no-save --no-package-lock` (pinned by
+    `test_install_dependencies_installs_the_missing_dom_peer`). This test pins
+    the other half of the contract: the template keeps declaring the package
+    that needs the peer, so the runtime patch stays load-bearing.
     """
 
     template = Path(web_handler.WebAppType.template_dir())
     package = json.loads((template / "frontend" / "package.json").read_text(encoding="utf-8"))
     declared = set(package.get("dependencies") or {}) | set(package.get("devDependencies") or {})
 
-    assert "@testing-library/dom" in declared
+    assert "@testing-library/react" in declared
 
 
-def test_shipped_template_declares_a_browser_install_script() -> None:
-    """The workspace gate runs this script, so it must exist and cover both
-    Playwright browser artefacts.
+def test_shipped_template_declares_playwright_tooling() -> None:
+    """The E2E runner and the browser-install CLI must both be installed.
 
-    `playwright install chromium` alone is not enough on Playwright 1.57: the
-    default headless mode launches `chromium_headless_shell`, which is a separate
-    download. Installing only `chromium` left every E2E run failing with
-    "Executable doesn't exist at ...chromium_headless_shell-<build>".
-    """
-
-    template = Path(web_handler.WebAppType.template_dir())
-    package = json.loads((template / "backend" / "package.json").read_text(encoding="utf-8"))
-    script = package["scripts"].get("e2e:install-browsers", "")
-
-    assert script, "the template must expose `e2e:install-browsers`"
-    assert "playwright install" in script
-    assert "chromium" in script
-    assert "chromium-headless-shell" in script
-
-
-def test_shipped_template_playwright_versions_agree() -> None:
-    """The CLI that installs browsers must match the runner that launches them.
-
-    `playwright` (CLI) and `@playwright/test` (runner) pin the browser build
-    revision. When they disagree, `playwright install` downloads a build the
-    runner does not look for - the same "Executable doesn't exist" failure.
+    The officially provisioned template does not declare an
+    `e2e:install-browsers` script, so `_verify_e2e_runner` falls back to
+    `npx playwright install chromium chromium-headless-shell`. That only works
+    when the template ships both halves of the toolchain: `playwright` (the
+    CLI that downloads the browsers) and `@playwright/test` (the runner that
+    launches them).
     """
 
     template = Path(web_handler.WebAppType.template_dir())
     package = json.loads((template / "backend" / "package.json").read_text(encoding="utf-8"))
     dependencies = package.get("devDependencies") or {}
 
-    assert dependencies.get("playwright") == dependencies.get("@playwright/test")
+    assert "playwright" in dependencies
+    assert "@playwright/test" in dependencies
 
 
-def test_shipped_template_playwright_config_reads_the_web_port() -> None:
-    """`web.py` tells the agent the config uses `PLAYWRIGHT_BASE_URL`; the
-    fallback must not be a port the workspace never serves on.
+def test_shipped_template_playwright_ranges_float_together() -> None:
+    """The browser build the CLI downloads must match the runner's expectation.
+
+    `playwright` and `@playwright/test` pin the browser build revision. The
+    officially provisioned template declares different carets (^1.28.0 vs
+    ^1.57.0), which is safe only because both ranges float to the same latest
+    1.x release at install time - npm resolves them to identical versions, so
+    the downloaded build is the one the runner looks for. Pin both to the same
+    floating-1.x shape; exact pins would reintroduce the mismatch risk.
+    """
+
+    template = Path(web_handler.WebAppType.template_dir())
+    package = json.loads((template / "backend" / "package.json").read_text(encoding="utf-8"))
+    dependencies = package.get("devDependencies") or {}
+
+    assert dependencies.get("playwright", "").startswith("^1.")
+    assert dependencies.get("@playwright/test", "").startswith("^1.")
+
+
+def test_shipped_template_playwright_config_reads_the_origin_from_the_environment() -> None:
+    """The config must resolve the origin under test from the environment.
+
+    `web.py` exports `PLAYWRIGHT_BASE_URL` for every E2E run; a config with no
+    env-driven origin would send Playwright to a hardcoded port the workspace
+    never serves on.
     """
 
     template = Path(web_handler.WebAppType.template_dir())
     config = (template / "backend" / "playwright.config.js").read_text(encoding="utf-8")
 
     assert "process.env.PLAYWRIGHT_BASE_URL" in config
-    assert "process.env.ARC_WEB_PORT" in config
