@@ -343,6 +343,175 @@ def cmd_usage(args: argparse.Namespace) -> int:
 
 
 # ============================================================
+# Subcommand: eval
+# ============================================================
+def build_eval_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "eval",
+        help="Run an A/B comparison between two compile configurations",
+        description=(
+            "Run a baseline and a candidate compile configuration against the same "
+            "requirement tree and report candidate-minus-baseline lift on pass rate, "
+            "tokens, latency and estimated cost."
+        ),
+    )
+    parser.add_argument(
+        "requirement_path",
+        help="Path to requirements directory or .yaml file (shared by both arms)",
+    )
+    parser.add_argument(
+        "--baseline-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Environment override for the baseline arm (repeatable)",
+    )
+    parser.add_argument(
+        "--candidate-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Environment override for the candidate arm (repeatable)",
+    )
+    parser.add_argument(
+        "--baseline-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Extra compile argument for the baseline arm, appended last (repeatable)",
+    )
+    parser.add_argument(
+        "--candidate-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Extra compile argument for the candidate arm, appended last (repeatable)",
+    )
+    parser.add_argument(
+        "--label-baseline",
+        dest="label_baseline",
+        default="baseline",
+        help="Display name of the baseline arm (default: baseline)",
+    )
+    parser.add_argument(
+        "--label-candidate",
+        dest="label_candidate",
+        default="candidate",
+        help="Display name of the candidate arm (default: candidate)",
+    )
+    parser.add_argument(
+        "--name",
+        default="",
+        help="Eval set name shown in the report (default: '<baseline> vs <candidate>')",
+    )
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=1,
+        help="Runs per arm; use one while iterating and 5 when reporting lift (default: 1)",
+    )
+    parser.add_argument(
+        "-t",
+        "--type",
+        dest="app_type",
+        default="web",
+        help=f"Application type (choices: {', '.join(list_app_types())})",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=3301,
+        help="Web server port passed to each run (default: 3301)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Per-run timeout; the run is recorded as failed when it expires",
+    )
+    parser.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        default=None,
+        help="Artifacts directory (default: records/evals/<timestamp>-<slug>)",
+    )
+    parser.add_argument(
+        "--work-root",
+        dest="work_root",
+        default=None,
+        help="Directory for throwaway run workspaces (default: system temp)",
+    )
+    parser.add_argument(
+        "--keep-workspaces",
+        dest="keep_workspaces",
+        action="store_true",
+        help="Keep run workspaces instead of deleting them after evidence snapshot",
+    )
+    parser.add_argument(
+        "--runner-script",
+        dest="runner_script",
+        default=None,
+        help="Run each arm with [python, SCRIPT] instead of the repository arc_main.py",
+    )
+    parser.set_defaults(func=cmd_eval)
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Execute eval subcommand."""
+    from core.evals import ArmConfig, eval_table, parse_env_overrides, render_report_text
+
+    try:
+        baseline_env = parse_env_overrides(args.baseline_env, flag="--baseline-env")
+        candidate_env = parse_env_overrides(args.candidate_env, flag="--candidate-env")
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 2
+    if args.repetitions < 1:
+        print("Error: --repetitions must be at least 1")
+        return 2
+
+    runner_command = None
+    if args.runner_script:
+        script = os.path.abspath(args.runner_script)
+        if not os.path.isfile(script):
+            print(f"Error: runner script not found: {script}")
+            return 2
+        runner_command = [sys.executable, script]
+
+    baseline = ArmConfig(label=args.label_baseline, env=baseline_env, argv=list(args.baseline_arg))
+    candidate = ArmConfig(label=args.label_candidate, env=candidate_env, argv=list(args.candidate_arg))
+    name = args.name.strip() or f"{baseline.label} vs {candidate.label}"
+    try:
+        result = eval_table(
+            name,
+            baseline,
+            candidate,
+            requirement_path=args.requirement_path,
+            repetitions=args.repetitions,
+            app_type=args.app_type,
+            web_port=args.port,
+            timeout_seconds=args.timeout,
+            runner_command=runner_command,
+            artifacts_dir=args.out_dir,
+            work_root=args.work_root,
+            keep_workspaces=args.keep_workspaces,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"Error: {exc}")
+        return 2
+
+    print()
+    print(render_report_text(result.report))
+    print()
+    all_runs_lost = all(run.get("error") for run in result.runs)
+    if all_runs_lost:
+        print("Error: every run failed to execute; see console.log under the sessions directory")
+        return 2
+    return 0
+
+
+# ============================================================
 # Main CLI entry
 # ============================================================
 def build_parser() -> argparse.ArgumentParser:
@@ -365,6 +534,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_compile_parser(subparsers)
     build_doctor_parser(subparsers)
     build_usage_parser(subparsers)
+    build_eval_parser(subparsers)
 
     return parser
 
