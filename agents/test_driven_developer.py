@@ -35,6 +35,7 @@ class TestDrivenDeveloper:
         requirement_path: str | None = None,
         app_type: str | None = None,
         app_handler: Any | None = None,
+        context_workspace_root: str | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", "openai:gpt-5.4")
@@ -42,6 +43,9 @@ class TestDrivenDeveloper:
         self.requirement_path = requirement_path or ""
         self.app_type = app_type
         self.app_handler = app_handler
+        # Context/session root: stays on the main workspace when the agent's
+        # filesystem root is an isolated per-node worktree.
+        self.context_workspace_root = context_workspace_root
         self._last_run_tests_result: str | None = None
         self._last_run_tests_exit_code: int | None = None
         self._last_verifier_report_text = ""
@@ -87,7 +91,7 @@ class TestDrivenDeveloper:
             return path.lstrip("./")
 
         context_pipeline.configure(
-            workspace_dir=workspace_root,
+            workspace_dir=self.context_workspace_root or workspace_root,
             app_type=app_type,
         )
         static_context, dynamic_context = context_pipeline.build_agent_context_split(

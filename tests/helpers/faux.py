@@ -134,7 +134,13 @@ class FakeAppHandler:
         self._results.extend(results)
         return self
 
-    async def run_test_group(self, test_type: str, file_paths: list[str]) -> str:
+    async def run_test_group(
+        self,
+        test_type: str,
+        file_paths: list[str],
+        web_port: int | None = None,
+    ) -> str:
+        del web_port  # per-task port override; the fake records the call only
         self.calls.append((test_type, list(file_paths)))
         if not self._results:
             raise RuntimeError(

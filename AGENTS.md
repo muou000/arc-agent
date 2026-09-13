@@ -59,7 +59,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 
 - 保持节点的设计、实施、成功、失败、恢复和重试状态可互相解释。
 - `--resume` 应复用现有输出工作区和追溯产物；`--retry-failed` 与 `--retry` 只能在续跑语义下使用。
-- 共享工作区、Git 检查点和测试环境目前要求保守调度。任何并发改动都必须先解决跨节点文件、Git `add`、队列状态和运行时资源隔离问题，并配套回归测试。
+- 默认（`ARC_NODE_WORKTREES` 未开启）保持共享工作区的严格串行调度。`ARC_NODE_WORKTREES=1` 下每个任务在独立 git worktree、端口槽位和 E2E 数据库中运行，任务结束合并回主工作区；修改该模式时必须同步维护 `core/worktree.py` 的合并/冲突语义、端口槽位分配和 `_task_dependencies_met` 的顺序规则，并配套真实 git 的回归测试。
 - 修改 post-run TDD retry 时，保持 `.arc/runner-events.jsonl` 的扫描字段、去重顺序和失败上下文传递一致。
 
 ### Runtime SDK 和追溯数据

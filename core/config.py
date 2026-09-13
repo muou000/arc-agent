@@ -82,16 +82,18 @@ def get_web_port() -> int:
     return _web_port
 
 
-def get_web_base_url() -> str:
-    return f"http://localhost:{_web_port}"
+def get_web_base_url(port: int | None = None) -> str:
+    resolved = int(port) if port is not None else _web_port
+    return f"http://localhost:{resolved}"
 
 
-def build_web_runtime_env() -> dict[str, str]:
+def build_web_runtime_env(web_port: int | None = None) -> dict[str, str]:
+    resolved = int(web_port) if web_port is not None else _web_port
     return {
-        "PORT": str(_web_port),
-        "ARC_WEB_PORT": str(_web_port),
-        "BASE_URL": get_web_base_url(),
-        "VITE_API_BASE_URL": get_web_base_url(),
+        "PORT": str(resolved),
+        "ARC_WEB_PORT": str(resolved),
+        "BASE_URL": get_web_base_url(resolved),
+        "VITE_API_BASE_URL": get_web_base_url(resolved),
     }
 
 

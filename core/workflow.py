@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from agents.interface_designer import InterfaceDesigner
 from agents.test_driven_developer import TestDrivenDeveloper
@@ -20,6 +22,7 @@ from core.logging import append_debug_log, write_terminal_log
 from core.path_safety import validate_clean_target
 from core.tdd_retry import build_tdd_reprompt, scan_test_failures
 from core.visual_analysis import precompute_visual_references, visual_precompute_enabled
+from core.worktree import MergeConflictError, NodeWorktreeManager, WorktreeError, WorktreeHandle
 
 
 load_project_env()
@@ -27,6 +30,18 @@ load_project_env()
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
 QUEUE_FILENAME = "processing_queue.json"
+
+# Historical mode: every task runs against the one shared workspace in queue
+# order, because stage agents, git checkpoints (`git add .`) and test runners
+# (one web port, one E2E database) would otherwise interfere with each other.
+# With ARC_NODE_WORKTREES=1 each in-flight task instead gets its own git
+# worktree, web port slot and worktree-local E2E database, so up to
+# ARC_MAX_CONCURRENT_TASKS (capped at MAX_PARALLEL_TASKS) tasks may run at
+# once. Sibling nodes normally touch disjoint files, so their branches merge
+# back cleanly; a merge conflict fails the node with an explicit reason and
+# preserves its worktree for inspection.
+DEFAULT_MAX_CONCURRENT_TASKS = 1
+MAX_PARALLEL_TASKS = 8
 
 PHASE_DESIGN = "DESIGN"
 PHASE_IMPLEMENT = "IMPLEMENT"
@@ -44,6 +59,22 @@ NODE_PASSED = "PASSED"
 NODE_CONVERGED = "CONVERGED"
 NODE_CONVERGED_WITH_FAILED_CHILDREN = "CONVERGED_WITH_FAILED_CHILDREN"
 NODE_FAILED = "FAILED"
+
+
+def _worktrees_enabled() -> bool:
+    raw = os.environ.get("ARC_NODE_WORKTREES", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+@dataclass
+class _TaskWorkspace:
+    """An in-flight task's isolated resources (worktree mode only)."""
+
+    node_id: str
+    handle: WorktreeHandle
+    slot: int
+    web_port: int | None
+    phase_runner: WorkflowPhaseRunner
 
 
 class ARCWorkflowManager:
@@ -67,6 +98,15 @@ class ARCWorkflowManager:
         self.arc_dir = os.path.join(self.workspace_path, ".arc")
         self.queue_path = os.path.join(self.arc_dir, QUEUE_FILENAME)
         self.runtime = None
+
+        # Per-node worktree parallelism (opt-in via ARC_NODE_WORKTREES=1).
+        self._parallel_mode = _worktrees_enabled()
+        self._worktree_manager = (
+            NodeWorktreeManager(self.workspace_path) if self._parallel_mode else None
+        )
+        self._merge_lock = asyncio.Lock()
+        self._port_slots: dict[int, str] = {}
+        self._port_slot_count = 1
 
         set_web_port(self.web_port)
         self.interface_designer = InterfaceDesigner(
@@ -125,6 +165,7 @@ class ARCWorkflowManager:
                     shutil.rmtree(item_path, ignore_errors=True)
                 else:
                     os.remove(item_path)
+            self._remove_worktree_root()
             return True
         except Exception as exc:
             await self._log("Compiler", f"Failed to clean workspace: {exc}", "error")
@@ -170,6 +211,7 @@ class ARCWorkflowManager:
 
         await self._log("System", "Initializing Git repository...")
         self.runtime.git.ensure_repo(create_initial_commit=True)
+        self._prune_worktrees()
         return True
 
     async def prepare_resume_context(self) -> None:
@@ -188,6 +230,7 @@ class ARCWorkflowManager:
         )
         self.runtime.traceability.init_store(reset=False)
         self.runtime.events.mark_run_resumed("ARC compilation resumed from processing queue.")
+        self._prune_worktrees()
 
     async def start_compilation(
         self,
@@ -350,22 +393,72 @@ class ARCWorkflowManager:
             )
 
     async def _drain_runnable_tasks(self, queue_state: dict[str, Any]) -> None:
-        """Run every PENDING task in queue order, one at a time.
+        """Run every PENDING task until none is left.
 
-        The stage agents, the git checkpoints and the test runners all work on
-        one shared workspace (and one web port during IMPLEMENT), so tasks must
-        not overlap. The flat order produced by _build_processing_tasks is the
-        valid execution order: a node's DESIGN precedes its IMPLEMENT and
-        children IMPLEMENT before their parent, so taking the first PENDING
-        task each round is sufficient.
+        Without per-node worktrees the drain is the historical strictly-serial
+        loop: the stage agents, git checkpoints and test runners all share one
+        workspace and one web port. With worktrees enabled, up to
+        ARC_MAX_CONCURRENT_TASKS tasks run at once, each against its own
+        worktree, port slot and E2E database. Ordering is still honoured: a
+        node's DESIGN precedes its IMPLEMENT, and an IMPLEMENT waits for every
+        descendant node's IMPLEMENT (children before their parent); sibling
+        subtrees are independent and may overlap.
         """
 
-        while True:
-            task = self._next_runnable_task(queue_state)
-            if task is None:
-                break
-            self._begin_task(task, queue_state)
-            await self._execute_task(task, queue_state)
+        max_concurrency = self._max_concurrent_tasks()
+        if max_concurrency <= 1:
+            while True:
+                task = self._next_runnable_task(queue_state)
+                if task is None:
+                    break
+                self._begin_task(task, queue_state)
+                await self._execute_task(task, queue_state)
+            return
+
+        self._port_slot_count = max_concurrency
+        await self._log(
+            "Compiler",
+            f"Parallel drain enabled: up to {max_concurrency} task(s) in flight, "
+            f"one worktree and web port per task (base port {self.web_port}).",
+        )
+        in_flight: dict[asyncio.Task[None], dict[str, Any]] = {}
+        try:
+            while True:
+                while len(in_flight) < max_concurrency:
+                    task = self._next_runnable_task(queue_state, in_flight.values())
+                    if task is None:
+                        break
+                    self._begin_task(task, queue_state)
+                    in_flight[asyncio.create_task(self._execute_task(task, queue_state))] = task
+                if not in_flight:
+                    break
+                done, _pending = await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
+                for finished in done:
+                    in_flight.pop(finished, None)
+                    # _execute_task turns phase failures into task state, so an
+                    # exception escaping here can only be a scheduler bug.
+                    finished.result()
+                # Loop back to refill the free slots (finishing tasks may have
+                # unblocked new work); cancellation delivered at the next await
+                # propagates through the finally below.
+        finally:
+            # Cancellation or an escaping scheduler exception must not leave
+            # child tasks mutating shared queue state after the drain exits.
+            for pending in in_flight:
+                if not pending.done():
+                    pending.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
+
+    def _max_concurrent_tasks(self) -> int:
+        if not self._parallel_mode:
+            return DEFAULT_MAX_CONCURRENT_TASKS
+        raw = os.environ.get("ARC_MAX_CONCURRENT_TASKS", "").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            return 1
+        return min(max(1, value), MAX_PARALLEL_TASKS)
 
     def _begin_task(self, task: dict[str, Any], queue_state: dict[str, Any]) -> None:
         node_id = task["node_id"]
@@ -381,16 +474,46 @@ class ARCWorkflowManager:
         requirement_data = self.runtime.traceability.get_requirement(node_id) or {}
 
         await self._log("Compiler", f"Running {phase} for node {node_id}...", node_id=node_id)
-        try:
-            task_ok = await self._run_task(task)
-        except Exception as exc:
-            await self._log(
-                "Compiler",
-                f"{phase} task for node {node_id} crashed: {type(exc).__name__}: {exc}",
-                "error",
+
+        ctx: _TaskWorkspace | None = None
+        if self._parallel_mode:
+            try:
+                ctx = await self._open_task_workspace(task)
+            except Exception as exc:
+                await self._log(
+                    "Compiler",
+                    f"Failed to prepare the isolated workspace for {node_id}: "
+                    f"{type(exc).__name__}: {exc}",
+                    "error",
+                    node_id,
+                )
+
+        task_ok = False
+        if ctx is not None or not self._parallel_mode:
+            try:
+                task_ok = await self._run_task(task, ctx)
+            except Exception as exc:
+                await self._log(
+                    "Compiler",
+                    f"{phase} task for node {node_id} crashed: {type(exc).__name__}: {exc}",
+                    "error",
+                    node_id,
+                )
+                task_ok = False
+
+        merged = True
+        if ctx is not None:
+            # Commit the worktree and merge its branch back; a merge conflict
+            # fails the node even when its phase succeeded, because the work
+            # never reached the integration workspace.
+            merged, _detail = await self._integrate_task_workspace(
+                ctx,
                 node_id,
+                phase if task_ok else f"{phase}-FAILED",
+                requirement_data,
             )
-            task_ok = False
+            if task_ok and not merged:
+                task_ok = False
 
         if task_ok:
             task["status"] = TASK_COMPLETED
@@ -403,21 +526,155 @@ class ARCWorkflowManager:
             else:
                 self.runtime.events.mark_implementation_done(node_id)
                 self.runtime.events.mark_test_passed(node_id)
-            await self._commit_phase_checkpoint(node_id, phase, requirement_data)
+            if ctx is None:
+                await self._commit_phase_checkpoint(node_id, phase, requirement_data)
             await self._log("Compiler", f"{phase} completed for node {node_id}.", node_id=node_id)
-            return
-
-        task["status"] = TASK_FAILED
-        self._set_node_state(queue_state["node_states"], node_id, NODE_FAILED)
-        self._mark_remaining_node_tasks_failed(queue_state, node_id)
-        self._save_processing_queue(queue_state)
-        if phase == PHASE_DESIGN:
-            self.runtime.events.mark_design_failed(node_id)
         else:
-            self.runtime.events.mark_implementation_failed(node_id)
-            self.runtime.events.mark_test_failed(node_id)
-        await self._commit_phase_checkpoint(node_id, f"{phase}-FAILED", requirement_data)
-        await self._log("Compiler", f"{phase} failed for node {node_id}.", "error", node_id)
+            task["status"] = TASK_FAILED
+            self._set_node_state(queue_state["node_states"], node_id, NODE_FAILED)
+            self._mark_remaining_node_tasks_failed(queue_state, node_id)
+            self._save_processing_queue(queue_state)
+            if phase == PHASE_DESIGN:
+                self.runtime.events.mark_design_failed(node_id)
+            else:
+                self.runtime.events.mark_implementation_failed(node_id)
+                self.runtime.events.mark_test_failed(node_id)
+            if ctx is None:
+                await self._commit_phase_checkpoint(node_id, f"{phase}-FAILED", requirement_data)
+            await self._log("Compiler", f"{phase} failed for node {node_id}.", "error", node_id)
+
+        if ctx is not None:
+            await self._close_task_workspace(ctx, preserve=not merged)
+
+    async def _open_task_workspace(self, task: dict[str, Any]) -> _TaskWorkspace:
+        """Create the task's isolated worktree, port slot and phase runner."""
+
+        node_id = task["node_id"]
+        slot = self._acquire_port_slot(node_id)
+        try:
+            handle = await asyncio.to_thread(self._worktree_manager.prepare, node_id)
+        except Exception:
+            self._release_port_slot(slot)
+            raise
+        web_port = self._slot_port(slot)
+        runner = self._build_task_phase_runner(handle.path, web_port)
+        await self._log(
+            "Compiler",
+            f"Isolated workspace for {node_id}: {handle.path}"
+            + (f" (web port {web_port})" if web_port is not None else ""),
+            node_id=node_id,
+        )
+        return _TaskWorkspace(
+            node_id=node_id,
+            handle=handle,
+            slot=slot,
+            web_port=web_port,
+            phase_runner=runner,
+        )
+
+    def _build_task_phase_runner(self, workspace_path: str, web_port: int | None) -> WorkflowPhaseRunner:
+        """Build adapters and an app handler rooted at the task's worktree.
+
+        The adapters are per-task instances because they carry per-run state
+        (TDD budget/verifier bookkeeping) that parallel tasks must not share.
+        Traceability, node sessions and the context pipeline stay rooted in the
+        main workspace via context_workspace_root/context_workspace_path.
+        """
+
+        common = dict(
+            log_cb=self.log_cb,
+            workspace_root=workspace_path,
+            requirement_path=self.requirement_path,
+            app_type=self.app_type,
+            context_workspace_root=self.workspace_path,
+        )
+        runner = WorkflowPhaseRunner(
+            workspace_path=workspace_path,
+            requirement_path=self.requirement_path,
+            app_type=self.app_type,
+            interface_designer=InterfaceDesigner(**common),
+            test_generator=TestGenerator(**common),
+            test_driven_developer=TestDrivenDeveloper(**common),
+            log_cb=self._log,
+            web_port=web_port,
+            context_workspace_path=self.workspace_path,
+        )
+        return runner
+
+    async def _integrate_task_workspace(
+        self,
+        ctx: _TaskWorkspace,
+        node_id: str,
+        phase: str,
+        requirement_data: dict[str, Any],
+    ) -> tuple[bool, str]:
+        commit_message = build_commit_message(node_id, phase, requirement_data)
+        async with self._merge_lock:
+            try:
+                committed, detail = await asyncio.to_thread(
+                    self._worktree_manager.integrate,
+                    ctx.handle,
+                    commit_message,
+                )
+            except MergeConflictError as exc:
+                await self._log("Compiler", str(exc), "error", node_id)
+                return False, str(exc)
+            except WorktreeError as exc:
+                await self._log("Compiler", f"Integration of {node_id} failed: {exc}", "error", node_id)
+                return False, str(exc)
+        if not committed:
+            await self._log("Compiler", "No file changes detected for this checkpoint.", node_id=node_id)
+        await self._log("Compiler", f"Integrated {node_id}: {detail}.", node_id=node_id)
+        return True, detail
+
+    async def _close_task_workspace(self, ctx: _TaskWorkspace, *, preserve: bool = False) -> None:
+        try:
+            await asyncio.to_thread(self._worktree_manager.discard, ctx.handle, preserve=preserve)
+        except Exception as exc:
+            await self._log(
+                "Compiler",
+                f"Worktree cleanup for {ctx.node_id} failed: {type(exc).__name__}: {exc}",
+                "warning",
+                ctx.node_id,
+            )
+        finally:
+            self._release_port_slot(ctx.slot)
+
+    def _acquire_port_slot(self, node_id: str) -> int:
+        for slot in range(self._port_slot_count):
+            if slot not in self._port_slots:
+                self._port_slots[slot] = node_id
+                return slot
+        # The drain caps in-flight tasks at the slot count, so exhaustion can
+        # only mean a scheduler bug that leaked a slot. Fail loudly instead of
+        # silently widening the port range into unrelated services.
+        raise RuntimeError(
+            f"No free port slot for {node_id}: all {self._port_slot_count} slot(s) "
+            f"are in flight ({sorted(self._port_slots.items())})."
+        )
+
+    def _release_port_slot(self, slot: int) -> None:
+        self._port_slots.pop(slot, None)
+
+    def _slot_port(self, slot: int) -> int | None:
+        if slot < 0:
+            return None
+        return self.web_port + 1 + slot
+
+    def _prune_worktrees(self) -> None:
+        if self._worktree_manager is None:
+            return
+        try:
+            self._worktree_manager.prune()
+        except Exception:
+            # Pruning is advisory; a stale registration only makes prepare()
+            # fall back to removing the leftover directory itself.
+            pass
+
+    def _remove_worktree_root(self) -> None:
+        if self._worktree_manager is None:
+            return
+        shutil.rmtree(self._worktree_manager.worktrees_root, ignore_errors=True)
 
     async def _prepare_auto_tdd_retry(self, queue_state: dict[str, Any]) -> list[str]:
         """Queue a single TDD-first retry for every node that ended the run in FAILED.
@@ -484,12 +741,15 @@ class ARCWorkflowManager:
         expected_tasks = self._build_processing_tasks(requirement_tree)
         expected_task_ids = [task["task_id"] for task in expected_tasks]
         node_ids = self._collect_node_ids(expected_tasks)
+        descendants = self._build_descendants_map(requirement_tree)
         existing_queue = read_json_file(self.queue_path)
         if self._is_compatible_queue(existing_queue, root_id, expected_task_ids):
             queue_state = existing_queue
             queue_state.setdefault("node_states", {})
             for node_id in node_ids:
                 queue_state["node_states"].setdefault(node_id, NODE_UNSEEN)
+            # Queues saved before per-node worktree parallelism lack the map.
+            queue_state.setdefault("descendants", descendants)
             self._apply_saved_states_to_tasks(queue_state)
             return queue_state
         if require_compatible_existing_queue:
@@ -501,10 +761,30 @@ class ARCWorkflowManager:
             "root_id": root_id,
             "tasks": expected_tasks,
             "node_states": {node_id: NODE_UNSEEN for node_id in node_ids},
+            "descendants": descendants,
             "last_task_id": None,
         }
         self._apply_saved_states_to_tasks(queue_state)
         return queue_state
+
+    @staticmethod
+    def _build_descendants_map(root_node: dict[str, Any]) -> dict[str, list[str]]:
+        """Map every node id to all of its transitive child ids."""
+
+        descendants: dict[str, list[str]] = {}
+
+        def walk(node: dict[str, Any], ancestors: list[str]) -> None:
+            node_id = str(node.get("id", "")).strip()
+            if not node_id:
+                return
+            for ancestor in ancestors:
+                descendants.setdefault(ancestor, []).append(node_id)
+            for child in node.get("children", []) or []:
+                if isinstance(child, dict):
+                    walk(child, [*ancestors, node_id])
+
+        walk(root_node, [])
+        return descendants
 
     def _build_processing_tasks(self, root_node: dict[str, Any]) -> list[dict[str, Any]]:
         tasks: list[dict[str, Any]] = []
@@ -600,18 +880,61 @@ class ARCWorkflowManager:
         return recovered
 
     @staticmethod
-    def _next_runnable_task(queue_state: dict[str, Any]) -> dict[str, Any] | None:
-        """Return the first PENDING task in the queue's flat order.
+    def _next_runnable_task(
+        queue_state: dict[str, Any],
+        in_flight: Iterable[dict[str, Any]] = (),
+    ) -> dict[str, Any] | None:
+        """Return the first PENDING task the queue's ordering allows to start.
 
-        The order built by _build_processing_tasks is the valid serial
-        execution order (a node's DESIGN precedes its IMPLEMENT, children
-        IMPLEMENT before their parent), so no extra dependency guards are
-        needed while the drain is strictly serial.
+        The flat order built by _build_processing_tasks encodes: a node's
+        DESIGN precedes its IMPLEMENT, and children IMPLEMENT before their
+        parent. With parallel draining, a task may additionally never start
+        while another task for the same node is in flight, and (enforced in
+        _task_dependencies_met) an IMPLEMENT waits for its descendants.
         """
+
+        busy_nodes = {str(task.get("node_id", "")) for task in in_flight}
         for task in queue_state["tasks"]:
-            if task["status"] == TASK_PENDING:
-                return task
+            if task["status"] != TASK_PENDING:
+                continue
+            if str(task.get("node_id", "")) in busy_nodes:
+                continue
+            if not ARCWorkflowManager._task_dependencies_met(queue_state, task):
+                continue
+            return task
         return None
+
+    @staticmethod
+    def _task_dependencies_met(queue_state: dict[str, Any], task: dict[str, Any]) -> bool:
+        """Guard the ordering the queue relies on but never encoded as edges.
+
+        A node's IMPLEMENT waits for its own DESIGN and for every descendant
+        node's IMPLEMENT (children before their parent; a failed descendant
+        does not block its parent, matching the historical rule that an
+        earlier failed IMPLEMENT does not either). Sibling subtrees impose no
+        order on each other, which is what makes parallel draining sound.
+        """
+
+        if task["phase"] != PHASE_IMPLEMENT:
+            return True
+        node_id = task["node_id"]
+        for other in queue_state["tasks"]:
+            if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
+                if other["status"] != TASK_COMPLETED:
+                    return False
+                break
+        descendants = set(queue_state.get("descendants", {}).get(node_id, []))
+        if not descendants:
+            return True
+        descendant_tasks = [
+            other
+            for other in queue_state["tasks"]
+            if other["phase"] == PHASE_IMPLEMENT and other["node_id"] in descendants
+        ]
+        return all(
+            other["status"] in {TASK_COMPLETED, TASK_FAILED}
+            for other in descendant_tasks
+        )
 
     @staticmethod
     def _mark_remaining_node_tasks_failed(queue_state: dict[str, Any], node_id: str) -> None:
@@ -750,15 +1073,16 @@ class ARCWorkflowManager:
         )
         context_pipeline.cache.invalidate_db_layers(node_id)
 
-    async def _run_task(self, task: dict[str, Any]) -> bool:
+    async def _run_task(self, task: dict[str, Any], ctx: "_TaskWorkspace | None" = None) -> bool:
         node_id = task["node_id"]
         requirement_data = self.runtime.traceability.get_requirement(node_id)
         if not requirement_data:
             await self._log("System", f"Requirement node {node_id} not found in database.", "error", node_id)
             return False
+        runner = ctx.phase_runner if ctx is not None else self.phase_runner
         if task["phase"] == PHASE_DESIGN:
-            return await self.phase_runner.run_design_phase(node_id, requirement_data)
-        return await self.phase_runner.run_implement_phase(node_id, requirement_data)
+            return await runner.run_design_phase(node_id, requirement_data)
+        return await runner.run_implement_phase(node_id, requirement_data)
 
     async def _commit_phase_checkpoint(self, node_id: str, phase: str, requirement_data: dict[str, Any]) -> None:
         commit_message = build_commit_message(node_id, phase, requirement_data)

@@ -98,6 +98,12 @@ ARC_SKIP_BROWSER_INSTALL=1  # 跳过编译前检查的 Playwright 浏览器安�
 ARC_AGENT_RECURSION_LIMIT=300          # 单个阶段 agent 会话的最大步数（LangGraph recursion limit），最小 20
 ARC_VISUAL_PRECOMPUTE=1                # 编译前并发预分析需求参考图（设 0/false/no/off 关闭）
 ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
+
+# 可选：每节点 worktree 并行（默认关闭，保持严格串行）
+# 开启后每个运行中的任务在自己的 git worktree、独立 web 端口和独立 E2E 数据库中执行，
+# 阶段完成后分支合并回主工作区；合并冲突会将该节点标记为失败并保留其 worktree 供排查。
+ARC_NODE_WORKTREES=1                   # 启用每节点隔离 worktree（设 0/false/no/off 关闭）
+ARC_MAX_CONCURRENT_TASKS=3             # 同时运行的任务数（仅在 ARC_NODE_WORKTREES=1 时生效，上限 8）
 ```
 
 运行健康检查验证配置：
