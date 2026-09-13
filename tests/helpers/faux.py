@@ -34,16 +34,24 @@ def faux_text(text: str) -> AIMessage:
     return AIMessage(content=text)
 
 
-def faux_tool_call(name: str, args: dict[str, Any], *, call_id: str | None = None) -> AIMessage:
+def faux_tool_call(
+    name: str,
+    args: dict[str, Any],
+    *,
+    call_id: str | None = None,
+    response_metadata: dict[str, Any] | None = None,
+) -> AIMessage:
     """A scripted assistant turn issuing exactly one tool call."""
 
-    return faux_tool_calls((name, args, call_id))
+    return faux_tool_calls((name, args, call_id), response_metadata=response_metadata)
 
 
-def faux_tool_calls(*calls: Any) -> AIMessage:
+def faux_tool_calls(*calls: Any, response_metadata: dict[str, Any] | None = None) -> AIMessage:
     """A scripted assistant turn issuing one or more tool calls.
 
     Each entry is either ``(name, args)`` or ``(name, args, call_id)``.
+    ``response_metadata`` simulates provider metadata such as
+    ``{"finish_reason": "length"}`` for truncated-output scenarios.
     """
 
     normalized = []
@@ -51,7 +59,7 @@ def faux_tool_calls(*calls: Any) -> AIMessage:
         name, args = call[0], call[1]
         call_id = call[2] if len(call) > 2 and call[2] else f"faux-call-{index}"
         normalized.append({"name": name, "args": args, "id": call_id, "type": "tool_call"})
-    return AIMessage(content="", tool_calls=normalized)
+    return AIMessage(content="", tool_calls=normalized, response_metadata=response_metadata or {})
 
 
 class FauxChatModel(BaseChatModel):
