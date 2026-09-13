@@ -7,6 +7,8 @@ the new contract:
 * transient failures (429/408/409/5xx, connection and timeout errors) are
   retried with exponential backoff, honoring ``Retry-After`` up to the cap;
 * non-transient 4xx failures fail fast with the normalized error;
+* quota/billing exhaustion fails fast even when the provider returns it as a
+  429: the error text is deterministic, so retries would only burn backoff time;
 * retries are configurable via ``ARC_MODEL_MAX_RETRIES`` and the delay env
   vars (``0`` restores the old no-retry behaviour);
 * anything that is not a model API exception propagates unwrapped.
@@ -37,6 +39,11 @@ def _status_error(status_code: int, *, headers: dict[str, str] | None = None) ->
     if status_code == 429:
         return RateLimitError("rate limited", response=response, body=None)
     return APIStatusError(f"HTTP {status_code}", response=response, body=None)
+
+
+def _rate_limit_error(message: str, *, body: object | None = None) -> RateLimitError:
+    response = httpx.Response(429, request=_request(), headers={})
+    return RateLimitError(message, response=response, body=body)
 
 
 def _connection_error() -> APIConnectionError:
@@ -132,6 +139,51 @@ def test_is_retryable_model_api_exception(exc: Exception, retryable: bool) -> No
     assert adapter._is_retryable_model_api_exception(exc) is retryable
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        # OpenAI quota/billing exhaustion wording.
+        "You exceeded your current quota, please check your plan and billing details",
+        "Error code: 429 - {'error': {'code': 'insufficient_quota'}}",
+        # Subscription/gateway usage limits returned as 429.
+        "Monthly usage limit reached. Your plan will reset on 2026-10-01",
+        "FreeUsageLimitError: enable available balance usage to continue",
+        # Common gateway balance/budget wording.
+        "Insufficient Balance: please top up your account",
+        "Request failed: out of budget",
+        "Quota exceeded for this subscription",
+    ],
+)
+def test_quota_exhaustion_429_is_not_retryable(message: str) -> None:
+    assert adapter._is_retryable_model_api_exception(_rate_limit_error(message)) is False
+
+
+def test_quota_error_code_in_body_is_not_retryable() -> None:
+    exc = _rate_limit_error(
+        "Error code: 429",
+        body={"error": {"message": "request failed", "code": "insufficient_quota"}},
+    )
+    assert adapter._is_retryable_model_api_exception(exc) is False
+
+
+def test_quota_text_wins_over_retryable_status() -> None:
+    response = httpx.Response(503, request=_request(), headers={})
+    exc = APIStatusError("Service Unavailable: billing hard limit reached", response=response, body=None)
+    assert adapter._is_retryable_model_api_exception(exc) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Transient throttle wording must not be mistaken for quota exhaustion.
+        "Rate limit reached for gpt-4 on requests per minute (RPM): Limit 500, Used 500",
+        "Too many requests, please slow down",
+    ],
+)
+def test_transient_throttle_429_stays_retryable(message: str) -> None:
+    assert adapter._is_retryable_model_api_exception(_rate_limit_error(message)) is True
+
+
 # ---------------------------------------------------------------------------
 # Retry loop
 # ---------------------------------------------------------------------------
@@ -180,6 +232,40 @@ def test_non_retryable_401_fails_fast_without_wrapping_delay(monkeypatch: pytest
         _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
 
     assert excinfo.value.status_code == 401
+    assert call.calls == 1
+    assert sleeps == []
+
+
+def test_quota_429_fails_fast_without_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
+    sleeps: list[float] = []
+    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+
+    call = _FlakyCall(
+        [_rate_limit_error("You exceeded your current quota, please check your plan and billing details")]
+    )
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
+
+    assert excinfo.value.status_code == 429
+    assert call.calls == 1
+    assert sleeps == []
+
+
+def test_async_quota_429_fails_fast_without_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
+    sleeps: list[float] = []
+
+    async def fake_asleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(adapter, "_asleep", fake_asleep)
+
+    call = _AsyncFlakyCall([_rate_limit_error("Monthly usage limit reached")])
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        asyncio.run(_acall_model_with_retries(call, api_mode="chat_completions", model="test-model"))
+
+    assert excinfo.value.status_code == 429
     assert call.calls == 1
     assert sleeps == []
 

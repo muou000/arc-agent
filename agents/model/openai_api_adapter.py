@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -29,6 +30,26 @@ _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_RETRY_INITIAL_DELAY = 2.0
 _DEFAULT_RETRY_MAX_DELAY = 30.0
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
+
+# Quota/billing exhaustion is deterministic: retrying only burns backoff time.
+# A 429 carrying these texts is an account or subscription limit, not a
+# transient throttle, so it must fail fast instead of entering the retry loop.
+# The list mirrors pi's NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN
+# (packages/ai/src/utils/retry.ts).
+_NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = re.compile(
+    "|".join(
+        (
+            r"insufficient[ _-]?quota",
+            r"insufficient (?:credits?|funds|balance)",
+            r"out of budget",
+            r"quota exceeded",
+            r"usage.?limit",
+            r"available balance",
+            r"billing",
+        )
+    ),
+    re.IGNORECASE,
+)
 
 # ARC builds one agent per stage invocation, so ``build_openai_chat_model`` used
 # to construct a brand-new ChatOpenAI (and therefore a brand-new httpx client)
@@ -339,10 +360,33 @@ def _should_retry_model_exception(
 def _is_retryable_model_api_exception(exc: Exception) -> bool:
     if isinstance(exc, (APIConnectionError, APITimeoutError, httpx.TransportError)):
         return True
+    if _is_provider_limit_error(exc):
+        return False
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):
         return status_code in _RETRYABLE_STATUS_CODES or status_code >= 500
     return False
+
+
+def _is_provider_limit_error(exc: Exception) -> bool:
+    """Return True when the error text indicates quota/billing exhaustion."""
+    return bool(_NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.search(_provider_error_text(exc)))
+
+
+def _provider_error_text(exc: Exception) -> str:
+    """Combine the exception text with structured body fields for classification."""
+    parts = [str(exc)]
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        candidates = [error] if isinstance(error, dict) else []
+        candidates.append(body)
+        for candidate in candidates:
+            for key in ("message", "type", "code"):
+                value = candidate.get(key)
+                if value:
+                    parts.append(str(value))
+    return "\n".join(parts)
 
 
 def _compute_retry_delay(policy: _ModelRetryPolicy, failed_attempt: int, exc: Exception) -> float:
