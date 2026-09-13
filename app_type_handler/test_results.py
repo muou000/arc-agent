@@ -165,6 +165,18 @@ _ENVIRONMENT_FAILURE_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "browser launch failed",
         re.compile(r"browserType\.launch[^\r\n]*"),
     ),
+    (
+        "test worker failed to start",
+        re.compile(r"Failed to start [a-z]+ worker for test files?", re.IGNORECASE),
+    ),
+    (
+        "cjs require of esm module",
+        re.compile(r"require\(\) of ES Module[^\r\n]*"),
+    ),
+    (
+        "native module built for another node version",
+        re.compile(r"NODE_MODULE_VERSION|was compiled against a different Node\.js version", re.IGNORECASE),
+    ),
 )
 
 
