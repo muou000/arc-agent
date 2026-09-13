@@ -262,7 +262,7 @@ def test_task_workspace_failure_fails_the_node_without_running_it(
     queue_state = _queue_state(manager, _requirement_tree())
     design_task = next(t for t in queue_state["tasks"] if t["task_id"] == "RA:DESIGN")
 
-    def broken_prepare(node_id: str):
+    def broken_prepare(node_id: str, group_key: str | None = None):
         raise RuntimeError("git exploded")
 
     monkeypatch.setattr(manager._worktree_manager, "prepare", broken_prepare)
@@ -280,3 +280,125 @@ def test_task_workspace_failure_fails_the_node_without_running_it(
     assert queue_state["node_states"]["RA"] == NODE_FAILED
     assert design_task["status"] == TASK_FAILED
     assert manager._port_slots == {}
+
+
+def test_subtree_tasks_share_one_worktree_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consecutive tasks of one top-level subtree reuse one worktree directory
+    (sequential inside the subtree), while different subtrees stay isolated."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][0]["children"] = [
+        {"id": "RA1", "name": "grandchild", "description": "a1", "children": []}
+    ]
+    queue_state = _queue_state(manager, tree)
+    for task in queue_state["tasks"]:
+        if task["phase"] == PHASE_DESIGN:
+            task["status"] = TASK_COMPLETED
+
+    seen_worktrees: dict[str, str] = {}
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        if ctx is not None:
+            seen_worktrees[task["node_id"]] = ctx.handle.path
+            Path(ctx.handle.path, f"{task['node_id']}.feature.js").write_text(
+                f"feature {task['node_id']};\n", encoding="utf-8"
+            )
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert seen_worktrees["RA"] == seen_worktrees["RA1"], "same subtree, same worktree"
+    assert seen_worktrees["RA"] != seen_worktrees["RB"], "different subtrees stay isolated"
+    assert queue_state["node_states"]["RA"] == NODE_PASSED
+    assert queue_state["node_states"]["RA1"] == NODE_PASSED
+    assert queue_state["node_states"]["RB"] == NODE_PASSED
+    assert not list((Path(manager.workspace_path) / ".arc" / "worktrees").iterdir()), (
+        "reusable worktrees are cleaned up after the drain"
+    )
+
+
+def _append_to_workspace_file(workspace: Path) -> None:
+    """Commit a shared glue file so leaf appends produce a resolvable conflict."""
+    import subprocess
+
+    glue = workspace / "backend" / "glue.js"
+    glue.write_text("// registry\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(workspace), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add glue"], cwd=str(workspace), check=True, capture_output=True)
+
+
+def test_additive_resolution_with_failing_health_gate_fails_the_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Append-only conflicts are resolved mechanically, but an unhealthy
+    post-merge verification must abort the merge and fail the node."""
+    import app_type_handler.web as web
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    _append_to_workspace_file(Path(manager.workspace_path))
+    queue_state = _queue_state(manager, _requirement_tree())
+    for task in queue_state["tasks"]:
+        if task["phase"] == PHASE_DESIGN:
+            task["status"] = TASK_COMPLETED
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        if ctx is not None and task["phase"] == PHASE_IMPLEMENT:
+            with open(Path(ctx.handle.path, "backend", "glue.js"), "a", encoding="utf-8") as file:
+                file.write(f"// {task['node_id']}\n")
+        return True
+
+    async def unhealthy_probe(workspace_path: str, port: int | None = None) -> str | None:
+        return "backend unhealthy"
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    monkeypatch.setattr(web, "probe_backend_health", unhealthy_probe)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    states = queue_state["node_states"]
+    failed = [node for node in ("RA", "RB") if states[node] == NODE_FAILED]
+    passed = [node for node in ("RA", "RB") if states[node] == NODE_PASSED]
+    assert len(failed) == 1 and len(passed) == 1, f"gate must fail exactly the resolved merge: {states}"
+    glue = (Path(manager.workspace_path) / "backend" / "glue.js").read_text(encoding="utf-8")
+    assert f"// {passed[0]}\n" in glue and f"// {failed[0]}\n" not in glue, (
+        "the aborted merge must not land the resolved union"
+    )
+
+
+def test_additive_resolution_passes_gate_and_lands_union(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app_type_handler.web as web
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    _append_to_workspace_file(Path(manager.workspace_path))
+    queue_state = _queue_state(manager, _requirement_tree())
+    for task in queue_state["tasks"]:
+        if task["phase"] == PHASE_DESIGN:
+            task["status"] = TASK_COMPLETED
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        if ctx is not None and task["phase"] == PHASE_IMPLEMENT:
+            with open(Path(ctx.handle.path, "backend", "glue.js"), "a", encoding="utf-8") as file:
+                file.write(f"// {task['node_id']}\n")
+        return True
+
+    async def healthy_probe(workspace_path: str, port: int | None = None) -> str | None:
+        return None
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    monkeypatch.setattr(web, "probe_backend_health", healthy_probe)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert all(queue_state["node_states"][node] == NODE_PASSED for node in ("RA", "RB"))
+    glue = (Path(manager.workspace_path) / "backend" / "glue.js").read_text(encoding="utf-8")
+    assert "// RA\n" in glue and "// RB\n" in glue, "both appends must land"

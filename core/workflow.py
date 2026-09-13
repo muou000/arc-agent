@@ -37,8 +37,13 @@ QUEUE_FILENAME = "processing_queue.json"
 # With ARC_NODE_WORKTREES=1 each in-flight task instead gets its own git
 # worktree, web port slot and worktree-local E2E database, so up to
 # ARC_MAX_CONCURRENT_TASKS (capped at MAX_PARALLEL_TASKS) tasks may run at
-# once. Sibling nodes normally touch disjoint files, so their branches merge
-# back cleanly; a merge conflict fails the node with an explicit reason and
+# once. Tasks are scheduled with subtree affinity: consecutive tasks of one
+# top-level subtree reuse one worktree directory and run sequentially inside
+# it, so siblings never race on shared files; different subtrees drain in
+# parallel and a freed slot steals work from another free group. Cross-subtree
+# conflicts that survive (shared glue files) are resolved mechanically when
+# every side only appended lines, guarded by a backend health check before the
+# merge commit; anything else fails the node with an explicit reason and
 # preserves its worktree for inspection.
 DEFAULT_MAX_CONCURRENT_TASKS = 1
 MAX_PARALLEL_TASKS = 8
@@ -401,8 +406,11 @@ class ARCWorkflowManager:
         ARC_MAX_CONCURRENT_TASKS tasks run at once, each against its own
         worktree, port slot and E2E database. Ordering is still honoured: a
         node's DESIGN precedes its IMPLEMENT, and an IMPLEMENT waits for every
-        descendant node's IMPLEMENT (children before their parent); sibling
-        subtrees are independent and may overlap.
+        descendant node's IMPLEMENT (children before their parent). Tasks are
+        picked with subtree affinity (one in-flight task per top-level
+        subtree, longest-remaining group first), so a subtree's tasks stay
+        sequential inside their shared worktree while different subtrees
+        overlap.
         """
 
         max_concurrency = self._max_concurrent_tasks()
@@ -425,7 +433,7 @@ class ARCWorkflowManager:
         try:
             while True:
                 while len(in_flight) < max_concurrency:
-                    task = self._next_runnable_task(queue_state, in_flight.values())
+                    task = self._next_affinity_task(queue_state, in_flight.values())
                     if task is None:
                         break
                     self._begin_task(task, queue_state)
@@ -449,6 +457,76 @@ class ARCWorkflowManager:
                     pending.cancel()
             if in_flight:
                 await asyncio.gather(*in_flight, return_exceptions=True)
+        # Normal completion only (cancellation re-raises through the finally):
+        # the reusable subtree worktrees are no longer needed this run.
+        await self._cleanup_reusable_worktrees()
+
+    @staticmethod
+    def _next_affinity_task(
+        queue_state: dict[str, Any],
+        in_flight: Iterable[dict[str, Any]] = (),
+    ) -> dict[str, Any] | None:
+        """Pick the next runnable task honouring subtree affinity.
+
+        Tasks group by their top-level requirement ancestor, and each group
+        owns one reusable worktree, so at most one task per group may run at
+        once. A freed slot prefers the free group with the most pending work
+        (longest-remaining first); when a group runs dry the slot steals work
+        from another free group. Without an affinity map (queues saved before
+        subtree affinity) every node is its own group and the pick degenerates
+        to the historical flat order.
+        """
+
+        affinity = queue_state.get("affinity") or {}
+        in_flight_tasks = list(in_flight)
+        busy_nodes = {str(task.get("node_id", "")) for task in in_flight_tasks}
+        busy_groups = {affinity.get(node, node) for node in busy_nodes}
+
+        pending_weight: dict[str, int] = {}
+        for other in queue_state["tasks"]:
+            if other["status"] != TASK_PENDING:
+                continue
+            node_id = str(other.get("node_id", ""))
+            if node_id in busy_nodes:
+                continue
+            group = str(affinity.get(node_id, node_id))
+            pending_weight[group] = pending_weight.get(group, 0) + 1
+
+        best_task: dict[str, Any] | None = None
+        best_weight = -1
+        for task in queue_state["tasks"]:
+            if task["status"] != TASK_PENDING:
+                continue
+            node_id = str(task.get("node_id", ""))
+            if node_id in busy_nodes:
+                continue
+            group = str(affinity.get(node_id, node_id))
+            if group in busy_groups:
+                continue
+            if not ARCWorkflowManager._task_dependencies_met(queue_state, task):
+                continue
+            weight = pending_weight.get(group, 0)
+            if weight > best_weight:
+                best_task, best_weight = task, weight
+        return best_task
+
+    async def _cleanup_reusable_worktrees(self) -> None:
+        if self._worktree_manager is None:
+            return
+        try:
+            removed = await asyncio.to_thread(self._worktree_manager.cleanup_reusable_worktrees)
+        except Exception as exc:
+            await self._log(
+                "Compiler",
+                f"Reusable worktree cleanup failed: {type(exc).__name__}: {exc}",
+                "warning",
+            )
+            return
+        if removed:
+            await self._log(
+                "Compiler",
+                f"Removed {len(removed)} reusable worktree(s) after the drain.",
+            )
 
     def _max_concurrent_tasks(self) -> int:
         if not self._parallel_mode:
@@ -478,7 +556,7 @@ class ARCWorkflowManager:
         ctx: _TaskWorkspace | None = None
         if self._parallel_mode:
             try:
-                ctx = await self._open_task_workspace(task)
+                ctx = await self._open_task_workspace(task, queue_state)
             except Exception as exc:
                 await self._log(
                     "Compiler",
@@ -546,13 +624,20 @@ class ARCWorkflowManager:
         if ctx is not None:
             await self._close_task_workspace(ctx, preserve=not merged)
 
-    async def _open_task_workspace(self, task: dict[str, Any]) -> _TaskWorkspace:
-        """Create the task's isolated worktree, port slot and phase runner."""
+    async def _open_task_workspace(self, task: dict[str, Any], queue_state: dict[str, Any]) -> _TaskWorkspace:
+        """Create the task's isolated worktree, port slot and phase runner.
+
+        The worktree directory is keyed by the task's top-level subtree
+        (affinity group) so consecutive tasks of one subtree reuse it;
+        ``prepare`` falls back to a node-keyed directory when the group
+        directory is dirty or quarantined.
+        """
 
         node_id = task["node_id"]
         slot = self._acquire_port_slot(node_id)
         try:
-            handle = await asyncio.to_thread(self._worktree_manager.prepare, node_id)
+            group_key = self._task_affinity(node_id, queue_state)
+            handle = await asyncio.to_thread(self._worktree_manager.prepare, node_id, group_key)
         except Exception:
             self._release_port_slot(slot)
             raise
@@ -609,12 +694,14 @@ class ARCWorkflowManager:
         requirement_data: dict[str, Any],
     ) -> tuple[bool, str]:
         commit_message = build_commit_message(node_id, phase, requirement_data)
+        verify = self._build_merge_health_gate() if self.app_type == "web" else None
         async with self._merge_lock:
             try:
                 committed, detail = await asyncio.to_thread(
                     self._worktree_manager.integrate,
                     ctx.handle,
                     commit_message,
+                    verify=verify,
                 )
             except MergeConflictError as exc:
                 await self._log("Compiler", str(exc), "error", node_id)
@@ -627,9 +714,38 @@ class ARCWorkflowManager:
         await self._log("Compiler", f"Integrated {node_id}: {detail}.", node_id=node_id)
         return True, detail
 
+    def _build_merge_health_gate(self) -> Callable[[], str | None]:
+        """Build the sync verification callback for additively resolved merges.
+
+        The callback runs inside the merge (worker thread) while the resolved
+        tree is staged but not yet committed, so a failed probe aborts the
+        merge without ever landing a broken registration on the integration
+        branch. It boots the merged workspace's backend on a throwaway port
+        and checks ``/api/health``.
+        """
+
+        def verify() -> str | None:
+            import socket
+
+            from app_type_handler.web import probe_backend_health
+
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                probe_port = int(sock.getsockname()[1])
+            return asyncio.run(probe_backend_health(self.workspace_path, probe_port))
+
+        return verify
+
     async def _close_task_workspace(self, ctx: _TaskWorkspace, *, preserve: bool = False) -> None:
         try:
-            await asyncio.to_thread(self._worktree_manager.discard, ctx.handle, preserve=preserve)
+            # Reusable (subtree) worktrees always survive their task: the next
+            # task of the subtree reuses the directory, and the end-of-drain
+            # cleanup removes it once the run no longer needs it.
+            await asyncio.to_thread(
+                self._worktree_manager.discard,
+                ctx.handle,
+                preserve=preserve or ctx.handle.reusable,
+            )
         except Exception as exc:
             await self._log(
                 "Compiler",
@@ -742,6 +858,7 @@ class ARCWorkflowManager:
         expected_task_ids = [task["task_id"] for task in expected_tasks]
         node_ids = self._collect_node_ids(expected_tasks)
         descendants = self._build_descendants_map(requirement_tree)
+        affinity = self._build_affinity_map(requirement_tree)
         existing_queue = read_json_file(self.queue_path)
         if self._is_compatible_queue(existing_queue, root_id, expected_task_ids):
             queue_state = existing_queue
@@ -750,6 +867,7 @@ class ARCWorkflowManager:
                 queue_state["node_states"].setdefault(node_id, NODE_UNSEEN)
             # Queues saved before per-node worktree parallelism lack the map.
             queue_state.setdefault("descendants", descendants)
+            queue_state.setdefault("affinity", affinity)
             self._apply_saved_states_to_tasks(queue_state)
             return queue_state
         if require_compatible_existing_queue:
@@ -762,6 +880,7 @@ class ARCWorkflowManager:
             "tasks": expected_tasks,
             "node_states": {node_id: NODE_UNSEEN for node_id in node_ids},
             "descendants": descendants,
+            "affinity": affinity,
             "last_task_id": None,
         }
         self._apply_saved_states_to_tasks(queue_state)
@@ -785,6 +904,42 @@ class ARCWorkflowManager:
 
         walk(root_node, [])
         return descendants
+
+    @staticmethod
+    def _build_affinity_map(root_node: dict[str, Any]) -> dict[str, str]:
+        """Map every node id to the top-level subtree it belongs to.
+
+        Tasks of one subtree run sequentially in the subtree's reusable
+        worktree, so a parent's and its children's design phases never race on
+        shared skeleton files; different subtrees drain in parallel. The root
+        itself forms its own group.
+        """
+
+        affinity: dict[str, str] = {}
+        root_id = str(root_node.get("id", "")).strip()
+        if root_id:
+            affinity[root_id] = root_id
+
+        def walk(node: dict[str, Any], group: str) -> None:
+            node_id = str(node.get("id", "")).strip()
+            if not node_id:
+                return
+            affinity[node_id] = group
+            for child in node.get("children", []) or []:
+                if isinstance(child, dict):
+                    walk(child, group)
+
+        for child in root_node.get("children", []) or []:
+            if isinstance(child, dict):
+                child_id = str(child.get("id", "")).strip()
+                if child_id:
+                    walk(child, child_id)
+        return affinity
+
+    @staticmethod
+    def _task_affinity(node_id: str, queue_state: dict[str, Any]) -> str:
+        affinity = queue_state.get("affinity") or {}
+        return str(affinity.get(node_id, node_id))
 
     def _build_processing_tasks(self, root_node: dict[str, Any]) -> list[dict[str, Any]]:
         tasks: list[dict[str, Any]] = []
