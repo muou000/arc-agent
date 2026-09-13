@@ -3,6 +3,7 @@ import os
 import json
 import sys
 import asyncio
+import shutil
 import subprocess
 import signal
 import hashlib
@@ -28,6 +29,20 @@ NPM_INSTALL_TIMEOUT_SECONDS = 900.0
 # the full budget before trying the fallback wastes minutes on every install.
 NPM_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 240.0
 LEGACY_PEER_DEPS_FLAG = "--legacy-peer-deps"
+
+# Node release lines where unflagged require(esm) is available (the template's
+# jsdom dependency chain needs it). Line 21 never received the backport.
+_REQUIRE_ESM_MINIMUMS = ((20, 19), (22, 12), (23, 2))
+
+
+def _node_supports_require_esm(version_text: str) -> bool:
+    match = re.match(r"v?(\d+)\.(\d+)(?:\.(\d+))?", str(version_text or "").strip())
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2))
+    if major > 23:
+        return True
+    return any(major == line_major and minor >= line_minor for line_major, line_minor in _REQUIRE_ESM_MINIMUMS)
 # Generous because a cold machine downloads ~150 MB of browser binaries. Once
 # the machine-wide Playwright cache is warm the command exits in seconds.
 PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
@@ -980,6 +995,46 @@ class WebAppType(AppTypeHandler):
         return ["node", "npm"]
 
     @classmethod
+    async def check_runtime_versions(cls, log_cb=None) -> bool:
+        """Reject Node runtimes that cannot run the template's test stack.
+
+        The frontend test tree (jsdom 27 -> html-encoding-sniffer 6 ->
+        ESM-only @exodus/bytes) needs unflagged ``require(esm)``. On older
+        runtimes (observed on Node 22.11) every vitest forks worker crashes at
+        startup, which no code edit can fix - without this gate the failure is
+        discovered per node and burns the entire TDD budget of every leaf.
+        """
+
+        async def log_error(message: str) -> None:
+            if log_cb is not None:
+                await _emit_log(log_cb, "System", message, "error")
+
+        try:
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                ["node", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            await log_error(
+                f"Node.js version check failed ({exc}); the web template requires "
+                "Node >= 22.12 (or >= 20.19 / >= 23.2)."
+            )
+            return False
+
+        version_text = (completed.stdout or "").strip()
+        if _node_supports_require_esm(version_text):
+            return True
+        await log_error(
+            f"Node.js {version_text or '<unknown>'} does not support unflagged require(esm); "
+            "the web template requires Node >= 22.12 (or >= 20.19 / >= 23.2). "
+            "Upgrade Node.js before compiling."
+        )
+        return False
+
+    @classmethod
     def runtime_contract_lines(
         cls,
         *,
@@ -1052,6 +1107,52 @@ class WebAppType(AppTypeHandler):
             )
         return None
 
+    async def _copy_requirement_assets(self) -> None:
+        """Copy requirement-provided image assets into the served frontend.
+
+        Requirements reference images such as ``assets/logo.png`` in their
+        descriptions and agents render those paths into components. Without a
+        copy step the agent fabricates binary files with ``write_file``
+        (observed: 0-byte PNGs on the 12306 benchmark) and every image-bearing
+        acceptance check fails. Assets are static inputs, so a plain copy into
+        Vite's public directory is enough; subdirectories are mirrored by
+        relative path, existing files are never overwritten, and a missing or
+        unreadable assets directory is not fatal.
+        """
+
+        if not self.requirement_path:
+            return
+        requirements_dir = Path(self.requirement_path).expanduser().resolve().parent
+        assets_dir = requirements_dir / "assets"
+        if not assets_dir.is_dir():
+            return
+        public_assets = Path(self.workspace_path) / "frontend" / "public" / "assets"
+        copied = 0
+        try:
+            public_assets.mkdir(parents=True, exist_ok=True)
+            for item in sorted(assets_dir.rglob("*")):
+                if not item.is_file():
+                    continue
+                target = public_assets / item.relative_to(assets_dir)
+                if target.exists():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(shutil.copy2, item, target)
+                copied += 1
+        except OSError as exc:
+            await self._log(
+                "System",
+                f"Failed to copy requirement assets from {assets_dir}: {exc}",
+                "warning",
+                None,
+            )
+            return
+        if copied:
+            await self._log(
+                "System",
+                f"Copied {copied} requirement asset(s) into frontend/public/assets.",
+            )
+
     async def post_template_setup(self) -> bool:
         """Assert the scaffolded runtime files resolve the web port from the environment.
 
@@ -1065,6 +1166,7 @@ class WebAppType(AppTypeHandler):
         silent no-op into a gate.
         """
 
+        await self._copy_requirement_assets()
         port_contract = (
             ("backend/src/index.js", "process.env.PORT"),
             ("frontend/vite.config.js", "process.env.ARC_WEB_PORT"),
@@ -1106,17 +1208,26 @@ class WebAppType(AppTypeHandler):
             ("backend", os.path.join(self.workspace_path, "backend")),
             ("frontend", os.path.join(self.workspace_path, "frontend")),
         )
-        all_ok = True
-        for label, target_path in targets:
-            if not os.path.exists(target_path):
-                continue
+        installable = [
+            (label, target_path)
+            for label, target_path in targets
+            if os.path.exists(target_path)
+        ]
+        if not installable:
+            return True
+
+        # The two installs write disjoint trees (separate package.json /
+        # node_modules), so their npm processes run concurrently; a serial
+        # drain pays the slower package resolution twice on cold caches.
+        for label, _target_path in installable:
             await self._log(
                 "System",
                 f"Installing {label} dependencies. This might take a moment...",
             )
-            if not await run_npm_install(target_path, self.log_cb):
-                all_ok = False
-        return all_ok
+        results = await asyncio.gather(
+            *(run_npm_install(target_path, self.log_cb) for _label, target_path in installable)
+        )
+        return all(results)
 
     async def verify_workspace(self) -> bool:
         """Fail fast when the scaffolded workspace cannot build or cannot run E2E.

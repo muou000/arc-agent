@@ -11,10 +11,20 @@ from pydantic import BaseModel
 
 from agents.runtime.contracts import AgentRuntimeContext
 from core.logging import format_json_for_log, log_to_logger
+from langgraph.errors import GraphRecursionError
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
-DEFAULT_RECURSION_LIMIT = 5000
+
+# Empirical ceiling for one stage-agent session (one ``ainvoke`` call). Healthy
+# sessions on the 12306 benchmark stay under ~150 graph steps; a runaway repair
+# loop (the model re-editing a file it just corrupted) blew past 450 steps and
+# kept going under the previous limit of 5000, burning ~20 minutes of model
+# calls on one node. When the limit trips, LangGraph raises GraphRecursionError;
+# the workflow marks the node failed and the queue moves on, so the node stays
+# recoverable via ``--resume``/``--retry``.
+DEFAULT_RECURSION_LIMIT = 300
+_MIN_RECURSION_LIMIT = 20
 
 
 async def ainvoke_stage_agent(
@@ -65,11 +75,18 @@ async def ainvoke_stage_agent(
             )
             return stream_payload
 
-    result = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": message}]},
-        context=context,
-        config=build_agent_config(thread_id),
-    )
+    config = build_agent_config(thread_id)
+    try:
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": message}]},
+            context=context,
+            config=config,
+        )
+    except GraphRecursionError as exc:
+        raise GraphRecursionError(
+            f"stage agent session hit its step budget (recursion_limit={config['recursion_limit']}). "
+            "If this node legitimately needs more steps, raise ARC_AGENT_RECURSION_LIMIT for the run."
+        ) from exc
     await _log_completed_tool_batches(log_cb, result, label=run_label, node_id=context.node_id)
     await _log_agent_trace(log_cb, result, label=run_label, thread_id=thread_id, node_id=context.node_id)
     payload = extract_payload(result)
@@ -228,6 +245,10 @@ async def _try_astream_stage_agent(
             )
             if isinstance(maybe_state, dict):
                 final_state = maybe_state
+    except GraphRecursionError:
+        # The step budget is exhausted; a full ainvoke retry would burn the
+        # same budget again on a fresh session. Let the failure propagate.
+        raise
     except Exception as exc:
         await _emit_log(
             log_cb,
@@ -326,6 +347,10 @@ def _try_stream_stage_agent_sync(
             return None
         _log_agent_trace_sync(log_cb, final_state, label=run_label, thread_id=thread_id, node_id=context.node_id)
         return extract_payload(final_state)
+    except GraphRecursionError:
+        # Same as the async stream path: a budget exhaustion must not trigger
+        # a full ainvoke retry on a fresh session.
+        raise
     except Exception as exc:
         _emit_log_sync(
             log_cb,
@@ -750,10 +775,21 @@ def _should_use_sync_stream_v3() -> bool:
     return False
 
 
+def _resolve_recursion_limit() -> int:
+    raw = os.environ.get("ARC_AGENT_RECURSION_LIMIT", "").strip()
+    if not raw:
+        return DEFAULT_RECURSION_LIMIT
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_RECURSION_LIMIT
+    return max(_MIN_RECURSION_LIMIT, value)
+
+
 def build_agent_config(thread_id: str) -> dict[str, Any]:
     return {
         "configurable": {"thread_id": thread_id},
-        "recursion_limit": DEFAULT_RECURSION_LIMIT,
+        "recursion_limit": _resolve_recursion_limit(),
     }
 
 

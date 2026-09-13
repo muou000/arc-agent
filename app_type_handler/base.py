@@ -96,6 +96,16 @@ class AppTypeHandler(ABC):
         """
         return True
 
+    @classmethod
+    async def check_runtime_versions(cls, log_cb=None) -> bool:
+        """Validate tool versions after the PATH existence check passes.
+
+        A tool can be on PATH yet too old to run the template's stack; the
+        default accepts everything and app types with version-sensitive
+        runtimes override this.
+        """
+        return True
+
     async def check_prerequisites(self) -> bool:
         from core.processes import check_prerequisites
 

@@ -65,6 +65,25 @@ from app_type_handler.test_results import classify_test_failure
             "║ Please run the following command to download new browsers:              ║",
             "browser binaries not installed",
         ),
+        # Test runner crashes that no code edit can fix (observed on the 12306
+        # benchmark with Node 22.11: jsdom's dependency tree requires require(esm)).
+        (
+            "Error: [vitest-pool]: Failed to start forks worker for test files "
+            "D:/ws/frontend/tests/data/REQ-1.1.homeContent.spec.ts.",
+            "test worker failed to start",
+        ),
+        (
+            "Caused by: Error: require() of ES Module "
+            "D:/ws/frontend/node_modules/@exodus/bytes/encoding-lite.js from "
+            "D:/ws/frontend/node_modules/html-encoding-sniffer/lib/html-encoding-sniffer.js "
+            "not supported.",
+            "cjs require of esm module",
+        ),
+        (
+            "Error: The module '//sqlite3' was compiled against a different "
+            "Node.js version using NODE_MODULE_VERSION 127.",
+            "native module built for another node version",
+        ),
     ],
 )
 def test_environment_failures_are_detected(output: str, expected_reason: str) -> None:

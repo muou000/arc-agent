@@ -67,6 +67,13 @@ def reset_visual_client_cache_for_tests() -> None:
         _VISUAL_CLIENT_CACHE.clear()
 
 
+# Guards the persist tail of analyze_and_attach_visual_references. Concurrent
+# precompute tasks each load a full copy of the cache file before their vision
+# calls, so the section must not interleave with itself; it is sync-only, so a
+# plain lock works on the event loop and also covers thread-based callers.
+_PERSIST_LOCK = threading.Lock()
+
+
 def build_visual_analysis_prompt() -> str:
     return """
 **ROLE:** You extract frontend style requirements from an input UI image.
@@ -126,6 +133,87 @@ For each data-bearing area:
 """
 
 
+def visual_precompute_enabled() -> bool:
+    raw = os.environ.get("ARC_VISUAL_PRECOMPUTE", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _precompute_concurrency() -> int:
+    raw = os.environ.get("ARC_VISUAL_PRECOMPUTE_CONCURRENCY", "").strip()
+    if raw.isdigit() and int(raw) >= 1:
+        return int(raw)
+    return 4
+
+
+async def precompute_visual_references(
+    *,
+    workspace_path: str,
+    requirements_dir: str,
+    requirement_nodes: list[tuple[str, dict[str, Any]]],
+    log_cb: LogCallback | None = None,
+) -> int:
+    """Analyze every still-unanalyzed reference image up front, in parallel.
+
+    DESIGN analyzed each node's reference image serially when the node's turn
+    came (~1.5-2.5 minutes per image; 34 image nodes on the 12306 benchmark
+    meant roughly an hour of blocking inside otherwise idle queue time). The
+    analysis is persisted per requirement and cached per image, so running the
+    same pass concurrently before the queue drains turns every later design
+    phase into a cache hit.
+
+    Failures are logged per node and never abort the pass; the affected node
+    simply retries analysis during its own DESIGN phase, exactly as it would
+    have without precompute.
+
+    Returns the number of nodes whose images were analyzed.
+    """
+
+    pending: list[tuple[str, dict[str, Any]]] = []
+    for req_id, requirement_data in requirement_nodes:
+        candidates = _collect_visual_candidates(requirement_data)
+        if any(not str(item.get("analysis") or "").strip() for item in candidates):
+            pending.append((req_id, requirement_data))
+    if not pending:
+        return 0
+
+    await _log(
+        log_cb,
+        "System",
+        f"Precomputing visual references for {len(pending)} node(s) "
+        f"with up to {_precompute_concurrency()} concurrent analysis call(s)...",
+    )
+    semaphore = asyncio.Semaphore(_precompute_concurrency())
+
+    async def run_one(req_id: str, requirement_data: dict[str, Any]) -> None:
+        async with semaphore:
+            await analyze_and_attach_visual_references(
+                workspace_path=workspace_path,
+                requirements_dir=requirements_dir,
+                requirement_data=requirement_data,
+                log_cb=log_cb,
+            )
+
+    results = await asyncio.gather(
+        *(run_one(req_id, data) for req_id, data in pending),
+        return_exceptions=True,
+    )
+    analyzed = 0
+    for (req_id, _data), result in zip(pending, results):
+        if isinstance(result, BaseException):
+            await _log(
+                log_cb,
+                "System",
+                f"Precompute visual analysis failed for {req_id}: "
+                f"{type(result).__name__}: {result}. The node will retry "
+                "analysis during its DESIGN phase.",
+                "error",
+                req_id,
+            )
+            continue
+        analyzed += 1
+    return analyzed
+
+
 async def analyze_and_attach_visual_references(
     *,
     workspace_path: str,
@@ -181,12 +269,21 @@ async def analyze_and_attach_visual_references(
 
     cache_updated = await _analyze_pending_images(pending, cache, visual_references, req_id, log_cb)
 
-    if cache_updated:
-        _save_visual_cache(workspace_path, cache)
-
     stored_references = [payload for payload in visual_references if payload is not None]
+    if cache_updated or stored_references:
+        with _PERSIST_LOCK:
+            if cache_updated:
+                # Merge over the on-disk cache instead of writing this task's
+                # stale full view: concurrent tasks loaded the file before
+                # their vision calls, so a plain save would drop the entries
+                # their siblings saved in the meantime.
+                merged_cache = _load_visual_cache(workspace_path)
+                merged_cache.update(cache)
+                _save_visual_cache(workspace_path, merged_cache)
+            if stored_references:
+                get_runtime().traceability.update_requirement_fields(req_id, visual_reference=stored_references)
+
     if stored_references:
-        get_runtime().traceability.update_requirement_fields(req_id, visual_reference=stored_references)
         requirement_data["visual_reference"] = stored_references
         await _log(log_cb, "System", f"Stored {len(stored_references)} visual references for {req_id}", None, req_id)
 

@@ -19,6 +19,7 @@ from core.files import load_requirements, read_json_file, validate_requirement_t
 from core.logging import append_debug_log, write_terminal_log
 from core.path_safety import validate_clean_target
 from core.tdd_retry import build_tdd_reprompt, scan_test_failures
+from core.visual_analysis import precompute_visual_references, visual_precompute_enabled
 
 
 load_project_env()
@@ -293,6 +294,8 @@ class ARCWorkflowManager:
             f"Loaded processing queue with {len(queue_state['tasks'])} task(s) for root node {root_id}.",
         )
 
+        await self._precompute_visual_references(requirement_tree)
+
         await self._drain_runnable_tasks(queue_state)
 
         # Post-run auto TDD re-prompt: after a full pass over the queue, scan the
@@ -307,6 +310,44 @@ class ARCWorkflowManager:
                 await self._drain_runnable_tasks(queue_state)
 
         return self._build_compile_result(queue_state)
+
+    async def _precompute_visual_references(self, requirement_tree: dict[str, Any]) -> None:
+        """Analyze all reference images concurrently before the queue drains.
+
+        Each image-bearing node otherwise blocks its DESIGN phase on a serial
+        vision call; the persisted analysis makes this pass a cache hit for
+        every later design phase. On ``--resume`` persisted analysis is reused
+        directly, and images lacking it are re-attached from the per-image
+        cache without another vision API call.
+        """
+
+        if not visual_precompute_enabled() or self.runtime is None:
+            return
+        nodes: list[tuple[str, dict[str, Any]]] = []
+
+        def walk(node: dict[str, Any]) -> None:
+            node_id = str(node.get("id") or "").strip()
+            if node_id:
+                nodes.append((node_id, self.runtime.traceability.get_requirement(node_id) or node))
+            for child in node.get("children", []) or []:
+                if isinstance(child, dict):
+                    walk(child)
+
+        walk(requirement_tree)
+        if not nodes:
+            return
+        requirements_dir = str(Path(self.requirement_path).expanduser().resolve().parent)
+        count = await precompute_visual_references(
+            workspace_path=self.workspace_path,
+            requirements_dir=requirements_dir,
+            requirement_nodes=nodes,
+            log_cb=self._log,
+        )
+        if count:
+            await self._log(
+                "Compiler",
+                f"Visual precompute finished; {count} node(s) analyzed before the node loop.",
+            )
 
     async def _drain_runnable_tasks(self, queue_state: dict[str, Any]) -> None:
         """Run every PENDING task in queue order, one at a time.
