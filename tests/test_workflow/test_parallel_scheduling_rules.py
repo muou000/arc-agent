@@ -183,6 +183,28 @@ def test_max_concurrent_tasks_clamps_and_defaults(monkeypatch) -> None:
     assert serial._max_concurrent_tasks() == 1, "no worktrees, no concurrency"
 
 
+def test_port_slot_exhaustion_fails_loudly(tmp_path, monkeypatch) -> None:
+    """A leaked slot is a scheduler bug: it must raise, not widen the port
+    range into unrelated services (PR #8 review)."""
+    import pytest
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "1")
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_path),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *a, **k: None,
+    )
+    manager._port_slot_count = 1
+    assert manager._acquire_port_slot("RA") == 0
+
+    with pytest.raises(RuntimeError, match="No free port slot"):
+        manager._acquire_port_slot("RB")
+    # The failed acquisition must not mutate the slot table.
+    assert manager._port_slots == {0: "RA"}
+
+
 # ----------------------------------------------------------------------
 # per-task port threading through the web test path
 # ----------------------------------------------------------------------

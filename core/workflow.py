@@ -432,12 +432,15 @@ class ARCWorkflowManager:
                     in_flight[asyncio.create_task(self._execute_task(task, queue_state))] = task
                 if not in_flight:
                     break
-                await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
-                for finished in [pending for pending in in_flight if pending.done()]:
+                done, _pending = await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
+                for finished in done:
                     in_flight.pop(finished, None)
                     # _execute_task turns phase failures into task state, so an
                     # exception escaping here can only be a scheduler bug.
                     finished.result()
+                # Loop back to refill the free slots (finishing tasks may have
+                # unblocked new work); cancellation delivered at the next await
+                # propagates through the finally below.
         finally:
             # Cancellation or an escaping scheduler exception must not leave
             # child tasks mutating shared queue state after the drain exits.
@@ -642,9 +645,13 @@ class ARCWorkflowManager:
             if slot not in self._port_slots:
                 self._port_slots[slot] = node_id
                 return slot
-        # Should not happen: the drain caps in-flight tasks at the slot count.
-        self._port_slots[max(self._port_slots, default=-1) + 1] = node_id
-        return max(self._port_slots) if self._port_slots else -1
+        # The drain caps in-flight tasks at the slot count, so exhaustion can
+        # only mean a scheduler bug that leaked a slot. Fail loudly instead of
+        # silently widening the port range into unrelated services.
+        raise RuntimeError(
+            f"No free port slot for {node_id}: all {self._port_slot_count} slot(s) "
+            f"are in flight ({sorted(self._port_slots.items())})."
+        )
 
     def _release_port_slot(self, slot: int) -> None:
         self._port_slots.pop(slot, None)
