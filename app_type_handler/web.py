@@ -4,11 +4,14 @@ import json
 import sys
 import asyncio
 import shutil
+import sqlite3
 import subprocess
 import signal
 import hashlib
 import inspect
+import urllib.request
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -985,6 +988,17 @@ async def _prepare_e2e_database(workspace_path: str, runtime_env: dict[str, str]
     return _extract_exit_code(prepare_output) == 0, prepare_output
 
 
+async def _seed_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -> tuple[bool, str]:
+    backend_path = os.path.join(workspace_path, "backend")
+    seed_output = await _execute_web_test_command(
+        "npm run db:seed",
+        cwd=backend_path,
+        timeout=60.0,
+        extra_env=runtime_env,
+    )
+    return _extract_exit_code(seed_output) == 0, seed_output
+
+
 async def _start_backend_runtime(
     workspace_path: str,
     runtime_env: dict[str, str],
@@ -1042,8 +1056,166 @@ async def _start_backend_runtime(
     return backend_process, start_command, startup_cleanup_note, instance_fingerprint
 
 
+@dataclass
+class _E2EBackendSession:
+    """A backend runtime kept alive across E2E attempts within one TDD session."""
+
+    process: asyncio.subprocess.Process
+    port: int
+    db_path: str
+    fingerprint: str
+    start_command: str
+    startup_detail: str
+    instance_fingerprint: str
+
+
+_BACKEND_FINGERPRINT_SKIPPED_DIRS = frozenset(
+    # `test-e2e` specs run in the Playwright process, never inside the express
+    # server, so spec-only edits must not force a server restart.
+    # `.arc-test-db` holds the per-suite sqlite files, not server code.
+    {"node_modules", ".arc-test-db", "dist", "dist-ssr", "coverage", ".git", "test-e2e"}
+)
+
+
+def _backend_source_fingerprint(backend_path: str) -> str | None:
+    """Content hash of the backend sources a running E2E server executes.
+
+    Mirrors `_frontend_source_fingerprint` and feeds the session-scoped E2E
+    runtime reuse decision: a live server may only be reused while the code it
+    loaded is byte-for-byte unchanged. Returns ``None`` when the backend
+    directory is missing, which makes the caller fall back to a fresh start.
+    """
+
+    root = Path(backend_path)
+    if not root.is_dir():
+        return None
+    digest = hashlib.sha256()
+    for key, value in sorted(build_web_runtime_env().items()):
+        digest.update(key.encode("utf-8"))
+        digest.update(b"=")
+        digest.update(str(value).encode("utf-8"))
+        digest.update(b"\0")
+    visited_real_dirs: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        real_dir = os.path.realpath(dirpath)
+        if real_dir in visited_real_dirs:
+            dirnames[:] = []
+            continue
+        visited_real_dirs.add(real_dir)
+        dirnames[:] = sorted(name for name in dirnames if name not in _BACKEND_FINGERPRINT_SKIPPED_DIRS)
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b"<unreadable>")
+    return digest.hexdigest()
+
+
+def _reset_sqlite_database_rows(db_path: str) -> tuple[bool, str]:
+    """Delete every row of every user table while keeping schema objects.
+
+    The file-level reset in `db:prepare:e2e` deletes the sqlite file, which
+    cannot run while the reused E2E server holds an open handle on it (an
+    unrecoverable in-use error on Windows). A row-level wipe reproduces the
+    prepared state - schema intact, zero rows, autoincrement counters reset -
+    against the same file the live server reads. Schema sources are guaranteed
+    unchanged by the backend fingerprint check that gates the reuse.
+    """
+
+    if not os.path.exists(db_path):
+        return False, f"E2E database file is missing: {db_path}"
+    try:
+        connection = sqlite3.connect(db_path, timeout=5.0)
+    except sqlite3.Error as exc:
+        return False, str(exc)
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF;")
+        table_names = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        ]
+        if not table_names:
+            return False, "E2E database has no user tables; the schema was never initialized."
+        for name in table_names:
+            connection.execute('DELETE FROM "' + name.replace('"', '""') + '"')
+        has_sequence = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+        ).fetchone()
+        if has_sequence is not None:
+            connection.execute("DELETE FROM sqlite_sequence")
+        connection.commit()
+        return True, "Cleared rows of: " + ", ".join(table_names)
+    except sqlite3.Error as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        connection.close()
+
+
+async def probe_backend_health(workspace_path: str, port: int | None = None) -> str | None:
+    """Boot the workspace's backend and check its health endpoint.
+
+    Used as the merge gate after an additively resolved worktree merge: the
+    mechanical resolution can produce syntactically valid but semantically
+    broken registrations (duplicate identifiers, double route mounts), and the
+    cheapest full check is "the integrated backend boots and serves
+    ``/api/health``".
+
+    Returns ``None`` on success. Workspaces without a backend ``start``
+    command have nothing to verify and also return ``None``; any other
+    failure returns a short reason string.
+    """
+
+    backend_path = os.path.join(workspace_path, "backend")
+    resolved_port = int(port) if port is not None else get_web_port()
+    if _resolve_backend_start_command(backend_path) is None:
+        return None
+
+    runtime_env = _build_e2e_runtime_env(workspace_path, ["merge-health-probe"], web_port=resolved_port)
+    process, _start_command, _cleanup_note, _fingerprint = await _start_backend_runtime(
+        workspace_path,
+        runtime_env,
+        web_port=resolved_port,
+    )
+    if process is None:
+        return "backend runtime failed to start on the merged workspace"
+
+    health_url = f"http://127.0.0.1:{resolved_port}/api/health"
+    last_error = "health endpoint did not respond"
+    try:
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(1.0)
+
+            def _request(url: str = health_url) -> int:
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    return int(response.status)
+
+            try:
+                status = await asyncio.to_thread(_request)
+                if status == 200:
+                    return None
+                last_error = f"health endpoint returned HTTP {status}"
+            except Exception as exc:
+                last_error = f"health endpoint unreachable: {type(exc).__name__}: {exc}"
+        return last_error
+    finally:
+        try:
+            await _terminate_process(process, port=resolved_port)
+        except Exception:
+            pass
+
+
 class WebAppType(AppTypeHandler):
     name = "web"
+
+    #: Session-scoped E2E backend runtime (see `_try_reuse_e2e_backend_session`).
+    #: Class-level default so every instance starts with no live session; once
+    #: a session exists the attribute is set on the instance only.
+    _e2e_runtime_session: _E2EBackendSession | None = None
 
     @classmethod
     def prerequisite_commands(cls) -> list[str]:
@@ -1454,6 +1626,11 @@ class WebAppType(AppTypeHandler):
         result_body = ""
 
         if normalized_type == "e2e":
+            # Single-file runs get their own target set and therefore their own
+            # E2E database, so they never ride the session runtime. Clear any
+            # live session first so the fresh start below cannot collide with a
+            # port the session still holds.
+            await self._terminate_e2e_session("Single-file E2E pre-start cleanup")
             e2e_runtime_env = _build_e2e_runtime_env(
                 self.workspace_path,
                 [execution.get("resolved_test_file", "")],
@@ -1533,6 +1710,78 @@ class WebAppType(AppTypeHandler):
 
         return _prepend_test_execution_header(execution, result_body)
 
+    async def _try_reuse_e2e_backend_session(
+        self,
+        e2e_runtime_env: dict[str, str],
+        resolved_port: int,
+        backend_fingerprint: str | None,
+    ) -> _E2EBackendSession | None:
+        """Return the live session runtime when this batch can run on it.
+
+        Reuse requires the previous server process to still be alive and
+        serving, and the backend sources, web port and E2E database path to be
+        identical to the ones it was started with. Any mismatch returns
+        ``None`` and the caller takes the fresh-start path.
+        """
+
+        session = self._e2e_runtime_session
+        if session is None:
+            return None
+        if session.process.returncode is not None:
+            return None
+        if session.port != resolved_port:
+            return None
+        if session.db_path != e2e_runtime_env.get("ARC_E2E_DB_PATH", ""):
+            return None
+        if backend_fingerprint is None or session.fingerprint != backend_fingerprint:
+            return None
+        if not await _wait_for_tcp_server("127.0.0.1", resolved_port, timeout=1.0):
+            return None
+        return session
+
+    async def _reset_live_e2e_database(self, e2e_runtime_env: dict[str, str]) -> tuple[bool, str]:
+        """Reset the E2E database rows while the backend runtime stays alive.
+
+        `db:prepare:e2e` recreates the database file, which cannot run against
+        a server that holds the file open. The row-level wipe plus a
+        `db:seed` re-run reproduces the prepared-and-seeded state on the same
+        file; a failure here makes the caller rebuild everything from scratch.
+        """
+
+        reset_ok, reset_output = await asyncio.to_thread(
+            _reset_sqlite_database_rows,
+            e2e_runtime_env.get("ARC_E2E_DB_PATH", ""),
+        )
+        if not reset_ok:
+            return False, f"Row-level reset of the live E2E database was not possible: {reset_output}"
+        seed_ok, seed_output = await _seed_e2e_database(self.workspace_path, e2e_runtime_env)
+        if not seed_ok:
+            return False, (
+                "Row-level reset of the live E2E database succeeded, but re-seeding "
+                f"via `npm run db:seed` did not.\n{seed_output}"
+            )
+        return True, (
+            "Reset the live E2E database at row level and re-seeded it; the backend runtime was kept alive.\n"
+            f"{reset_output}\n{seed_output}"
+        )
+
+    async def _terminate_e2e_session(self, context: str) -> str:
+        """Tear down the session-scoped E2E runtime, if one is alive."""
+
+        session = self._e2e_runtime_session
+        if session is None:
+            return ""
+        self._e2e_runtime_session = None
+        try:
+            return await _terminate_process(session.process, port=session.port)
+        except Exception as exc:
+            return f"Backend runtime cleanup failed: {exc}"
+
+    async def shutdown_e2e_runtime(self) -> None:
+        note = await self._terminate_e2e_session("E2E runtime session shutdown")
+        if note:
+            await self._log("System", f"Session-scoped E2E backend runtime shut down. {note}")
+
     async def run_test_group(self, test_type: str, file_paths: list[str], web_port: int | None = None) -> str:
         resolved_port = int(web_port) if web_port is not None else get_web_port()
         normalized_type = (test_type or "").strip().lower()
@@ -1611,41 +1860,73 @@ class WebAppType(AppTypeHandler):
             execution.get("resolved_targets", []),
             web_port=resolved_port,
         )
-        database_ready, database_prepare_output = await _prepare_e2e_database(
-            self.workspace_path,
-            e2e_runtime_env,
-        )
-        if not database_ready:
-            return _prepend_group_execution_header(
-                execution,
-                "E2E database preparation failed before backend startup.\n\n"
-                f"=== Frontend Build ===\n{frontend_build_output}\n\n"
-                f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
-                f"=== Database Prepare ===\n{database_prepare_output}",
-            )
 
         backend_process = None
         backend_start_command = ""
         backend_startup_detail = ""
         backend_instance_fingerprint = ""
         backend_cleanup_note = ""
-        body = ""
+        database_prepare_output = ""
+        reused_runtime = False
+        backend_fingerprint = _backend_source_fingerprint(os.path.join(self.workspace_path, "backend"))
         try:
-            (
-                backend_process,
-                backend_start_command,
-                backend_startup_detail,
-                backend_instance_fingerprint,
-            ) = await _start_backend_runtime(self.workspace_path, e2e_runtime_env, web_port=resolved_port)
-            if backend_process is None:
-                return _prepend_group_execution_header(
-                    execution,
-                    "Exit Code: 1\n\n"
-                    f"=== Frontend Build ===\n{frontend_build_output}\n\n"
-                    f"=== Database Prepare ===\n{database_prepare_output}\n\n"
-                    f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
-                    f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
-                    f"STDERR:\n{backend_startup_detail or 'No startup detail recorded.'}\n",
+            reused_session = await self._try_reuse_e2e_backend_session(
+                e2e_runtime_env,
+                resolved_port,
+                backend_fingerprint,
+            )
+            if reused_session is not None:
+                reset_ok, database_prepare_output = await self._reset_live_e2e_database(e2e_runtime_env)
+                if reset_ok:
+                    reused_runtime = True
+                    backend_process = reused_session.process
+                    backend_start_command = reused_session.start_command
+                    backend_startup_detail = reused_session.startup_detail
+                    backend_instance_fingerprint = reused_session.instance_fingerprint
+
+            if not reused_runtime:
+                backend_cleanup_note = await self._terminate_e2e_session("Stale E2E runtime cleanup")
+                database_ready, database_prepare_output = await _prepare_e2e_database(
+                    self.workspace_path,
+                    e2e_runtime_env,
+                )
+                if not database_ready:
+                    failure_body = (
+                        "E2E database preparation failed before backend startup.\n\n"
+                        f"=== Frontend Build ===\n{frontend_build_output}\n\n"
+                        f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
+                        f"=== Database Prepare ===\n{database_prepare_output}"
+                    )
+                    if backend_cleanup_note:
+                        failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
+                    return _prepend_group_execution_header(execution, failure_body)
+
+                (
+                    backend_process,
+                    backend_start_command,
+                    backend_startup_detail,
+                    backend_instance_fingerprint,
+                ) = await _start_backend_runtime(self.workspace_path, e2e_runtime_env, web_port=resolved_port)
+                if backend_process is None:
+                    failure_body = (
+                        "Exit Code: 1\n\n"
+                        f"=== Frontend Build ===\n{frontend_build_output}\n\n"
+                        f"=== Database Prepare ===\n{database_prepare_output}\n\n"
+                        f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
+                        f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
+                        f"STDERR:\n{backend_startup_detail or 'No startup detail recorded.'}\n"
+                    )
+                    if backend_cleanup_note:
+                        failure_body += f"\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
+                    return _prepend_group_execution_header(execution, failure_body)
+                self._e2e_runtime_session = _E2EBackendSession(
+                    process=backend_process,
+                    port=resolved_port,
+                    db_path=e2e_runtime_env.get("ARC_E2E_DB_PATH", ""),
+                    fingerprint=backend_fingerprint or "",
+                    start_command=backend_start_command,
+                    startup_detail=backend_startup_detail,
+                    instance_fingerprint=backend_instance_fingerprint,
                 )
 
             playwright_command = "npx playwright test"
@@ -1661,31 +1942,42 @@ class WebAppType(AppTypeHandler):
             playwright_exit_code = _extract_exit_code(playwright_result)
             if playwright_exit_code is None:
                 playwright_exit_code = 1
+            if reused_runtime:
+                backend_runtime_section = (
+                    "Reused the live backend runtime from an earlier E2E attempt in this TDD session "
+                    "(backend sources, port and E2E database unchanged).\n"
+                    f"Command: {backend_start_command}\n"
+                    f"Port: {resolved_port}\n\n"
+                    f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}"
+                )
+            else:
+                backend_runtime_section = (
+                    f"Command: {backend_start_command}\n"
+                    f"Port: {resolved_port}\n\n"
+                    f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}"
+                )
+            deferred_cleanup = (
+                "Deferred: the backend runtime stays alive for subsequent E2E attempts of this "
+                "session and is shut down when the node's IMPLEMENT phase finishes."
+            )
+            cleanup_section = deferred_cleanup
+            if backend_cleanup_note:
+                cleanup_section = f"Previous runtime cleanup: {backend_cleanup_note}\n{deferred_cleanup}"
             body = (
                 f"Exit Code: {playwright_exit_code}\n\n"
                 f"=== Frontend Build ===\n{frontend_build_output}\n\n"
                 f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n"
                 f"DB Label: {e2e_runtime_env.get('ARC_E2E_DB_LABEL', 'unknown')}\n\n"
                 f"=== Database Prepare ===\n{database_prepare_output}\n\n"
-                f"=== Backend Runtime ===\nCommand: {backend_start_command}\n"
-                f"Port: {resolved_port}\n\n"
-                f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}\n\n"
+                f"=== Backend Runtime ===\n{backend_runtime_section}\n\n"
                 f"=== Backend Instance Fingerprint ===\n{backend_instance_fingerprint or 'No backend instance fingerprint recorded.'}\n\n"
-                f"{playwright_result}"
+                f"{playwright_result}\n\n"
+                f"=== Backend Runtime Cleanup ===\n{cleanup_section}"
             )
         except Exception as exc:
             return f"Failed to start grouped E2E execution: {str(exc)}"
-        finally:
-            try:
-                backend_cleanup_note = await _terminate_process(backend_process, port=resolved_port)
-            except Exception as cleanup_exc:
-                backend_cleanup_note = f"Backend runtime cleanup failed: {cleanup_exc}"
 
-        body = (
-            f"{body}\n\n"
-            f"=== Backend Runtime Cleanup ===\n{backend_cleanup_note or 'No cleanup note recorded.'}"
-        )
-        if "Backend runtime cleanup failed:" in backend_cleanup_note and "Exit Code: 0" in body:
+        if "Backend runtime cleanup failed:" in body and "Exit Code: 0" in body:
             body = body.replace("Exit Code: 0", "Exit Code: 1", 1)
         return _prepend_group_execution_header(execution, body)
 

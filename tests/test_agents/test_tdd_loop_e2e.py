@@ -302,6 +302,9 @@ def test_run_implement_phase_marks_node_completed(tmp_project_dir: Path, arc_run
     assert arc_runtime.traceability.get_interface("IF-CALC")["implemented"] is True
     node_session = sessions.load_node_session(node_id)
     assert node_session["phase_status"]["implement"] == "completed"
+    # The IMPLEMENT phase must release the session-scoped E2E runtime
+    # (web handler keeps one backend server across run_tests calls).
+    assert fake.shutdown_calls == 1
 
 
 # ---------------------------------------------------------------------------

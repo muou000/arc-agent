@@ -137,6 +137,7 @@ class FakeAppHandler:
     def __init__(self, results: list[str] | None = None) -> None:
         self._results: deque[str] = deque(results or [])
         self.calls: list[tuple[str, list[str]]] = []
+        self.shutdown_calls = 0
 
     def queue(self, *results: str) -> "FakeAppHandler":
         self._results.extend(results)
@@ -155,6 +156,9 @@ class FakeAppHandler:
                 f"FakeAppHandler ran out of scripted results after {len(self.calls)} call(s)."
             )
         return self._results.popleft()
+
+    async def shutdown_e2e_runtime(self) -> None:
+        self.shutdown_calls += 1
 
     async def run_build(self) -> str:
         return "Exit Code: 0\nSTDERR:\n(fake build ok)\n"

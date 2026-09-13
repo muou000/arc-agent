@@ -281,10 +281,17 @@ class WorkflowPhaseRunner:
             self._update_node_session(node_id, {"phase_status": {"implement": "completed"}})
             return True
 
-        final_ok = await self._run_tdd_for_node(
-            node_id=node_id,
-            tests=tests,
-        )
+        final_ok = False
+        try:
+            final_ok = await self._run_tdd_for_node(
+                node_id=node_id,
+                tests=tests,
+            )
+        finally:
+            # The session-scoped E2E runtime (web) deliberately outlives single
+            # run_tests calls; the end of the IMPLEMENT phase is the point it
+            # must not outlive, so the per-task port is freed for reuse.
+            await self.app_handler.shutdown_e2e_runtime()
         if final_ok:
             self._mark_interfaces_implemented(interfaces)
         self._update_node_session(
