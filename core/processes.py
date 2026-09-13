@@ -27,7 +27,8 @@ async def check_prerequisites(app_type: str, log_cb: LogCallback | None = None) 
     normalized = (app_type or "web").strip().lower()
     from app_type_handler import get_app_type_handler_class
 
-    required = get_app_type_handler_class(normalized).prerequisite_commands()
+    handler_class = get_app_type_handler_class(normalized)
+    required = handler_class.prerequisite_commands()
     missing = [command for command in required if shutil.which(command) is None]
     if missing:
         await _emit_log(
@@ -36,6 +37,8 @@ async def check_prerequisites(app_type: str, log_cb: LogCallback | None = None) 
             f"Missing required command(s) for app_type={normalized}: {', '.join(missing)}",
             status="error",
         )
+        return False
+    if not await handler_class.check_runtime_versions(log_cb=log_cb):
         return False
     await _emit_log(log_cb, "System", f"Prerequisite check passed for app_type={normalized}.")
     return True

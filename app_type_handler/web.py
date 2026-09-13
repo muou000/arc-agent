@@ -28,6 +28,20 @@ NPM_INSTALL_TIMEOUT_SECONDS = 900.0
 # the full budget before trying the fallback wastes minutes on every install.
 NPM_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 240.0
 LEGACY_PEER_DEPS_FLAG = "--legacy-peer-deps"
+
+# Node release lines where unflagged require(esm) is available (the template's
+# jsdom dependency chain needs it). Line 21 never received the backport.
+_REQUIRE_ESM_MINIMUMS = ((20, 19), (22, 12), (23, 2))
+
+
+def _node_supports_require_esm(version_text: str) -> bool:
+    match = re.match(r"v?(\d+)\.(\d+)(?:\.(\d+))?", str(version_text or "").strip())
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2))
+    if major > 23:
+        return True
+    return any(major == line_major and minor >= line_minor for line_major, line_minor in _REQUIRE_ESM_MINIMUMS)
 # Generous because a cold machine downloads ~150 MB of browser binaries. Once
 # the machine-wide Playwright cache is warm the command exits in seconds.
 PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
@@ -978,6 +992,46 @@ class WebAppType(AppTypeHandler):
     @classmethod
     def prerequisite_commands(cls) -> list[str]:
         return ["node", "npm"]
+
+    @classmethod
+    async def check_runtime_versions(cls, log_cb=None) -> bool:
+        """Reject Node runtimes that cannot run the template's test stack.
+
+        The frontend test tree (jsdom 27 -> html-encoding-sniffer 6 ->
+        ESM-only @exodus/bytes) needs unflagged ``require(esm)``. On older
+        runtimes (observed on Node 22.11) every vitest forks worker crashes at
+        startup, which no code edit can fix - without this gate the failure is
+        discovered per node and burns the entire TDD budget of every leaf.
+        """
+
+        async def log_error(message: str) -> None:
+            if log_cb is not None:
+                await _emit_log(log_cb, "System", message, "error")
+
+        try:
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                ["node", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            await log_error(
+                f"Node.js version check failed ({exc}); the web template requires "
+                "Node >= 22.12 (or >= 20.19 / >= 23.2)."
+            )
+            return False
+
+        version_text = (completed.stdout or "").strip()
+        if _node_supports_require_esm(version_text):
+            return True
+        await log_error(
+            f"Node.js {version_text or '<unknown>'} does not support unflagged require(esm); "
+            "the web template requires Node >= 22.12 (or >= 20.19 / >= 23.2). "
+            "Upgrade Node.js before compiling."
+        )
+        return False
 
     @classmethod
     def runtime_contract_lines(
