@@ -6,6 +6,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import threading
 from pathlib import Path, PureWindowsPath
 from typing import Any, Awaitable, Callable
 
@@ -19,6 +20,12 @@ LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | Non
 
 VISUAL_ANALYSIS_PROMPT_VERSION = "frontend-style-requirements"
 MAX_VISUAL_IMAGE_BYTES = 10 * 1024 * 1024
+
+# Guards the persist tail of analyze_and_attach_visual_references. Concurrent
+# precompute tasks each load a full copy of the cache file before their vision
+# calls, so the section must not interleave with itself; it is sync-only, so a
+# plain lock works on the event loop and also covers thread-based callers.
+_PERSIST_LOCK = threading.Lock()
 
 
 def build_visual_analysis_prompt() -> str:
@@ -200,11 +207,20 @@ async def analyze_and_attach_visual_references(
         except Exception as exc:
             await _log(log_cb, "System", f"Failed to analyze image {image_path}: {exc}", "error", req_id)
 
-    if cache_updated:
-        _save_visual_cache(workspace_path, cache)
+    if cache_updated or visual_references:
+        with _PERSIST_LOCK:
+            if cache_updated:
+                # Merge over the on-disk cache instead of writing this task's
+                # stale full view: concurrent tasks loaded the file before
+                # their vision calls, so a plain save would drop the entries
+                # their siblings saved in the meantime.
+                merged_cache = _load_visual_cache(workspace_path)
+                merged_cache.update(cache)
+                _save_visual_cache(workspace_path, merged_cache)
+            if visual_references:
+                get_runtime().traceability.update_requirement_fields(req_id, visual_reference=visual_references)
 
     if visual_references:
-        get_runtime().traceability.update_requirement_fields(req_id, visual_reference=visual_references)
         requirement_data["visual_reference"] = visual_references
         await _log(log_cb, "System", f"Stored {len(visual_references)} visual references for {req_id}", None, req_id)
 

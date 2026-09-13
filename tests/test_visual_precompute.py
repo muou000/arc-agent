@@ -113,6 +113,37 @@ def test_nodes_with_existing_analysis_are_skipped(image_env, monkeypatch) -> Non
     assert count == 0
 
 
+def test_concurrent_tasks_do_not_erase_sibling_cache_entries(
+    image_env,
+    monkeypatch,
+) -> None:
+    """Each task loads the cache file before its vision calls; a plain
+    whole-file save at the end would overwrite the entries its siblings saved
+    in the meantime, costing duplicate vision API calls on the next run."""
+    workspace, requirements = image_env
+
+    async def fake_request(full_path: str) -> str:
+        await asyncio.sleep(0.05)
+        return f"analysis for {Path(full_path).name}"
+
+    monkeypatch.setattr(visual_analysis, "_request_visual_analysis", fake_request)
+    updates: list = []
+    monkeypatch.setattr(visual_analysis, "get_runtime", lambda: _stub_runtime(updates))
+
+    asyncio.run(
+        visual_analysis.precompute_visual_references(
+            workspace_path=str(workspace),
+            requirements_dir=str(requirements),
+            requirement_nodes=[_node("REQ-1", "a.png"), _node("REQ-2", "b.png")],
+        )
+    )
+
+    import json
+
+    cache = json.loads((workspace / ".arc" / "visual_analysis_cache.json").read_text(encoding="utf-8"))
+    assert len(cache) == 2, f"both image entries must survive the concurrent pass, got: {sorted(cache)}"
+
+
 def test_precompute_env_toggle() -> None:
     import os
 
