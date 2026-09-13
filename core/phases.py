@@ -31,6 +31,8 @@ class WorkflowPhaseRunner:
         test_generator: Any,
         test_driven_developer: Any,
         log_cb: LogCallback | None = None,
+        web_port: int | None = None,
+        context_workspace_path: str | None = None,
     ) -> None:
         self.workspace_path = str(Path(workspace_path).expanduser().resolve())
         self.requirement_path = requirement_path
@@ -39,6 +41,12 @@ class WorkflowPhaseRunner:
         self.test_generator = test_generator
         self.test_driven_developer = test_driven_developer
         self.log_cb = log_cb
+        # Per-task test port override (per-node worktree parallelism); None
+        # keeps the process-wide configured port.
+        self.web_port = web_port
+        # Shared-workspace root for traceability-adjacent reads (visual cache),
+        # distinct from workspace_path when this runner works in a worktree.
+        self.context_workspace_path = context_workspace_path or self.workspace_path
         self.app_handler = create_app_type_handler(
             app_type=app_type,
             workspace_path=self.workspace_path,
@@ -55,7 +63,7 @@ class WorkflowPhaseRunner:
     async def run_design_phase(self, node_id: str, requirement_data: dict[str, Any]) -> bool:
         is_non_leaf = bool(requirement_data.get("children_ids"))
         requirement_data = await analyze_and_attach_visual_references(
-            workspace_path=self.workspace_path,
+            workspace_path=self.context_workspace_path,
             requirements_dir=str(Path(self.requirement_path).expanduser().resolve().parent),
             requirement_data=requirement_data,
             log_cb=self._log,
@@ -414,7 +422,11 @@ class WorkflowPhaseRunner:
                 f"`run_tests` {selected_type} usage {usage_by_type[selected_type]}/{TDD_RUN_TESTS_BUDGET}.",
                 node_id=node_id,
             )
-            output = await self.app_handler.run_test_group(selected_type, selected_files)
+            output = await self.app_handler.run_test_group(
+                selected_type,
+                selected_files,
+                web_port=self.web_port,
+            )
             await self._log(
                 "TestDrivenDeveloper",
                 (

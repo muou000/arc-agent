@@ -51,12 +51,16 @@ class TestGenerator:
         workspace_root: str | None = None,
         requirement_path: str | None = None,
         app_type: str | None = None,
+        context_workspace_root: str | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", "openai:gpt-5.4")
         self.workspace_root = workspace_root
         self.requirement_path = requirement_path or ""
         self.app_type = app_type
+        # Context/session root: stays on the main workspace when the agent's
+        # filesystem root is an isolated per-node worktree.
+        self.context_workspace_root = context_workspace_root
 
     async def run(
         self,
@@ -74,7 +78,7 @@ class TestGenerator:
         app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
         selected_skill_names = test_generation_skills(requirement_data)
         context_pipeline.configure(
-            workspace_dir=workspace_root,
+            workspace_dir=self.context_workspace_root or workspace_root,
             app_type=app_type,
         )
         static_context, dynamic_context = context_pipeline.build_agent_context_split(
