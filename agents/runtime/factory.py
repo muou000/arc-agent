@@ -179,16 +179,37 @@ def _message_hit_output_limit(message: Any) -> bool:
     return isinstance(details, dict) and bool(details.get("reason"))
 
 
-def _truncation_rejection_tool_message(call: "Mapping[str, Any]") -> ToolMessage:
+def _output_cut_reason(message: Any) -> str:
+    """Human-readable cause of the cut, for the rejection wording."""
+
+    metadata = getattr(message, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return "the assistant response was cut off before completion"
+    if metadata.get("finish_reason") in _LENGTH_FINISH_REASONS:
+        return "the assistant response hit the output token limit"
+    details = metadata.get("incomplete_details")
+    reason = details.get("reason") if isinstance(details, dict) else None
+    if reason == "content_filter":
+        return "the assistant response was cut off by the provider's content policy"
+    if reason:
+        return f"the assistant response hit the output token limit ({reason})"
+    return "the assistant response was cut off before completion"
+
+
+def _truncation_rejection_tool_message(call: "Mapping[str, Any]", cut_reason: str) -> ToolMessage:
     """Error tool result for a tool call issued inside a truncated response."""
 
-    reason = call.get("error")
-    detail = f" Its arguments could not be parsed ({reason})." if reason else ""
+    parse_error = call.get("error")
+    detail = f" Its arguments could not be parsed ({parse_error})." if parse_error else ""
+    advice = (
+        "Adjust the output content and re-issue the tool call."
+        if "content policy" in cut_reason
+        else "Re-issue the tool call with complete arguments."
+    )
     return ToolMessage(
         content=(
             f"Error: tool call `{call.get('name') or '<unknown>'}` was not executed: "
-            "the assistant response hit the output token limit, so its arguments may "
-            f"be truncated.{detail} Re-issue the tool call with complete arguments."
+            f"{cut_reason}, so its arguments may be truncated.{detail} {advice}"
         ),
         tool_call_id=str(call.get("id") or ""),
         status="error",
@@ -245,13 +266,14 @@ class TruncatedToolCallGuardMiddleware(AgentMiddleware[Any, Any, Any]):
         return replace(response, result=guarded)
 
     def _rejections_for(self, message: AIMessage, answered: set[str]) -> list[ToolMessage]:
+        cut_reason = _output_cut_reason(message)
         rejections: list[ToolMessage] = []
         for call in (*message.tool_calls, *message.invalid_tool_calls):
             call_id = str(call.get("id") or "")
             if not call_id or call_id in answered:
                 continue
             answered.add(call_id)
-            rejections.append(_truncation_rejection_tool_message(call))
+            rejections.append(_truncation_rejection_tool_message(call, cut_reason))
         return rejections
 
 

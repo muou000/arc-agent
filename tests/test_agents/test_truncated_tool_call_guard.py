@@ -196,6 +196,49 @@ def test_response_without_result_attribute_passes_through() -> None:
     assert middleware._fail_truncated_tool_calls(passthrough) is passthrough
 
 
+def test_content_filter_cut_gets_policy_specific_wording() -> None:
+    """content_filter cuts are still intercepted (fail closed), with distinct advice.
+
+    Re-issuing identical content cannot succeed through a content policy, so
+    the rejection tells the model to adjust the output instead of just
+    re-issuing; the agent step budget bounds any repeated refusal.
+    """
+
+    recorder: list = []
+    middleware = TruncatedToolCallGuardMiddleware()
+    message = _tool_call_message(
+        "call-filtered",
+        metadata={"status": "incomplete", "incomplete_details": {"reason": "content_filter"}},
+    )
+
+    result = asyncio.run(
+        middleware.awrap_model_call(None, _handler(_model_response(message), recorder))
+    )
+
+    rejection = next(m for m in result.result if isinstance(m, ToolMessage))
+    assert rejection.tool_call_id == "call-filtered"
+    assert "content policy" in rejection.content
+    assert "Adjust the output content" in rejection.content
+    assert "Re-issue the tool call with complete arguments" not in rejection.content
+
+
+def test_max_output_tokens_cut_keeps_reissue_advice() -> None:
+    recorder: list = []
+    middleware = TruncatedToolCallGuardMiddleware()
+    message = _tool_call_message(
+        "call-cut",
+        metadata={"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+    )
+
+    result = asyncio.run(
+        middleware.awrap_model_call(None, _handler(_model_response(message), recorder))
+    )
+
+    rejection = next(m for m in result.result if isinstance(m, ToolMessage))
+    assert "output token limit (max_output_tokens)" in rejection.content
+    assert "Re-issue the tool call with complete arguments" in rejection.content
+
+
 def test_message_hit_output_limit_metadata_variants() -> None:
     assert _message_hit_output_limit(AIMessage(content="", response_metadata={"finish_reason": "length"}))
     assert _message_hit_output_limit(AIMessage(content="", response_metadata={"status": "incomplete"}))
