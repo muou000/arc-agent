@@ -322,10 +322,19 @@ class ContextPipeline:
 
         Stage agents otherwise re-read the same template-owned scaffold files
         (database harness, build/test configs, dependency manifests) through
-        ``read_file`` on node after node. The block is memoised across nodes
-        against a per-file fingerprint, so a node that edits a scaffold file
-        (adding tables to ``init_db.js``, installing a dependency) invalidates
-        it and the next context build picks up the new content.
+        ``read_file`` on node after node. The block is memoised against a
+        per-file fingerprint, so a node that edits a scaffold file (adding
+        tables to ``init_db.js``, installing a dependency) invalidates it and
+        subsequent context builds pick up the new content.
+
+        Deliberately not routed through ``cache.get_or_compute``: those keys
+        are per-node, which would recompute this node-invariant block once per
+        node and defeat the whole point. The block reflects the scaffold as it
+        was at build time; the node currently editing a scaffold file sees its
+        own edits in its conversation history, and the fingerprint protects
+        later builds from serving its predecessor's version. Everything here
+        runs synchronously on the event loop, so concurrent node builds cannot
+        interleave inside the fingerprint-check/write sequence.
         """
 
         entries = self._scaffold_file_entries()
@@ -346,10 +355,14 @@ class ContextPipeline:
                 continue
             if len(content) > self.SCAFFOLD_FILE_CHAR_LIMIT:
                 content = content[: self.SCAFFOLD_FILE_CHAR_LIMIT].rstrip() + "\n... [truncated]"
-            sections.append(f"--- {relative} ---\n{content}")
-            total += len(content)
-            if total >= self.SCAFFOLD_TOTAL_CHAR_LIMIT:
+            section = f"--- {relative} ---\n{content}"
+            # Budget counts the emitted size (including the section header).
+            # The first file is always included so the layer can never come
+            # back silently empty when one file exceeds the whole budget.
+            if sections and total + len(section) > self.SCAFFOLD_TOTAL_CHAR_LIMIT:
                 break
+            sections.append(section)
+            total += len(section)
         block = "<scaffold_files>\n" + "\n\n".join(sections) + "\n</scaffold_files>" if sections else ""
         self._scaffold_cache = (fingerprint, block)
         return block

@@ -256,3 +256,35 @@ def test_scaffold_cache_resets_when_the_app_type_changes(
     pipeline.configure(app_type="cli")
 
     assert pipeline._get_scaffold_files_context() == "", "cli declares no scaffold files"
+
+
+def test_scaffold_layer_respects_the_total_budget(
+    pipeline: ContextPipeline,
+    tmp_project_dir: Path,
+) -> None:
+    database = tmp_project_dir / "backend" / "src" / "database"
+    database.mkdir(parents=True, exist_ok=True)
+    (database / "init_db.js").write_text("A" * 400 + "\n", encoding="utf-8")
+    (database / "db_runtime.js").write_text("B" * 400 + "\n", encoding="utf-8")
+    pipeline.configure(workspace_dir=str(tmp_project_dir.resolve()), app_type="web")
+    pipeline.SCAFFOLD_TOTAL_CHAR_LIMIT = 500
+
+    block = pipeline._get_scaffold_files_context()
+
+    assert "init_db.js" in block
+    assert "db_runtime.js" not in block, "a file that would exceed the budget is excluded, not appended oversized"
+
+
+def test_scaffold_layer_always_includes_the_first_file(
+    pipeline: ContextPipeline,
+    tmp_project_dir: Path,
+) -> None:
+    database = tmp_project_dir / "backend" / "src" / "database"
+    database.mkdir(parents=True, exist_ok=True)
+    (database / "init_db.js").write_text("A" * 900 + "\n", encoding="utf-8")
+    pipeline.configure(workspace_dir=str(tmp_project_dir.resolve()), app_type="web")
+    pipeline.SCAFFOLD_TOTAL_CHAR_LIMIT = 100
+
+    block = pipeline._get_scaffold_files_context()
+
+    assert "init_db.js" in block, "the budget must never collapse the layer into an empty block"
