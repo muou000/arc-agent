@@ -79,6 +79,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 ### App-type handler 和模板
 
 - `app_type_handler` 的注册表、模板目录、`template.yaml`、package manifest、测试路径和运行命令必须保持一致。
+- Web 模板的共享装配文件（`app.js`、`App.tsx`、`pages/HomePage.tsx`、`init_db.js` 等）是注册式 glue：节点只新增 `routes/`、`schema/`、`pages/`、`sections/`、`providers/` 模块，共享文件由模板加载器装配。修改 glue 路径或注册约定时，必须同步 `WebAppType.registration_contract_lines`、`design_denied_write_paths` 与 `tests/test_template_contract/`，三者不一致会同时产生错误拦截和并行合并冲突。
 - 修改 Web 模板时，检查前端构建、后端健康端点、单端口运行、数据库测试隔离和 Playwright/Vitest 契约；修改 Android/CLI handler 时，确认对应模板和环境门禁真实存在，不要只增加注册表项。
 - 模板契约变更必须同步更新 `tests/test_template_contract/` 和模板 README。依赖或 lockfile 变更应说明原因，并确认不是无关版本漂移。
 

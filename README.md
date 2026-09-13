@@ -103,6 +103,9 @@ ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
 # 可选：每节点 worktree 并行（默认关闭，保持严格串行）
 # 开启后每个运行中的任务在自己的 git worktree、独立 web 端口和独立 E2E 数据库中执行，
 # 阶段完成后分支合并回主工作区；合并冲突会将该节点标记为失败并保留其 worktree 供排查。
+# Web 模板的共享装配文件（app.js、App.tsx、pages/HomePage.tsx、init_db.js 等）为注册式 glue：
+# 各节点只新增自己的 routes/schema/pages/sections/providers 模块，共享文件由模板自动装配，
+# 且 DESIGN 阶段对共享 glue 的写入会被 stage discipline 直接拒绝，从源头避免并行合并冲突。
 ARC_NODE_WORKTREES=1                   # 启用每节点隔离 worktree（设 0/false/no/off 关闭）
 ARC_MAX_CONCURRENT_TASKS=3             # 同时运行的任务数（仅在 ARC_NODE_WORKTREES=1 时生效，上限 8）
 ```
