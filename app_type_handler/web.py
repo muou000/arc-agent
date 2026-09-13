@@ -1145,6 +1145,28 @@ class WebAppType(AppTypeHandler):
             "Database-using tests must use the app-type-provided isolated test harness/scaffold.",
         ]
 
+    @classmethod
+    def scaffold_context_files(cls) -> list[str]:
+        return [
+            # Database scaffold: the prompt tells agents to extend these files
+            # instead of one-off helpers, so every DB-related node re-reads
+            # them to learn the harness API.
+            "backend/src/database/init_db.js",
+            "backend/src/database/db_runtime.js",
+            "backend/src/database/seed_db.js",
+            "backend/src/database/test_harness.js",
+            "backend/src/database/prepare_e2e.js",
+            "backend/src/database/index.js",
+            # Build/test infrastructure that pins the test setup contract.
+            "frontend/vite.config.js",
+            "frontend/test/setup.ts",
+            "backend/vitest.config.js",
+            "backend/playwright.config.js",
+            # Dependency manifests agents consult to see what is installed.
+            "backend/package.json",
+            "frontend/package.json",
+        ]
+
     def validate_test_path(self, test_type: str, file_path: str) -> str | None:
         normalized_type = (test_type or "").strip().lower()
         if normalized_type not in {"unit", "integration", "e2e"}:

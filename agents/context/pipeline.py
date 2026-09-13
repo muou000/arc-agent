@@ -70,6 +70,9 @@ class ContextPipeline:
         self._interface_index: (
             tuple[tuple[int, int, int], dict[str, list[dict[str, Any]]], list[dict[str, Any]]] | None
         ) = None
+        # (per-file fingerprint, block) for the app-type scaffold files, shared
+        # across nodes because their content only changes when a file is edited.
+        self._scaffold_cache: tuple[tuple, str] | None = None
 
     def configure(
         self,
@@ -98,11 +101,13 @@ class ContextPipeline:
         if changed:
             self.cache.clear()
             self._interface_index = None
+            self._scaffold_cache = None
 
     def set_runtime(self, runtime: Any | None) -> None:
         self.runtime = runtime
         self.cache.clear()
         self._interface_index = None
+        self._scaffold_cache = None
 
     def _store(self):
         return getattr(self.runtime, "traceability", None)
@@ -274,6 +279,80 @@ class ContextPipeline:
             android_package=self.config.android_package,
         )
         return "<test_harness>\n" + "\n".join(f"- {line}" for line in lines) + "\n</test_harness>"
+
+    SCAFFOLD_STAGE_AGENTS = frozenset(
+        {"InterfaceDesigner", "TestGenerator", "TestDrivenDeveloper", "TestFailureVerifier"}
+    )
+    SCAFFOLD_FILE_CHAR_LIMIT = 4500
+    SCAFFOLD_TOTAL_CHAR_LIMIT = 22000
+
+    def _scaffold_file_entries(self) -> list[tuple[str, Path]]:
+        app_type = (self.config.app_type or "web").strip().lower()
+        handler_class = self._get_app_type_handler_class(app_type)
+        workspace = Path(self.config.workspace_dir)
+        entries: list[tuple[str, Path]] = []
+        for raw in handler_class.scaffold_context_files():
+            relative = str(raw or "").strip().replace("\\", "/")
+            if not relative or relative.startswith("/") or ".." in relative.split("/"):
+                continue
+            entries.append((relative, workspace / relative))
+        return entries
+
+    @staticmethod
+    def _scaffold_fingerprint(entries: list[tuple[str, Path]]) -> tuple:
+        marks: list[tuple] = []
+        for relative, path in entries:
+            try:
+                stat = path.stat()
+            except OSError:
+                marks.append((relative, None))
+            else:
+                marks.append((relative, stat.st_mtime_ns, stat.st_size, stat.st_ino))
+        return tuple(marks)
+
+    @staticmethod
+    def _read_scaffold_file(path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def _get_scaffold_files_context(self) -> str:
+        """Content of the app-type scaffold files, shared by every node.
+
+        Stage agents otherwise re-read the same template-owned scaffold files
+        (database harness, build/test configs, dependency manifests) through
+        ``read_file`` on node after node. The block is memoised across nodes
+        against a per-file fingerprint, so a node that edits a scaffold file
+        (adding tables to ``init_db.js``, installing a dependency) invalidates
+        it and the next context build picks up the new content.
+        """
+
+        entries = self._scaffold_file_entries()
+        if not entries:
+            return ""
+        fingerprint = self._scaffold_fingerprint(entries)
+        cached = self._scaffold_cache
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+
+        sections: list[str] = []
+        total = 0
+        for relative, path in entries:
+            if not path.is_file():
+                continue
+            content = self._read_scaffold_file(path)
+            if content is None:
+                continue
+            if len(content) > self.SCAFFOLD_FILE_CHAR_LIMIT:
+                content = content[: self.SCAFFOLD_FILE_CHAR_LIMIT].rstrip() + "\n... [truncated]"
+            sections.append(f"--- {relative} ---\n{content}")
+            total += len(content)
+            if total >= self.SCAFFOLD_TOTAL_CHAR_LIMIT:
+                break
+        block = "<scaffold_files>\n" + "\n\n".join(sections) + "\n</scaffold_files>" if sections else ""
+        self._scaffold_cache = (fingerprint, block)
+        return block
 
     @staticmethod
     def _dedupe_records_by_file_path_keep_latest(
@@ -549,6 +628,10 @@ class ContextPipeline:
             context_parts.append(project_structure)
         if agent_type == "TestGenerator":
             context_parts.append(self.cache.get_or_compute(node_id, "test_harness_context", self._get_test_harness_context))
+        if agent_type in self.SCAFFOLD_STAGE_AGENTS:
+            scaffold_files = self._get_scaffold_files_context()
+            if scaffold_files:
+                context_parts.append(scaffold_files)
 
         node_session_layers = self.cache.get_or_compute(
             node_id,
@@ -631,6 +714,8 @@ class ContextPipeline:
         ]
         if agent_type == "TestGenerator":
             parts.append(self.cache.get_or_compute(node_id, "test_harness_context", self._get_test_harness_context))
+        if agent_type in self.SCAFFOLD_STAGE_AGENTS:
+            parts.append(self._get_scaffold_files_context())
         return "\n\n".join(part for part in parts if part)
 
     def build_agent_context_split(
