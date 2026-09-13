@@ -1,0 +1,27 @@
+name: PR Agent
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  pr_agent_job:
+    if: ${{ github.event.sender.type != 'Bot' }}   # 防止 bot 对自己的评论作出反应（死循环）
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: write
+      checks: write
+    steps:
+      - name: PR Agent action step
+        id: pragent
+        uses: the-pr-agent/pr-agent@main
+        env:
+          OPENAI__KEY: ${{ secrets.OPENAI__KEY }}
+          OPENAI__API_BASE: ${{ secrets.OPENAI__API_BASE }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG__MODEL: ${{ secrets.CONFIG__MODEL }}
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ secrets.CONFIG__CUSTOM_MODEL_MAX_TOKENS }}
