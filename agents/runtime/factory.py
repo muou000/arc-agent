@@ -225,6 +225,14 @@ class TruncatedToolCallGuardMiddleware(AgentMiddleware[Any, Any, Any]):
     lesson). Rewrite the response so every unanswered tool call in the truncated
     message gets an explicit error tool result; the router then hands control
     back to the model, which re-issues the calls with complete arguments.
+
+    The truncated AIMessage deliberately KEEPS its ``tool_calls``: it is the
+    only dispatch source (langchain's model-to-tools edge fires on unanswered
+    ``tool_calls``), and keeping them present-but-covered is what routes
+    control back to the model with the error results in context. Stripping
+    them would end the run without a reissue, and downstream post-processing
+    (tool-batch logs, trace formatting) pairs those calls with the injected
+    error results by id.
     """
 
     def wrap_model_call(
