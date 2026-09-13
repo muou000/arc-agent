@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 _TOKEN_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning", "total")
 _COST_KEYS = ("input", "output", "cache_read", "cache_write", "total")
@@ -62,21 +62,26 @@ def _bucket(target: dict[str, dict[str, Any]], key: str) -> dict[str, Any]:
     return bucket
 
 
-def _iter_llm_usage_events(path: Path) -> list[dict[str, Any]]:
+def _iter_llm_usage_events(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield ``llm_usage`` records line by line, never buffering the file.
+
+    Streaming keeps large event logs out of memory; a trailing partial line
+    (a concurrent writer mid-append) fails JSON parsing and is skipped like
+    any other malformed line.
+    """
     if not path.exists():
-        return []
-    records: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(record, dict) and record.get("type") == "llm_usage":
-            records.append(record)
-    return records
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("type") == "llm_usage":
+                yield record
 
 
 def _accumulate(bucket: dict[str, Any], record: dict[str, Any]) -> None:

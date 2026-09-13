@@ -302,7 +302,6 @@ class TestLLMUsageEvents:
 
 class TestDemoTestStatus:
     """Demo helpers are documented as no-op with respect to disk state."""
-    """Demo helpers are documented as no-op with respect to disk state."""
 
     def test_read_returns_empty_payload(self, events: EventClient) -> None:
         assert events.read_demo_test_status_payload() == {"tests": {}, "requirements": {}}

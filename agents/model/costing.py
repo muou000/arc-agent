@@ -31,9 +31,13 @@ class ModelCost:
 
 # Benchmark model catalog, CNY per 1M tokens as of 2026-09; keys match the
 # model name sent to the API (resolved case-insensitively). The catalog lists
-# no cache-write prices, so cache writes bill at the input rate. qwen3.6-*
-# entries list no cache-hit price, so their cache_read rate assumes no cache
-# discount rather than understating cached-token cost.
+# no cache-write prices, so cache writes bill at the input rate.
+#
+# Notes on individual entries:
+# - qwen3.6-* list no cache-hit price; their cache_read rate equals the input
+#   rate on purpose ("no cache discount"), not a missing price — do not
+#   "fix" it to 0 or infer a discount for them.
+# - All other entries carry the catalog's explicit cache-read discount.
 _BUILTIN_MODEL_COSTS: dict[str, ModelCost] = {
     "deepseek-v4-flash": ModelCost(input=3.0, output=9.0, cache_read=0.1),
     "deepseek-v4-pro": ModelCost(input=9.0, output=27.0, cache_read=0.3),
