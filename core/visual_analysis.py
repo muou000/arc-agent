@@ -21,6 +21,52 @@ LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | Non
 VISUAL_ANALYSIS_PROMPT_VERSION = "frontend-style-requirements"
 MAX_VISUAL_IMAGE_BYTES = 10 * 1024 * 1024
 
+# Per-image analyses are independent requests, so a small fan-in shortens the
+# DESIGN critical path. The cap keeps a large reference set from tripping
+# provider rate limits; tune with ARC_VISUAL_ANALYSIS_CONCURRENCY.
+DEFAULT_VISUAL_ANALYSIS_CONCURRENCY = 4
+MAX_VISUAL_ANALYSIS_CONCURRENCY = 8
+
+# One client per endpoint avoids a fresh TCP+TLS handshake per image, mirroring
+# the model adapter's client cache.
+_VISUAL_CLIENT_CACHE: dict[tuple[str, str], OpenAI] = {}
+_VISUAL_CLIENT_LOCK = threading.Lock()
+
+
+def _max_visual_analysis_concurrency() -> int:
+    raw = os.environ.get("ARC_VISUAL_ANALYSIS_CONCURRENCY", "").strip()
+    if not raw:
+        return DEFAULT_VISUAL_ANALYSIS_CONCURRENCY
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_VISUAL_ANALYSIS_CONCURRENCY
+    return max(1, min(value, MAX_VISUAL_ANALYSIS_CONCURRENCY))
+
+
+def _get_visual_client() -> OpenAI:
+    visual_base_url = _resolve_visual_base_url()
+    visual_api_key = _resolve_visual_api_key()
+    if not visual_base_url:
+        raise RuntimeError("Visual API base URL is not configured.")
+    if not visual_api_key:
+        raise RuntimeError("Visual API key is not configured.")
+    cache_key = (visual_base_url, visual_api_key)
+    with _VISUAL_CLIENT_LOCK:
+        client = _VISUAL_CLIENT_CACHE.get(cache_key)
+        if client is None:
+            client = OpenAI(api_key=visual_api_key, base_url=visual_base_url)
+            _VISUAL_CLIENT_CACHE[cache_key] = client
+        return client
+
+
+def reset_visual_client_cache_for_tests() -> None:
+    """Drop cached visual clients so a test can assert construction behaviour."""
+
+    with _VISUAL_CLIENT_LOCK:
+        _VISUAL_CLIENT_CACHE.clear()
+
+
 # Guards the persist tail of analyze_and_attach_visual_references. Concurrent
 # precompute tasks each load a full copy of the cache file before their vision
 # calls, so the section must not interleave with itself; it is sync-only, so a
@@ -186,16 +232,18 @@ async def analyze_and_attach_visual_references(
         return requirement_data
 
     cache = _load_visual_cache(workspace_path)
-    cache_updated = False
-    visual_references: list[dict[str, Any]] = []
+    # Payloads are written back by candidate index, so the final order matches
+    # the sequential implementation regardless of analysis completion order.
+    visual_references: list[dict[str, Any] | None] = [None] * len(candidates)
+    pending: list[tuple[int, str, Path, str]] = []
 
-    for item in candidates:
+    for index, item in enumerate(candidates):
         image_path = str(item.get("image_path") or "").strip()
         if not image_path:
             continue
         existing_analysis = str(item.get("analysis") or "").strip()
         if existing_analysis:
-            visual_references.append(_reference_payload(image_path, existing_analysis, item.get("resolved_image_path")))
+            visual_references[index] = _reference_payload(image_path, existing_analysis, item.get("resolved_image_path"))
             continue
 
         try:
@@ -209,26 +257,20 @@ async def analyze_and_attach_visual_references(
 
         try:
             cache_key = _build_visual_cache_key(full_path)
-            cached_entry = cache.get(cache_key)
-            if isinstance(cached_entry, dict) and cached_entry.get("analysis"):
-                visual_references.append(_reference_payload(image_path, str(cached_entry["analysis"]), str(full_path)))
-                await _log(log_cb, "System", f"Reusing cached visual analysis: {image_path}", None, req_id)
-                continue
-
-            await _log(log_cb, "System", f"Analyzing visual element: {image_path}", None, req_id)
-            analysis = await _request_visual_analysis(full_path)
-            cache[cache_key] = {
-                "image_path": image_path,
-                "full_path": str(full_path),
-                "prompt_version": VISUAL_ANALYSIS_PROMPT_VERSION,
-                "analysis": analysis,
-            }
-            cache_updated = True
-            visual_references.append(_reference_payload(image_path, analysis, str(full_path)))
         except Exception as exc:
             await _log(log_cb, "System", f"Failed to analyze image {image_path}: {exc}", "error", req_id)
+            continue
+        cached_entry = cache.get(cache_key)
+        if isinstance(cached_entry, dict) and cached_entry.get("analysis"):
+            visual_references[index] = _reference_payload(image_path, str(cached_entry["analysis"]), str(full_path))
+            await _log(log_cb, "System", f"Reusing cached visual analysis: {image_path}", None, req_id)
+            continue
+        pending.append((index, image_path, full_path, cache_key))
 
-    if cache_updated or visual_references:
+    cache_updated = await _analyze_pending_images(pending, cache, visual_references, req_id, log_cb)
+
+    stored_references = [payload for payload in visual_references if payload is not None]
+    if cache_updated or stored_references:
         with _PERSIST_LOCK:
             if cache_updated:
                 # Merge over the on-disk cache instead of writing this task's
@@ -238,14 +280,59 @@ async def analyze_and_attach_visual_references(
                 merged_cache = _load_visual_cache(workspace_path)
                 merged_cache.update(cache)
                 _save_visual_cache(workspace_path, merged_cache)
-            if visual_references:
-                get_runtime().traceability.update_requirement_fields(req_id, visual_reference=visual_references)
+            if stored_references:
+                get_runtime().traceability.update_requirement_fields(req_id, visual_reference=stored_references)
 
-    if visual_references:
-        requirement_data["visual_reference"] = visual_references
-        await _log(log_cb, "System", f"Stored {len(visual_references)} visual references for {req_id}", None, req_id)
+    if stored_references:
+        requirement_data["visual_reference"] = stored_references
+        await _log(log_cb, "System", f"Stored {len(stored_references)} visual references for {req_id}", None, req_id)
 
     return requirement_data
+
+
+async def _analyze_pending_images(
+    pending: list[tuple[int, str, Path, str]],
+    cache: dict[str, Any],
+    visual_references: list[dict[str, Any] | None],
+    req_id: str,
+    log_cb: LogCallback | None,
+) -> bool:
+    """Analyze the cache-miss images with bounded concurrency.
+
+    Every analysis is an independent request, so up to
+    ``ARC_VISUAL_ANALYSIS_CONCURRENCY`` of them run at once. Results and
+    per-image failures land by index, keeping the sequential ordering of
+    ``visual_references``; a failing image is logged and skipped exactly as in
+    the previous serial loop.
+    """
+    if not pending:
+        return False
+
+    semaphore = asyncio.Semaphore(_max_visual_analysis_concurrency())
+    cache_updated = False
+
+    async def analyze_one(index: int, image_path: str, full_path: Path, cache_key: str) -> None:
+        nonlocal cache_updated
+        try:
+            async with semaphore:
+                await _log(log_cb, "System", f"Analyzing visual element: {image_path}", None, req_id)
+                analysis = await _request_visual_analysis(full_path)
+            cache[cache_key] = {
+                "image_path": image_path,
+                "full_path": str(full_path),
+                "prompt_version": VISUAL_ANALYSIS_PROMPT_VERSION,
+                "analysis": analysis,
+            }
+            cache_updated = True
+            visual_references[index] = _reference_payload(image_path, analysis, str(full_path))
+        except Exception as exc:
+            await _log(log_cb, "System", f"Failed to analyze image {image_path}: {exc}", "error", req_id)
+
+    results = await asyncio.gather(*(analyze_one(*entry) for entry in pending), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return cache_updated
 
 
 def _collect_visual_candidates(requirement_data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -314,6 +401,14 @@ def _build_visual_cache_key(full_path: Path) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
+def _build_image_data_url(full_path: Path) -> str:
+    mime_type, _ = mimetypes.guess_type(str(full_path))
+    if not mime_type:
+        mime_type = "image/png"
+    base64_image = base64.b64encode(full_path.read_bytes()).decode("utf-8")
+    return f"data:{mime_type};base64,{base64_image}"
+
+
 async def _request_visual_analysis(full_path: Path) -> str:
     try:
         image_size = full_path.stat().st_size
@@ -324,19 +419,11 @@ async def _request_visual_analysis(full_path: Path) -> str:
             f"Visual image is too large ({image_size} bytes; maximum {MAX_VISUAL_IMAGE_BYTES} bytes)."
         )
 
-    visual_base_url = _resolve_visual_base_url()
-    visual_api_key = _resolve_visual_api_key()
-    if not visual_base_url:
-        raise RuntimeError("Visual API base URL is not configured.")
-    if not visual_api_key:
-        raise RuntimeError("Visual API key is not configured.")
+    client = _get_visual_client()
 
-    mime_type, _ = mimetypes.guess_type(str(full_path))
-    if not mime_type:
-        mime_type = "image/png"
-    base64_image = base64.b64encode(full_path.read_bytes()).decode("utf-8")
-    data_url = f"data:{mime_type};base64,{base64_image}"
-    client = OpenAI(api_key=visual_api_key, base_url=visual_base_url)
+    # Reading and encoding a 10 MB image can stall the event loop; keeping it
+    # on a worker thread lets concurrent analyses keep making progress.
+    data_url = await asyncio.to_thread(_build_image_data_url, full_path)
     response = await asyncio.to_thread(
         client.chat.completions.create,
         model=_normalize_openai_model_name(os.environ.get("VISUAL_MODEL") or os.environ.get("MODEL", "")),
