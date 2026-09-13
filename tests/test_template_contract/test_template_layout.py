@@ -152,13 +152,19 @@ class TestRegistrationGlueStructure:
 
     def test_app_tsx_registers_pages_and_providers_via_glob(self) -> None:
         text = (TEMPLATE_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
-        assert "import.meta.glob('./pages/**/*.tsx'" in text
-        assert "import.meta.glob('./providers/*.tsx'" in text
+        assert "import.meta.glob(" in text
+        assert "'./pages/**/*.tsx'" in text
+        assert "'./providers/*.tsx'" in text
+        # Test assets must be excluded so a misplaced test file cannot leak
+        # into the app bundle through the eager glob.
+        assert "'!./pages/**/__tests__/**'" in text
+        assert "'!./pages/**/*.test.tsx'" in text
         assert "<Routes>" in text
 
     def test_home_page_composes_sections_via_glob(self) -> None:
         text = (TEMPLATE_ROOT / "frontend" / "src" / "pages" / "HomePage.tsx").read_text(encoding="utf-8")
-        assert "import.meta.glob('../sections/home/*.tsx'" in text
+        assert "'../sections/home/*.tsx'" in text
+        assert "'!../sections/home/*.test.tsx'" in text
         assert "sectionOrder" in text
         assert "export const route = '/'" in text
 

@@ -136,6 +136,8 @@ describe('registration-based glue', () => {
     );
     expect(screen.getByTestId('provider-boundary')).toBeTruthy();
     expect(screen.getByTestId('hero-section')).toBeTruthy();
+    // A pages/ module without a route export is never mounted.
+    expect(screen.queryByText('draft')).toBeNull();
   });
 
   it('routes to pages registered through the route export', () => {
@@ -158,6 +160,19 @@ describe('registration-based glue', () => {
         )
         (installed_frontend / "src" / "providers" / "TestProvider.tsx").write_text(
             self._TEST_PROVIDER, encoding="utf-8"
+        )
+        # A non-page component (no route export) and misplaced test assets must
+        # not break the registration globs: the component is silently ignored
+        # and the test asset is excluded from the app bundle entirely.
+        (installed_frontend / "src" / "pages" / "DraftWidget.tsx").write_text(
+            "function DraftWidget() {\n  return <div>draft</div>;\n}\n\nexport default DraftWidget;\n",
+            encoding="utf-8",
+        )
+        misplaced_test = installed_frontend / "src" / "pages" / "__tests__"
+        misplaced_test.mkdir(exist_ok=True)
+        (misplaced_test / "ignored.test.tsx").write_text(
+            "import { it } from 'vitest';\nit('never runs in the app bundle', () => {});\n",
+            encoding="utf-8",
         )
         tests_dir = installed_frontend / "tests"
         tests_dir.mkdir(exist_ok=True)

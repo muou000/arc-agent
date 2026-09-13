@@ -4,8 +4,24 @@ import { Route, Routes } from 'react-router-dom';
 type PageModule = { default: ComponentType; route?: unknown };
 type ProviderModule = { default: ComponentType<{ children?: ReactNode }> };
 
-const pageModules = import.meta.glob('./pages/**/*.tsx', { eager: true }) as Record<string, PageModule>;
-const providerModules = import.meta.glob('./providers/*.tsx', { eager: true }) as Record<string, ProviderModule>;
+// Pages register themselves by exporting `route` next to the default component,
+// and providers by being default-export components in `src/providers/`. This
+// file is template-owned glue: never edit it to add a page or provider. Test
+// assets are excluded from the globs so a misplaced test file cannot leak into
+// the app bundle; modules without the expected export are ignored.
+const pageModules = import.meta.glob(
+  [
+    './pages/**/*.tsx',
+    '!./pages/**/__tests__/**',
+    '!./pages/**/*.test.tsx',
+    '!./pages/**/*.spec.tsx',
+  ],
+  { eager: true },
+) as Record<string, PageModule>;
+const providerModules = import.meta.glob(
+  ['./providers/*.tsx', '!./providers/*.test.tsx', '!./providers/*.spec.tsx'],
+  { eager: true },
+) as Record<string, ProviderModule>;
 
 interface PageDefinition {
   file: string;

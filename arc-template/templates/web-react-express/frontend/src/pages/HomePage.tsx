@@ -2,9 +2,12 @@ import type { ComponentType } from 'react';
 
 type SectionModule = { default: ComponentType; sectionOrder?: unknown };
 
-const sectionModules = import.meta.glob('../sections/home/*.tsx', {
-  eager: true,
-}) as Record<string, SectionModule>;
+// Test assets are excluded so a misplaced test file cannot leak into the app
+// bundle; modules without a default export are ignored.
+const sectionModules = import.meta.glob(
+  ['../sections/home/*.tsx', '!../sections/home/*.test.tsx', '!../sections/home/*.spec.tsx'],
+  { eager: true },
+) as Record<string, SectionModule>;
 
 interface SectionDefinition {
   file: string;
