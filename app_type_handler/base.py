@@ -250,6 +250,30 @@ class AppTypeHandler(ABC):
         return []
 
     @classmethod
+    def registration_contract_lines(cls) -> list[str]:
+        """Prompt lines describing how agents extend shared composition glue.
+
+        App types whose templates assemble shared files from per-feature
+        registration modules override this. An empty result means the app type
+        has no registration contract and design-stage writes are unrestricted.
+        """
+
+        return []
+
+    @classmethod
+    def design_denied_write_paths(cls) -> list[str]:
+        """Workspace-relative glue paths that InterfaceDesigner must not write.
+
+        Parallel per-node worktrees merge back into one integration branch, so
+        two nodes editing the same glue file fail the later merge. Templates
+        with registration-based glue list those files here; the DESIGN-stage
+        discipline blocks them and points the agent at the registration
+        modules instead.
+        """
+
+        return []
+
+    @classmethod
     def project_structure_lines(
         cls,
         *,

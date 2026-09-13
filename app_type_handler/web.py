@@ -1065,6 +1065,39 @@ class WebAppType(AppTypeHandler):
         ]
 
     @classmethod
+    def registration_contract_lines(cls) -> list[str]:
+        return [
+            "Shared runtime glue is registration-based: nodes only add their own module files, and the template assembles the shared files from them automatically. Concurrent nodes therefore never edit the same file.",
+            "- Backend API: add `backend/src/routes/<feature>.routes.js` exporting `{ mountPath: '/api/<feature>', router }` (an `express.Router()`). Every module is mounted automatically; never edit `backend/src/app.js` or `backend/src/routes/index.js`.",
+            "- Database schema and seed data: add `backend/src/database/schema/<feature>.schema.js` exporting an idempotent `async apply(db)` plus an optional numeric `order` (default 100) that creates tables with IF NOT EXISTS-style guards. Modules load automatically on every startup; never edit `backend/src/database/init_db.js`.",
+            "- Frontend page: add `frontend/src/pages/<Page>.tsx` exporting the default component and `export const route = '<path>'` (for example `'/login'`). Pages register automatically; never edit `frontend/src/App.tsx` or `frontend/src/main.tsx`.",
+            "- Home page regions: add `frontend/src/sections/home/<Section>.tsx` exporting the default component and an optional `export const sectionOrder = <number>` (lower renders first). The home page composes them automatically; never edit `frontend/src/pages/HomePage.tsx`.",
+            "- Global providers such as session/auth state: add `frontend/src/providers/<Name>Provider.tsx` exporting a default provider component that renders `{children}`. Providers nest automatically around the app in filename order; never edit `frontend/src/main.tsx`.",
+            "- Frontend API access: import the shared axios client from `frontend/src/api/index.ts` inside a new per-feature module such as `frontend/src/api/<feature>.ts`; keep per-feature styling inside the feature's own components instead of editing `frontend/src/index.css`.",
+            "- Runtime infrastructure files (`backend/src/index.js`, `backend/src/routes/index.js`, `backend/src/database/init_db.js`, `backend/src/database/db_runtime.js`, `backend/src/database/seed_db.js`, `backend/src/database/prepare_e2e.js`, `backend/src/database/test_harness.js`, `backend/src/database/index.js`) belong to the app scaffold: extend behavior through your own modules, never by editing them.",
+            "A design-stage write blocked as shared runtime glue means the contract belongs in a new registration module per the rules above, not in the shared file.",
+        ]
+
+    @classmethod
+    def design_denied_write_paths(cls) -> list[str]:
+        return [
+            "frontend/src/App.tsx",
+            "frontend/src/main.tsx",
+            "frontend/src/index.css",
+            "frontend/src/api/index.ts",
+            "frontend/src/pages/HomePage.tsx",
+            "backend/src/app.js",
+            "backend/src/index.js",
+            "backend/src/routes/index.js",
+            "backend/src/database/init_db.js",
+            "backend/src/database/db_runtime.js",
+            "backend/src/database/seed_db.js",
+            "backend/src/database/prepare_e2e.js",
+            "backend/src/database/test_harness.js",
+            "backend/src/database/index.js",
+        ]
+
+    @classmethod
     def project_structure_lines(
         cls,
         *,
@@ -1082,10 +1115,13 @@ class WebAppType(AppTypeHandler):
             "  - Frontend shared test setup: frontend/test/setup.ts",
             "  - Backend source root: backend/src/",
             "  - Shared database scaffold: backend/src/database/",
+            "  - Backend API route modules: backend/src/routes/*.routes.js (auto-mounted)",
+            "  - Database schema modules: backend/src/database/schema/*.schema.js (auto-loaded)",
             "  - Backend Vitest tests: backend/tests/...",
             "  - Frontend Vitest tests: frontend/tests/...",
             "  - Playwright E2E tests: backend/test-e2e/...",
             "  - Database-using tests must allocate an isolated test DB through the scaffold.",
+            "  - Shared composition glue is registration-based: add per-feature modules instead of editing app.js, App.tsx, main.tsx, pages/HomePage.tsx, or init_db.js.",
             "  - Prefer entrypoints, route files, and owner files before broader search.",
         ]
 
