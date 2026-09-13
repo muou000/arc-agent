@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 from agents.test_driven_developer import TestDrivenDeveloper
 from core import sessions
@@ -76,6 +77,20 @@ def write_test_file(tmp_project_dir: Path) -> None:
     path = tmp_project_dir / UNIT_TEST_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("def test_add():\n    assert add(1, 1) == 2\n", encoding="utf-8")
+
+
+def track_tdd_sessions(tdd: TestDrivenDeveloper) -> list[str]:
+    """Record the ``test_type`` of every agent session the scheduler opens."""
+
+    session_types: list[str] = []
+    original_run = tdd.run
+
+    async def recording_run(**kwargs: Any) -> str:
+        session_types.append(str(kwargs["test_type"]))
+        return await original_run(**kwargs)
+
+    tdd.run = recording_run
+    return session_types
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +448,9 @@ def test_tdd_pass_advances_active_layer_immediately(tmp_project_dir: Path, arc_r
         ]
     )
     fake = FakeAppHandler([passing_test_output(), passing_test_output()])
-    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    session_types = track_tdd_sessions(tdd)
+    runner = make_runner(tmp_project_dir, tdd, fake)
 
     final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
 
@@ -443,6 +460,9 @@ def test_tdd_pass_advances_active_layer_immediately(tmp_project_dir: Path, arc_r
         ("Unit", [UNIT_TEST_FILE]),
         ("Integration", [INTEGRATION_TEST_FILE]),
     ]
+    # Integration passed inside the Unit session, so the outer scheduler must
+    # not open a follow-up Integration session for it.
+    assert session_types == ["Unit"]
     assert model.call_count == 4
     all_tool_results = "\n".join(
         str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
@@ -459,7 +479,10 @@ def test_tdd_budget_exhaustion_advances_to_next_layer(tmp_project_dir: Path, arc
     The prompt promises "the system moves to later layers even if an earlier
     layer fails or exhausts its budget"; the executor used to keep the active
     layer pinned to the exhausted one, so in-session requests for the next
-    layer were rejected and the session deadlocked.
+    layer were rejected and the session deadlocked. The in-session advance
+    must also leave the outer scheduler's per-layer contract intact: the
+    closed Unit layer never gets a second session, while Integration still
+    gets its own session to spend the rest of its budget.
     """
 
     node_id = "REQ-TDD-EXH"
@@ -488,7 +511,9 @@ def test_tdd_budget_exhaustion_advances_to_next_layer(tmp_project_dir: Path, arc
         passing_test_output(),
     ]
     fake = FakeAppHandler(outputs)
-    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    session_types = track_tdd_sessions(tdd)
+    runner = make_runner(tmp_project_dir, tdd, fake)
 
     final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
 
@@ -498,6 +523,10 @@ def test_tdd_budget_exhaustion_advances_to_next_layer(tmp_project_dir: Path, arc
         ("Integration", [INTEGRATION_TEST_FILE]),
         ("Integration", [INTEGRATION_TEST_FILE]),
     ]
+    # One Unit session only: after the in-session advance the outer scheduler
+    # must not reopen the closed Unit layer, and Integration keeps its own
+    # session with its remaining budget (per-layer budget semantics intact).
+    assert session_types == ["Unit", "Integration"]
     all_tool_results = "\n".join(
         str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
     )

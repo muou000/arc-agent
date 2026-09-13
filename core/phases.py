@@ -385,7 +385,10 @@ class WorkflowPhaseRunner:
                     # in-session advance the model stays locked to the closed
                     # layer (next-layer requests are rejected) and deadloops on
                     # budget-exhausted responses (observed on the 12306
-                    # benchmark: ~5 minutes of pure model turns per node).
+                    # benchmark: ~5 minutes of pure model turns per node). The
+                    # advance cannot make the outer scheduler reopen this layer:
+                    # it visits each layer once and its session loop breaks on
+                    # the budget check, so a closed layer never runs again.
                     active_test_type = closed_next_type
                     return (
                         "Exit Code: 1\n"
@@ -509,6 +512,11 @@ class WorkflowPhaseRunner:
                     node_id=node_id,
                 )
                 break
+            # Between sessions the outer loop owns the layer transitions: it
+            # re-pins the active layer and visits each layer exactly once, so
+            # a layer the executor closed or advanced past in-session never
+            # gets a second session (the while below only runs for layers
+            # that are still failing and not yet out of budget).
             active_test_type = ordered_type
             previous_failure_summary = str(sessions.load_node_session(node_id).get("recent_failure_summary", "") or "")
             while parse_test_results(result_by_type.get(ordered_type, "")).get("exit_code") != 0:
