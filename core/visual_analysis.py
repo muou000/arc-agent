@@ -80,6 +80,66 @@ For each data-bearing area:
 """
 
 
+def visual_precompute_enabled() -> bool:
+    raw = os.environ.get("ARC_VISUAL_PRECOMPUTE", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _precompute_concurrency() -> int:
+    raw = os.environ.get("ARC_VISUAL_PRECOMPUTE_CONCURRENCY", "").strip()
+    if raw.isdigit() and int(raw) >= 1:
+        return int(raw)
+    return 4
+
+
+async def precompute_visual_references(
+    *,
+    workspace_path: str,
+    requirements_dir: str,
+    requirement_nodes: list[tuple[str, dict[str, Any]]],
+    log_cb: LogCallback | None = None,
+) -> int:
+    """Analyze every still-unanalyzed reference image up front, in parallel.
+
+    DESIGN analyzed each node's reference image serially when the node's turn
+    came (~1.5-2.5 minutes per image; 34 image nodes on the 12306 benchmark
+    meant roughly an hour of blocking inside otherwise idle queue time). The
+    analysis is persisted per requirement and cached per image, so running the
+    same pass concurrently before the queue drains turns every later design
+    phase into a cache hit.
+
+    Returns the number of nodes whose images needed analysis.
+    """
+
+    pending: list[tuple[str, dict[str, Any]]] = []
+    for req_id, requirement_data in requirement_nodes:
+        candidates = _collect_visual_candidates(requirement_data)
+        if any(not str(item.get("analysis") or "").strip() for item in candidates):
+            pending.append((req_id, requirement_data))
+    if not pending:
+        return 0
+
+    await _log(
+        log_cb,
+        "System",
+        f"Precomputing visual references for {len(pending)} node(s) "
+        f"with up to {_precompute_concurrency()} concurrent analysis call(s)...",
+    )
+    semaphore = asyncio.Semaphore(_precompute_concurrency())
+
+    async def run_one(req_id: str, requirement_data: dict[str, Any]) -> None:
+        async with semaphore:
+            await analyze_and_attach_visual_references(
+                workspace_path=workspace_path,
+                requirements_dir=requirements_dir,
+                requirement_data=requirement_data,
+                log_cb=log_cb,
+            )
+
+    await asyncio.gather(*(run_one(req_id, data) for req_id, data in pending))
+    return len(pending)
+
+
 async def analyze_and_attach_visual_references(
     *,
     workspace_path: str,
