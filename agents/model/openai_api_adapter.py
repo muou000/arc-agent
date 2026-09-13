@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -29,6 +30,34 @@ _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_RETRY_INITIAL_DELAY = 2.0
 _DEFAULT_RETRY_MAX_DELAY = 30.0
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
+
+# Quota/billing exhaustion is deterministic: retrying only burns backoff time.
+# A status carrying these texts is an account or subscription limit, not a
+# transient throttle, so it must fail fast instead of entering the retry loop.
+# The list mirrors pi's NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN
+# (packages/ai/src/utils/retry.ts), minus bare "billing": that also matches
+# non-limit mentions (billing email prompts) and transient provider-side
+# billing-subsystem outages.
+_NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = re.compile(
+    "|".join(
+        (
+            r"insufficient[ _-]?quota",
+            r"exceeded your (?:current )?quota",
+            r"insufficient (?:credits?|funds|balance)",
+            r"out of budget",
+            r"quota exceeded",
+            r"usage.?limit",
+            r"available balance",
+            r"billing (?:hard )?limit",
+            r"payment required",
+        )
+    ),
+    re.IGNORECASE,
+)
+
+# Explicit throttle wording marks the error as transient even when it also
+# mentions quota/limit text (e.g. "quota exceeded for requests per minute").
+_TRANSIENT_THROTTLE_ERROR_PATTERN = re.compile(r"rate.?limit|too many requests|throttl", re.IGNORECASE)
 
 # ARC builds one agent per stage invocation, so ``build_openai_chat_model`` used
 # to construct a brand-new ChatOpenAI (and therefore a brand-new httpx client)
@@ -341,8 +370,36 @@ def _is_retryable_model_api_exception(exc: Exception) -> bool:
         return True
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):
+        if _is_provider_limit_error(exc):
+            return False
         return status_code in _RETRYABLE_STATUS_CODES or status_code >= 500
     return False
+
+
+def _is_provider_limit_error(exc: Exception) -> bool:
+    """Return True when the error text indicates quota/billing exhaustion."""
+    text = _provider_error_text(exc)
+    if _TRANSIENT_THROTTLE_ERROR_PATTERN.search(text):
+        return False
+    return bool(_NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.search(text))
+
+
+def _provider_error_text(exc: Exception) -> str:
+    """Combine the exception text with structured body fields for classification."""
+    parts = [str(exc)]
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        for candidate in (body.get("error"), body):
+            if isinstance(candidate, dict):
+                for key in ("message", "type", "code"):
+                    value = candidate.get(key)
+                    if value:
+                        parts.append(str(value))
+            elif candidate:
+                parts.append(str(candidate))
+    elif isinstance(body, (str, list)) and body:
+        parts.append(str(body))
+    return "\n".join(parts)
 
 
 def _compute_retry_delay(policy: _ModelRetryPolicy, failed_attempt: int, exc: Exception) -> float:
