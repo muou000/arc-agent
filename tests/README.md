@@ -35,6 +35,9 @@ tests/
     └── test_post_run_tdd_retry.py  # core/tdd_retry.py 的扫描与提示构造
 ```
 
+另有 `test_evals/`：A/B 评测工作流测试（`core/evals.py` 的指标提取、对比数学、报告渲染，
+`eval_table` 端到端与 `arc eval` CLI，全部基于 `fake_eval_runner.py` 假 runner，无模型访问）。
+
 ---
 
 ## 运行测试
@@ -101,6 +104,17 @@ make clean       # 清理 pytest 缓存与 __pycache__
   跳过空行/非 JSON/空 node_id。
 - `core/tdd_retry.py` 的 `build_tdd_reprompt`：在提示中包含 node_id、失败详情，并完整
   表述 TDD 序列（先写失败测试，禁止为通过而弱化测试）。
+
+### `test_evals/`
+
+- `core/evals.py` 的节点状态分桶、run 级 pass 判定（runner 退出码为 0 且无 FAILED 节点）
+  与 `llm_usage` 聚合读取。
+- 对比数学：按 repetition 配对、pass rate（pp）、tokens / latency / est. cost 均值差，
+  以及缺失遥测与未配对 repetition 时的 unavailable 语义。
+- 报告渲染与 pi `Eval Comparisons` 版式一致（`report.txt` / `report.json` / `runs.jsonl`）。
+- `eval_table` 端到端（`fake_eval_runner.py`）：工件落盘、`.arc` 证据快照、工作区清理、
+  超时与启动失败仍产出报告。
+- `arc eval` 子命令的参数解析、校验与 `--runner-script` 注入路径。
 
 ---
 

@@ -37,12 +37,13 @@ flowchart LR
    - Web 模板契约测试（`template.yaml` 清单与文件系统一致、Express `/api/health`、Vite 构建）；
    - 编译工作流纯函数测试。
 2. **Auto TDD re-prompt**（`core/tdd_retry.py`）：运行结束后扫描 runner 事件中的 `test/failed` 节点，自动构造 TDD 优先的修复提示，为失败节点的重试提供上下文。
+3. **A/B 评测**（`core/evals.py` + `arc eval` 子命令）：将 baseline 与 candidate 两个编译配置对同一需求树各运行 N 次，产出 pass rate / tokens / latency / est. cost 四指标提升报告（对齐 ARC-Bench 参考实现 pi 的 `evalHarnessTable` 工作流），详见下文「A/B 评测」。
 
 ## 目录结构
 
 ```
 arc-agent/
-├── arc_main.py               # CLI 入口（compile / doctor / config / usage 子命令）
+├── arc_main.py               # CLI 入口（compile / doctor / config / usage / eval 子命令）
 ├── main.py                   # ARC-Bench 平台适配入口
 ├── agents/                   # 三个舞台智能体
 │   ├── interface_designer.py #   接口设计
@@ -55,7 +56,7 @@ arc-agent/
 │   └── tools/                #   智能体工具（构建、追溯）
 ├── app_type_handler/         # 应用类型处理器（web / android / cli）
 ├── arcbench_agent_runtime/   # ARC-Bench Python SDK（事件、追溯、Git）
-├── core/                     # 编译工作流、阶段调度、配置、日志
+├── core/                     # 编译工作流、阶段调度、配置、日志、A/B 评测
 ├── skills/                   # 技能库（Markdown 形式的阶段指导）
 ├── arc-template/templates/   # Web 应用模板（React + Vite + Express + SQLite）
 └── tests/                    # 契约测试套件（见 tests/README.md）
@@ -147,6 +148,44 @@ python arc_main.py usage --project-dir path/to/output --json   # 机读 JSON
 token，2026-09，见 `agents/model/costing.py`）。目录是封闭集合：模型名匹配不区分大小写
 （`MiniMax-M3` 与 `minimax-m3` 同价），表外模型一律不计成本（报表中显示为 unpriced），
 目录调整时直接更新 `costing.py` 中的 `_BUILTIN_MODEL_COSTS` 表。
+
+### A/B 评测
+
+`arc eval` 将同一份需求树分别以 baseline 和 candidate 两个配置各编译 N 次，输出四指标的
+candidate − baseline 提升报告（移植自 ARC-Bench 参考实现 pi 的 `evalHarnessTable`
+评测工作流）。两个 arm 的差异通过环境变量覆盖和附加 compile 参数表达：
+
+```bash
+python arc_main.py eval path/to/requirements \
+  --baseline-env ARC_AUTO_TDD_RETRY=0 \
+  --candidate-env ARC_AUTO_TDD_RETRY=1 \
+  --repetitions 5
+```
+
+- `--baseline-env` / `--candidate-env` 为各 arm 的环境变量覆盖（会盖过 `.env` 同名变量），
+  `--baseline-arg` / `--candidate-arg` 为附加 compile 参数（追加在命令末尾，取值以 `=`
+  形式传入时可含 `--` 前缀）。每次运行都是干净子进程，与普通 `arc compile` 一致。
+- 调试用 `--repetitions 1`，报告提升时建议 5 次；`--timeout` 给单次运行设置秒级上限，
+  超时按失败运行计入报告。报告默认写入 `records/evals/<时间戳>-<名称>/`，`--out-dir` 可覆盖。
+
+```text
+Eval Comparisons
+  baseline vs candidate
+     Baseline  baseline
+    Candidate  candidate (5/5 pairs)
+    Pass rate  +60.0 pp (candidate 80.0%, baseline 20.0%)
+       Tokens  -1200.0 (candidate 22800.0, baseline 24000.0)
+      Latency  -850.0ms (candidate 14000.0ms, baseline 14850.0ms)
+    Est. cost  -¥0.0100 (candidate ¥0.1100, baseline ¥0.1200)
+```
+
+- 运行按 repetition 配对：pass rate 是配对运行中编译成功（runner 退出码为 0 且无 FAILED
+  节点）的占比，tokens / latency / est. cost 是配对运行的均值差；一侧缺失遥测时该指标
+  标记 unavailable 而不是猜测。成本为 CNY，来自 `agents/model/costing.py` 单价目录。
+- 产物目录包含 `report.txt` / `report.json`（结构化对比）、`runs.jsonl`（每次运行一条
+  记录）和 `sessions/<run_id>/`（该次运行的 runner 事件、队列、追溯表、节点会话与控制台
+  输出快照）。运行工作区默认放在系统临时目录并在快照后删除，`--work-root` /
+  `--keep-workspaces` 可控制。
 
 ### 测试
 
