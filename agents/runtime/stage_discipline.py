@@ -102,7 +102,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 f"Repeated write blocked: {path} was already changed in this stage. "
                 "Wait for a file-operation or system-validation error before changing it again."
             )
-        if self._stage == "interface_design" and path in self._denied_write_paths:
+        if self._stage == "interface_design" and path.rstrip("/") in self._denied_write_paths:
             return (
                 f"InterfaceDesigner must not edit shared runtime glue: {path}. Shared files are "
                 "assembled automatically from per-feature registration modules; add a new route, "
@@ -197,16 +197,19 @@ def _discipline_path(args: dict[str, Any]) -> str:
 
 
 def _virtual_workspace_paths(paths: Iterable[str]) -> Iterable[str]:
-    """Normalize workspace-relative glue paths to the agent's virtual view.
+    """Normalize workspace-relative glue paths to the agent's virtual views.
 
-    The denylist is authored as workspace-relative paths (``frontend/src/App.tsx``);
-    agents address files under the virtual ``/workspace/`` root.
+    The denylist is authored as workspace-relative paths (``frontend/src/App.tsx``).
+    Agents normally address files under the virtual ``/workspace/`` root, but a
+    bare ``/<relative>`` spelling reaches the same tooling, so each entry matches
+    both forms.
     """
 
     for raw in paths:
         normalized = str(raw or "").strip().replace("\\", "/").strip("/")
         if normalized:
             yield f"/workspace/{normalized}"
+            yield f"/{normalized}"
 
 
 def _as_nonnegative_int(value: Any, *, default: int) -> int:

@@ -357,3 +357,24 @@ def test_design_without_denylist_keeps_previous_behavior() -> None:
         make_request("write_file", {"file_path": "/workspace/frontend/src/App.tsx", "content": "x"}),
     )
     assert result.content == "ok"
+
+
+def test_denied_glue_paths_match_unprefixed_virtual_paths() -> None:
+    middleware = make_design_with_glue_denylist(["frontend/src/App.tsx"])
+    result = run(
+        middleware,
+        make_request("write_file", {"file_path": "/frontend/src/App.tsx", "content": "x"}),
+    )
+    assert isinstance(result, ToolMessage) and result.status == "error"
+
+
+def test_denied_glue_paths_match_trailing_slash_spellings() -> None:
+    middleware = make_design_with_glue_denylist(["frontend/src/App.tsx"])
+    result = run(
+        middleware,
+        make_request(
+            "edit_file",
+            {"file_path": "/workspace/frontend/src/App.tsx/", "old_string": "a", "new_string": "b"},
+        ),
+    )
+    assert isinstance(result, ToolMessage) and result.status == "error"
