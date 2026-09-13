@@ -245,3 +245,31 @@ def test_parse_env_overrides_rejects_bad_entries():
         parse_env_overrides(["A=1", "novalue"], flag="--x")
     with pytest.raises(ValueError, match="--x"):
         parse_env_overrides(["=1"], flag="--x")
+
+
+# ---------------------------------------------------------------------------
+# default artifacts dir naming
+# ---------------------------------------------------------------------------
+def test_default_artifacts_dir_stamp_is_utc_and_slugified():
+    import time as _time
+
+    from core.evals import DEFAULT_ARTIFACTS_ROOT, _next_default_artifacts_dir
+
+    lower_bound = _time.strftime("%Y%m%d-%H%M%S", _time.gmtime())
+    path = _next_default_artifacts_dir("Skill Lift 汇报")
+    upper_bound = _time.strftime("%Y%m%d-%H%M%S", _time.gmtime())
+    stamp, slug = path.name[:15], path.name[16:]  # stamp is the fixed 15-char prefix
+    assert path.parent == DEFAULT_ARTIFACTS_ROOT
+    assert lower_bound <= stamp <= upper_bound
+    assert slug == "skill-lift"  # non-ascii runs collapse to nothing
+
+
+def test_default_artifacts_dir_skips_existing_names(tmp_path, monkeypatch):
+    from core.evals import _next_default_artifacts_dir
+
+    monkeypatch.setattr("core.evals.DEFAULT_ARTIFACTS_ROOT", tmp_path)
+    first = _next_default_artifacts_dir("dup")
+    first.mkdir(parents=True)
+    second = _next_default_artifacts_dir("dup")
+    assert second != first
+    assert second.name == f"{first.name}-2"

@@ -377,18 +377,30 @@ def eval_table(
     return EvalResult(report=report, runs=runs, artifacts_dir=artifacts)
 
 
-def _prepare_artifacts_dir(artifacts_dir: str | Path | None, name: str) -> Path:
-    if artifacts_dir:
-        base = Path(artifacts_dir)
-        base.mkdir(parents=True, exist_ok=True)
-        return base
+def _next_default_artifacts_dir(name: str) -> Path:
+    """Unique not-yet-created artifacts path under the default root.
+
+    The stamp is UTC (matching every other machine timestamp in the harness)
+    so directory ordering stays stable across timezone or DST changes.
+    """
+
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:60] or "eval"
-    base = DEFAULT_ARTIFACTS_ROOT / f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}"
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    base = DEFAULT_ARTIFACTS_ROOT / f"{stamp}-{slug}"
     candidate = base
     index = 2
     while candidate.exists():
         candidate = base.with_name(f"{base.name}-{index}")
         index += 1
+    return candidate
+
+
+def _prepare_artifacts_dir(artifacts_dir: str | Path | None, name: str) -> Path:
+    if artifacts_dir:
+        base = Path(artifacts_dir)
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    candidate = _next_default_artifacts_dir(name)
     candidate.mkdir(parents=True)
     return candidate
 
