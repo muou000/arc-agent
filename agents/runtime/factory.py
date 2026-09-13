@@ -160,9 +160,12 @@ def _message_hit_output_limit(message: Any) -> bool:
     """Return True when the provider cut this response short of completion.
 
     Chat-completions responses carry ``finish_reason="length"`` in
-    ``response_metadata``; Responses-API responses carry ``status="incomplete"``
-    (``incomplete_details.reason="max_output_tokens"``). Either way the payload
-    may end mid-argument.
+    ``response_metadata``; Responses-API responses carry
+    ``status="incomplete"``. Some proxies pass only
+    ``incomplete_details`` through, so a populated
+    ``incomplete_details.reason`` (which only exists on incomplete
+    responses) counts as a cut on its own. Either way the payload may end
+    mid-argument.
     """
 
     metadata = getattr(message, "response_metadata", None)
@@ -170,7 +173,10 @@ def _message_hit_output_limit(message: Any) -> bool:
         return False
     if metadata.get("finish_reason") in _LENGTH_FINISH_REASONS:
         return True
-    return metadata.get("status") == "incomplete"
+    if metadata.get("status") == "incomplete":
+        return True
+    details = metadata.get("incomplete_details")
+    return isinstance(details, dict) and bool(details.get("reason"))
 
 
 def _truncation_rejection_tool_message(call: "Mapping[str, Any]") -> ToolMessage:

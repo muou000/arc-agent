@@ -63,6 +63,24 @@ def test_length_truncated_tool_calls_get_error_results() -> None:
     assert "Re-issue" in rejection.content
 
 
+def test_incomplete_details_without_status_is_intercepted() -> None:
+    """Proxies may pass through incomplete_details only; that still marks a cut."""
+
+    recorder: list = []
+    middleware = TruncatedToolCallGuardMiddleware()
+    message = _tool_call_message(
+        "call-truncated",
+        metadata={"incomplete_details": {"reason": "max_output_tokens"}},
+    )
+
+    result = asyncio.run(
+        middleware.awrap_model_call(None, _handler(_model_response(message), recorder))
+    )
+
+    rejections = [m for m in result.result if isinstance(m, ToolMessage)]
+    assert [m.tool_call_id for m in rejections] == ["call-truncated"]
+
+
 def test_responses_api_incomplete_status_is_intercepted() -> None:
     recorder: list = []
     middleware = TruncatedToolCallGuardMiddleware()
@@ -181,8 +199,12 @@ def test_response_without_result_attribute_passes_through() -> None:
 def test_message_hit_output_limit_metadata_variants() -> None:
     assert _message_hit_output_limit(AIMessage(content="", response_metadata={"finish_reason": "length"}))
     assert _message_hit_output_limit(AIMessage(content="", response_metadata={"status": "incomplete"}))
+    assert _message_hit_output_limit(AIMessage(content="", response_metadata={"incomplete_details": {"reason": "max_output_tokens"}}))
+    assert _message_hit_output_limit(AIMessage(content="", response_metadata={"incomplete_details": {"reason": "content_filter"}}))
     assert not _message_hit_output_limit(AIMessage(content="", response_metadata={"finish_reason": "stop"}))
     assert not _message_hit_output_limit(AIMessage(content="", response_metadata={"finish_reason": "tool_calls"}))
     assert not _message_hit_output_limit(AIMessage(content="", response_metadata={"status": "completed"}))
+    assert not _message_hit_output_limit(AIMessage(content="", response_metadata={"incomplete_details": None}))
+    assert not _message_hit_output_limit(AIMessage(content="", response_metadata={}))
     assert not _message_hit_output_limit(AIMessage(content=""))
     assert not _message_hit_output_limit(ToolMessage(content="x", tool_call_id="call-1"))
