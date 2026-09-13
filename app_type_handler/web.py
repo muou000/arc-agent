@@ -1115,11 +1115,14 @@ class WebAppType(AppTypeHandler):
         copy step the agent fabricates binary files with ``write_file``
         (observed: 0-byte PNGs on the 12306 benchmark) and every image-bearing
         acceptance check fails. Assets are static inputs, so a plain copy into
-        Vite's public directory is enough; existing files are never overwritten
-        and a missing or unreadable assets directory is not fatal.
+        Vite's public directory is enough; subdirectories are mirrored by
+        relative path, existing files are never overwritten, and a missing or
+        unreadable assets directory is not fatal.
         """
 
-        requirements_dir = Path(self.requirement_path or "").expanduser().resolve().parent
+        if not self.requirement_path:
+            return
+        requirements_dir = Path(self.requirement_path).expanduser().resolve().parent
         assets_dir = requirements_dir / "assets"
         if not assets_dir.is_dir():
             return
@@ -1127,12 +1130,13 @@ class WebAppType(AppTypeHandler):
         copied = 0
         try:
             public_assets.mkdir(parents=True, exist_ok=True)
-            for item in sorted(assets_dir.iterdir()):
+            for item in sorted(assets_dir.rglob("*")):
                 if not item.is_file():
                     continue
-                target = public_assets / item.name
+                target = public_assets / item.relative_to(assets_dir)
                 if target.exists():
                     continue
+                target.parent.mkdir(parents=True, exist_ok=True)
                 await asyncio.to_thread(shutil.copy2, item, target)
                 copied += 1
         except OSError as exc:

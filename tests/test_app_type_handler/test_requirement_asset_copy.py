@@ -95,15 +95,25 @@ def test_copy_failure_is_logged_not_raised(tmp_path, monkeypatch) -> None:
     assert logs and logs[0][0] == "warning"
 
 
-def test_subdirectories_in_assets_are_skipped(tmp_path) -> None:
+def test_empty_requirement_path_is_a_no_op(tmp_path) -> None:
+    (tmp_path / "frontend").mkdir()
+    handler = _handler(tmp_path, "")
+
+    asyncio.run(handler._copy_requirement_assets())
+
+    assert not (tmp_path / "frontend" / "public").exists()
+
+
+def test_nested_assets_are_copied_preserving_relative_paths(tmp_path) -> None:
     requirement_path = _make_requirements(tmp_path)
-    (requirements_assets := tmp_path / "input" / "requirements" / "assets" / "nested").mkdir()
-    (requirements_assets / "deep.png").write_bytes(b"x")
+    nested = tmp_path / "input" / "requirements" / "assets" / "nested"
+    nested.mkdir()
+    (nested / "deep.png").write_bytes(b"deep")
     (tmp_path / "frontend").mkdir()
     handler = _handler(tmp_path, requirement_path)
 
     asyncio.run(handler._copy_requirement_assets())
 
     copied = tmp_path / "frontend" / "public" / "assets"
+    assert (copied / "nested" / "deep.png").read_bytes() == b"deep"
     assert (copied / "logo.png").exists()
-    assert not (copied / "nested").exists()
