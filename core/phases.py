@@ -315,7 +315,7 @@ class WorkflowPhaseRunner:
         active_test_type: str | None = None
 
         async def run_requested_tests(requested_type: str | None = None, requested_files: list[str] | None = None) -> str:
-            nonlocal environment_failure
+            nonlocal environment_failure, active_test_type
             requested = str(requested_type or "").strip()
             if active_test_type is None:
                 return (
@@ -368,10 +368,45 @@ class WorkflowPhaseRunner:
                     status="error",
                     node_id=node_id,
                 )
+                if environment_failure is not None:
+                    return (
+                        "Exit Code: 1\n"
+                        "STDERR:\n"
+                        f"run_tests budget exhausted for {selected_type}: {used}/{TDD_RUN_TESTS_BUDGET}.\n"
+                        "The workspace failed for an environmental reason. Do not call run_tests again; "
+                        "return your report now.\n"
+                    )
+                closed_next_index = ordered_types.index(selected_type) + 1
+                closed_next_type = ordered_types[closed_next_index] if closed_next_index < len(ordered_types) else None
+                if closed_next_type is not None:
+                    # Advance the active layer the moment its budget is gone. The
+                    # prompt promises "the system moves to later layers even if an
+                    # earlier layer fails or exhausts its budget"; without this
+                    # in-session advance the model stays locked to the closed
+                    # layer (next-layer requests are rejected) and deadloops on
+                    # budget-exhausted responses (observed on the 12306
+                    # benchmark: ~5 minutes of pure model turns per node). The
+                    # advance cannot make the outer scheduler reopen this layer:
+                    # it visits each layer once and its session loop breaks on
+                    # the budget check, so a closed layer never runs again.
+                    active_test_type = closed_next_type
+                    return (
+                        "Exit Code: 1\n"
+                        "STDERR:\n"
+                        f"The {selected_type} layer is closed: run_tests budget exhausted at "
+                        f"{used}/{TDD_RUN_TESTS_BUDGET}.\n"
+                        f"The system has advanced the active layer to `{closed_next_type}`; "
+                        f"`run_tests(test_type='{closed_next_type}')` now targets it.\n"
+                        f"Apply a concrete repair before spending the {closed_next_type} budget, or end your turn "
+                        f"with a concise summary of the failing {selected_type} tests and the next edit target.\n"
+                    )
                 return (
                     "Exit Code: 1\n"
                     "STDERR:\n"
-                    f"run_tests budget exhausted for {selected_type}: {used}/{TDD_RUN_TESTS_BUDGET}.\n"
+                    f"The {selected_type} layer is closed: run_tests budget exhausted at "
+                    f"{used}/{TDD_RUN_TESTS_BUDGET}. This was the last scheduled layer.\n"
+                    "End your turn now with a concise summary of the failing tests and the next edit target. "
+                    "Do not call run_tests again.\n"
                 )
             usage_by_type[selected_type] = used + 1
             await self._log(
@@ -428,10 +463,21 @@ class WorkflowPhaseRunner:
             next_index = ordered_types.index(selected_type) + 1
             next_type = ordered_types[next_index] if next_index < len(ordered_types) else None
             if passed and next_type:
+                # Advance immediately instead of waiting for the session to
+                # end. Otherwise a model that keeps polling `run_tests` after a
+                # pass re-runs the passing layer until its budget is gone and
+                # then deadloops on rejected next-layer requests (observed on
+                # the 12306 benchmark: attempts 6-10 re-ran an already-passing
+                # batch, then the session burned minutes on "the system says it
+                # will advance but never does").
+                active_test_type = next_type
                 output += (
                     "\n\nARC_TEST_LAYER_STATUS:\n"
                     f"- {selected_type} passed.\n"
-                    f"- The system will advance to the next test layer: {next_type}.\n"
+                    f"- The system has advanced the active layer to `{next_type}`; "
+                    f"`run_tests(test_type='{next_type}')` now targets it.\n"
+                    f"- The {selected_type} layer is closed: further `{selected_type}` calls are rejected "
+                    "without consuming budget.\n"
                     "- Do not return IMPLEMENTED until all scheduled layers have been attempted and passed.\n"
                 )
             elif passed:
@@ -466,6 +512,11 @@ class WorkflowPhaseRunner:
                     node_id=node_id,
                 )
                 break
+            # Between sessions the outer loop owns the layer transitions: it
+            # re-pins the active layer and visits each layer exactly once, so
+            # a layer the executor closed or advanced past in-session never
+            # gets a second session (the while below only runs for layers
+            # that are still failing and not yet out of budget).
             active_test_type = ordered_type
             previous_failure_summary = str(sessions.load_node_session(node_id).get("recent_failure_summary", "") or "")
             while parse_test_results(result_by_type.get(ordered_type, "")).get("exit_code") != 0:
