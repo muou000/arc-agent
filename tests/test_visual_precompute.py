@@ -144,6 +144,50 @@ def test_concurrent_tasks_do_not_erase_sibling_cache_entries(
     assert len(cache) == 2, f"both image entries must survive the concurrent pass, got: {sorted(cache)}"
 
 
+def test_one_failing_node_does_not_abort_the_precompute_pass(
+    image_env,
+    monkeypatch,
+) -> None:
+    """A persist failure for one node (e.g. a requirement missing from the
+    traceability store) must degrade to a per-node error, not abort the whole
+    compile before the queue drains."""
+    workspace, requirements = image_env
+    logs: list[tuple] = []
+    updates: list = []
+
+    class _PartiallyFailingRuntime:
+        def __init__(self) -> None:
+            self.traceability = SimpleNamespace(update_requirement_fields=self._update)
+
+        def _update(self, req_id: str, **fields) -> None:
+            if req_id == "REQ-1":
+                raise ValueError(f"Requirement not found: {req_id}")
+            updates.append((req_id, fields))
+
+    async def log_cb(agent_name, message, status=None, node_id=None):
+        logs.append((node_id, status))
+
+    async def fake_request(full_path: str) -> str:
+        await asyncio.sleep(0.01)
+        return f"analysis for {Path(full_path).name}"
+
+    monkeypatch.setattr(visual_analysis, "_request_visual_analysis", fake_request)
+    monkeypatch.setattr(visual_analysis, "get_runtime", lambda: _PartiallyFailingRuntime())
+
+    count = asyncio.run(
+        visual_analysis.precompute_visual_references(
+            workspace_path=str(workspace),
+            requirements_dir=str(requirements),
+            requirement_nodes=[_node("REQ-1", "a.png"), _node("REQ-2", "b.png")],
+            log_cb=log_cb,
+        )
+    )
+
+    assert count == 1, "only the healthy node counts as analyzed"
+    assert {req_id for req_id, _fields in updates} == {"REQ-2"}
+    assert ("REQ-1", "error") in logs
+
+
 def test_precompute_env_toggle() -> None:
     import os
 

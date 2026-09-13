@@ -115,7 +115,11 @@ async def precompute_visual_references(
     same pass concurrently before the queue drains turns every later design
     phase into a cache hit.
 
-    Returns the number of nodes whose images needed analysis.
+    Failures are logged per node and never abort the pass; the affected node
+    simply retries analysis during its own DESIGN phase, exactly as it would
+    have without precompute.
+
+    Returns the number of nodes whose images were analyzed.
     """
 
     pending: list[tuple[str, dict[str, Any]]] = []
@@ -143,8 +147,25 @@ async def precompute_visual_references(
                 log_cb=log_cb,
             )
 
-    await asyncio.gather(*(run_one(req_id, data) for req_id, data in pending))
-    return len(pending)
+    results = await asyncio.gather(
+        *(run_one(req_id, data) for req_id, data in pending),
+        return_exceptions=True,
+    )
+    analyzed = 0
+    for (req_id, _data), result in zip(pending, results):
+        if isinstance(result, BaseException):
+            await _log(
+                log_cb,
+                "System",
+                f"Precompute visual analysis failed for {req_id}: "
+                f"{type(result).__name__}: {result}. The node will retry "
+                "analysis during its DESIGN phase.",
+                "error",
+                req_id,
+            )
+            continue
+        analyzed += 1
+    return analyzed
 
 
 async def analyze_and_attach_visual_references(
