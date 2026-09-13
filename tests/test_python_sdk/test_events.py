@@ -198,7 +198,110 @@ class TestRefreshSignals:
         assert lines[0]["reason"] == "arcbench_agent_runtime"
 
 
+class TestLLMUsageEvents:
+    """Pin the ``llm_usage`` schema: one event per model call, pi-style usage."""
+
+    def test_record_llm_usage_writes_canonical_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        cost = {
+            "input": 0.000225,
+            "output": 0.0003,
+            "cache_read": 0.000025,
+            "cache_write": 0.0,
+            "total": 0.00055,
+        }
+        events.record_llm_usage(
+            node_id=" REQ-1 ",
+            phase="DESIGN",
+            model="gpt-4o",
+            api_mode="chat_completions",
+            source="reported",
+            input_tokens=90,
+            output_tokens=30,
+            cache_read_tokens=20,
+            cache_write_tokens=10,
+            cache_write_1h_tokens=None,
+            reasoning_tokens=5,
+            total_tokens=150,
+            cost=cost,
+        )
+
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "llm_usage",
+            "node_id": "REQ-1",
+            "phase": "DESIGN",
+            "model": "gpt-4o",
+            "api_mode": "chat_completions",
+            "source": "reported",
+            "usage": {
+                "input": 90,
+                "output": 30,
+                "cache_read": 20,
+                "cache_write": 10,
+                "cache_write_1h": None,
+                "reasoning": 5,
+                "total": 150,
+            },
+            "cost": cost,
+            "timestamp": lines[0]["timestamp"],
+        }
+
+    def test_empty_node_id_is_allowed_for_run_level_calls(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        # Unlike requirement_state events, usage without a node is valid: it
+        # attributes planning-time model calls to the run as a whole.
+        events.record_llm_usage(model="gpt-4o", input_tokens=1, output_tokens=1, total_tokens=2)
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["node_id"] == ""
+        assert lines[0]["phase"] == ""
+
+    def test_defaults_report_zero_usage_without_cost(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_llm_usage(node_id="REQ-1")
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["source"] == "reported"
+        assert lines[0]["usage"] == {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "cache_write_1h": None,
+            "reasoning": None,
+            "total": 0,
+        }
+        assert lines[0]["cost"] is None
+
+    def test_negative_and_invalid_values_are_clamped(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_llm_usage(
+            node_id="REQ-1",
+            input_tokens=-5,
+            output_tokens="7",
+            reasoning_tokens=-1,
+            total_tokens=None,
+        )
+        lines = _read_jsonl(event_paths.runner_events_path)
+        usage = lines[0]["usage"]
+        assert usage["input"] == 0
+        assert usage["output"] == 7
+        assert usage["reasoning"] is None  # negative breakdown is not reportable
+        assert usage["total"] == 0
+
+    def test_non_dict_cost_is_normalized_to_null(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_llm_usage(node_id="REQ-1", cost="not-a-dict")  # type: ignore[arg-type]
+        assert _read_jsonl(event_paths.runner_events_path)[0]["cost"] is None
+
+
 class TestDemoTestStatus:
+    """Demo helpers are documented as no-op with respect to disk state."""
     """Demo helpers are documented as no-op with respect to disk state."""
 
     def test_read_returns_empty_payload(self, events: EventClient) -> None:
