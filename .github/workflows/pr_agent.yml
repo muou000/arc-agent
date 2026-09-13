@@ -25,3 +25,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CONFIG__MODEL: ${{ secrets.CONFIG__MODEL }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ secrets.CONFIG__CUSTOM_MODEL_MAX_TOKENS }}
+          CONFIG__RESPONSE_LANGUAGE: "zh-CN"
