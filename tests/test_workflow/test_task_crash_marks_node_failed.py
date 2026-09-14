@@ -11,6 +11,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agents.model.openai_api_adapter import ARCModelAPIError
 from core.workflow import (
     ARCWorkflowManager,
@@ -19,6 +21,13 @@ from core.workflow import (
     TASK_FAILED,
     TASK_PENDING,
 )
+
+
+@pytest.fixture(autouse=True)
+def _serial_drain_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Parallel worktree mode is the default and needs a real git worktree;
+    # these tests exercise the shared-workspace serial drain path.
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "0")
 
 
 class _Traceability:

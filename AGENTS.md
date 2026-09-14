@@ -59,7 +59,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 
 - 保持节点的设计、实施、成功、失败、恢复和重试状态可互相解释。
 - `--resume` 应复用现有输出工作区和追溯产物；`--retry-failed` 与 `--retry` 只能在续跑语义下使用。
-- 默认（`ARC_NODE_WORKTREES` 未开启）保持共享工作区的严格串行调度。`ARC_NODE_WORKTREES=1` 下任务按顶层子树亲和调度：同一子树的任务在共享的 worktree 目录中顺序执行，不同子树并行（独立端口槽位和 E2E 数据库），任务结束合并回主工作区；跨子树共享 glue 文件的纯追加冲突由合并层机械消解并受合并后健康检查门禁约束，其余冲突将该节点标记为失败并保留其 worktree。修改该模式时必须同步维护 `core/worktree.py` 的复用/隔离区/合并/冲突语义、`_next_affinity_task` 的分组规则、端口槽位分配和 `_task_dependencies_met` 的顺序规则，并配套真实 git 的回归测试。
+- 默认启用每节点 worktree 并行调度（设置 `ARC_NODE_WORKTREES=0/false/no/off` 可恢复共享工作区的严格串行调度）。并行下任务按顶层子树亲和调度：同一子树的任务在共享的 worktree 目录中顺序执行，不同子树并行（独立端口槽位和 E2E 数据库，默认并发 `ARC_MAX_CONCURRENT_TASKS=3`、上限 8），任务结束合并回主工作区；跨子树共享 glue 文件的纯追加冲突由合并层机械消解并受合并后健康检查门禁约束，其余冲突将该节点标记为失败并保留其 worktree。修改该模式时必须同步维护 `core/worktree.py` 的复用/隔离区/合并/冲突语义、`_next_affinity_task` 的分组规则、端口槽位分配和 `_task_dependencies_met` 的顺序规则，并配套真实 git 的回归测试。
 - 修改 post-run TDD retry 时，保持 `.arc/runner-events.jsonl` 的扫描字段、去重顺序和失败上下文传递一致。
 
 ### Runtime SDK 和追溯数据

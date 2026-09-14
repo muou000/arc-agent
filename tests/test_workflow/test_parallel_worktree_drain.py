@@ -10,7 +10,8 @@ contract required before concurrent tasks may run:
 - a merge conflict fails exactly the conflicting node and leaves the
   integration workspace (and the other node) untouched;
 - a parent's IMPLEMENT waits for all descendant IMPLEMENTs;
-- without ARC_NODE_WORKTREES the drain stays strictly serial.
+- parallel mode is the default; with ARC_NODE_WORKTREES=0 the drain stays
+  strictly serial.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from core.workflow import (
     ARCWorkflowManager,
     NODE_FAILED,
     NODE_PASSED,
+    PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS,
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
     TASK_COMPLETED,
@@ -232,8 +234,16 @@ def test_merge_conflict_fails_only_the_conflicting_node(
     assert len(preserved) == 1 and conflicting[0] in preserved[0].name
 
 
-def test_serial_drain_is_the_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_parallel_mode_is_the_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ARC_NODE_WORKTREES", raising=False)
+    manager = _make_parallel_manager(tmp_path)
+
+    assert manager._parallel_mode is True
+    assert manager._max_concurrent_tasks() == PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS
+
+
+def test_serial_drain_with_worktrees_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "0")
     manager = _make_parallel_manager(tmp_path)
     queue_state = _queue_state(manager, _requirement_tree())
 
