@@ -160,6 +160,26 @@ def test_plan_stage_skills_returns_none_on_failure(arc_runtime, payload):
     assert load_node_session("n1") == {}
 
 
+def test_parse_plan_json_tolerates_prose_and_broken_candidates():
+    from agents.skills.planning import _parse_plan_json
+
+    good = {"design": ["frontend-design"], "test_generation": [], "implementation": []}
+    # Prose before/after the object.
+    assert _parse_plan_json('Sure, here is the plan: {"design": []} Done.') == {"design": []}
+    # First "{" opens invalid JSON; the later object still parses.
+    assert _parse_plan_json('intro {not json} {"design": ["frontend-design"]}') == {
+        "design": ["frontend-design"]
+    }
+    # Code fence + prose combination.
+    assert _parse_plan_json('```json\nPlan: {"design": []}\n```') == {"design": []}
+
+    with pytest.raises(ValueError, match="no JSON object"):
+        _parse_plan_json("totally not json")
+    # Parse failures carry a response excerpt for diagnosis.
+    with pytest.raises(ValueError, match="utterly unparseable drivel"):
+        _parse_plan_json("utterly unparseable drivel")
+
+
 def test_plan_stage_skills_skips_when_model_missing(arc_runtime, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MODEL", raising=False)
 

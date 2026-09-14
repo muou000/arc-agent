@@ -183,18 +183,34 @@ def _extract_text(response: Any) -> str:
 
 
 def _parse_plan_json(text: str) -> dict[str, Any]:
+    """Extract the first complete top-level JSON object from the response.
+
+    Candidate scanning via ``JSONDecoder.raw_decode`` survives prose around
+    the object (e.g. "Sure, here is the plan: {...} Done.") and a first
+    ``{`` that opens invalid JSON; a plain find/rfind slice would grab a
+    wrong span in both cases.
+    """
+
     stripped = text.strip()
     if stripped.startswith("```"):
         stripped = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", stripped)
         stripped = re.sub(r"\s*```\s*$", "", stripped)
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("planner response contained no JSON object")
-    payload = json.loads(stripped[start : end + 1])
-    if not isinstance(payload, dict):
-        raise ValueError("planner response JSON was not an object")
-    return payload
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(stripped):
+        if char != "{":
+            continue
+        try:
+            payload, _end = decoder.raw_decode(stripped[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError(f"planner response contained no JSON object: {_excerpt(stripped)}")
+
+
+def _excerpt(text: str, limit: int = 200) -> str:
+    short = " ".join(text.split())
+    return short if len(short) <= limit else short[:limit] + "...<truncated>"
 
 
 def _validate_plan(plan: SkillPlanResponse) -> tuple[dict[str, Any], list[str]]:
