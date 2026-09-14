@@ -99,6 +99,59 @@ def installed_backend(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     yield scratch / "backend"
 
 
+_DB_INIT_SEMANTICS_CHECK = """\
+// Contract: initializeDatabase() always resolves to an open handle for the
+// current database path, even when closeDb()/setDbPath() race an in-flight
+// first init (regression for SQLITE_MISUSE: Database is closed).
+// The close-race MUST be the first init in the process: later calls hit the
+// memoized path and can self-heal, hiding the bug.
+process.chdir(__dirname);
+const assert = require('assert');
+const { initializeDatabase, closeDb } = require('./src/database/init_db');
+
+const unhandled = [];
+process.on('unhandledRejection', (err) => unhandled.push(err));
+
+async function usable(handle, label) {
+  await new Promise((resolve, reject) => {
+    handle.run('SELECT 1 AS one', (err) => {
+      if (err) reject(new Error(`${label}: ${err.message}`));
+      else resolve();
+    });
+  });
+}
+
+async function main() {
+  const racing = initializeDatabase();
+  await closeDb();
+  await usable(await racing, 'close-race');
+
+  const h1 = await initializeDatabase();
+  const h2 = await initializeDatabase();
+  assert.strictEqual(h2, h1, 'sequential second call should reuse the open handle');
+  await usable(h2, 'second-call');
+
+  const switched = await initializeDatabase({ dbPath: 'check-switch.sqlite' });
+  await usable(switched, 'dbPath-switch');
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepStrictEqual(unhandled, [], 'no unhandled rejections expected');
+
+  await closeDb();
+  require('fs').rmSync('database.db', { force: true });
+  require('fs').rmSync('check-switch.sqlite', { force: true });
+  console.log('DB_INIT_SEMANTICS_OK');
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error(err && err.message ? err.message : err);
+    process.exit(1);
+  });
+"""
+
+
 class TestBackendContract:
     def test_app_module_loads(self, installed_backend: Path) -> None:
         proc = subprocess.run(
@@ -138,6 +191,21 @@ class TestBackendContract:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+    def test_database_init_handle_semantics(self, installed_backend: Path) -> None:
+        """initializeDatabase() must never hand out a closed handle, even when
+        closeDb()/setDbPath() race an in-flight first init."""
+        script = installed_backend / "db_init_semantics_check.js"
+        script.write_text(_DB_INIT_SEMANTICS_CHECK, encoding="utf-8")
+        proc = subprocess.run(
+            [_NODE_BIN, script.name],
+            cwd=str(installed_backend),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        assert "DB_INIT_SEMANTICS_OK" in proc.stdout
 
     def test_vitest_config_targets_tests_dir(self) -> None:
         text = (TEMPLATE_BACKEND / "vitest.config.js").read_text(encoding="utf-8")

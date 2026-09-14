@@ -17,11 +17,34 @@ TEMPLATE_DATABASE = (
 )
 
 
-def test_init_db_returns_a_handle_when_memoized() -> None:
-    """The memoized branch must resolve to the database, not to the promise."""
+def _source() -> str:
+    return (TEMPLATE_DATABASE / "init_db.js").read_text(encoding="utf-8")
 
-    source = (TEMPLATE_DATABASE / "init_db.js").read_text(encoding="utf-8")
 
-    assert "return initPromise;" not in source
-    assert "await initPromise;" in source
-    assert "return getDb();" in source
+def test_init_db_never_returns_a_bare_init_promise() -> None:
+    """Returning the init promise hands callers a Promise<void>, not a handle."""
+
+    assert "return initPromise;" not in _source()
+
+
+def test_init_promise_resolves_to_the_database_handle() -> None:
+    """Awaiting the memoized init must yield the database handle itself."""
+
+    assert "return database;" in _source()
+
+
+def test_init_validates_generation_before_returning_the_handle() -> None:
+    """A concurrent closeDb()/setDbPath() must never yield a closed handle.
+
+    initializeDatabase() re-checks that the handle it is about to return is
+    still the current one and retries otherwise; otherwise the caller's next
+    DB operation fails with "SQLITE_MISUSE: Database is closed".
+    """
+
+    assert "db === database" in _source()
+
+
+def test_close_db_absorbs_orphaned_init_rejections() -> None:
+    """An init interrupted by closeDb() must not become an unhandled rejection."""
+
+    assert ".catch(() => {})" in _source()
