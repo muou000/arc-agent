@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -13,7 +14,7 @@ from agents.context.prompts.interface_designer import get_system_prompt, get_use
 from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
-from agents.runtime.runners import ainvoke_stage_agent
+from agents.runtime.runners import ainvoke_stage_agent, salvage_json_objects
 from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
 from agents.tools.traceability import build_traceability_tools
@@ -122,11 +123,83 @@ class InterfaceDesigner:
             log_cb=self.log_cb,
         )
         bundle = self._normalize_design_payload(payload)
+        if not bundle["interfaces"]:
+            recovered = self._recover_interfaces_from_raw(payload)
+            if recovered:
+                await self._log(
+                    f"Recovered {len(recovered)} interface(s) from the final message JSON.",
+                    node_id=node_id,
+                )
+                bundle["interfaces"] = recovered
         await self._log(
             f"Interface design returned {len(bundle.get('interfaces', []))} interface(s).",
             node_id=node_id,
         )
         return bundle
+
+    @staticmethod
+    def _recover_interfaces_from_raw(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Fenced-JSON fallback for contracts the structured tool call missed.
+
+        Models sometimes answer the DESIGN turn with prose plus a ```json```
+        block instead of calling the structured-output tool (observed on the
+        ticket-booking benchmark: both parallel leaves "returned 0 interfaces"
+        while the full contract array sat inside the final message). When the
+        structured result is empty and the raw final message was preserved,
+        recover the JSON objects embedded in that text. The scanner is
+        quote-aware and only keeps objects that still parse, so damaged prose
+        never becomes a contract; entries without an ``interface_id`` are
+        dropped later by the workflow's ``_prepare_interfaces``.
+        """
+
+        if not payload.get("_raw_final_message"):
+            return []
+        summary_text = str(payload.get("summary") or "")
+        raw_text = str(payload.get("_raw_final_message") or "")
+        # The fallback branch of extract_payload always puts the full final
+        # text into ``summary``; unwrapping the raw debug dump too keeps the
+        # scan source aligned with the marker this method gates on, so an
+        # adapter that only populates ``_raw_final_message`` still recovers.
+        final_text = summary_text if summary_text.strip() else InterfaceDesigner._text_from_raw_dump(raw_text)
+        if not final_text.strip():
+            return []
+        return [
+            item
+            for item in salvage_json_objects(final_text)
+            if any(key in item for key in ("interface_id", "file_path", "specification", "responsibility"))
+        ]
+
+    @staticmethod
+    def _text_from_raw_dump(raw_text: str) -> str:
+        """Unwrap the escaped message dump so the scanner can see its braces.
+
+        ``_stringify_final_message`` stores a JSON-encoded debug dump; the
+        fenced JSON inside it is escaped into a string value that the
+        quote-aware scanner would skip. Decode it first and return the
+        assistant content (string or text-block list) when possible.
+        """
+
+        try:
+            dumped = json.loads(raw_text)
+        except json.JSONDecodeError:
+            return raw_text
+        if not isinstance(dumped, dict):
+            return raw_text
+        content = dumped.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            texts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str) and text.strip():
+                        texts.append(text)
+                elif isinstance(block, str) and block.strip():
+                    texts.append(block)
+            if texts:
+                return "\n".join(texts)
+        return raw_text
 
     @staticmethod
     def _load_merge_conflict_context(node_id: str) -> dict[str, Any] | None:
