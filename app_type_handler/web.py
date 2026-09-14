@@ -1122,6 +1122,11 @@ def _reset_sqlite_database_rows(db_path: str) -> tuple[bool, str]:
     prepared state - schema intact, zero rows, autoincrement counters reset -
     against the same file the live server reads. Schema sources are guaranteed
     unchanged by the backend fingerprint check that gates the reuse.
+
+    A schema with user triggers refuses the wipe: `DELETE` fires them, and a
+    trigger writing into an already-cleared table would leave rows behind that
+    a fresh `db:prepare:e2e` would never contain. Refusing keeps the caller on
+    the fresh-start path, which is always semantically equivalent.
     """
 
     if not os.path.exists(db_path):
@@ -1135,6 +1140,19 @@ def _reset_sqlite_database_rows(db_path: str) -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
     try:
         connection.execute("PRAGMA foreign_keys = OFF;")
+        trigger_names = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        ]
+        if trigger_names:
+            return False, (
+                "E2E database schema defines user triggers ("
+                + ", ".join(trigger_names)
+                + "); a row-level wipe would fire them and diverge from the "
+                "file-level `db:prepare:e2e` state."
+            )
         table_names = [
             str(row[0])
             for row in connection.execute(

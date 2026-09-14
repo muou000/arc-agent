@@ -419,6 +419,66 @@ def test_reset_sqlite_database_rows_keeps_schema_and_resets_counters(tmp_path) -
     assert {row[0] for row in tables} == {"users", "orders"}
 
 
+def test_reset_sqlite_database_rows_refuses_user_triggers(tmp_path) -> None:
+    """DELETE fires triggers; a wipe could leave rows a fresh prepare never has.
+
+    An AFTER DELETE trigger writing into an already-cleared table would keep
+    those rows after the wipe, so the state would diverge from a fresh
+    `db:prepare:e2e` + seed. The reset must refuse and let the caller fall
+    back to the file-level prepare.
+    """
+
+    db_path = str(tmp_path / "audited.sqlite")
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+        connection.execute("CREATE TABLE audit_log (id INTEGER PRIMARY KEY, note TEXT)")
+        connection.execute("CREATE TRIGGER users_audit AFTER DELETE ON users BEGIN INSERT INTO audit_log (note) VALUES ('user deleted'); END")
+        connection.execute("INSERT INTO users (name) VALUES ('alice')")
+        connection.commit()
+    finally:
+        connection.close()
+
+    ok, output = web_handler._reset_sqlite_database_rows(db_path)
+
+    assert not ok
+    assert "trigger" in output.lower()
+    # Nothing was touched: the caller's fresh start gets the original file.
+    connection = sqlite3.connect(db_path)
+    try:
+        users_left = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        log_left = connection.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+    finally:
+        connection.close()
+    assert users_left == 1
+    assert log_left == 0
+
+
+def test_falls_back_to_fresh_start_when_schema_has_triggers(tmp_path, monkeypatch) -> None:
+    workspace, fingerprint = _make_workspace(tmp_path)
+    env = web_handler._build_e2e_runtime_env(str(workspace), ["test-e2e/login.spec.ts"], web_port=4321)
+    _make_sqlite(env["ARC_E2E_DB_PATH"])
+    connection = sqlite3.connect(env["ARC_E2E_DB_PATH"])
+    try:
+        connection.execute(
+            "CREATE TRIGGER users_audit AFTER DELETE ON users BEGIN INSERT INTO users (name) VALUES ('ghost'); END"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    handler = _make_handler(workspace)
+    handler._e2e_runtime_session = _make_session(env["ARC_E2E_DB_PATH"], fingerprint)
+
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+
+    asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    assert start_calls == ["start"]
+
+
 def test_reset_sqlite_database_rows_reports_missing_file_and_empty_schema(tmp_path) -> None:
     ok, _output = web_handler._reset_sqlite_database_rows(str(tmp_path / "absent.sqlite"))
     assert not ok
