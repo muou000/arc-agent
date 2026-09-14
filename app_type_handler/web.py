@@ -1489,6 +1489,13 @@ class WebAppType(AppTypeHandler):
         not - and every generated component test then fails to import it with
         no way for the agent to recover. ``--no-save --no-package-lock`` keeps
         the provided template files untouched.
+
+        The patch runs with ``--legacy-peer-deps`` too, and not only for
+        symmetry: it is reached precisely when the plain install could not be
+        used, so a plain resolution here hits the same arborist crash on npm
+        10.x and silently leaves the peer missing. ``@testing-library/dom``
+        declares no peers of its own, so skipping peer resolution for it is
+        free.
         """
         dom_package = os.path.join(frontend_dir, "node_modules", "@testing-library", "dom")
         if os.path.isdir(dom_package):
@@ -1499,7 +1506,8 @@ class WebAppType(AppTypeHandler):
             "@testing-library/react 16, not declared by the provided template)...",
         )
         returncode, _stdout, stderr = await _run_npm_command(
-            'npm install --no-save --no-package-lock "@testing-library/dom@^10.4.0"',
+            "npm install --no-save --no-package-lock "
+            f'{LEGACY_PEER_DEPS_FLAG} "@testing-library/dom@^10.4.0"',
             frontend_dir,
             NPM_INSTALL_TIMEOUT_SECONDS,
         )

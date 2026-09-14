@@ -15,7 +15,12 @@ from pathlib import Path
 
 import pytest
 
-from core.worktree import MergeConflictError, NodeWorktreeManager, WorktreeError
+from core.worktree import (
+    MergeConflictError,
+    MergeVerificationError,
+    NodeWorktreeManager,
+    WorktreeError,
+)
 
 
 def _git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
@@ -211,3 +216,198 @@ def test_git_failure_raises_worktree_error(tmp_path: Path) -> None:
 
     with pytest.raises(WorktreeError):
         manager.prepare("REQ-1.1")
+
+
+# ----------------------------------------------------------------------
+# subtree worktree reuse
+# ----------------------------------------------------------------------
+
+
+def test_group_worktree_is_reused_across_sibling_nodes(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+
+    first = manager.prepare("REQ-2.1", group_key="REQ-2")
+    assert Path(first.path).name == "REQ-2", "the group directory is keyed by the subtree"
+    assert first.reusable is True
+    (Path(first.path) / "backend" / "sibling.js").write_text("one;\n", encoding="utf-8")
+    manager.integrate(first, "REQ-2.1 design")
+
+    second = manager.prepare("REQ-2.2", group_key="REQ-2")
+
+    assert Path(second.path) == Path(first.path), "sibling tasks reuse the group worktree"
+    assert second.branch == "arc-node/REQ-2.2", "branches stay per node"
+    assert (Path(second.path) / "backend" / "sibling.js").exists(), (
+        "the new node's branch starts at the latest integration HEAD"
+    )
+    assert not manager._worktree_dirty(second.path), "the reused worktree must be clean"
+    branches = _git(["branch", "--list", "arc-node/REQ-2.1"], repo).stdout
+    assert "arc-node/REQ-2.1" in branches, "per-node branches stay for audit"
+
+
+def test_node_keyed_prepare_is_unaffected_by_group_reuse(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+
+    handle = manager.prepare("REQ-2.1")
+
+    assert Path(handle.path).name == "REQ-2.1"
+    assert handle.reusable is False
+    assert manager._is_registered(Path(handle.path))
+
+
+def test_conflict_quarantines_group_dir_and_falls_back(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(handle.path) / "backend" / "src.js").write_text("from worktree;\n", encoding="utf-8")
+    manager.commit(handle, "wip")
+    (repo / "backend" / "src.js").write_text("from integration;\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "integration edit"], repo)
+
+    with pytest.raises(MergeConflictError):
+        manager.integrate(handle, "REQ-2.1 conflict")
+
+    other = manager.prepare("REQ-2.2", group_key="REQ-2")
+
+    assert Path(other.path).name == "REQ-2.2", "a quarantined group dir is not handed to another node"
+    assert manager._is_registered(Path(handle.path)), "the quarantined dir stays for inspection"
+
+
+def test_dirty_group_dir_falls_back_without_touching_leftovers(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(handle.path) / "scratch.txt").write_text("half-written", encoding="utf-8")
+
+    other = manager.prepare("REQ-2.2", group_key="REQ-2")
+
+    assert Path(other.path).name == "REQ-2.2", "a dirty group dir must not mix states"
+    assert (Path(handle.path) / "scratch.txt").read_text(encoding="utf-8") == "half-written", (
+        "the crashed sibling's leftovers stay untouched"
+    )
+
+
+def test_same_node_retry_reuses_its_dirty_group_dir(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(handle.path) / "scratch.txt").write_text("in-flight work", encoding="utf-8")
+
+    retried = manager.prepare("REQ-2.1", group_key="REQ-2")
+
+    assert Path(retried.path) == Path(handle.path), "a retried node keeps its in-flight state"
+    assert (Path(retried.path) / "scratch.txt").read_text(encoding="utf-8") == "in-flight work"
+
+
+def test_cleanup_reusable_worktrees_keeps_quarantined_and_dirty(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+
+    ok = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(ok.path) / "backend" / "ok.js").write_text("ok;\n", encoding="utf-8")
+    manager.integrate(ok, "REQ-2.1 ok")
+
+    conflicted = manager.prepare("REQ-3.1", group_key="REQ-3")
+    (Path(conflicted.path) / "backend" / "src.js").write_text("from worktree;\n", encoding="utf-8")
+    manager.commit(conflicted, "wip")
+    (repo / "backend" / "src.js").write_text("from integration;\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "integration edit"], repo)
+    with pytest.raises(MergeConflictError):
+        manager.integrate(conflicted, "REQ-3.1 conflict")
+
+    dirty = manager.prepare("REQ-4.1", group_key="REQ-4")
+    (Path(dirty.path) / "scratch.txt").write_text("half-written", encoding="utf-8")
+
+    removed = manager.cleanup_reusable_worktrees()
+
+    assert not Path(ok.path).exists(), "clean successful group worktrees are removed"
+    assert manager._is_registered(Path(conflicted.path)), "quarantined worktrees stay"
+    assert manager._is_registered(Path(dirty.path)), "dirty worktrees stay"
+    assert Path(ok.path).name in [Path(path).name for path in removed]
+
+
+# ----------------------------------------------------------------------
+# additive conflict resolution
+# ----------------------------------------------------------------------
+
+
+def test_integrate_resolves_append_only_conflicts(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst a = require('./a');\nroute('/a', a);\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst b = require('./b');\nroute('/b', b);\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "append b"], repo)
+
+    committed, detail = manager.integrate(handle, "REQ-2.1 append")
+
+    assert committed is True
+    merged = (repo / "backend" / "src.js").read_text(encoding="utf-8")
+    assert "require('./a')" in merged and "route('/a', a)" in merged
+    assert "require('./b')" in merged and "route('/b', b)" in merged
+    assert "console.log('v1')" in merged, "the common base stays exactly once"
+    assert "additive" in detail
+    assert not (repo / ".git" / "MERGE_HEAD").exists(), "the merge commit completes"
+
+
+def test_integrate_additive_resolution_fails_closed_on_health_gate(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst a = require('./a');\n", encoding="utf-8"
+    )
+    manager.commit(handle, "append a")
+    (repo / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst b = require('./b');\n", encoding="utf-8"
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "append b"], repo)
+
+    with pytest.raises(MergeVerificationError, match="post-merge verification"):
+        manager.integrate(handle, "REQ-2.1 append", verify=lambda: "backend unhealthy")
+
+    assert (repo / "backend" / "src.js").read_text(encoding="utf-8") == (
+        "console.log('v1');\nconst b = require('./b');\n"
+    ), "the aborted merge restores the integration workspace"
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    assert manager._is_registered(Path(handle.path)), "the worktree stays for inspection"
+
+
+def test_integrate_additive_resolution_with_passing_gate_commits(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst a = require('./a');\n", encoding="utf-8"
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst b = require('./b');\n", encoding="utf-8"
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "append b"], repo)
+
+    committed, _detail = manager.integrate(handle, "REQ-2.1 append", verify=lambda: None)
+
+    assert committed is True
+    merged = (repo / "backend" / "src.js").read_text(encoding="utf-8")
+    assert "require('./a')" in merged and "require('./b')" in merged
+
+
+def test_integrate_does_not_union_new_file_conflicts(tmp_path: Path) -> None:
+    """add/add of a brand-new file is a genuine semantic conflict (two agents
+    authored different content for the same path) and must not be merged by
+    concatenation."""
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "new.js").write_text("from worktree;\n", encoding="utf-8")
+    manager.commit(handle, "add new file")
+    (repo / "backend" / "new.js").write_text("from integration;\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "add same file on integration"], repo)
+
+    with pytest.raises(MergeConflictError):
+        manager.integrate(handle, "REQ-2.1 add/add")
+
+    assert not (repo / ".git" / "MERGE_HEAD").exists()

@@ -130,6 +130,85 @@ def test_next_runnable_task_skips_busy_and_blocked_tasks() -> None:
 
 
 # ----------------------------------------------------------------------
+# subtree affinity scheduling
+# ----------------------------------------------------------------------
+
+
+def test_affinity_map_groups_by_top_level_subtree() -> None:
+    assert ARCWorkflowManager._build_affinity_map(_tree()) == {
+        "R": "R",
+        "RA": "RA",
+        "RA1": "RA",
+        "RB": "RB",
+    }
+
+
+def test_next_affinity_task_never_picks_a_busy_group() -> None:
+    """One task per group at a time: the group owns the reusable worktree."""
+    queue = {
+        "tasks": [
+            _task("RA1", PHASE_DESIGN, TASK_PENDING, 0),
+            _task("RB", PHASE_IMPLEMENT, TASK_PENDING, 1),
+        ],
+        "descendants": {"RA": ["RA1"]},
+        "affinity": {"RA": "RA", "RA1": "RA", "RB": "RB"},
+    }
+    in_flight = [_task("RA", PHASE_IMPLEMENT, TASK_RUNNING)]
+
+    pick = ARCWorkflowManager._next_affinity_task(queue, in_flight)
+
+    assert pick["task_id"] == "RB:IMPLEMENT"
+
+
+def test_next_affinity_task_prefers_the_largest_free_group() -> None:
+    queue = {
+        "tasks": [
+            _task("RB", PHASE_IMPLEMENT, TASK_PENDING, 0),
+            _task("RA1", PHASE_IMPLEMENT, TASK_PENDING, 1),
+            _task("RA2", PHASE_DESIGN, TASK_PENDING, 2),
+        ],
+        "descendants": {},
+        "affinity": {"RB": "RB", "RA1": "RA", "RA2": "RA"},
+    }
+
+    pick = ARCWorkflowManager._next_affinity_task(queue, [])
+
+    assert pick["node_id"] == "RA1", "longest-remaining group first, even when later in flat order"
+
+
+def test_next_affinity_task_without_map_matches_flat_order() -> None:
+    """Queues saved before affinity lack the map; the pick degenerates to the
+    historical first-runnable task."""
+    queue = _queue(
+        [
+            _task("RA", PHASE_IMPLEMENT, TASK_PENDING, 0),
+            _task("RB", PHASE_IMPLEMENT, TASK_PENDING, 1),
+        ],
+        {},
+    )
+
+    assert ARCWorkflowManager._next_affinity_task(queue, []) is ARCWorkflowManager._next_runnable_task(queue, [])
+
+
+def test_next_affinity_task_steals_from_another_free_group() -> None:
+    """When the group with runnable work is busy (its subtree's design task is
+    in flight), the slot takes another free group's runnable task."""
+    queue = {
+        "tasks": [
+            _task("RA1", PHASE_IMPLEMENT, TASK_PENDING, 0),
+            _task("RB", PHASE_IMPLEMENT, TASK_PENDING, 1),
+        ],
+        "descendants": {"RA": ["RA1"]},
+        "affinity": {"RA": "RA", "RA1": "RA", "RB": "RB"},
+    }
+    in_flight = [_task("RA", PHASE_DESIGN, TASK_RUNNING)]  # RA group busy
+
+    pick = ARCWorkflowManager._next_affinity_task(queue, in_flight)
+
+    assert pick["task_id"] == "RB:IMPLEMENT"
+
+
+# ----------------------------------------------------------------------
 # port slots
 # ----------------------------------------------------------------------
 
