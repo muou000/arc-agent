@@ -731,6 +731,16 @@ def test_design_gate_fails_open_for_queues_saved_before_parents() -> None:
     assert ARCWorkflowManager._task_dependencies_met(state, child) is True
 
 
+def test_design_gate_blocks_when_the_parent_design_task_is_missing() -> None:
+    # A parents entry without a matching DESIGN task is an inconsistent
+    # queue: block the child instead of designing against an unknown
+    # baseline.
+    state = _gate_queue_state(TASK_COMPLETED)
+    state["tasks"] = [state["tasks"][1]]  # drop R:DESIGN, keep RA:DESIGN
+    child = state["tasks"][0]
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is False
+
+
 def test_child_design_waits_for_parent_design_and_leaves_stay_parallel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -774,3 +784,34 @@ def test_child_design_waits_for_parent_design_and_leaves_stay_parallel(
     assert all(queue_state["node_states"][node] == NODE_PASSED for node in ("R", "RA", "RB"))
     tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
     assert all(status == TASK_COMPLETED for status in tasks.values())
+
+
+def test_failed_parent_design_unblocks_children_with_an_audit_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed parent DESIGN must not deadlock its children, and the
+    failure leaves an auditable trace saying the children proceed against
+    the integration state without the parent shell."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "3")
+    manager = _make_parallel_manager(tmp_path)
+    logs = _collect_logs(manager)
+    queue_state = _queue_state(manager, _requirement_tree())
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        return task["task_id"] != "R:DESIGN"
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    states = queue_state["node_states"]
+    assert states["R"] == NODE_FAILED, "the failed parent fails its own node"
+    assert states["RA"] == NODE_PASSED and states["RB"] == NODE_PASSED, (
+        "children proceed without the parent shell"
+    )
+    tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
+    assert tasks["R:DESIGN"] == TASK_FAILED and tasks["R:IMPLEMENT"] == TASK_FAILED
+    assert any(
+        "descendant node(s) (RA, RB) will design against the integration state" in message
+        for message in logs
+    ), logs

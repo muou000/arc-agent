@@ -646,6 +646,19 @@ class ARCWorkflowManager:
             self._save_processing_queue(queue_state)
             if phase == PHASE_DESIGN:
                 self.runtime.events.mark_design_failed(node_id)
+                # Audit trail for the parent-serial gate: a failed parent
+                # unblocks its children, so record that they will design
+                # against the integration state without this shell.
+                descendants = queue_state.get("descendants", {}).get(node_id) or []
+                if descendants:
+                    await self._log(
+                        "Compiler",
+                        f"DESIGN failed for node {node_id}; {len(descendants)} descendant node(s) "
+                        f"({', '.join(descendants)}) will design against the integration state "
+                        "without this node's shell.",
+                        "warning",
+                        node_id,
+                    )
             else:
                 self.runtime.events.mark_implementation_failed(node_id)
                 self.runtime.events.mark_test_failed(node_id)
@@ -1228,11 +1241,17 @@ class ARCWorkflowManager:
         if phase == PHASE_DESIGN:
             parent_id = str((queue_state.get("parents") or {}).get(node_id, "") or "")
             if parent_id:
+                parent_design_status: str | None = None
                 for other in queue_state["tasks"]:
                     if other["phase"] == PHASE_DESIGN and other["node_id"] == parent_id:
-                        if other["status"] not in {TASK_COMPLETED, TASK_FAILED}:
-                            return False
+                        parent_design_status = str(other.get("status", ""))
                         break
+                # A parents entry without a matching DESIGN task means the
+                # queue is inconsistent with its own map (tasks are built
+                # from the same tree, so this should be unreachable): block
+                # instead of designing against an unknown baseline.
+                if parent_design_status not in {TASK_COMPLETED, TASK_FAILED}:
+                    return False
         elif phase == PHASE_IMPLEMENT:
             for other in queue_state["tasks"]:
                 if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
