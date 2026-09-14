@@ -101,6 +101,46 @@ def test_map_includes_glue_anchor_summaries(pipeline: ContextPipeline, tmp_proje
     assert "tables: users, orders" in structure
 
 
+def test_anchor_extraction_tolerates_common_jsx_and_router_forms(pipeline: ContextPipeline, tmp_project_dir: Path) -> None:
+    _write_map_workspace(tmp_project_dir)
+    _configure(pipeline, tmp_project_dir)
+    # Multiline element expressions and type-only imports are common in
+    # agent-written JSX; router-mounted endpoints appear once route modules
+    # register through a router instance.
+    (tmp_project_dir / "frontend" / "src" / "App.tsx").write_text(
+        "import { Route, Routes } from 'react-router-dom';\n"
+        "import type RouteConfig from './route-config';\n"
+        "import MultiPage from './pages/MultiPage';\n"
+        "export default function App() {\n"
+        "  return (\n"
+        "    <Routes>\n"
+        "      <Route\n"
+        "        path=\"/multi\"\n"
+        "        element={\n"
+        "          <MultiPage />\n"
+        "        }\n"
+        "      />\n"
+        "    </Routes>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_project_dir / "backend" / "src" / "app.js").write_text(
+        "const authRoutes = require('./routes/auth');\n"
+        "const router = express.Router();\n"
+        "router.post('/api/login');\n"
+        "app.use('/api/auth', authRoutes);\n",
+        encoding="utf-8",
+    )
+
+    structure = pipeline.get_static_context("REQ-2", "InterfaceDesigner")
+
+    assert "/multi -> MultiPage" in structure, "multiline element expressions must still parse"
+    assert "./pages/MultiPage" in structure, "value imports must be listed"
+    assert "./route-config" not in structure, "type-only imports must be excluded"
+    assert "/api/login" in structure, "router-mounted endpoints must be captured"
+
+
 def test_map_annotates_interface_owners(pipeline: ContextPipeline, arc_runtime, tmp_project_dir: Path) -> None:
     _write_map_workspace(tmp_project_dir)
     _configure(pipeline, tmp_project_dir)

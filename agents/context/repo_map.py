@@ -63,10 +63,14 @@ _ESM_DEFAULT_RE = re.compile(r"^\s*export\s+default\s+([A-Za-z_$][\w$]*)\s*[;\n]
 _PY_DEF_RE = re.compile(r"^(?:def|class)\s+([A-Za-z_]\w*)", re.MULTILINE)
 
 _REACT_ROUTE_RE = re.compile(
-    r"<Route[^>]*\bpath=[\"']([^\"']+)[\"'][^>]*\belement=\{<([A-Za-z_$][\w$]*)"
+    r"<Route[^>]*\bpath=[\"']([^\"']+)[\"'][^>]*\belement=\{\s*<([A-Za-z_$][\w$]*)"
 )
-_PAGE_IMPORT_RE = re.compile(r"^\s*import\s+[A-Za-z_$][\w$]*\s+from\s+['\"]([^'\"]+)['\"]", re.MULTILINE)
-_EXPRESS_MOUNT_RE = re.compile(r"\bapp\.(?:use|get|post|put|delete|patch)\(\s*['\"]([^'\"]+)['\"]")
+_PAGE_IMPORT_RE = re.compile(
+    r"^\s*import\s+(?!type\b)[A-Za-z_$][\w$]*\s+from\s+['\"]([^'\"]+)['\"]", re.MULTILINE
+)
+_EXPRESS_MOUNT_RE = re.compile(
+    r"\b(?:app|router)\.(?:use|get|post|put|delete|patch)\(\s*['\"]([^'\"]+)['\"]"
+)
 _EXPRESS_REQUIRE_RE = re.compile(r"^\s*const\s+[\w$]+\s*=\s*require\(['\"](\.[^'\"]*)['\"]\)", re.MULTILINE)
 # The trailing ``(`` keeps prose matches out: init_db.js carries instruction
 # comments like "Use CREATE TABLE IF NOT EXISTS to create new tables", where
@@ -189,14 +193,19 @@ def build_workspace_map_lines(
         lines.extend(anchor_lines)
 
     entries: list[tuple[str, list[str]]] = []
-    for dirpath, dirnames, filenames in os.walk(workspace):
+    # followlinks=False is os.walk's default; spelled out because the map is
+    # prompt material and must never wander outside the workspace through a
+    # symlinked directory. Symlinked files are skipped for the same reason.
+    for dirpath, dirnames, filenames in os.walk(workspace, followlinks=False):
         dirnames[:] = sorted(name for name in dirnames if name not in EXCLUDED_DIR_NAMES)
         for filename in sorted(filenames):
             if filename in EXCLUDED_FILE_NAMES:
                 continue
             path = Path(dirpath) / filename
+            if path.is_symlink():
+                continue
             relative = _normalize_relative(str(path.relative_to(workspace)))
-            if not relative or relative in anchor_paths:
+            if not relative or ".." in relative.split("/") or relative in anchor_paths:
                 continue
             suffix = path.suffix.lower()
             exports = _extract_exports(path) if suffix in SOURCE_SUFFIXES else []
