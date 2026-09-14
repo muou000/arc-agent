@@ -1217,8 +1217,8 @@ async def probe_backend_health(workspace_path: str, port: int | None = None) -> 
     ``/api/health``".
 
     Returns ``None`` on success. Workspaces without a backend ``start``
-    command have nothing to verify and also return ``None``; any other
-    failure returns a short reason string.
+    command have nothing to verify and also return ``None``; a failed
+    teardown or any other failure returns a short reason string.
     """
 
     backend_path = os.path.join(workspace_path, "backend")
@@ -1237,6 +1237,7 @@ async def probe_backend_health(workspace_path: str, port: int | None = None) -> 
 
     health_url = f"http://127.0.0.1:{resolved_port}/api/health"
     last_error = "health endpoint did not respond"
+    cleanup_error = ""
     try:
         for attempt in range(3):
             if attempt:
@@ -1249,16 +1250,25 @@ async def probe_backend_health(workspace_path: str, port: int | None = None) -> 
             try:
                 status = await asyncio.to_thread(_request)
                 if status == 200:
-                    return None
+                    last_error = None
+                    break
                 last_error = f"health endpoint returned HTTP {status}"
             except Exception as exc:
                 last_error = f"health endpoint unreachable: {type(exc).__name__}: {exc}"
-        return last_error
     finally:
         try:
             await _terminate_process(process, port=resolved_port)
-        except Exception:
-            pass
+        except Exception as exc:
+            cleanup_error = f"backend runtime cleanup failed: {type(exc).__name__}: {exc}"
+
+    if last_error is None and cleanup_error:
+        # The backend served /api/health, but its teardown failed: the leaked
+        # process keeps running inside the merged workspace (holding file locks
+        # on Windows), so the gate must not report success.
+        return cleanup_error
+    if cleanup_error:
+        return f"{last_error}; {cleanup_error}"
+    return last_error
 
 
 class WebAppType(AppTypeHandler):
