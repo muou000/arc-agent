@@ -100,6 +100,18 @@ def test_recover_interfaces_requires_raw_final_message_marker() -> None:
     assert InterfaceDesigner._recover_interfaces_from_raw(payload) == []
 
 
+def test_recover_interfaces_falls_back_to_the_raw_message_when_summary_is_empty() -> None:
+    # The gate marker and the scan source must stay aligned: an adapter that
+    # only populates _raw_final_message still recovers the contracts.
+    payload = {
+        "summary": "",
+        "_raw_final_message": '{"content": "prose\\n\\n```json\\n{\\"interfaces\\": [{\\"interface_id\\": \\"IF-RAW\\", \\"type\\": \\"FUNC\\"}]}\\n```"}',
+    }
+    assert InterfaceDesigner._recover_interfaces_from_raw(payload) == [
+        {"interface_id": "IF-RAW", "type": "FUNC"}
+    ]
+
+
 def test_recover_interfaces_filters_non_contract_objects() -> None:
     payload = {
         "summary": 'note {"unrelated": true} then ```json\n{"interfaces": [{"interface_id": "IF-X", "type": "FUNC"}]}\n```',
