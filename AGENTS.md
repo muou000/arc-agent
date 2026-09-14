@@ -84,7 +84,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 
 ### A/B 评测
 
-- `core/evals.py` 的四指标口径（pass rate、tokens、latency、est. cost）、`runs.jsonl` / `report.json` 字段和报告版式是评测工作流契约；修改时同步 `tests/test_evals/` 与 README 的「A/B 评测」一节。
+- `core/evals.py` 的五指标口径（pass rate、tokens、cache hit rate、latency、est. cost）、`runs.jsonl` / `report.json` 字段和报告版式是评测工作流契约；修改时同步 `tests/test_evals/` 与 README 的「A/B 评测」一节。
 - 评测通过子进程调用 compile（缺省 runner 为仓库 `arc_main.py` 的 `compile` 入口；`--runner-script` 注入的通用脚本只接收 `<requirement> -o <workspace> -t <type> --port <port> [arm 参数]` 纯运行参数），只读取运行工作区的 `.arc/` 产物（runner 事件、队列）聚合指标；不要为取指标绕过 runtime SDK 直接改写工作区。测试一律使用注入的 runner（如 `tests/test_evals/fake_eval_runner.py`），不得消耗真实模型调用。报告默认写入 `records/evals/`，属于新增运行证据，不要改动已有评测目录。
 
 ## 测试和验证

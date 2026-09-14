@@ -37,7 +37,7 @@ flowchart LR
    - Web 模板契约测试（`template.yaml` 清单与文件系统一致、Express `/api/health`、Vite 构建）；
    - 编译工作流纯函数测试。
 2. **Auto TDD re-prompt**（`core/tdd_retry.py`）：运行结束后扫描 runner 事件中的 `test/failed` 节点，自动构造 TDD 优先的修复提示，为失败节点的重试提供上下文。
-3. **A/B 评测**（`core/evals.py` + `arc eval` 子命令）：将 baseline 与 candidate 两个编译配置对同一需求树各运行 N 次，产出 pass rate / tokens / latency / est. cost 四指标提升报告（对齐 ARC-Bench 参考实现 pi 的 `evalHarnessTable` 工作流），详见下文「A/B 评测」。
+3. **A/B 评测**（`core/evals.py` + `arc eval` 子命令）：将 baseline 与 candidate 两个编译配置对同一需求树各运行 N 次，产出 pass rate / tokens / cache hit rate / latency / est. cost 五指标提升报告（对齐 ARC-Bench 参考实现 pi 的 `evalHarnessTable` 工作流），详见下文「A/B 评测」。
 
 ## 目录结构
 
@@ -141,12 +141,23 @@ ARC-Bench 平台入口为 `main.py`，会自动附加 `compile` 子命令并读�
 每次模型调用的 token 用量与成本会在编译过程中写入 `.arc/runner-events.jsonl`（`llm_usage`
 事件，pi 风格语义：`input` 不含缓存读写，`reasoning` 是 `output` 的子集；provider 未返回
 usage 时以 tiktoken 估算并标记 `source: estimated`）。编译结束后可聚合查看每节点 / 每阶段 /
-每模型的用量与成本：
+每模型的用量与成本，以及 provider 前缀缓存命中率：
 
 ```bash
 python arc_main.py usage --project-dir path/to/output          # 汇总报表
 python arc_main.py usage --project-dir path/to/output --json   # 机读 JSON
 ```
+
+命中率口径：`cache_hit_rate = cache_read / prompt_tokens`，其中 `prompt_tokens` 是
+provider 已报告 usage 的调用的 prompt 总量（`input + cache_read + cache_write`）；
+estimated 调用没有缓存分解，不计入分母，避免稀释命中率。provider 已报告但 cache 字段为
+0 的调用视为真实未命中（不支持缓存的 provider 与从不命中的 provider 在数据上不可区分）；
+没有任何已报告调用的 bucket 命中率为 `null`（报表中显示 `-`，未测量），与真实 0% 区分。
+按阶段（DESIGN / IMPLEMENT /
+TEST 等）的命中率视图用于定位前缀抖动：命中率低且 cache write 高，说明上下文前缀在
+漂移（时间戳、随机 ID、顺序变化），先修前缀稳定性——稳定内容在前、逐节点动态内容在后——
+这比压缩上下文更省成本。注意该指标度量的是 provider 的 prompt cache；`NodeContextCache`
+（`agents/context/pipeline.py`）只是进程内 memoize，省的是本地计算，与此指标无关。
 
 内置单价取自基准评测模型目录（DeepSeek / Z.AI / Moonshot / MiniMax / Qwen，CNY 每百万
 token，2026-09，见 `agents/model/costing.py`）。目录是封闭集合：模型名匹配不区分大小写
@@ -155,7 +166,7 @@ token，2026-09，见 `agents/model/costing.py`）。目录是封闭集合：模
 
 ### A/B 评测
 
-`arc eval` 将同一份需求树分别以 baseline 和 candidate 两个配置各编译 N 次，输出四指标的
+`arc eval` 将同一份需求树分别以 baseline 和 candidate 两个配置各编译 N 次，输出五指标的
 candidate − baseline 提升报告（移植自 ARC-Bench 参考实现 pi 的 `evalHarnessTable`
 评测工作流）。两个 arm 的差异通过环境变量覆盖和附加 compile 参数表达：
 
@@ -182,13 +193,16 @@ Eval Comparisons
     Candidate  candidate (5/5 pairs)
     Pass rate  +60.0 pp (candidate 80.0%, baseline 20.0%)
        Tokens  -1200.0 (candidate 22800.0, baseline 24000.0)
+    Cache hit  +12.3 pp (candidate 61.5%, baseline 49.2%)
       Latency  -850.0ms (candidate 14000.0ms, baseline 14850.0ms)
     Est. cost  -¥0.0100 (candidate ¥0.1100, baseline ¥0.1200)
 ```
 
 - 运行按 repetition 配对：pass rate 是配对运行中编译成功（runner 退出码为 0 且无 FAILED
-  节点）的占比，tokens / latency / est. cost 是配对运行的均值差；一侧缺失遥测时该指标
-  标记 unavailable 而不是猜测。成本为 CNY，来自 `agents/model/costing.py` 单价目录。
+  节点）的占比，tokens / latency / est. cost 是配对运行的均值差；cache hit rate 的口径
+  与「Token 用量统计」一致（`runs.jsonl` 中存 0–1 比率，报告中以百分点呈现），运行中没有任何
+  provider 已报告缓存分解的调用时记为 None。一侧缺失遥测时该指标标记 unavailable 而不是
+  猜测。成本为 CNY，来自 `agents/model/costing.py` 单价目录。
 - 产物目录包含 `report.txt` / `report.json`（结构化对比）、`runs.jsonl`（每次运行一条
   记录）和 `sessions/<run_id>/`（该次运行的 runner 事件、队列、追溯表、节点会话与控制台
   输出快照）。运行工作区默认放在系统临时目录并在快照后删除，`--work-root` /

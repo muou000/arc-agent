@@ -798,6 +798,12 @@ def _format_bucket_cost(cost: dict, *, priced_calls: int) -> str:
     return f"{_CNY}{cost.get('total', 0.0):.4f}"
 
 
+def _format_hit_rate(rate: float | None) -> str:
+    """Shared hit-rate cell: one decimal for totals and rows alike; ``-`` unmeasured."""
+
+    return "    -" if rate is None else f"{rate * 100:>4.1f}%"
+
+
 def print_usage_report(summary: dict, events_path) -> None:
     """Print the aggregated LLM token usage and cost from runner events."""
     print(f"\n{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}")
@@ -829,6 +835,14 @@ def print_usage_report(summary: dict, events_path) -> None:
     if usage["reasoning"]:
         print(f"{Fore.WHITE}Reasoning:{Style.RESET_ALL} {usage['reasoning']:,} (subset of output)")
 
+    prompt_tokens = totals.get("prompt_tokens", 0)
+    if prompt_tokens:
+        print(
+            f"{Fore.WHITE}Cache:{Style.RESET_ALL}     hit {_format_hit_rate(totals.get('cache_hit_rate'))}"
+            f" (read {usage['cache_read']:,} | write {usage['cache_write']:,} | prompt {prompt_tokens:,};"
+            f" low hit with many writes = jittering context prefix)"
+        )
+
     if totals["calls"] > totals.get("unpriced_calls", 0):
         print(f"{Fore.WHITE}Cost:{Style.RESET_ALL}      {_format_cost_detail(totals.get('cost', {}))}")
 
@@ -845,6 +859,7 @@ def print_usage_report(summary: dict, events_path) -> None:
             print(
                 f"  {display:<42} calls {bucket['calls']:>3}"
                 f"  tokens {bucket.get('total', 0):>9,}"
+                f"  hit {_format_hit_rate(bucket.get('cache_hit_rate'))}"
                 f"  {_format_bucket_cost(bucket.get('cost', {}), priced_calls=priced_calls)}"
             )
 
