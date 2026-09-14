@@ -6,6 +6,7 @@ from typing import Any
 from arcbench_agent_runtime.runtime import AgentRuntime
 from agents.context.pipeline import set_context_config, set_context_runtime
 from agents.model.usage_capture import LLMUsageRecord, set_llm_usage_sink
+from agents.runtime.tool_usage import ToolUsageRecord, set_tool_usage_sink
 
 
 _runtime: AgentRuntime | None = None
@@ -31,6 +32,7 @@ def configure_runtime(
     )
     set_context_runtime(_runtime)
     set_llm_usage_sink(_make_llm_usage_sink(_runtime))
+    set_tool_usage_sink(_make_tool_usage_sink(_runtime))
     set_context_config(
         workspace_dir=resolved_project_dir,
         app_type=app_type,
@@ -63,6 +65,24 @@ def _make_llm_usage_sink(runtime: AgentRuntime) -> Any:
     return sink
 
 
+def _make_tool_usage_sink(runtime: AgentRuntime) -> Any:
+    """Persist every observed tool round-trip as a ``tool_usage`` runner event."""
+
+    def sink(record: ToolUsageRecord) -> None:
+        runtime.events.record_tool_usage(
+            node_id=record.node_id,
+            phase=record.phase,
+            tool=record.tool,
+            status=record.status,
+            path=record.path,
+            offset=record.offset,
+            limit=record.limit,
+            result_chars=record.result_chars,
+        )
+
+    return sink
+
+
 def get_runtime() -> AgentRuntime:
     if _runtime is None:
         raise RuntimeError("ARC runtime has not been configured.")
@@ -78,3 +98,4 @@ def reset_runtime_for_tests() -> None:
     _runtime = None
     set_context_runtime(None)
     set_llm_usage_sink(None)
+    set_tool_usage_sink(None)

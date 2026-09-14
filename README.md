@@ -148,6 +148,15 @@ python arc_main.py usage --project-dir path/to/output          # 汇总报表
 python arc_main.py usage --project-dir path/to/output --json   # 机读 JSON
 ```
 
+### 工具往返观测
+
+agent 的每次工具往返（含被 stage discipline 拦截的调用）同样写入 `runner-events.jsonl`
+（`tool_usage` 事件：`tool` / `status`（`ok`、`error`、`blocked`）/ `detail`（文件路径、
+`read_file` 的 `offset`/`limit`、结果字符数与是否为空））。`usage` 命令会聚合出每节点 /
+每工具的往返次数，以及两个浪费信号：`unpaged_reads`（未带 `limit` 的整文件读取）和
+`empty_results`（成功但返回为空，即无效 grep/读取），用于定位"全量读大文件""无效搜索"
+这类可修复的往返浪费。
+
 内置单价取自基准评测模型目录（DeepSeek / Z.AI / Moonshot / MiniMax / Qwen，CNY 每百万
 token，2026-09，见 `agents/model/costing.py`）。目录是封闭集合：模型名匹配不区分大小写
 （`MiniMax-M3` 与 `minimax-m3` 同价），表外模型一律不计成本（报表中显示为 unpriced），

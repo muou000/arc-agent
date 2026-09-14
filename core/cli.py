@@ -799,7 +799,7 @@ def _format_bucket_cost(cost: dict, *, priced_calls: int) -> str:
 
 
 def print_usage_report(summary: dict, events_path) -> None:
-    """Print the aggregated LLM token usage and cost from runner events."""
+    """Print the aggregated LLM token usage, cost and tool round-trips."""
     print(f"\n{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}")
     print(f"{Fore.CYAN}LLM Token Usage{Style.RESET_ALL}")
     print(f"{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}\n")
@@ -808,9 +808,15 @@ def print_usage_report(summary: dict, events_path) -> None:
     totals = summary.get("totals", {})
     if not totals.get("calls"):
         print(f"\n{Fore.YELLOW}No llm_usage events recorded yet.{Style.RESET_ALL}")
-        print(f"{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}\n")
-        return
+    else:
+        _print_llm_usage_body(totals, summary)
 
+    _print_tool_usage_section(summary.get("tools") or {}, events_path)
+
+    print(f"{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}\n")
+
+
+def _print_llm_usage_body(totals: dict, summary: dict) -> None:
     estimated = totals.get("estimated_calls", 0)
     unpriced = totals.get("unpriced_calls", 0)
     notes = []
@@ -848,4 +854,41 @@ def print_usage_report(summary: dict, events_path) -> None:
                 f"  {_format_bucket_cost(bucket.get('cost', {}), priced_calls=priced_calls)}"
             )
 
-    print(f"{Fore.BLUE}{'━' * 78}{Style.RESET_ALL}\n")
+
+def _print_tool_usage_section(tools_summary: dict, events_path) -> None:
+    print(f"\n{Fore.CYAN}Tool Round-Trips{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}Events:{Style.RESET_ALL}   {events_path}")
+
+    totals = tools_summary.get("totals", {})
+    if not totals.get("calls"):
+        print(f"\n{Fore.YELLOW}No tool_usage events recorded yet.{Style.RESET_ALL}")
+        return
+
+    notes = []
+    if totals.get("blocked"):
+        notes.append(f"{totals['blocked']} blocked")
+    if totals.get("errors"):
+        notes.append(f"{totals['errors']} errors")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
+    print(f"{Fore.WHITE}Calls:{Style.RESET_ALL}     {totals['calls']}{suffix}")
+    print(
+        f"{Fore.WHITE}Signals:{Style.RESET_ALL}   unpaged reads {totals.get('unpaged_reads', 0):,}"
+        f" | empty results {totals.get('empty_results', 0):,}"
+    )
+
+    for title, section_key in (("By node", "by_node"), ("By tool", "by_tool")):
+        section = tools_summary.get(section_key, {})
+        if not section:
+            continue
+        print(f"\n{Fore.CYAN}{title}{Style.RESET_ALL}")
+        rows = sorted(section.items(), key=lambda item: item[1].get("calls", 0), reverse=True)
+        for name, bucket in rows:
+            label = name or "(run)"
+            display = label if len(label) <= 40 else label[:37] + "..."
+            print(
+                f"  {display:<42} calls {bucket['calls']:>3}"
+                f"  blocked {bucket.get('blocked', 0):>3}"
+                f"  errors {bucket.get('errors', 0):>3}"
+                f"  unpaged {bucket.get('unpaged_reads', 0):>3}"
+                f"  empty {bucket.get('empty_results', 0):>3}"
+            )

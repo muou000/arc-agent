@@ -140,6 +140,48 @@ class EventClient:
             },
         )
 
+    def record_tool_usage(
+        self,
+        *,
+        node_id: str = "",
+        phase: str = "",
+        tool: str = "",
+        status: str = "ok",
+        path: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+        result_chars: int = 0,
+    ) -> None:
+        """Append one ``tool_usage`` event for a single agent tool round-trip.
+
+        ``status`` is ``"ok"``, ``"error"`` (the tool ran and failed) or
+        ``"blocked"`` (a discipline middleware refused the call before
+        execution). ``detail`` carries the per-tool observations used to spot
+        wasteful round-trips: file reads record their ``offset``/``limit``
+        (``limit=None`` means the model asked for an unpaged, whole-file read)
+        and every event records the result size so empty grep/read results are
+        visible. An empty ``node_id`` attributes the call to the run as a whole.
+        """
+        normalized_chars = _nonneg_int(result_chars)
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "tool_usage",
+                "node_id": str(node_id or "").strip(),
+                "phase": str(phase or "").strip(),
+                "tool": str(tool or "").strip(),
+                "status": str(status or "").strip() or "ok",
+                "detail": {
+                    "path": str(path or "").strip() or None,
+                    "offset": _nullable_nonneg_int(offset),
+                    "limit": _nullable_nonneg_int(limit),
+                    "result_chars": normalized_chars,
+                    "result_empty": normalized_chars == 0,
+                },
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def _emit_runner_state(self, state: str, message: str | None = None) -> None:
         append_jsonl(
             self.paths.runner_events_path,

@@ -300,6 +300,90 @@ class TestLLMUsageEvents:
         assert _read_jsonl(event_paths.runner_events_path)[0]["cost"] is None
 
 
+class TestToolUsageEvents:
+    """Pin the ``tool_usage`` schema: one event per agent tool round-trip."""
+
+    def test_record_tool_usage_writes_canonical_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_tool_usage(
+            node_id=" REQ-1 ",
+            phase="IMPLEMENT",
+            tool="read_file",
+            status="ok",
+            path="/workspace/src/app.tsx",
+            offset=0,
+            limit=None,
+            result_chars=12345,
+        )
+
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "tool_usage",
+            "node_id": "REQ-1",
+            "phase": "IMPLEMENT",
+            "tool": "read_file",
+            "status": "ok",
+            "detail": {
+                "path": "/workspace/src/app.tsx",
+                "offset": 0,
+                "limit": None,
+                "result_chars": 12345,
+                "result_empty": False,
+            },
+            "timestamp": lines[0]["timestamp"],
+        }
+
+    def test_defaults_report_ok_status_without_file_detail(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_tool_usage(tool="grep")
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["status"] == "ok"
+        assert lines[0]["detail"] == {
+            "path": None,
+            "offset": None,
+            "limit": None,
+            "result_chars": 0,
+            "result_empty": True,
+        }
+
+    def test_blocked_and_error_statuses_are_preserved(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_tool_usage(node_id="REQ-1", tool="read_file", status="blocked")
+        events.record_tool_usage(node_id="REQ-1", tool="run_tests", status="error", result_chars=42)
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert [line["status"] for line in lines] == ["blocked", "error"]
+        assert lines[1]["detail"]["result_empty"] is False
+
+    def test_negative_and_invalid_values_are_clamped(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_tool_usage(
+            node_id="REQ-1",
+            tool="read_file",
+            offset=-5,
+            limit="7",
+            result_chars=-1,
+        )
+        lines = _read_jsonl(event_paths.runner_events_path)
+        detail = lines[0]["detail"]
+        assert detail["offset"] is None  # negative breakdown is not reportable
+        assert detail["limit"] == 7
+        assert detail["result_chars"] == 0
+        assert detail["result_empty"] is True
+
+    def test_empty_node_id_is_allowed_for_run_level_calls(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_tool_usage(tool="grep", status="error")
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["node_id"] == ""
+        assert lines[0]["phase"] == ""
+
+
 class TestDemoTestStatus:
     """Demo helpers are documented as no-op with respect to disk state."""
 

@@ -292,8 +292,8 @@ def cmd_config(args: argparse.Namespace) -> int:
 def build_usage_parser(subparsers) -> None:
     parser = subparsers.add_parser(
         "usage",
-        help="Report LLM token usage and cost from runner events",
-        description="Aggregate llm_usage events from .arc/runner-events.jsonl into per-node, per-phase, per-model and run totals.",
+        help="Report LLM token usage, cost and tool round-trips from runner events",
+        description="Aggregate llm_usage and tool_usage events from .arc/runner-events.jsonl into per-node, per-phase, per-model/tool and run totals.",
     )
     parser.add_argument(
         "--project-dir",
@@ -324,7 +324,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
         pass  # usage reporting works without provider configuration
 
     from arcbench_agent_runtime.context import RuntimePaths
-    from arcbench_agent_runtime.usage import aggregate_llm_usage
+    from arcbench_agent_runtime.usage import aggregate_llm_usage, aggregate_tool_usage
 
     if args.events_path:
         events_path = Path(args.events_path).expanduser().resolve()
@@ -335,6 +335,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
         return 2
 
     summary = aggregate_llm_usage(events_path)
+    summary["tools"] = aggregate_tool_usage(events_path)
     if args.as_json:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
