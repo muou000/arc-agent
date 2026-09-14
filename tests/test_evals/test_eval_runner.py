@@ -195,7 +195,7 @@ def test_eval_table_survives_runner_launch_failure(tmp_path):
     assert comparison["pairs"] == 1
     assert comparison["tokens"]["delta"] is None
     text = (tmp_path / "artifacts" / "report.txt").read_text(encoding="utf-8")
-    assert text.count("unavailable (missing telemetry)") == 2  # tokens and cost
+    assert text.count("unavailable (missing telemetry)") == 3  # tokens, cache hit, cost
 
 
 def test_eval_table_records_timeout(tmp_path):

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .base import AppTypeHandler
+from .base import AppTypeHandler, GlueAnchorSpec
 from .path_validation import is_scoped_test_path, normalize_safe_relative_path
 from core.config import build_web_runtime_env, get_web_base_url, get_web_port
 from core.processes import finalize_subprocess
@@ -1207,6 +1207,70 @@ def _reset_sqlite_database_rows(db_path: str) -> tuple[bool, str]:
         connection.close()
 
 
+async def probe_backend_health(workspace_path: str, port: int | None = None) -> str | None:
+    """Boot the workspace's backend and check its health endpoint.
+
+    Used as the merge gate after an additively resolved worktree merge: the
+    mechanical resolution can produce syntactically valid but semantically
+    broken registrations (duplicate identifiers, double route mounts), and the
+    cheapest full check is "the integrated backend boots and serves
+    ``/api/health``".
+
+    Returns ``None`` on success. Workspaces without a backend ``start``
+    command have nothing to verify and also return ``None``; a failed
+    teardown or any other failure returns a short reason string.
+    """
+
+    backend_path = os.path.join(workspace_path, "backend")
+    resolved_port = int(port) if port is not None else get_web_port()
+    if _resolve_backend_start_command(backend_path) is None:
+        return None
+
+    runtime_env = _build_e2e_runtime_env(workspace_path, ["merge-health-probe"], web_port=resolved_port)
+    process, _start_command, _cleanup_note, _fingerprint = await _start_backend_runtime(
+        workspace_path,
+        runtime_env,
+        web_port=resolved_port,
+    )
+    if process is None:
+        return "backend runtime failed to start on the merged workspace"
+
+    health_url = f"http://127.0.0.1:{resolved_port}/api/health"
+    last_error = "health endpoint did not respond"
+    cleanup_error = ""
+    try:
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(1.0)
+
+            def _request(url: str = health_url) -> int:
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    return int(response.status)
+
+            try:
+                status = await asyncio.to_thread(_request)
+                if status == 200:
+                    last_error = None
+                    break
+                last_error = f"health endpoint returned HTTP {status}"
+            except Exception as exc:
+                last_error = f"health endpoint unreachable: {type(exc).__name__}: {exc}"
+    finally:
+        try:
+            await _terminate_process(process, port=resolved_port)
+        except Exception as exc:
+            cleanup_error = f"backend runtime cleanup failed: {type(exc).__name__}: {exc}"
+
+    if last_error is None and cleanup_error:
+        # The backend served /api/health, but its teardown failed: the leaked
+        # process keeps running inside the merged workspace (holding file locks
+        # on Windows), so the gate must not report success.
+        return cleanup_error
+    if cleanup_error:
+        return f"{last_error}; {cleanup_error}"
+    return last_error
+
+
 class WebAppType(AppTypeHandler):
     name = "web"
 
@@ -1315,6 +1379,26 @@ class WebAppType(AppTypeHandler):
             "Integration tests: place under `frontend/tests/...` for frontend integration or `backend/tests/...` for API/service/database integration.",
             "E2E tests: place under `backend/test-e2e/...` and use a JavaScript or TypeScript test filename.",
             "Database-using tests must use the app-type-provided isolated test harness/scaffold.",
+        ]
+
+    @classmethod
+    def workspace_glue_anchor_specs(cls) -> list[GlueAnchorSpec]:
+        return [
+            GlueAnchorSpec(
+                path="frontend/src/App.tsx",
+                label="frontend route registration",
+                extractors=("react_routes", "page_imports"),
+            ),
+            GlueAnchorSpec(
+                path="backend/src/app.js",
+                label="backend route registration",
+                extractors=("express_routes",),
+            ),
+            GlueAnchorSpec(
+                path="backend/src/database/init_db.js",
+                label="database schema",
+                extractors=("sql_tables",),
+            ),
         ]
 
     @classmethod

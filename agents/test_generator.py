@@ -85,6 +85,7 @@ class TestGenerator:
             node_id=node_id,
             agent_type=self.agent_name,
             preloaded_source=preloaded_source,
+            map_workspace_dir=workspace_root,
         )
         interface_contract = context_pipeline.get_interface_contract_context(node_id)
         context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())

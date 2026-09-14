@@ -353,7 +353,7 @@ def build_eval_parser(subparsers) -> None:
         description=(
             "Run a baseline and a candidate compile configuration against the same "
             "requirement tree and report candidate-minus-baseline lift on pass rate, "
-            "tokens, latency and estimated cost."
+            "tokens, cache hit rate, latency and estimated cost."
         ),
     )
     parser.add_argument(
