@@ -239,6 +239,39 @@ def test_falls_back_to_fresh_start_when_reseeding_fails(tmp_path, monkeypatch) -
 
     assert start_calls == ["start"]
     assert "Reused the live backend runtime" not in result
+    # The reset-failure reason must survive the fallback for debuggability.
+    assert "fell back to a fresh start" in result
+    assert "db:seed" in result
+
+
+def test_runtime_session_is_strictly_per_instance(tmp_path, monkeypatch) -> None:
+    """Parallel tasks build one handler per task; sessions must not leak across."""
+
+    workspace, fingerprint = _make_workspace(tmp_path)
+    env = web_handler._build_e2e_runtime_env(str(workspace), ["test-e2e/login.spec.ts"], web_port=4321)
+    _make_sqlite(env["ARC_E2E_DB_PATH"])
+
+    first = _make_handler(workspace)
+    second = _make_handler(workspace)
+    session = _make_session(env["ARC_E2E_DB_PATH"], fingerprint)
+    first._e2e_runtime_session = session
+
+    # The second instance starts blind even while the first holds a live session.
+    assert second._e2e_runtime_session is None
+
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+    result = asyncio.run(second.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    assert start_calls == ["start"]
+    assert second._e2e_runtime_session is not None
+    assert second._e2e_runtime_session is not session
+    # Shutting down one instance leaves the other's session in place.
+    asyncio.run(second.shutdown_e2e_runtime())
+    assert first._e2e_runtime_session is session
+    assert "Exit Code: 0" in result
+
 
 
 def test_falls_back_to_fresh_start_when_database_has_no_schema(tmp_path, monkeypatch) -> None:
@@ -328,6 +361,29 @@ def test_backend_fingerprint_ignores_non_server_paths(tmp_path) -> None:
 
 def test_backend_fingerprint_missing_directory(tmp_path) -> None:
     assert web_handler._backend_source_fingerprint(str(tmp_path / "absent")) is None
+
+
+def test_backend_fingerprint_ignores_runtime_env(tmp_path, monkeypatch) -> None:
+    """The fingerprint is a pure source hash; env values must not break reuse.
+
+    Port/DB-path dimensions are session-key comparisons in the reuse check, so
+    a per-attempt env change (e.g. a new label) must not force a restart.
+    """
+
+    backend = tmp_path / "backend"
+    (backend / "src").mkdir(parents=True)
+    (backend / "src" / "app.js").write_text("console.log('v1')\n", encoding="utf-8")
+
+    before = web_handler._backend_source_fingerprint(str(backend))
+    monkeypatch.setattr(
+        web_handler,
+        "build_web_runtime_env",
+        lambda **kwargs: {"SOME_RUNTIME_VALUE": "different-per-attempt"},
+    )
+    after = web_handler._backend_source_fingerprint(str(backend))
+
+    assert before is not None
+    assert before == after
 
 
 def test_reset_sqlite_database_rows_keeps_schema_and_resets_counters(tmp_path) -> None:

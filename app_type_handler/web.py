@@ -1080,21 +1080,21 @@ _BACKEND_FINGERPRINT_SKIPPED_DIRS = frozenset(
 def _backend_source_fingerprint(backend_path: str) -> str | None:
     """Content hash of the backend sources a running E2E server executes.
 
-    Mirrors `_frontend_source_fingerprint` and feeds the session-scoped E2E
-    runtime reuse decision: a live server may only be reused while the code it
-    loaded is byte-for-byte unchanged. Returns ``None`` when the backend
-    directory is missing, which makes the caller fall back to a fresh start.
+    Feeds the session-scoped E2E runtime reuse decision: a live server may
+    only be reused while the code it loaded is byte-for-byte unchanged.
+    Returns ``None`` when the backend directory is missing, which makes the
+    caller fall back to a fresh start.
+
+    Deliberately a pure source-tree hash: the other reuse dimensions (web
+    port, E2E database path) are session-key comparisons in
+    `_try_reuse_e2e_backend_session`, and runtime-env values that vary per
+    attempt would spuriously break reuse here.
     """
 
     root = Path(backend_path)
     if not root.is_dir():
         return None
     digest = hashlib.sha256()
-    for key, value in sorted(build_web_runtime_env().items()):
-        digest.update(key.encode("utf-8"))
-        digest.update(b"=")
-        digest.update(str(value).encode("utf-8"))
-        digest.update(b"\0")
     visited_real_dirs: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         real_dir = os.path.realpath(dirpath)
@@ -1128,8 +1128,11 @@ def _reset_sqlite_database_rows(db_path: str) -> tuple[bool, str]:
         return False, f"E2E database file is missing: {db_path}"
     try:
         connection = sqlite3.connect(db_path, timeout=5.0)
-    except sqlite3.Error as exc:
-        return False, str(exc)
+    except (sqlite3.Error, OSError) as exc:
+        # OSError/PermissionError included: on Windows a sharing violation on
+        # the file the live server holds open surfaces here, and the caller
+        # must take the fresh-start fallback instead of crashing.
+        return False, f"{type(exc).__name__}: {exc}"
     try:
         connection.execute("PRAGMA foreign_keys = OFF;")
         table_names = [
@@ -1149,7 +1152,7 @@ def _reset_sqlite_database_rows(db_path: str) -> tuple[bool, str]:
             connection.execute("DELETE FROM sqlite_sequence")
         connection.commit()
         return True, "Cleared rows of: " + ", ".join(table_names)
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         return False, f"{type(exc).__name__}: {exc}"
     finally:
         connection.close()
@@ -1158,10 +1161,12 @@ def _reset_sqlite_database_rows(db_path: str) -> tuple[bool, str]:
 class WebAppType(AppTypeHandler):
     name = "web"
 
-    #: Session-scoped E2E backend runtime (see `_try_reuse_e2e_backend_session`).
-    #: Class-level default so every instance starts with no live session; once
-    #: a session exists the attribute is set on the instance only.
-    _e2e_runtime_session: _E2EBackendSession | None = None
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Session-scoped E2E backend runtime (see `_try_reuse_e2e_backend_session`).
+        # Strictly per instance: parallel worktree tasks build one handler per
+        # task, and a task must never observe another task's live runtime.
+        self._e2e_runtime_session: _E2EBackendSession | None = None
 
     @classmethod
     def prerequisite_commands(cls) -> list[str]:
@@ -1822,16 +1827,30 @@ class WebAppType(AppTypeHandler):
                 backend_fingerprint,
             )
             if reused_session is not None:
-                reset_ok, database_prepare_output = await self._reset_live_e2e_database(e2e_runtime_env)
+                reset_ok, reset_output = await self._reset_live_e2e_database(e2e_runtime_env)
+                database_prepare_output = reset_output
                 if reset_ok:
                     reused_runtime = True
                     backend_process = reused_session.process
                     backend_start_command = reused_session.start_command
                     backend_startup_detail = reused_session.startup_detail
                     backend_instance_fingerprint = reused_session.instance_fingerprint
+                else:
+                    # The fresh start below overwrites database_prepare_output,
+                    # so carry the reset failure reason in the cleanup note:
+                    # both failure bodies and the deferred-cleanup section
+                    # surface it there.
+                    backend_cleanup_note = (
+                        "Live E2E runtime reset was not possible; fell back to a fresh start: "
+                        f"{reset_output}"
+                    )
 
             if not reused_runtime:
-                backend_cleanup_note = await self._terminate_e2e_session("Stale E2E runtime cleanup")
+                stale_note = await self._terminate_e2e_session("Stale E2E runtime cleanup")
+                if stale_note:
+                    backend_cleanup_note = (
+                        f"{backend_cleanup_note}\n{stale_note}" if backend_cleanup_note else stale_note
+                    )
                 database_ready, database_prepare_output = await _prepare_e2e_database(
                     self.workspace_path,
                     e2e_runtime_env,
