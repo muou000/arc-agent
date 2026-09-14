@@ -109,6 +109,7 @@ def workspace_tool_policy() -> str:
             "Use file tools only inside the virtual project root `/workspace`. The sole exception is a direct read of an attached skill at `/skills/<skill-name>/SKILL.md`.",
             "Skills use progressive disclosure: their index already provides exact paths. When full instructions are needed, call `read_file` directly on the listed `SKILL.md`; never use `ls`, `glob`, `grep`, or shell commands under `/skills`.",
             "Do not call file tools on `/`, host paths, `.arc`, `.git`, `requirements`, environment files, dependency directories, generated outputs, or lockfiles.",
+            "The requirement snapshot is already embedded in the task context; reads under `requirements/` are always denied by policy, so do not spend turns attempting them.",
             "Use dedicated file tools for file work: `glob` for file discovery, `grep` for content search, `read_file` for reading, `edit_file` for modifying existing files, and `write_file` only for new files.",
             "The generic `execute` and `delete` tools are disabled. Use only the system-provided `run_tests` or `run_build` validation tools when the current stage exposes them.",
             "Start exploration with exact paths from the requirement, interface contract, test manifest, traceability records, or failure output.",

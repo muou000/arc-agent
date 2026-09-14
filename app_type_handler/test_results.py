@@ -125,7 +125,12 @@ _ENVIRONMENT_FAILURE_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "missing dependency",
         re.compile(r"(?:Cannot find module|Cannot find package)\s+'([^']+)'"),
     ),
-    ("missing dependency", re.compile(r"ERR_MODULE_NOT_FOUND")),
+    # Bare ERR_MODULE_NOT_FOUND hits without a quoted specifier on the rest of
+    # the line (e.g. ``Error [ERR_MODULE_NOT_FOUND]: ...`` or ``code:
+    # 'ERR_MODULE_NOT_FOUND'``). Lines whose specifier is quoted are matched by
+    # the capture patterns above instead - and judged by the relative-specifier
+    # guard in classify_test_failure.
+    ("missing dependency", re.compile(r"ERR_MODULE_NOT_FOUND(?![^\r\n]*['\"][^'\"]+['\"])")),
     (
         "unresolved import",
         re.compile(r"(?:Failed to resolve import|Could not resolve)\s+\"?([^\"\s]+)\"?"),
@@ -191,14 +196,27 @@ def classify_test_failure(test_output: str) -> str:
     cannot fix any of these - it has no way to install packages mid-compile - so
     retrying only burns the TDD budget. Callers use this to stop the loop early
     instead of spending every attempt on an un-fixable failure.
+
+    Unresolved *relative* specifiers (``./helper``, ``../src/module``) are the
+    exception: they point at workspace files the agent can create or import
+    paths it can correct with an edit, so they are treated as ordinary
+    fixable failures. Only bare package names (or absolute paths outside the
+    agent's reach) count as environmental.
     """
 
     output = test_output or ""
     for reason, pattern in _ENVIRONMENT_FAILURE_MARKERS:
-        match = pattern.search(output)
-        if not match:
-            continue
-        detail = next((group for group in match.groups() if group), "")
-        detail = " ".join(detail.split())[:_DETAIL_LIMIT].strip()
-        return f"{reason}: {detail}" if detail else reason
+        for match in pattern.finditer(output):
+            detail = next((group for group in match.groups() if group), "")
+            if _is_relative_specifier(detail):
+                continue
+            detail = " ".join(detail.split())[:_DETAIL_LIMIT].strip()
+            return f"{reason}: {detail}" if detail else reason
     return ""
+
+
+def _is_relative_specifier(specifier: str) -> bool:
+    """True when a module specifier resolves inside the editable workspace."""
+
+    spec = (specifier or "").strip().replace("\\", "/")
+    return spec.startswith(("./", "../"))
