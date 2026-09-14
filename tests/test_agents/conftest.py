@@ -29,8 +29,9 @@ def arc_runtime(tmp_project_dir: Path, monkeypatch: pytest.MonkeyPatch):
     Provider env vars (``OPENAI_BASE_URL`` and friends) are scrubbed by the
     autouse ``isolate_model_env`` fixture in ``tests/conftest.py``, because
     ``core.workflow`` runs ``load_project_env()`` at import time and a host
-    ``.env`` leaking ``OPENAI_BASE_URL`` would make ``build_stage_agent``
-    silently drop ``response_format`` and change agent behaviour mid-suite.
+    ``.env`` leaking ``OPENAI_BASE_URL`` would flip the ``response_format``
+    capability decision (or trigger a real probe) and change agent behaviour
+    mid-suite.
     """
 
     root = tmp_project_dir.resolve()

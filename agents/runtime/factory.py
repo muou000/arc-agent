@@ -4,7 +4,6 @@ import os
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import urlparse
 
 from deepagents import GeneralPurposeSubagentProfile, FilesystemPermission, HarnessProfile, create_deep_agent, register_harness_profile
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
@@ -15,6 +14,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel, Field, create_model
 
 from agents.model.factory import create_arc_chat_model
+from agents.model.openai_api_adapter import structured_output_supported
 from agents.runtime.checkpointer import get_checkpointer
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.stage_discipline import StageDisciplineMiddleware
@@ -407,7 +407,7 @@ def build_stage_agent(
             ),
         ),
         context_schema=AgentRuntimeContext,
-        response_format=_resolve_response_format(response_format),
+        response_format=_resolve_response_format(response_format, model=model),
         checkpointer=resolved_checkpointer,
     )
 
@@ -585,11 +585,18 @@ def _register_arc_tool_exclusions(*, model: Any, resolved_model: Any) -> None:
     _REGISTERED_HARNESS_PROFILES.update(registered)
 
 
-def _resolve_response_format(response_format: object | None) -> object | None:
-    base_url = os.getenv("OPENAI_API_BASE", "").strip() or os.getenv("OPENAI_BASE_URL", "").strip()
-    if base_url and not _is_openai_base_url(base_url):
+def _resolve_response_format(response_format: object | None, *, model: str | object = "") -> object | None:
+    """Keep the pydantic response format only when the endpoint supports it.
+
+    Capability is decided by ``structured_output_supported``: an explicit
+    ``ARC_STRUCTURED_OUTPUT`` override wins, direct/official-OpenAI endpoints
+    are always supported, and custom ``OPENAI_BASE_URL`` endpoints get one
+    cached tool-call probe per process (fail-open on inconclusive results).
+    """
+
+    if response_format is None:
         return None
-    return response_format
+    return response_format if structured_output_supported(model) else None
 
 
 def _apply_windows_filesystem_path_compat() -> None:
@@ -634,12 +641,7 @@ def _apply_windows_filesystem_path_compat() -> None:
     _WINDOWS_PATH_COMPAT_APPLIED = True
 
 
-def _is_openai_base_url(base_url: str) -> bool:
-    host = urlparse(base_url).hostname or ""
-    return host == "api.openai.com" or host.endswith(".openai.com")
-
-
-def _resolve_source_paths(paths: list[str] | None, root: Path, skills_root: Path, *, default: list[str]) -> list[str]:
+def _resolve_source_paths(paths: list[str], root: Path, skills_root: Path, *, default: list[str]) -> list[str]:
     candidates = paths if paths is not None else default
     resolved: list[str] = []
     for path in candidates:
