@@ -96,6 +96,12 @@ async function initializeDatabase(options = {}) {
   // init; re-validate before handing the handle out and retry against the
   // current state instead of silently returning a closed database (which made
   // the next DB operation fail with "SQLITE_MISUSE: Database is closed").
+  //
+  // Distinguishing invalidation from failure: every operation that changes
+  // `db` (closeDb, setDbPath, a newer startInit) also nulls or replaces
+  // `initPromise`. So when the promise we awaited is still the current
+  // initPromise, nothing invalidated our generation and the rejection is a
+  // genuine init failure — surface it immediately instead of burning retries.
   let lastError = null;
   for (let attempt = 0; attempt < MAX_INIT_ATTEMPTS; attempt += 1) {
     const pending = initPromise;
@@ -107,20 +113,26 @@ async function initializeDatabase(options = {}) {
         }
         // Generation was swapped while waiting; fall through and re-check.
       } catch (error) {
-        lastError = error;
         if (initPromise === pending) {
           initPromise = null;
+          throw error;
         }
+        lastError = error;
       }
       continue;
     }
 
+    const promise = startInit();
     try {
-      const database = await startInit();
+      const database = await promise;
       if (db === database) {
         return database;
       }
     } catch (error) {
+      if (initPromise === promise) {
+        initPromise = null;
+        throw error;
+      }
       lastError = error;
     }
   }

@@ -126,6 +126,23 @@ async function main() {
   await closeDb();
   await usable(await racing, 'close-race');
 
+  // Repeated first-init races: every initializeDatabase() that follows a
+  // closeDb() is a fresh first init, so each iteration re-arms the race and
+  // exercises both PRAGMA-before-close and close-during-PRAGMA interleavings.
+  for (let i = 0; i < 10; i += 1) {
+    const raced = initializeDatabase();
+    await closeDb();
+    await usable(await raced, `close-race-${i}`);
+  }
+
+  // Concurrent callers racing one close: every resolved handle must be usable.
+  const burst = [initializeDatabase(), initializeDatabase(), initializeDatabase()];
+  await closeDb();
+  const burstHandles = await Promise.all(burst);
+  for (const [i, handle] of burstHandles.entries()) {
+    await usable(handle, `burst-${i}`);
+  }
+
   const h1 = await initializeDatabase();
   const h2 = await initializeDatabase();
   assert.strictEqual(h2, h1, 'sequential second call should reuse the open handle');
