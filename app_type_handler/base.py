@@ -3,6 +3,7 @@ import inspect
 import os
 import shutil
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -11,6 +12,22 @@ TEMPLATE_ID_BY_APP_TYPE = {
     "android": "mobile-android-java",
     "cli": "cli-python",
 }
+
+
+@dataclass(frozen=True)
+class GlueAnchorSpec:
+    """Declarative description of one shared integration-point file.
+
+    The workspace map extracts a compact, always-current summary of these
+    glue files (route registration, mounted endpoints, database tables) so
+    stage agents stop re-reading and re-discovering the integration surface
+    on every node. ``extractors`` names the summary strategies implemented in
+    ``agents/context/repo_map.py``.
+    """
+
+    path: str
+    label: str
+    extractors: tuple[str, ...] = field(default=())
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
@@ -277,6 +294,18 @@ class AppTypeHandler(ABC):
         android_package: str | None = None,
     ) -> list[str]:
         del web_port, android_package
+        return []
+
+    @classmethod
+    def workspace_glue_anchor_specs(cls) -> list[GlueAnchorSpec]:
+        """Shared integration-point files the workspace map summarises.
+
+        Unlike ``scaffold_context_files`` these are node integration points
+        that agents edit during the run, so their content is not injected
+        verbatim; only compact, regex-extracted summaries are. Returning an
+        empty list (the default) means the app type declares no anchors and
+        the map shows the plain file inventory.
+        """
         return []
 
     @classmethod

@@ -42,3 +42,22 @@ def test_node_integration_glue_is_not_declared_as_scaffold() -> None:
     assert "backend/src/index.js" not in files
     assert "frontend/src/App.tsx" not in files
     assert "frontend/src/main.tsx" not in files
+
+
+def test_web_declares_glue_anchors_for_the_shared_integration_points() -> None:
+    specs = {spec.path: spec for spec in WebAppType.workspace_glue_anchor_specs()}
+
+    assert "frontend/src/App.tsx" in specs, "route registration must be summarised for every node"
+    assert "backend/src/app.js" in specs, "backend route mounts must be summarised for every node"
+    assert "react_routes" in specs["frontend/src/App.tsx"].extractors
+    assert "express_routes" in specs["backend/src/app.js"].extractors
+
+
+def test_glue_anchor_specs_are_workspace_relative_and_boundary_safe() -> None:
+    for handler in (AppTypeHandler, WebAppType):
+        for spec in handler.workspace_glue_anchor_specs():
+            assert not spec.path.startswith("/"), f"absolute anchor path: {spec.path}"
+            assert "\\" not in spec.path, f"non-normalized anchor path: {spec.path}"
+            assert ".." not in spec.path.split("/"), f"anchor path escapes the workspace: {spec.path}"
+            assert spec.label.strip(), f"anchor without a label: {spec.path}"
+            assert spec.extractors, f"anchor without extractors: {spec.path}"

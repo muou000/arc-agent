@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from agents.context.repo_map import build_workspace_map_lines
+
 
 @dataclass
 class ContextConfig:
@@ -262,14 +264,51 @@ class ContextPipeline:
         )
         return f"<tech_stack_context>\n{content}\n</tech_stack_context>"
 
-    def _get_project_structure(self, agent_type: str = "") -> str:
+    def _get_project_structure(self, agent_type: str = "", map_workspace_dir: str | None = None) -> str:
         app_type = (self.config.app_type or "web").strip().lower()
         handler_class = self._get_app_type_handler_class(app_type)
         lines = handler_class.project_structure_lines(
             web_port=self.config.web_port,
             android_package=self.config.android_package,
         )
-        return "<project_structure>\n" + "\n".join(lines) + "\n</project_structure>"
+        # Live map of the workspace the stage agent will actually explore.
+        # ``map_workspace_dir`` is threaded per call because under
+        # ``ARC_NODE_WORKTREES`` the agent's filesystem root is its task
+        # worktree while this pipeline stays rooted at the main workspace
+        # (node sessions, traceability); a shared config field would let
+        # parallel tasks overwrite each other's map root.
+        map_root = Path(map_workspace_dir or self.config.workspace_dir)
+        map_lines = build_workspace_map_lines(
+            map_root,
+            handler_class.workspace_glue_anchor_specs(),
+            owners_by_path=self._interface_owners_by_path(),
+        )
+        return "<project_structure>\n" + "\n".join(lines + map_lines) + "\n</project_structure>"
+
+    def _interface_owners_by_path(self) -> dict[str, list[str]]:
+        """file_path -> owning req_ids from the interfaces table.
+
+        Feeds the map's per-file owner annotations: a later sibling sees which
+        node already placed which file, which is both exploration information
+        and collision awareness for shared integration points.
+        """
+
+        store = self._store()
+        if store is None:
+            return {}
+        _, rows = self._load_interface_index()
+        owners: dict[str, list[str]] = {}
+        for iface in rows:
+            file_path = str(iface.get("file_path", "") or "").strip().replace("\\", "/")
+            req_ids = self._normalize_req_ids(iface)
+            if not file_path or not req_ids:
+                continue
+            key = file_path.lstrip("/").removeprefix("./")
+            existing = owners.setdefault(key, [])
+            for req_id in req_ids:
+                if req_id not in existing:
+                    existing.append(req_id)
+        return owners
 
     def _get_test_harness_context(self) -> str:
         app_type = (self.config.app_type or "web").strip().lower()
@@ -618,6 +657,7 @@ class ContextPipeline:
         agent_type: str,
         preloaded_source: str | None = None,
         target_test_files: list[str] | None = None,
+        map_workspace_dir: str | None = None,
     ) -> str:
         store = self._store()
         if store is None:
@@ -635,7 +675,7 @@ class ContextPipeline:
         project_structure = self.cache.get_or_compute(
             node_id,
             f"project_structure::{agent_type}",
-            lambda: self._get_project_structure(agent_type),
+            lambda: self._get_project_structure(agent_type, map_workspace_dir),
         )
         if project_structure:
             context_parts.append(project_structure)
@@ -716,13 +756,18 @@ class ContextPipeline:
 
         return "\n\n".join(part for part in context_parts if part)
 
-    def get_static_context(self, node_id: str, agent_type: str = "") -> str:
+    def get_static_context(
+        self,
+        node_id: str,
+        agent_type: str = "",
+        map_workspace_dir: str | None = None,
+    ) -> str:
         parts = [
             self.cache.get_or_compute(node_id, "tech_stack_context", self._get_tech_stack_context),
             self.cache.get_or_compute(
                 node_id,
                 f"project_structure::{agent_type}",
-                lambda: self._get_project_structure(agent_type),
+                lambda: self._get_project_structure(agent_type, map_workspace_dir),
             ),
         ]
         if agent_type == "TestGenerator":
@@ -738,14 +783,16 @@ class ContextPipeline:
         agent_type: str,
         preloaded_source: str | None = None,
         target_test_files: list[str] | None = None,
+        map_workspace_dir: str | None = None,
     ) -> tuple[str, str]:
         full_context = self.build_agent_context(
             node_id=node_id,
             agent_type=agent_type,
             preloaded_source=preloaded_source,
             target_test_files=target_test_files,
+            map_workspace_dir=map_workspace_dir,
         )
-        static = self.get_static_context(node_id, agent_type)
+        static = self.get_static_context(node_id, agent_type, map_workspace_dir)
         dynamic = full_context
         for part in [item.strip() for item in static.split("\n\n") if item.strip()]:
             dynamic = dynamic.replace(part, "", 1)

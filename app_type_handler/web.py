@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .base import AppTypeHandler
+from .base import AppTypeHandler, GlueAnchorSpec
 from .path_validation import is_scoped_test_path, normalize_safe_relative_path
 from core.config import build_web_runtime_env, get_web_base_url, get_web_port
 from core.processes import finalize_subprocess
@@ -1315,6 +1315,26 @@ class WebAppType(AppTypeHandler):
             "Integration tests: place under `frontend/tests/...` for frontend integration or `backend/tests/...` for API/service/database integration.",
             "E2E tests: place under `backend/test-e2e/...` and use a JavaScript or TypeScript test filename.",
             "Database-using tests must use the app-type-provided isolated test harness/scaffold.",
+        ]
+
+    @classmethod
+    def workspace_glue_anchor_specs(cls) -> list[GlueAnchorSpec]:
+        return [
+            GlueAnchorSpec(
+                path="frontend/src/App.tsx",
+                label="frontend route registration",
+                extractors=("react_routes", "page_imports"),
+            ),
+            GlueAnchorSpec(
+                path="backend/src/app.js",
+                label="backend route registration",
+                extractors=("express_routes",),
+            ),
+            GlueAnchorSpec(
+                path="backend/src/database/init_db.js",
+                label="database schema",
+                extractors=("sql_tables",),
+            ),
         ]
 
     @classmethod
