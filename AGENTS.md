@@ -118,11 +118,11 @@ python arc_main.py doctor
 - 开发任务一律在独立的 git worktree 中进行，无论是否存在并发会话；不要直接在 `main` 的共享工作区改动或新建/切换 branch（branch 切换会改变工作区内容，可能破坏其他会话或用户正在进行的工作）。每个任务：
 
   ```text
-  git worktree add ../arc-agent-wt-<任务名> -b <任务分支名>
-  cd ../arc-agent-wt-<任务名>
+  git worktree add ../<任务名> -b <任务分支名>
+  cd ../<任务名>
   ```
 
-  任务完成后把该任务分支 push 到上游并发起 PR（不要在本地直接合并到 `main`）；PR 合并后再用 `git worktree remove ../arc-agent-wt-<任务名>` 清理 worktree。
+  任务完成后把该任务分支 push 到上游并发起 PR（不要在本地直接合并到 `main`）；PR 合并后再用 `git worktree remove ../<任务名>` 清理 worktree。
 - git worktree 使用注意事项：
 
   - worktree 共享同一套仓库对象和分支，但每个 worktree 的工作区文件和索引相互独立；同一分支同时只能被一个 worktree 检出，因此创建 worktree 时应一并 `-b` 新建任务分支，避免检出冲突。
