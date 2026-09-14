@@ -13,6 +13,7 @@ from agents.test_generator import TestGenerator
 from app_type_handler import create_app_type_handler, normalize_app_type
 from agents.context.pipeline import context_pipeline
 from core import commits, config, files, sessions
+from core.file_claims import get_file_claim_registry
 from core.phases import WorkflowPhaseRunner
 from core.service import configure_runtime
 from core.commits import build_commit_message
@@ -114,6 +115,10 @@ class ARCWorkflowManager:
         self._worktree_manager = (
             NodeWorktreeManager(self.workspace_path) if self._parallel_mode else None
         )
+        # Nothing is in flight when a compile starts (fresh or resumed), so
+        # any claims left by a previous process are stale by definition:
+        # landed files are tracked in git and un-landed work re-runs.
+        get_file_claim_registry(self.workspace_path).reset()
         self._merge_lock = asyncio.Lock()
         self._port_slots: dict[int, str] = {}
         self._port_slot_count = 1
@@ -585,17 +590,38 @@ class ARCWorkflowManager:
                 task_ok = False
 
         merged = True
+        merge_conflict: list[str] = []
         if ctx is not None:
             # Commit the worktree and merge its branch back; a merge conflict
             # fails the node even when its phase succeeded, because the work
-            # never reached the integration workspace.
-            merged, _detail = await self._integrate_task_workspace(
+            # never reached the integration workspace. One narrow exception:
+            # the first DESIGN conflict re-queues the node once with the
+            # conflicting paths as guidance, so a parallel sibling that won
+            # the file does not cost the whole node.
+            merged, _detail, merge_conflict = await self._integrate_task_workspace(
                 ctx,
                 node_id,
                 phase if task_ok else f"{phase}-FAILED",
                 requirement_data,
             )
             if task_ok and not merged:
+                if (
+                    merge_conflict
+                    and phase == PHASE_DESIGN
+                    and not sessions.load_node_session(node_id).get("merge_conflict_retry_used")
+                ):
+                    requeued = await self._requeue_design_after_merge_conflict(
+                        ctx, queue_state, node_id, merge_conflict
+                    )
+                    if requeued:
+                        await self._close_task_workspace(ctx)
+                        return
+                # Requeue declined (already used, not a DESIGN conflict, or
+                # the requeue itself failed): fall through to the failure
+                # branch. The method tail still closes ctx with
+                # preserve=True there, so a declined requeue never leaks the
+                # worktree - it is preserved for --retry exactly like any
+                # other failed merge.
                 task_ok = False
 
         if task_ok:
@@ -697,7 +723,14 @@ class ARCWorkflowManager:
         node_id: str,
         phase: str,
         requirement_data: dict[str, Any],
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, list[str]]:
+        """Merge the task's branch back; report conflicting paths if any.
+
+        Returns ``(merged, detail, conflict_paths)``; ``conflict_paths`` is
+        non-empty only when the merge aborted on a conflict, and carries the
+        unmerged files for the conflict-aware DESIGN retry.
+        """
+
         commit_message = build_commit_message(node_id, phase, requirement_data)
         verify = self._build_merge_health_gate() if self.app_type == "web" else None
         async with self._merge_lock:
@@ -710,14 +743,97 @@ class ARCWorkflowManager:
                 )
             except MergeConflictError as exc:
                 await self._log("Compiler", str(exc), "error", node_id)
-                return False, str(exc)
+                return False, str(exc), list(getattr(exc, "files", []) or [])
             except WorktreeError as exc:
                 await self._log("Compiler", f"Integration of {node_id} failed: {exc}", "error", node_id)
-                return False, str(exc)
+                return False, str(exc), []
         if not committed:
             await self._log("Compiler", "No file changes detected for this checkpoint.", node_id=node_id)
         await self._log("Compiler", f"Integrated {node_id}: {detail}.", node_id=node_id)
-        return True, detail
+        return True, detail, []
+
+    async def _requeue_design_after_merge_conflict(
+        self,
+        ctx: _TaskWorkspace,
+        queue_state: dict[str, Any],
+        node_id: str,
+        conflict_paths: list[str],
+    ) -> bool:
+        """Re-queue a node's DESIGN once after a merge conflict.
+
+        The conflicting files stay owned by the winning sibling (its branch
+        is already merged), so the node's branch is reset to the current
+        integration HEAD - the retry sees the sibling's files on disk and
+        designs around them. The conflicting paths are stored in the node
+        session for the DESIGN prompt; a second conflict (or an IMPLEMENT
+        conflict) fails the node as before.
+
+        Every decline path leaves the task workspace exactly as a regular
+        conflict failure left it: quarantined, branch intact, preserved for
+        ``--retry``. The queue is validated *before* the branch reset so a
+        decline never discards the node's conflicted commits.
+        """
+
+        design_task = None
+        implement_task = None
+        for task in queue_state["tasks"]:
+            if task["node_id"] != node_id:
+                continue
+            if task["phase"] == PHASE_DESIGN:
+                design_task = task
+            elif task["phase"] == PHASE_IMPLEMENT:
+                implement_task = task
+        if design_task is None or implement_task is None:
+            await self._log(
+                "Compiler",
+                f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete.",
+                "error",
+                node_id,
+            )
+            return False
+
+        try:
+            await asyncio.to_thread(self._worktree_manager.reset_branch_to_integration, ctx.handle)
+        except WorktreeError as exc:
+            await self._log(
+                "Compiler",
+                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead: {exc}",
+                "error",
+                node_id,
+            )
+            return False
+
+        design_task["status"] = TASK_PENDING
+        implement_task["status"] = TASK_PENDING
+        self.runtime.traceability.clear_node_design_artifacts(node_id)
+        self.runtime.traceability.reset_test_pass_statuses_for_requirement(node_id)
+        self._set_node_state(queue_state["node_states"], node_id, NODE_UNSEEN)
+        sessions.merge_node_session(
+            node_id,
+            {
+                "interfaces": [],
+                "materialized_files": [],
+                "test_artifacts": [],
+                "phase_status": {"design": "pending", "test": "pending", "implement": "pending"},
+                "resume_context": {},
+                "result_state": "",
+                "merge_conflict_context": {"paths": list(conflict_paths), "phase": "design"},
+                "merge_conflict_retry_used": True,
+            },
+        )
+        context_pipeline.cache.invalidate_file_layers(node_id)
+        context_pipeline.cache.invalidate_db_layers(node_id)
+        self._save_processing_queue(queue_state)
+        await self._log(
+            "Compiler",
+            "Merge conflict on: "
+            + ", ".join(conflict_paths[:8])
+            + f". Re-queued {node_id} DESIGN once; the retry starts from the merged integration "
+            "state and must avoid the sibling-owned paths.",
+            "warning",
+            node_id,
+        )
+        return True
 
     def _build_merge_health_gate(self) -> Callable[[], str | None]:
         """Build the sync verification callback for additively resolved merges.
@@ -759,6 +875,10 @@ class ARCWorkflowManager:
                 ctx.node_id,
             )
         finally:
+            # Release the node's new-file claims: after a successful merge the
+            # files are tracked in git (claims are moot), and after a terminal
+            # failure the paths must be free for other nodes.
+            get_file_claim_registry(self.workspace_path).release_node(ctx.node_id)
             self._release_port_slot(ctx.slot)
 
     def _acquire_port_slot(self, node_id: str) -> int:
@@ -1186,6 +1306,12 @@ class ARCWorkflowManager:
                 "phase_status": {"design": "pending", "test": "pending", "implement": "pending"},
                 "resume_context": {},
                 "result_state": "",
+                # A manual retry is a fresh DESIGN pass: restore the node's
+                # one-shot conflict retry budget and drop stale conflict
+                # paths so the prompt is not misdirected (None replaces the
+                # dict wholesale; deep-merge would keep a {} patch intact).
+                "merge_conflict_context": None,
+                "merge_conflict_retry_used": False,
             },
         )
         context_pipeline.cache.invalidate_file_layers(node_id)
@@ -1229,6 +1355,10 @@ class ARCWorkflowManager:
                 "resume_context": {},
                 "result_state": "",
                 "recent_failure_summary": "",
+                # Fresh DESIGN pass: restore the conflict-retry budget and
+                # drop stale conflict paths (see _reset_node_from_design_retry).
+                "merge_conflict_context": None,
+                "merge_conflict_retry_used": False,
             },
         )
         context_pipeline.cache.invalidate_db_layers(node_id)

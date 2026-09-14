@@ -328,6 +328,8 @@ def build_stage_agent(
     memory: list[str] | None = None,
     tools: list[object] | None = None,
     checkpointer: Any = _UNSET,
+    node_id: str | None = None,
+    claims_workspace_root: str | None = None,
 ):
     """Create an agent instance with ARC's first-batch filesystem policy.
 
@@ -358,6 +360,28 @@ def build_stage_agent(
     _register_arc_tool_exclusions(model=model, resolved_model=resolved_model)
     resolved_skills = _resolve_source_paths(skills, root, skills_root, default=[f"{SKILLS_PREFIX}/"])
 
+    file_claim_gate = None
+    if node_id and claims_workspace_root:
+        # Parallel-worktree ownership guard for new files. The two roots are
+        # deliberately different:
+        # - ``claims_workspace_root`` is the *integration* workspace, where
+        #   the shared claim registry lives; every in-flight node resolves
+        #   the same registry through it. In parallel mode the per-task
+        #   runner always injects it (``context_workspace_root``); in serial
+        #   mode it equals the one shared workspace.
+        # - ``agent_root`` is *this agent's* filesystem root — the task
+        #   worktree in parallel mode — and defines what "tracked" means.
+        #   A sibling's committed-but-unmerged file is untracked here
+        #   precisely because its branch is invisible in this worktree;
+        #   that is the arbitration the claims provide.
+        from core.file_claims import FileClaimGate, get_file_claim_registry
+
+        file_claim_gate = FileClaimGate(
+            get_file_claim_registry(claims_workspace_root),
+            node_id=node_id,
+            agent_root=str(root),
+        )
+
     return create_deep_agent(
         name=name,
         model=resolved_model,
@@ -367,7 +391,7 @@ def build_stage_agent(
             ToolUsageMiddleware(),
             TruncatedToolCallGuardMiddleware(),
             ToolArgumentSanitizerMiddleware(),
-            StageDisciplineMiddleware(stage=stage),
+            StageDisciplineMiddleware(stage=stage, file_claim_gate=file_claim_gate),
             DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
         ],
         tools=tools or [],

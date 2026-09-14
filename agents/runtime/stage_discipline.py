@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
+
+if TYPE_CHECKING:
+    from core.file_claims import FileClaimGate
 
 _FILE_WRITE_TOOLS = frozenset({"edit_file", "write_file"})
 _VALIDATION_TOOLS = frozenset({"run_build", "run_tests"})
@@ -29,8 +32,14 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
 
     state_schema = StageDisciplineState
 
-    def __init__(self, *, stage: Literal["interface_design", "test_generation", "implementation"]) -> None:
+    def __init__(
+        self,
+        *,
+        stage: Literal["interface_design", "test_generation", "implementation"],
+        file_claim_gate: "FileClaimGate | None" = None,
+    ) -> None:
         self._stage = stage
+        self._file_claim_gate = file_claim_gate
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._written_paths: set[str] = set()
         self._failed_paths: set[str] = set()
@@ -115,6 +124,12 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                     f"InterfaceDesigner may only materialize small skeletons (at most {_MAX_SKELETON_LINES} lines per write). "
                     "Record the complete business contract for TDD instead of implementing it now."
                 )
+        if self._file_claim_gate is not None:
+            # Cross-node ownership of new files (parallel worktrees): claim
+            # the path for this node or reject a sibling's claimed path. The
+            # claim is recorded only for writes the discipline allows above,
+            # so a skeleton-limit rejection never claims a path.
+            return self._file_claim_gate.check_and_claim(path)
         return None
 
     def _with_bounded_read(self, request: ToolCallRequest) -> ToolCallRequest:

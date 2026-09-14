@@ -204,6 +204,8 @@ class TestDrivenDeveloper:
             permitted_skill_names=selected_skill_names,
             memory=[],
             tools=[run_tests, run_build, *traceability_tools],
+            node_id=node_id,
+            claims_workspace_root=self.context_workspace_root or workspace_root,
         )
         message = get_user_prompt(
             node_id=node_id,

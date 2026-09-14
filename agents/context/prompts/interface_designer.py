@@ -72,35 +72,51 @@ def get_user_prompt(
     node_id: str,
     requirement_data: dict[str, Any],
     dynamic_context: str,
+    merge_conflict: dict[str, Any] | None = None,
 ) -> str:
+    extra_sections = [
+        section(
+            "Task",
+            [
+                "The workflow has not pre-classified this node; decide whether it is leaf or non-leaf from `children_ids` and visual references before designing.",
+                "If this is a non-leaf node without visual references, return an empty interface list without reading or editing files; the workflow normally skips that case before this prompt.",
+                "Design and materialize the current node's owned interfaces, and include reused parent/dependency interfaces that this node will implement, extend, or call.",
+                "Return `summary`, `interfaces`, and `files_written`.",
+                "Use the response to record contracts that would require more than a small skeleton. Do not turn DESIGN into an implementation pass; TestDrivenDeveloper will implement the complete behavior and repair tests.",
+                "Leaf interfaces may span UI, API, FUNC, and DB only when the requirement truly owns those layers; if the UI shell was parent-designed, include that reused UI interface in this node's returned interfaces so downstream tests and implementation can use it.",
+                "If this leaf node changes authenticated state, the interface set must represent the global session/auth path, not only the initiating page. Include session loading/current-user API and shared UI auth state interfaces when they are required for system consistency.",
+                "If this leaf node reads or mutates cart, checkout, account, product, order, catalog, inventory, or other durable user/domain data, the interface set must represent the connected app path. Do not model it only as component-local state.",
+                "If this leaf node depends on records that already exist according to its description or GIVEN steps, the interface set must represent where those records are seeded or loaded from. Treat the requirement's natural-language data as a DB/persistence contract, not as an instruction to add hidden test fixtures.",
+                "For files near or above 500 lines, prefer interfaces that extract new behavior into smaller modules and leave only route/shell wiring in the large file.",
+                "Files the project structure shows as owned by other requirement ids - plus the template app entry, route registration, and database bootstrap - are shared integration surfaces: extend them with the smallest additive edit (one import, one registration line at the established mount point) instead of rewriting or reorganizing them. Put owned behavior in new modules and wire them from the shared surface additively.",
+                "Non-leaf interfaces must stay UI/composition-oriented. Do not create API, FUNC, or DB interfaces for a non-leaf node.",
+                "Each interface should include `interface_id`, `req_id`, `type`, `name`, `file_path`, `first_line`, `responsibility`, `specification`, `inputs`, `outputs`, `callers`, `callees`, and `test_focus` when applicable.",
+                "The `type` field must be exactly one of `UI`, `API`, `FUNC`, or `DB`.",
+                "Return schema paths as workspace-relative paths based on the project structure context; do not include the virtual `/workspace/` prefix in `file_path` or `files_written`.",
+                "New `interface_id` values must be globally stable and include the current node id. Reused interfaces should keep their existing `interface_id` so the system can attach the current node to the same traceability record.",
+                "On retry, prefer returning updated versions of existing current-node interfaces with the same `interface_id`; do not mint duplicate ids for the same contract.",
+                "In `summary`, include a concise design rationale: owned boundary, reused interfaces, and how the chain remains connected to the app.",
+                "Do not return an empty interface list unless the node truly has no current-node owned contract to record; explain that case in `summary`.",
+            ],
+        ),
+    ]
+    paths = [str(path) for path in (merge_conflict or {}).get("paths", []) if str(path).strip()]
+    if paths:
+        extra_sections.append(
+            section(
+                "Merge Conflict Retry",
+                [
+                    "This DESIGN pass is a one-shot retry after the previous pass conflicted with a parallel sibling requirement node during merge.",
+                    f"The sibling now owns these file paths (they are already merged into the workspace you see): {', '.join(paths)}.",
+                    "Do not create, rewrite, or reorganize those files. The sibling's contracts there are the baseline this node must work with.",
+                    "Place this node's owned contracts in node-owned file paths - new cohesive modules named after this requirement's own domain - and wire them from the shared surfaces with small additive edits.",
+                    "If the design genuinely needs a sibling-owned contract, include it as a reused interface in the response (keeping its existing boundary) instead of reimplementing it.",
+                ],
+            )
+        )
     return task_context_block(
         node_id=node_id,
         dynamic_context=dynamic_context,
         requirement_data=requirement_data,
-        extra_sections=[
-            section(
-                "Task",
-                [
-                    "The workflow has not pre-classified this node; decide whether it is leaf or non-leaf from `children_ids` and visual references before designing.",
-                    "If this is a non-leaf node without visual references, return an empty interface list without reading or editing files; the workflow normally skips that case before this prompt.",
-                    "Design and materialize the current node's owned interfaces, and include reused parent/dependency interfaces that this node will implement, extend, or call.",
-                    "Return `summary`, `interfaces`, and `files_written`.",
-                    "Use the response to record contracts that would require more than a small skeleton. Do not turn DESIGN into an implementation pass; TestDrivenDeveloper will implement the complete behavior and repair tests.",
-                    "Leaf interfaces may span UI, API, FUNC, and DB only when the requirement truly owns those layers; if the UI shell was parent-designed, include that reused UI interface in this node's returned interfaces so downstream tests and implementation can use it.",
-                    "If this leaf node changes authenticated state, the interface set must represent the global session/auth path, not only the initiating page. Include session loading/current-user API and shared UI auth state interfaces when they are required for system consistency.",
-                    "If this leaf node reads or mutates cart, checkout, account, product, order, catalog, inventory, or other durable user/domain data, the interface set must represent the connected app path. Do not model it only as component-local state.",
-                    "If this leaf node depends on records that already exist according to its description or GIVEN steps, the interface set must represent where those records are seeded or loaded from. Treat the requirement's natural-language data as a DB/persistence contract, not as an instruction to add hidden test fixtures.",
-                    "For files near or above 500 lines, prefer interfaces that extract new behavior into smaller modules and leave only route/shell wiring in the large file.",
-                    "Files the project structure shows as owned by other requirement ids - plus the template app entry, route registration, and database bootstrap - are shared integration surfaces: extend them with the smallest additive edit (one import, one registration line at the established mount point) instead of rewriting or reorganizing them. Put owned behavior in new modules and wire them from the shared surface additively.",
-                    "Non-leaf interfaces must stay UI/composition-oriented. Do not create API, FUNC, or DB interfaces for a non-leaf node.",
-                    "Each interface should include `interface_id`, `req_id`, `type`, `name`, `file_path`, `first_line`, `responsibility`, `specification`, `inputs`, `outputs`, `callers`, `callees`, and `test_focus` when applicable.",
-                    "The `type` field must be exactly one of `UI`, `API`, `FUNC`, or `DB`.",
-                    "Return schema paths as workspace-relative paths based on the project structure context; do not include the virtual `/workspace/` prefix in `file_path` or `files_written`.",
-                    "New `interface_id` values must be globally stable and include the current node id. Reused interfaces should keep their existing `interface_id` so the system can attach the current node to the same traceability record.",
-                    "On retry, prefer returning updated versions of existing current-node interfaces with the same `interface_id`; do not mint duplicate ids for the same contract.",
-                    "In `summary`, include a concise design rationale: owned boundary, reused interfaces, and how the chain remains connected to the app.",
-                    "Do not return an empty interface list unless the node truly has no current-node owned contract to record; explain that case in `summary`.",
-                ],
-            ),
-        ],
+        extra_sections=extra_sections,
     )

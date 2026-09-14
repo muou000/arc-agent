@@ -16,13 +16,19 @@ branched from the integration HEAD so those three hazards disappear:
 
 When the task finishes, the worktree's branch is merged back into the
 integration branch under the workflow's merge lock. Sibling nodes touch
-disjoint files in the common case, so merges are clean; a conflict aborts the
-merge, fails the node with an explicit reason, and keeps the worktree on disk
-for inspection and ``--retry``. One narrow conflict class is resolved
-mechanically instead: when every side of a conflict only *appends* lines to an
-existing file (the shared glue-file registration pattern, e.g. ``app.js``
-route blocks), the additions are replayed onto the common base and the caller
-may run a health check on the resolved tree before the merge is committed.
+disjoint files in the common case, so merges are clean. Two guards cover the
+overlapping cases: ``core.file_claims`` blocks a stage agent from creating a
+new file a parallel sibling already created (the add/add case no resolver
+can fix), and the workflow re-queues a node's DESIGN once after a merge
+conflict (``reset_branch_to_integration`` puts the retry back at the merged
+integration HEAD, so the winning sibling's files are visible to it). A
+conflict that survives both guards fails the node with an explicit reason
+and keeps the worktree on disk for inspection and ``--retry``. One narrow
+conflict class is resolved mechanically instead: when every side of a
+conflict only *appends* lines to an existing file (the shared glue-file
+registration pattern, e.g. ``app.js`` route blocks), the additions are
+replayed onto the common base and the caller may run a health check on the
+resolved tree before the merge is committed.
 
 Tasks may share one worktree *directory* per subtree (``group_key`` in
 ``prepare``): consecutive tasks of a subtree run sequentially in the same
@@ -70,7 +76,15 @@ class WorktreeError(RuntimeError):
 
 
 class MergeConflictError(WorktreeError):
-    """The node branch cannot be merged into the integration branch."""
+    """The node branch cannot be merged into the integration branch.
+
+    ``files`` carries the conflicting paths so callers can react to them
+    (the workflow's conflict-aware DESIGN retry uses them as guidance).
+    """
+
+    def __init__(self, message: str, files: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.files = list(files or [])
 
 
 class MergeVerificationError(MergeConflictError):
@@ -261,7 +275,8 @@ class NodeWorktreeManager:
             files = ", ".join(unmerged[:8]) or "unknown files"
             raise MergeConflictError(
                 f"Merging {handle.branch} conflicted with {current_branch} on: {files}. "
-                "The worktree is preserved for inspection."
+                "The worktree is preserved for inspection.",
+                files=unmerged,
             )
 
         failure: str | None = None
@@ -381,6 +396,30 @@ class NodeWorktreeManager:
         """Drop stale worktree registrations from interrupted runs."""
 
         self._git(["worktree", "prune"], cwd=self.main_workspace, check=False)
+
+    def reset_branch_to_integration(self, handle: WorktreeHandle) -> None:
+        """Reset a conflicted node's branch to the current integration HEAD.
+
+        After a merge conflict the node branch holds the losing (conflicting)
+        commits. A conflict-aware DESIGN retry re-runs the node from the
+        current integration state - which already contains the winning
+        sibling's files - so its branch is reset here and the worktree
+        directory is un-quarantined for reuse. The discarded commits stay
+        reachable through git's reflog for inspection.
+        """
+
+        self._quarantined.discard(str(Path(handle.path)))
+        integration = self._integration_branch()
+        reset = self._git(
+            ["checkout", "-B", handle.branch, integration],
+            cwd=handle.path,
+            check=False,
+        )
+        if reset.returncode != 0:
+            raise WorktreeError(
+                f"resetting branch {handle.branch} to {integration} failed: "
+                f"{reset.stderr.strip() or reset.stdout.strip()}"
+            )
 
     def cleanup_reusable_worktrees(self) -> list[str]:
         """Remove reusable worktree directories left over after a run.
