@@ -1837,7 +1837,12 @@ class WebAppType(AppTypeHandler):
         backend_cleanup_note = ""
         database_prepare_output = ""
         reused_runtime = False
-        backend_fingerprint = _backend_source_fingerprint(os.path.join(self.workspace_path, "backend"))
+        # Off the event loop: hashing a large backend tree is pure blocking I/O
+        # and must not freeze concurrent runner work on the same loop.
+        backend_fingerprint = await asyncio.to_thread(
+            _backend_source_fingerprint,
+            os.path.join(self.workspace_path, "backend"),
+        )
         try:
             reused_session = await self._try_reuse_e2e_backend_session(
                 e2e_runtime_env,
