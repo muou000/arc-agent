@@ -389,9 +389,10 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
     )
     assert "has advanced the active layer" not in all_tool_results
     # The first failing run offers the repair-and-revalidate contract; the
-    # second (still environmental) run closes the layer for good.
-    assert "one repair-and-revalidate attempt" in all_tool_results
-    assert "Do not retry run_tests" in all_tool_results
+    # second (still environmental) run closes the layer for good. The two
+    # status headers must be unambiguous about which state the layer is in.
+    assert "This is your one repair-and-revalidate attempt" in all_tool_results
+    assert "This layer is closed" in all_tool_results
     node_session = sessions.load_node_session(node_id)
     assert "environment failure" in node_session["recent_failure_summary"]
     assert "missing dependency" in node_session["recent_failure_summary"]
@@ -437,7 +438,7 @@ def test_environment_failure_repair_revalidates_and_passes(tmp_project_dir: Path
     all_tool_results = "\n".join(
         str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
     )
-    assert "one repair-and-revalidate attempt" in all_tool_results
+    assert "This is your one repair-and-revalidate attempt" in all_tool_results
     # The repair really landed in the workspace and the node recovered.
     assert (tmp_project_dir / "src" / "testing-library-dom.js").exists()
     assert arc_runtime.traceability.get_test("T1")["passed"] is True

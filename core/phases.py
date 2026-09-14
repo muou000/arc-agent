@@ -549,24 +549,21 @@ class WorkflowPhaseRunner:
                     "\n\nARC_TEST_LAYER_STATUS:\n"
                     f"- {selected_type} is still failing for an environmental reason "
                     f"({environment_failure}).\n"
-                    "- This is an environment failure (a missing dependency or a broken "
-                    "install), not an assertion failure.\n"
-                    "- Do not retry run_tests and do not edit the tests to work around it. "
-                    "Return a short report naming the missing dependency instead.\n"
+                    "- This layer is closed: the one repair-and-revalidate attempt has been used.\n"
+                    "- Do not call run_tests again; return a short report naming the missing "
+                    "dependency instead.\n"
                 )
             elif environment_failure:
                 output += (
                     "\n\nARC_TEST_LAYER_STATUS:\n"
                     f"- {selected_type} could not run: {environment_failure}.\n"
-                    "- This looks like an environment failure (a missing dependency or a "
-                    "broken install), not an assertion failure.\n"
-                    "- You get exactly one repair-and-revalidate attempt: if the root cause is "
-                    "fixable with a file edit (create the missing local module, correct a wrong "
-                    "relative import, add a missing npm script), make that edit and call "
-                    "run_tests once more.\n"
-                    "- If the failure names a package that must be installed, you cannot fix it "
-                    "mid-run: do not retry run_tests; return a short report naming the missing "
-                    "dependency instead.\n"
+                    "- This is your one repair-and-revalidate attempt for this environment failure.\n"
+                    "- First decide the root cause. If it is fixable with a file edit (create a "
+                    "missing local module, correct a wrong relative import, add a missing npm "
+                    "script), make that edit and call run_tests once more to re-validate.\n"
+                    "- If instead it names a package that must be installed, you cannot fix it "
+                    "mid-run: end your turn with a short report naming the missing dependency "
+                    "and do not call run_tests again.\n"
                 )
             return output
 
