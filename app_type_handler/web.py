@@ -1155,60 +1155,6 @@ def _reset_sqlite_database_rows(db_path: str) -> tuple[bool, str]:
         connection.close()
 
 
-async def probe_backend_health(workspace_path: str, port: int | None = None) -> str | None:
-    """Boot the workspace's backend and check its health endpoint.
-
-    Used as the merge gate after an additively resolved worktree merge: the
-    mechanical resolution can produce syntactically valid but semantically
-    broken registrations (duplicate identifiers, double route mounts), and the
-    cheapest full check is "the integrated backend boots and serves
-    ``/api/health``".
-
-    Returns ``None`` on success. Workspaces without a backend ``start``
-    command have nothing to verify and also return ``None``; any other
-    failure returns a short reason string.
-    """
-
-    backend_path = os.path.join(workspace_path, "backend")
-    resolved_port = int(port) if port is not None else get_web_port()
-    if _resolve_backend_start_command(backend_path) is None:
-        return None
-
-    runtime_env = _build_e2e_runtime_env(workspace_path, ["merge-health-probe"], web_port=resolved_port)
-    process, _start_command, _cleanup_note, _fingerprint = await _start_backend_runtime(
-        workspace_path,
-        runtime_env,
-        web_port=resolved_port,
-    )
-    if process is None:
-        return "backend runtime failed to start on the merged workspace"
-
-    health_url = f"http://127.0.0.1:{resolved_port}/api/health"
-    last_error = "health endpoint did not respond"
-    try:
-        for attempt in range(3):
-            if attempt:
-                await asyncio.sleep(1.0)
-
-            def _request(url: str = health_url) -> int:
-                with urllib.request.urlopen(url, timeout=5) as response:
-                    return int(response.status)
-
-            try:
-                status = await asyncio.to_thread(_request)
-                if status == 200:
-                    return None
-                last_error = f"health endpoint returned HTTP {status}"
-            except Exception as exc:
-                last_error = f"health endpoint unreachable: {type(exc).__name__}: {exc}"
-        return last_error
-    finally:
-        try:
-            await _terminate_process(process, port=resolved_port)
-        except Exception:
-            pass
-
-
 class WebAppType(AppTypeHandler):
     name = "web"
 
