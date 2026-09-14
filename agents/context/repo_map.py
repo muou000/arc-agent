@@ -111,8 +111,7 @@ def _extract_exports(path: Path) -> list[str]:
     return names
 
 
-def _extract_anchor_tokens(path: Path, extractor: str) -> list[str]:
-    content = _read_text_bounded(path)
+def _extract_anchor_tokens(content: str, extractor: str) -> list[str]:
     if not content:
         return []
     tokens: list[str] = []
@@ -143,9 +142,11 @@ def _anchor_lines(workspace: Path, specs: list[GlueAnchorSpec]) -> tuple[list[st
         path = workspace / relative
         if not path.is_file():
             continue
+        # One bounded read per glue file, shared by all of its extractors.
+        content = _read_text_bounded(path) or ""
         parts: list[str] = []
         for extractor in spec.extractors:
-            tokens = _extract_anchor_tokens(path, extractor)
+            tokens = _extract_anchor_tokens(content, extractor)
             if tokens:
                 parts.append(f"{extractor}: {', '.join(tokens)}")
         summary = "; ".join(parts) if parts else "empty (no registered items yet)"
