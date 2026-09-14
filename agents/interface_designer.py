@@ -13,7 +13,7 @@ from agents.context.prompts.interface_designer import get_system_prompt, get_use
 from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
-from agents.runtime.runners import ainvoke_stage_agent
+from agents.runtime.runners import ainvoke_stage_agent, salvage_json_objects
 from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
 from agents.tools.traceability import build_traceability_tools
@@ -122,11 +122,45 @@ class InterfaceDesigner:
             log_cb=self.log_cb,
         )
         bundle = self._normalize_design_payload(payload)
+        if not bundle["interfaces"]:
+            recovered = self._recover_interfaces_from_raw(payload)
+            if recovered:
+                await self._log(
+                    f"Recovered {len(recovered)} interface(s) from the final message JSON.",
+                    node_id=node_id,
+                )
+                bundle["interfaces"] = recovered
         await self._log(
             f"Interface design returned {len(bundle.get('interfaces', []))} interface(s).",
             node_id=node_id,
         )
         return bundle
+
+    @staticmethod
+    def _recover_interfaces_from_raw(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Fenced-JSON fallback for contracts the structured tool call missed.
+
+        Models sometimes answer the DESIGN turn with prose plus a ```json```
+        block instead of calling the structured-output tool (observed on the
+        ticket-booking benchmark: both parallel leaves "returned 0 interfaces"
+        while the full contract array sat inside the final message). When the
+        structured result is empty and the raw final message was preserved,
+        recover the JSON objects embedded in that text. The scanner is
+        quote-aware and only keeps objects that still parse, so damaged prose
+        never becomes a contract; entries without an ``interface_id`` are
+        dropped later by the workflow's ``_prepare_interfaces``.
+        """
+
+        if not payload.get("_raw_final_message"):
+            return []
+        final_text = str(payload.get("summary") or "")
+        if not final_text.strip():
+            return []
+        return [
+            item
+            for item in salvage_json_objects(final_text)
+            if any(key in item for key in ("interface_id", "file_path", "specification", "responsibility"))
+        ]
 
     @staticmethod
     def _load_merge_conflict_context(node_id: str) -> dict[str, Any] | None:

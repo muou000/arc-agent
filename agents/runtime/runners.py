@@ -153,19 +153,155 @@ def parse_json_payload(text: str) -> dict[str, Any] | None:
             return None
         next_string: str | None = None
         for candidate in _json_candidates(current):
-            try:
-                payload = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            normalized = _normalize_payload_value(payload)
-            if normalized is not None:
-                return normalized
-            if isinstance(payload, str) and payload.strip():
-                next_string = payload.strip()
+            outcome = _loads_candidate(candidate)
+            if isinstance(outcome, dict):
+                return outcome
+            if isinstance(outcome, str) and outcome.strip():
+                next_string = outcome.strip()
         if next_string is None:
+            # Model-written JSON blobs (answering with prose plus a fenced
+            # block instead of the structured-output tool call) often carry
+            # syntax damage that strict parsing rejects wholesale. Try the
+            # tolerant repairs before giving up on the whole payload.
+            for candidate in _json_candidates(current):
+                recovered = _loads_candidate_tolerant(candidate)
+                if isinstance(recovered, dict):
+                    return recovered
             return None
         current = next_string
     return None
+
+
+def _loads_candidate(candidate: str) -> dict[str, Any] | str | None:
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    normalized = _normalize_payload_value(payload)
+    if normalized is not None:
+        return normalized
+    if isinstance(payload, str) and payload.strip():
+        return payload.strip()
+    return None
+
+
+def _loads_candidate_tolerant(candidate: str) -> dict[str, Any] | None:
+    repaired_variants = (
+        _escape_control_chars_in_strings(candidate),
+        _strip_trailing_commas(_escape_control_chars_in_strings(candidate)),
+    )
+    for repaired in repaired_variants:
+        if repaired == candidate:
+            continue
+        try:
+            payload = json.loads(repaired)
+        except json.JSONDecodeError:
+            continue
+        normalized = _normalize_payload_value(payload)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def salvage_json_objects(text: str) -> list[dict[str, Any]]:
+    """Recover complete JSON objects from damaged model-written payloads.
+
+    A long fenced JSON answer cut off by the output-token limit fails every
+    whole-document load even though every object written before the cut is
+    intact. A quote-aware brace scanner slices out the root object and its
+    direct children; only slices that still parse as JSON objects survive, so
+    damaged prose can never turn into a contract.
+    """
+
+    repaired = _escape_control_chars_in_strings(text or "")
+    results: list[dict[str, Any]] = []
+    openings: list[int] = []
+    in_string = False
+    escaped = False
+    for index, ch in enumerate(repaired):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            openings.append(index)
+        elif ch == "}":
+            if not openings:
+                continue
+            start = openings.pop()
+            if len(openings) <= 1:
+                try:
+                    payload = json.loads(repaired[start : index + 1])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    results.append(payload)
+    return results
+
+
+def _escape_control_chars_in_strings(text: str) -> str:
+    if not any(ch in text for ch in ("\n", "\r", "\t")):
+        return text
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            elif ch == "\n":
+                out.append("\\n")
+                continue
+            elif ch == "\r":
+                out.append("\\r")
+                continue
+            elif ch == "\t":
+                out.append("\\t")
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out)
+
+
+def _strip_trailing_commas(text: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for index, ch in enumerate(text):
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        if ch == ",":
+            lookahead = index + 1
+            while lookahead < len(text) and text[lookahead] in " \t\r\n":
+                lookahead += 1
+            if lookahead < len(text) and text[lookahead] in "}]":
+                continue
+        out.append(ch)
+    return "".join(out)
 
 
 def _normalize_payload_value(value: Any) -> dict[str, Any] | None:
