@@ -87,6 +87,16 @@ class AppTypeHandler(ABC):
             return False
         return True
 
+    async def shutdown_e2e_runtime(self) -> None:
+        """Release any E2E runtime kept alive across a TDD session.
+
+        The web handler keeps one backend server running between E2E
+        ``run_tests`` calls so a TDD fix loop does not pay server start/stop
+        per attempt. App types without a long-lived E2E runtime do nothing.
+        Called when a node's IMPLEMENT phase finishes.
+        """
+        return None
+
     async def verify_workspace(self) -> bool:
         """Post-install gate. Returning False aborts the compilation.
 
