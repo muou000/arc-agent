@@ -270,6 +270,19 @@ class AppTypeHandler(ABC):
         return []
 
     @classmethod
+    def scaffold_context_files(cls) -> list[str]:
+        """Workspace-relative scaffold files shared verbatim by every node.
+
+        The context pipeline injects their content once as a static layer so
+        stage agents stop re-reading the same template-owned files (database
+        harness, build/test configs) via ``read_file`` on every node. Only
+        template-owned files whose staleness is detectable belong here; node
+        integration points (route registration glue, entry files) must stay
+        out because agents edit them during the run.
+        """
+        return []
+
+    @classmethod
     @abstractmethod
     def build_stack_block(
         cls,
