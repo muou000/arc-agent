@@ -99,6 +99,7 @@ class TestDrivenDeveloper:
             agent_type=self.agent_name,
             preloaded_source=preloaded_source,
             target_test_files=self._current_test_files,
+            map_workspace_dir=workspace_root,
         )
         interface_contract = context_pipeline.get_interface_contract_context(node_id)
         context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())

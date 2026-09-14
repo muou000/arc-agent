@@ -74,6 +74,7 @@ class InterfaceDesigner:
         static_context, dynamic_context = context_pipeline.build_agent_context_split(
             node_id=node_id,
             agent_type=self.agent_name,
+            map_workspace_dir=workspace_root,
         )
         context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
 
