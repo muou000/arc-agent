@@ -16,7 +16,7 @@
 
 - 根目录规则适用于 Python 编译器、agent 适配器、运行时 SDK、app-type handler、模板和测试。
 - 修改 `skills/vercel-react-best-practices/` 或 `skills/vercel-composition-patterns/` 时，遵守对应目录下的 `AGENTS.md`。
-- 开始工作前运行 `git status --short`。保留其他会话或用户已有的修改，只处理当前任务相关文件。
+- 开发任务一律在独立的 git worktree 中进行（见「Git、依赖和敏感信息」）；开始前运行 `git status --short` 了解主工作区状态，只处理当前任务相关文件。
 
 ## 项目目标
 
@@ -115,9 +115,23 @@ python arc_main.py doctor
 
 ## Git、依赖和敏感信息
 
-- 日常开发直接在 `main` 的共享工作区进行；不要因为开始任务就新建或切换 branch，branch 切换会改变工作区内容，可能破坏其他会话正在进行的工作。
+- 开发任务一律在独立的 git worktree 中进行，无论是否存在并发会话；不要直接在 `main` 的共享工作区改动或新建/切换 branch（branch 切换会改变工作区内容，可能破坏其他会话或用户正在进行的工作）。每个任务：
+
+  ```text
+  git worktree add ../arc-agent-wt-<任务名> -b <任务分支名>
+  cd ../arc-agent-wt-<任务名>
+  ```
+
+  任务完成后把该任务分支 push 到上游并发起 PR（不要在本地直接合并到 `main`）；PR 合并后再用 `git worktree remove ../arc-agent-wt-<任务名>` 清理 worktree。
+- git worktree 使用注意事项：
+
+  - worktree 共享同一套仓库对象和分支，但每个 worktree 的工作区文件和索引相互独立；同一分支同时只能被一个 worktree 检出，因此创建 worktree 时应一并 `-b` 新建任务分支，避免检出冲突。
+  - 操作前先用 `git worktree list` 查看现有 worktree；不要移动、删除、checkout 或重置其他会话正在使用的 worktree，清理前确认对应分支已合并。
+  - worktree 之间不共享未跟踪文件。
+  - 测试、构建和生成的应用只在自己的 worktree 内执行；多个 worktree 并行运行时注意端口和临时目录等资源的冲突。
+  - 这里的开发用 worktree 与 `ARC_NODE_WORKTREES`（生成应用阶段的节点级任务 worktree，见「工作流和队列」）是两个不同的机制，互不影响。
 - 不执行会覆盖用户工作的 `git reset --hard`、`git checkout`、`git clean` 或无范围的 `git add -A`；除非用户明确要求，不提交代码。
-- 需要提交时，才从当前 HEAD 新建专用 branch 完成提交（`git switch -c` 不改动工作区文件，未提交修改随工作区保留）。只提交本任务修改的代码内容：本任务独占的文件按显式路径 `git add`；同一文件混有其他任务或用户的修改时，用 `git add -p` 只暂存本任务的改动块；提交前用 `git diff --staged` 核对暂存内容不含其他会话的修改。
+- 需要提交时才提交：提交只进入本任务 worktree 创建时用 `-b` 新建的任务分支，不要提交或推送到 `main`；任务分支通过 push 到上游并创建 PR 合并回 `main`，不要在本地直接合并。只提交本任务修改的代码内容：本任务独占的文件按显式路径 `git add`；同一文件混有其他任务或用户的修改时，用 `git add -p` 只暂存本任务的改动块；提交前用 `git diff --staged` 核对暂存内容不含其他会话的修改。
 - 不把 API key、完整 `.env`、真实用户数据、生成工作区敏感文件或 provider 响应凭据写入日志、测试、提交或文档。
 - `package-lock.json`、依赖版本、模板入口、事件字段和追溯表结构都是受保护接口。必要修改可以进行，但必须有明确理由、对应测试和同步文档。
 - 只在任务需要时修改 `records/` 或 `.workbuddy-ai/`；它们不能替代代码、测试和可复现的验证证据。
