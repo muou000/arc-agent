@@ -392,13 +392,22 @@ def probe_tool_call_support(
         return None
 
     if response.status_code != 200:
-        if response.status_code in {400, 404, 422} and _TOOL_CALL_ERROR_PATTERN.search(response.text):
-            return False
+        if response.status_code in {400, 404, 422}:
+            try:
+                body = response.text
+            except Exception:
+                # Undecodable gateway error page: classification is impossible.
+                return None
+            if _TOOL_CALL_ERROR_PATTERN.search(body):
+                return False
         return None
 
     try:
         data = response.json()
-    except ValueError:
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        # A 200 whose body is not a JSON object says nothing about tool support.
         return None
 
     if api_mode == "responses":

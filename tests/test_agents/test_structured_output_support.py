@@ -219,6 +219,42 @@ def test_probe_connection_error_fails_open(monkeypatch: pytest.MonkeyPatch):
     ) is None
 
 
+def test_probe_non_dict_json_body_is_inconclusive():
+    """A 200 whose body is a JSON list/string must fail open, not raise."""
+
+    assert (
+        probe_tool_call_support(
+            base_url=_CUSTOM_BASE_URL,
+            model="deepseek-v4-flash",
+            api_mode="chat_completions",
+            transport=_RecordingTransport(lambda request: _json_response(200, [1, 2, 3])),
+        )
+        is None
+    )
+
+
+def test_probe_garbled_error_body_is_inconclusive():
+    """A 400 with an undecodable body must fail open, not raise."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            headers={"content-type": "application/json; charset=utf-8"},
+            content=b"\xff\xfe\xfa\xfbgarbled-gateway-page",
+            request=request,
+        )
+
+    assert (
+        probe_tool_call_support(
+            base_url=_CUSTOM_BASE_URL,
+            model="deepseek-v4-flash",
+            api_mode="chat_completions",
+            transport=_RecordingTransport(responder),
+        )
+        is None
+    )
+
+
 def test_probe_responses_mode_posts_to_responses_endpoint(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("ARC_OPENAI_API_MODE", "responses")
     seen_urls: list[str] = []
