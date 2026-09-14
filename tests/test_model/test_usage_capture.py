@@ -407,3 +407,39 @@ class TestConfigureRuntimeWiring:
             assert event["cost"] is not None
         finally:
             service.reset_runtime_for_tests()
+
+    def test_configure_runtime_persists_tool_usage_events(
+        self, tmp_project_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agents.runtime.tool_usage import record_tool_usage
+        from core import service
+
+        service.reset_runtime_for_tests()
+        try:
+            runtime = service.configure_runtime(project_dir=str(tmp_project_dir))
+            with llm_usage_context("REQ-1", "IMPLEMENT"):
+                record_tool_usage(
+                    tool="read_file",
+                    status="ok",
+                    path="/workspace/src/app.tsx",
+                    offset=0,
+                    limit=None,
+                    result_chars=90000,
+                )
+
+            lines = [
+                json.loads(line)
+                for line in runtime.paths.runner_events_path.read_text(encoding="utf-8").splitlines()
+                if line
+            ]
+            assert len(lines) == 1
+            event = lines[0]
+            assert event["type"] == "tool_usage"
+            assert event["node_id"] == "REQ-1"
+            assert event["phase"] == "IMPLEMENT"
+            assert event["tool"] == "read_file"
+            assert event["status"] == "ok"
+            assert event["detail"]["limit"] is None  # unpaged whole-file read
+            assert event["detail"]["result_chars"] == 90000
+        finally:
+            service.reset_runtime_for_tests()

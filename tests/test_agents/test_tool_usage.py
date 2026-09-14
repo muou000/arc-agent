@@ -1,0 +1,179 @@
+"""Unit tests for ``ToolUsageMiddleware`` (agents/runtime/tool_usage.py).
+
+The middleware observes every stage-agent tool round-trip (including calls
+blocked by ``StageDisciplineMiddleware``, which runs one layer inward) and
+dispatches one ``ToolUsageRecord`` per call to the process-wide sink. These
+tests wire a capturing sink directly, so no agent runtime is needed.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from langchain.agents.middleware.types import ToolCallRequest
+from langchain_core.messages import ToolMessage
+
+from agents.model.usage_capture import llm_usage_context
+from agents.runtime.stage_discipline import StageDisciplineMiddleware
+from agents.runtime.tool_usage import (
+    ToolUsageMiddleware,
+    get_tool_usage_sink,
+    record_tool_usage,
+    set_tool_usage_sink,
+)
+
+
+def make_request(
+    name: str,
+    args: dict[str, Any] | None = None,
+    *,
+    call_id: str = "call-1",
+) -> ToolCallRequest:
+    return ToolCallRequest(
+        tool_call={"name": name, "args": args or {}, "id": call_id},
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+
+def ok_tool(request: ToolCallRequest) -> ToolMessage:
+    return ToolMessage(content="line one\nline two", name=request.tool_call["name"], tool_call_id=request.tool_call["id"])
+
+
+def error_tool(request: ToolCallRequest) -> ToolMessage:
+    return ToolMessage(
+        content="Error: file not found",
+        name=request.tool_call["name"],
+        tool_call_id=request.tool_call["id"],
+        status="error",
+    )
+
+
+def setup_function() -> None:
+    set_tool_usage_sink(None)
+
+
+def teardown_function() -> None:
+    set_tool_usage_sink(None)
+
+
+def test_ok_call_is_recorded_with_context_attribution() -> None:
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    with llm_usage_context("REQ-1", "IMPLEMENT"):
+        result = middleware.wrap_tool_call(make_request("edit_file", {"file_path": "/workspace/src/app.ts"}), ok_tool)
+
+    assert isinstance(result, ToolMessage) and result.content == "line one\nline two"
+    assert len(records) == 1
+    record = records[0]
+    assert record.tool == "edit_file"
+    assert record.node_id == "REQ-1"
+    assert record.phase == "IMPLEMENT"
+    assert record.status == "ok"
+    assert record.path == "/workspace/src/app.ts"
+    assert record.result_chars == len("line one\nline two")
+    assert record.offset is None and record.limit is None
+
+
+def test_read_file_records_pagination_and_unpaged_reads_stay_none() -> None:
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    middleware.wrap_tool_call(
+        make_request("read_file", {"file_path": "/workspace/src/big.ts", "offset": 200, "limit": 100}), ok_tool
+    )
+    # No explicit limit: the whole-file-read signal (limit stays None).
+    middleware.wrap_tool_call(make_request("read_file", {"file_path": "/workspace/src/big.ts"}), ok_tool)
+
+    assert [record.limit for record in records] == [100, None]
+    assert [record.offset for record in records] == [200, None]
+    assert records[1].status == "ok"
+
+
+def test_blocked_call_is_recorded_when_outermost() -> None:
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    usage = ToolUsageMiddleware()
+    discipline = StageDisciplineMiddleware(stage="interface_design")
+    path = "/workspace/src/dup.ts"
+
+    with llm_usage_context("REQ-2", "DESIGN"):
+        first = usage.wrap_tool_call(
+            make_request("write_file", {"file_path": path, "content": "a\n"}, call_id="c1"),
+            lambda req: discipline.wrap_tool_call(req, ok_tool),
+        )
+        second = usage.wrap_tool_call(
+            make_request("write_file", {"file_path": path, "content": "b\n"}, call_id="c2"),
+            lambda req: discipline.wrap_tool_call(req, ok_tool),
+        )
+
+    assert isinstance(first, ToolMessage) and first.status != "error"
+    assert isinstance(second, ToolMessage) and "Repeated write blocked" in second.content
+    statuses = [(record.tool, record.status) for record in records]
+    assert statuses == [("write_file", "ok"), ("write_file", "blocked")]
+    assert records[1].node_id == "REQ-2"
+
+
+def test_error_result_is_recorded_as_error() -> None:
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    middleware.wrap_tool_call(make_request("grep", {"query": "missing"}), error_tool)
+
+    assert records[0].status == "error"
+    assert records[0].result_chars == len("Error: file not found")
+
+
+def test_missing_sink_is_a_noop() -> None:
+    middleware = ToolUsageMiddleware()
+    result = middleware.wrap_tool_call(make_request("read_file", {"file_path": "/workspace/src/a.ts"}), ok_tool)
+    assert isinstance(result, ToolMessage)
+    assert get_tool_usage_sink() is None
+
+
+def test_broken_sink_never_breaks_the_tool_call() -> None:
+    def broken_sink(record: Any) -> None:
+        raise RuntimeError("sink exploded")
+
+    set_tool_usage_sink(broken_sink)
+    middleware = ToolUsageMiddleware()
+
+    result = middleware.wrap_tool_call(make_request("edit_file", {"file_path": "/workspace/src/a.ts"}), ok_tool)
+
+    assert isinstance(result, ToolMessage) and result.content == "line one\nline two"
+
+
+def test_record_tool_usage_outside_context_has_empty_attribution() -> None:
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+
+    record_tool_usage(tool="grep", status="ok", result_chars=0)
+
+    assert records[0].node_id == ""
+    assert records[0].phase == ""
+
+
+def test_async_wrap_records_usage() -> None:
+    import asyncio
+
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    async def async_ok(request: ToolCallRequest) -> ToolMessage:
+        return ok_tool(request)
+
+    async def run() -> Any:
+        return await middleware.awrap_tool_call(
+            make_request("read_file", {"file_path": "/workspace/src/a.ts", "limit": 50}), async_ok
+        )
+
+    result = asyncio.run(run())
+    assert isinstance(result, ToolMessage)
+    assert len(records) == 1
+    assert records[0].limit == 50

@@ -1,9 +1,13 @@
-"""Aggregation helpers over ``llm_usage`` runner events.
+"""Aggregation helpers over ``llm_usage`` and ``tool_usage`` runner events.
 
 ``EventClient.record_llm_usage`` appends one event per model call to
 ``.arc/runner-events.jsonl``. This module folds those events into per-node,
 per-phase, per-model and run-level token/cost totals so optimization work has
-measured numbers to regress against. It only reads the JSONL file — no runtime
+measured numbers to regress against. ``EventClient.record_tool_usage``
+likewise appends one event per agent tool round-trip; ``aggregate_tool_usage``
+folds those into per-node/per-tool round-trip counts, which is how whole-file
+reads (unpaged ``read_file`` calls) and ineffective greps (empty results)
+become measurable. Both aggregators only read the JSONL file — no runtime
 object is required, so post-run tooling can aggregate a finished workspace.
 
 ``reasoning`` tokens are a subset of ``output`` (pi semantics) and are only
@@ -145,3 +149,79 @@ def _float(value: Any) -> float:
         return max(0.0, float(value))
     except (TypeError, ValueError):
         return 0.0
+
+
+def empty_tool_bucket() -> dict[str, Any]:
+    return {
+        "calls": 0,
+        "blocked": 0,
+        "errors": 0,
+        "empty_results": 0,
+        "unpaged_reads": 0,
+    }
+
+
+def aggregate_tool_usage(events_path: str | Path) -> dict[str, Any]:
+    """Aggregate ``tool_usage`` events from a runner-events JSONL file.
+
+    Returns ``{"totals", "by_node", "by_tool", "by_phase"}``. Every event
+    counts as one tool round-trip; ``blocked`` counts discipline-refused
+    calls, ``errors`` tool executions that failed, ``empty_results`` successful
+    calls that returned nothing (the ineffective-grep signal), and
+    ``unpaged_reads`` ``read_file`` attempts without an explicit ``limit``
+    (the whole-file-read signal; the event's ``result_chars`` ranks them by
+    size). Events of other types and unparseable lines are skipped.
+    """
+    path = Path(events_path)
+    totals = empty_tool_bucket()
+    by_node: dict[str, dict[str, Any]] = {}
+    by_tool: dict[str, dict[str, Any]] = {}
+    by_phase: dict[str, dict[str, Any]] = {}
+    for record in _iter_tool_usage_events(path):
+        _accumulate_tool(totals, record)
+        _accumulate_tool(_tool_bucket(by_node, str(record.get("node_id") or "")), record)
+        _accumulate_tool(_tool_bucket(by_tool, str(record.get("tool") or "")), record)
+        _accumulate_tool(_tool_bucket(by_phase, str(record.get("phase") or "")), record)
+    return {"totals": totals, "by_node": by_node, "by_tool": by_tool, "by_phase": by_phase}
+
+
+def _tool_bucket(target: dict[str, dict[str, Any]], key: str) -> dict[str, Any]:
+    bucket = target.get(key)
+    if bucket is None:
+        bucket = empty_tool_bucket()
+        target[key] = bucket
+    return bucket
+
+
+def _iter_tool_usage_events(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield ``tool_usage`` records line by line, never buffering the file."""
+
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("type") == "tool_usage":
+                yield record
+
+
+def _accumulate_tool(bucket: dict[str, Any], record: dict[str, Any]) -> None:
+    bucket["calls"] += 1
+    status = str(record.get("status") or "")
+    if status == "blocked":
+        bucket["blocked"] += 1
+    elif status == "error":
+        bucket["errors"] += 1
+    detail = record.get("detail")
+    if not isinstance(detail, dict):
+        return
+    if status == "ok" and bool(detail.get("result_empty")):
+        bucket["empty_results"] += 1
+    if str(record.get("tool") or "") == "read_file" and detail.get("limit") is None:
+        bucket["unpaged_reads"] += 1

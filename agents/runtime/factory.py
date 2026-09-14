@@ -18,6 +18,7 @@ from agents.model.factory import create_arc_chat_model
 from agents.runtime.checkpointer import get_checkpointer
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.stage_discipline import StageDisciplineMiddleware
+from agents.runtime.tool_usage import ToolUsageMiddleware
 from core.path_compat import normalize_windows_extended_prefix_path, normalize_windows_extended_prefix_text
 
 if TYPE_CHECKING:
@@ -363,6 +364,7 @@ def build_stage_agent(
         backend=backend,
         system_prompt=system_prompt,
         middleware=[
+            ToolUsageMiddleware(),
             TruncatedToolCallGuardMiddleware(),
             ToolArgumentSanitizerMiddleware(),
             StageDisciplineMiddleware(stage=stage),

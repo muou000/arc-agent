@@ -9,6 +9,9 @@ from langchain_core.messages import ToolMessage
 
 _FILE_WRITE_TOOLS = frozenset({"edit_file", "write_file"})
 _VALIDATION_TOOLS = frozenset({"run_build", "run_tests"})
+# Marker prefix of results produced by _blocked(); tool-usage observability
+# uses it to tell blocked round-trips apart from tool errors.
+BLOCKED_RESULT_PREFIX = "Error: ARC stage discipline:"
 _MAX_DESIGN_WRITES = 8
 _MAX_SKELETON_LINES = 160
 _MAX_READ_LIMIT = 200
@@ -171,7 +174,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
     @staticmethod
     def _blocked(request: ToolCallRequest, message: str) -> ToolMessage:
         return ToolMessage(
-            content=f"Error: ARC stage discipline: {message}",
+            content=f"{BLOCKED_RESULT_PREFIX} {message}",
             name=str(request.tool_call.get("name", "tool")),
             tool_call_id=str(request.tool_call.get("id", "")),
             status="error",
