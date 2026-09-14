@@ -17,11 +17,15 @@ Every bucket also carries a provider prefix-cache hit rate:
 prompt total (``input + cache_read + cache_write``) accumulated over
 provider-reported calls only. Estimated calls carry no cache breakdown by
 construction (pi semantics), so they are kept out of the denominator instead
-of silently diluting the rate. This rate measures the provider's prompt cache
-— a low value with many writes means the assembled context prefix is jittering
-(timestamps, random ids, ordering drift). The in-process ``NodeContextCache``
-in ``agents.context.pipeline`` is memoization of local computation and has no
-bearing on this number.
+of silently diluting the rate. Reported calls whose cache fields are zero
+count as genuine zero-hit prompt tokens — a provider that does not track
+caching is indistinguishable from a provider that never hits, by construction
+of the data. When no reported call exists the rate is ``None`` (unmeasured),
+not ``0.0``, so consumers can tell "no data" from "a real 0% run". This rate
+measures the provider's prompt cache — a low value with many writes means the
+assembled context prefix is jittering (timestamps, random ids, ordering
+drift). The in-process ``NodeContextCache`` in ``agents.context.pipeline`` is
+memoization of local computation and has no bearing on this number.
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ def empty_usage_bucket() -> dict[str, Any]:
         "estimated_calls": 0,
         "unpriced_calls": 0,
         "prompt_tokens": 0,
-        "cache_hit_rate": 0.0,
+        "cache_hit_rate": None,
         **{key: 0 for key in _TOKEN_KEYS},
         "cost": {key: 0.0 for key in _COST_KEYS},
     }
@@ -124,9 +128,9 @@ def _accumulate(bucket: dict[str, Any], record: dict[str, Any]) -> None:
         bucket["cost"][key] += _float(cost.get(key))
 
 
-def _cache_hit_rate(bucket: dict[str, Any]) -> float:
+def _cache_hit_rate(bucket: dict[str, Any]) -> float | None:
     prompt_tokens = bucket["prompt_tokens"]
-    return bucket["cache_read"] / prompt_tokens if prompt_tokens > 0 else 0.0
+    return bucket["cache_read"] / prompt_tokens if prompt_tokens > 0 else None
 
 
 def _int(value: Any) -> int:

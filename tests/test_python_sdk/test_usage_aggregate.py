@@ -206,11 +206,23 @@ class TestAggregateLLMUsage:
         assert totals["cache_hit_rate"] == pytest.approx(20 / 120)
         assert summary["by_phase"]["IMPLEMENT"]["cache_hit_rate"] == pytest.approx(20 / 120)
 
-    def test_no_reported_calls_yield_zero_hit_rate(self, tmp_path: Path) -> None:
+    def test_reported_zero_cache_is_measured_zero(self, tmp_path: Path) -> None:
+        # A reported call with zero cache fields is a genuine 0% hit (e.g. a
+        # provider without caching), not "unmeasured" — it counts in the
+        # denominator and yields rate 0.0.
+        events_path = _write_events(
+            tmp_path / "runner-events.jsonl",
+            [_usage_event(cache_read=0, cache_write=0)],
+        )
+        summary = aggregate_llm_usage(events_path)
+        assert summary["totals"]["prompt_tokens"] == 90
+        assert summary["totals"]["cache_hit_rate"] == 0.0
+
+    def test_no_reported_calls_yield_unmeasured_hit_rate(self, tmp_path: Path) -> None:
         events_path = _write_events(
             tmp_path / "runner-events.jsonl",
             [_usage_event(source="estimated", cache_read=0, cache_write=0)],
         )
         summary = aggregate_llm_usage(events_path)
         assert summary["totals"]["prompt_tokens"] == 0
-        assert summary["totals"]["cache_hit_rate"] == 0.0
+        assert summary["totals"]["cache_hit_rate"] is None

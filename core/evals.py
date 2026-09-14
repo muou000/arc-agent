@@ -167,7 +167,7 @@ def collect_run_record(
             "total_tokens": totals["total"],
             "cost_total": totals["cost"]["total"],
             "prompt_tokens": totals["prompt_tokens"],
-            "cache_hit_rate": totals["cache_hit_rate"] if totals["prompt_tokens"] > 0 else None,
+            "cache_hit_rate": totals["cache_hit_rate"],
         }
 
     queue = read_json(workspace / ".arc" / _QUEUE_FILENAME, default={})

@@ -150,7 +150,10 @@ python arc_main.py usage --project-dir path/to/output --json   # 机读 JSON
 
 命中率口径：`cache_hit_rate = cache_read / prompt_tokens`，其中 `prompt_tokens` 是
 provider 已报告 usage 的调用的 prompt 总量（`input + cache_read + cache_write`）；
-estimated 调用没有缓存分解，不计入分母，避免稀释命中率。按阶段（DESIGN / IMPLEMENT /
+estimated 调用没有缓存分解，不计入分母，避免稀释命中率。provider 已报告但 cache 字段为
+0 的调用视为真实未命中（不支持缓存的 provider 与从不命中的 provider 在数据上不可区分）；
+没有任何已报告调用的 bucket 命中率为 `null`（报表中显示 `-`，未测量），与真实 0% 区分。
+按阶段（DESIGN / IMPLEMENT /
 TEST 等）的命中率视图用于定位前缀抖动：命中率低且 cache write 高，说明上下文前缀在
 漂移（时间戳、随机 ID、顺序变化），先修前缀稳定性——稳定内容在前、逐节点动态内容在后——
 这比压缩上下文更省成本。注意该指标度量的是 provider 的 prompt cache；`NodeContextCache`
