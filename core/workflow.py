@@ -31,21 +31,24 @@ LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | Non
 
 QUEUE_FILENAME = "processing_queue.json"
 
-# Historical mode: every task runs against the one shared workspace in queue
-# order, because stage agents, git checkpoints (`git add .`) and test runners
-# (one web port, one E2E database) would otherwise interfere with each other.
-# With ARC_NODE_WORKTREES=1 each in-flight task instead gets its own git
-# worktree, web port slot and worktree-local E2E database, so up to
-# ARC_MAX_CONCURRENT_TASKS (capped at MAX_PARALLEL_TASKS) tasks may run at
-# once. Tasks are scheduled with subtree affinity: consecutive tasks of one
-# top-level subtree reuse one worktree directory and run sequentially inside
-# it, so siblings never race on shared files; different subtrees drain in
-# parallel and a freed slot steals work from another free group. Cross-subtree
-# conflicts that survive (shared glue files) are resolved mechanically when
-# every side only appended lines, guarded by a backend health check before the
-# merge commit; anything else fails the node with an explicit reason and
-# preserves its worktree for inspection.
+# Per-node worktree parallelism is the default: each in-flight task gets its
+# own git worktree, web port slot and worktree-local E2E database, so up to
+# ARC_MAX_CONCURRENT_TASKS (default PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS,
+# capped at MAX_PARALLEL_TASKS) tasks may run at once. Setting
+# ARC_NODE_WORKTREES=0 restores the historical mode: every task runs against
+# the one shared workspace in strict queue order, because stage agents, git
+# checkpoints (`git add .`) and test runners (one web port, one E2E database)
+# would otherwise interfere with each other. Tasks are scheduled with subtree
+# affinity: consecutive tasks of one top-level subtree reuse one worktree
+# directory and run sequentially inside it, so siblings never race on shared
+# files; different subtrees drain in parallel and a freed slot steals work
+# from another free group. Cross-subtree conflicts that survive (shared glue
+# files) are resolved mechanically when every side only appended lines,
+# guarded by a backend health check before the merge commit; anything else
+# fails the node with an explicit reason and preserves its worktree for
+# inspection.
 DEFAULT_MAX_CONCURRENT_TASKS = 1
+PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS = 3
 MAX_PARALLEL_TASKS = 8
 
 PHASE_DESIGN = "DESIGN"
@@ -68,7 +71,8 @@ NODE_FAILED = "FAILED"
 
 def _worktrees_enabled() -> bool:
     raw = os.environ.get("ARC_NODE_WORKTREES", "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # Parallel mode is the default; only an explicit falsy value disables it.
+    return raw not in {"0", "false", "no", "off"}
 
 
 @dataclass
@@ -104,7 +108,8 @@ class ARCWorkflowManager:
         self.queue_path = os.path.join(self.arc_dir, QUEUE_FILENAME)
         self.runtime = None
 
-        # Per-node worktree parallelism (opt-in via ARC_NODE_WORKTREES=1).
+        # Per-node worktree parallelism (default on; ARC_NODE_WORKTREES=0
+        # restores the shared-workspace serial mode).
         self._parallel_mode = _worktrees_enabled()
         self._worktree_manager = (
             NodeWorktreeManager(self.workspace_path) if self._parallel_mode else None
@@ -535,7 +540,7 @@ class ARCWorkflowManager:
         try:
             value = int(raw)
         except ValueError:
-            return 1
+            return PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS
         return min(max(1, value), MAX_PARALLEL_TASKS)
 
     def _begin_task(self, task: dict[str, Any], queue_state: dict[str, Any]) -> None:

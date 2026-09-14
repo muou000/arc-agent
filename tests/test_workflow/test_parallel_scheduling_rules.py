@@ -12,6 +12,7 @@ from __future__ import annotations
 from core.config import build_web_runtime_env, get_web_base_url
 from core.workflow import (
     ARCWorkflowManager,
+    PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS,
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
     TASK_COMPLETED,
@@ -248,7 +249,9 @@ def test_max_concurrent_tasks_clamps_and_defaults(monkeypatch) -> None:
     assert manager._max_concurrent_tasks() == 1
 
     monkeypatch.delenv("ARC_MAX_CONCURRENT_TASKS")
-    assert manager._max_concurrent_tasks() == 1, "parallel mode without a level stays at 1"
+    assert manager._max_concurrent_tasks() == PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS, (
+        "parallel mode without a level uses the default"
+    )
 
     monkeypatch.setenv("ARC_NODE_WORKTREES", "0")
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "4")
