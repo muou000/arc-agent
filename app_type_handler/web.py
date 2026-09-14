@@ -452,18 +452,49 @@ def _prepend_group_execution_header(execution: dict[str, str], test_result: str)
     return f"{chr(10).join(lines)}\n\n{test_result}"
 
 
-async def _wait_for_tcp_server(host: str, port: int, timeout: float = 20.0) -> bool:
+async def _wait_for_http_server(host: str, port: int, timeout: float = 20.0) -> bool:
+    """Wait until the port answers with a complete HTTP response.
+
+    A TCP listener alone does not prove the application layer is serving:
+    startup work (route registration, asynchronous database initialization)
+    may still be in flight when the socket starts accepting. Both backend
+    startup and session reuse therefore require an HTTP round trip. Any
+    response status counts - a 404 from an app without the template's
+    `/api/health` endpoint still proves the HTTP stack answers requests -
+    while connection failures and silent sockets keep the probe polling.
+    """
+
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
 
     while loop.time() < deadline:
         try:
             reader, writer = await asyncio.open_connection(host, port)
-            writer.close()
-            await writer.wait_closed()
-            return True
         except OSError:
             await asyncio.sleep(0.5)
+            continue
+        try:
+            request = (
+                f"GET /api/health HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            )
+            writer.write(request.encode("ascii"))
+            await writer.drain()
+            status_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        except (OSError, asyncio.TimeoutError):
+            await asyncio.sleep(0.5)
+            continue
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+        if status_line.startswith(b"HTTP/"):
+            return True
+        await asyncio.sleep(0.5)
 
     return False
 
@@ -1035,7 +1066,7 @@ async def _start_backend_runtime(
     except Exception as exc:
         return None, start_command, f"Failed to start backend runtime with `{start_command}`: {str(exc)}", ""
 
-    server_ready = await _wait_for_tcp_server("127.0.0.1", resolved_port, timeout=20.0)
+    server_ready = await _wait_for_http_server("127.0.0.1", resolved_port, timeout=20.0)
     if not server_ready:
         cleanup_note = ""
         try:
@@ -1704,7 +1735,7 @@ class WebAppType(AppTypeHandler):
             return None
         if backend_fingerprint is None or session.fingerprint != backend_fingerprint:
             return None
-        if not await _wait_for_tcp_server("127.0.0.1", resolved_port, timeout=1.0):
+        if not await _wait_for_http_server("127.0.0.1", resolved_port, timeout=5.0):
             return None
         return session
 

@@ -103,13 +103,13 @@ def _patch_fresh_start(monkeypatch, recorder: _CommandRecorder, start_calls: lis
         start_calls.append("start")
         return _FakeProcess(), "npm run start", "startup ok", "launcher:4321"
 
-    async def _fake_tcp(host: str, port: int, timeout: float = 20.0) -> bool:
+    async def _fake_http(host: str, port: int, timeout: float = 20.0) -> bool:
         return True
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
     monkeypatch.setattr(web_handler, "_prepare_e2e_database", _fake_prepare)
     monkeypatch.setattr(web_handler, "_start_backend_runtime", _fake_start)
-    monkeypatch.setattr(web_handler, "_wait_for_tcp_server", _fake_tcp)
+    monkeypatch.setattr(web_handler, "_wait_for_http_server", _fake_http)
     monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
 
@@ -200,6 +200,30 @@ def test_restarts_server_when_previous_process_died(tmp_path, monkeypatch) -> No
     recorder = _CommandRecorder()
     start_calls: list[str] = []
     _patch_fresh_start(monkeypatch, recorder, start_calls)
+
+    asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    assert start_calls == ["start"]
+
+
+def test_falls_back_to_fresh_start_when_reuse_probe_not_serving(tmp_path, monkeypatch) -> None:
+    """Reuse requires an HTTP round trip, not just an open TCP port."""
+
+    workspace, fingerprint = _make_workspace(tmp_path)
+    env = web_handler._build_e2e_runtime_env(str(workspace), ["test-e2e/login.spec.ts"], web_port=4321)
+    _make_sqlite(env["ARC_E2E_DB_PATH"])
+
+    handler = _make_handler(workspace)
+    handler._e2e_runtime_session = _make_session(env["ARC_E2E_DB_PATH"], fingerprint)
+
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+
+    async def _http_not_ready(host: str, port: int, timeout: float = 5.0) -> bool:
+        return False
+
+    monkeypatch.setattr(web_handler, "_wait_for_http_server", _http_not_ready)
 
     asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
@@ -489,3 +513,47 @@ def test_reset_sqlite_database_rows_reports_missing_file_and_empty_schema(tmp_pa
     ok, output = web_handler._reset_sqlite_database_rows(empty_path)
     assert not ok
     assert "no user tables" in output
+
+
+def test_wait_for_http_server_accepts_any_http_response_and_rejects_silence() -> None:
+    """Any complete HTTP response proves readiness; silence or refusal does not.
+
+    A 404 must still count: an app without the template's `/api/health`
+    endpoint answers HTTP all the same, and demanding 200 would disable
+    reuse for it entirely.
+    """
+
+    async def _scenario() -> None:
+        async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await reader.readline()  # the request line
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async def silent_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            # Accepts the socket but never answers: TCP-ready, app not serving.
+            writer.close()
+            await writer.wait_closed()
+
+        http_server = await asyncio.start_server(http_handler, "127.0.0.1", 0)
+        silent_server = await asyncio.start_server(silent_handler, "127.0.0.1", 0)
+        # Reserve a port and free it again to get a guaranteed-closed target.
+        closed_probe = await asyncio.start_server(None, "127.0.0.1", 0)
+        closed_port = closed_probe.sockets[0].getsockname()[1]
+        closed_probe.close()
+        await closed_probe.wait_closed()
+        try:
+            http_port = http_server.sockets[0].getsockname()[1]
+            silent_port = silent_server.sockets[0].getsockname()[1]
+
+            assert await web_handler._wait_for_http_server("127.0.0.1", http_port, timeout=5.0)
+            assert await web_handler._wait_for_http_server("127.0.0.1", silent_port, timeout=0.3) is False
+            assert await web_handler._wait_for_http_server("127.0.0.1", closed_port, timeout=0.3) is False
+        finally:
+            http_server.close()
+            await http_server.wait_closed()
+            silent_server.close()
+            await silent_server.wait_closed()
+
+    asyncio.run(_scenario())
