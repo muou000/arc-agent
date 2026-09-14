@@ -3,8 +3,9 @@
 Ports the comparative eval workflow of the ARC-Bench reference (pi,
 ``packages/evals``): declare a baseline arm and a candidate arm, run each arm
 ``repetitions`` times against the same requirement tree, and report the
-candidate-minus-baseline lift on four fixed metrics — pass rate (pp), tokens,
-latency (ms) and estimated cost (CNY) — each with both arms' absolute values.
+candidate-minus-baseline lift on five fixed metrics — pass rate (pp), tokens,
+cache hit rate (pp), latency (ms) and estimated cost (CNY) — each with both
+arms' absolute values.
 
 One invocation writes a self-contained artifacts directory (by default under
 ``records/evals/``):
@@ -25,9 +26,10 @@ baseline/candidate difference is expressed purely as environment overrides and
 extra compile arguments on :class:`ArmConfig`.
 
 Lift semantics mirror pi: runs are paired by repetition; the pass rate is the
-share of paired runs whose compilation succeeded, and token/latency/cost
-deltas are candidate-minus-baseline means over those pairs. Missing telemetry
-(one side has no ``llm_usage`` events) keeps the absolute values of the other
+share of paired runs whose compilation succeeded, and token/cache-hit/latency/
+cost deltas are candidate-minus-baseline means over those pairs. Missing
+telemetry (one side has no ``llm_usage`` events, or none with a
+provider-reported cache breakdown) keeps the absolute values of the other
 side but reports the delta as unavailable instead of guessing.
 
 Runner contract: ``runner_command`` is the full command prefix of one run; the
@@ -147,8 +149,10 @@ def collect_run_record(
     Reads ``.arc/processing_queue.json`` for node outcomes and aggregates
     ``.arc/runner-events.jsonl`` for token/cost totals; both are optional so a
     run that crashed before producing artifacts still yields a usable record.
-    A run counts as passed only when the runner exited 0, no node stayed in a
-    failed state, and at least one node was recorded.
+    ``cache_hit_rate`` is ``None`` when no call reported a provider cache
+    breakdown (denominator ``prompt_tokens`` stayed 0). A run counts as passed
+    only when the runner exited 0, no node stayed in a failed state, and at
+    least one node was recorded.
     """
 
     workspace = Path(workspace)
@@ -162,6 +166,8 @@ def collect_run_record(
             "unpriced_calls": totals["unpriced_calls"],
             "total_tokens": totals["total"],
             "cost_total": totals["cost"]["total"],
+            "prompt_tokens": totals["prompt_tokens"],
+            "cache_hit_rate": totals["cache_hit_rate"] if totals["prompt_tokens"] > 0 else None,
         }
 
     queue = read_json(workspace / ".arc" / _QUEUE_FILENAME, default={})
@@ -224,6 +230,9 @@ def summarize_runs(runs: Sequence[dict[str, Any]], *, repetitions: int) -> dict[
         "repetitions": repetitions,
         "pass_rate": pass_rate,
         "tokens": _metric(lambda run: _usage_field(run, "total_tokens")),
+        # cache_hit_rate is stored as a ratio (0-1) per run; the comparison
+        # metric is in percent so its delta reads in percentage points.
+        "cache_hit_rate": _metric(lambda run: _usage_percent_field(run, "cache_hit_rate")),
         "latency_ms": _metric(lambda run: run.get("latency_ms")),
         "est_cost": _metric(lambda run: _usage_field(run, "cost_total")),
     }
@@ -234,6 +243,11 @@ def _usage_field(run: dict[str, Any], key: str) -> float | None:
     if not isinstance(usage, dict) or usage.get(key) is None:
         return None
     return float(usage[key])
+
+
+def _usage_percent_field(run: dict[str, Any], key: str) -> float | None:
+    value = _usage_field(run, key)
+    return None if value is None else 100.0 * value
 
 
 def render_report_text(report: dict[str, Any]) -> str:
@@ -251,6 +265,7 @@ def render_report_text(report: dict[str, Any]) -> str:
         f"{'Pass rate':>13}  {_format_pass_rate(comparison['pass_rate'], comparison['pairs'], comparison['repetitions'])}"
     )
     lines.append(f"{'Tokens':>13}  {_format_float_delta(comparison['tokens'], 'f')}")
+    lines.append(f"{'Cache hit':>13}  {_format_pp_delta(comparison['cache_hit_rate'])}")
     lines.append(f"{'Latency':>13}  {_format_float_delta(comparison['latency_ms'], 'ms')}")
     lines.append(f"{'Est. cost':>13}  {_format_cost_delta(comparison['est_cost'])}")
     return "\n".join(lines)
@@ -263,6 +278,15 @@ def _format_pass_rate(metric: dict[str, Any], pairs: int, repetitions: int) -> s
     assert delta_pp is not None
     return (
         f"{delta_pp:+.1f} pp"
+        f" (candidate {metric['candidate']:.1f}%, baseline {metric['baseline']:.1f}%)"
+    )
+
+
+def _format_pp_delta(metric: dict[str, Any]) -> str:
+    if metric["delta"] is None:
+        return "unavailable (missing telemetry)"
+    return (
+        f"{metric['delta']:+.1f} pp"
         f" (candidate {metric['candidate']:.1f}%, baseline {metric['baseline']:.1f}%)"
     )
 

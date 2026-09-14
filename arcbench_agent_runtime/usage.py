@@ -11,6 +11,17 @@ included in sums when the provider reported them; unreported breakdowns count
 as zero. Costs are CNY sums over priced calls; ``unpriced_calls`` counts calls
 whose model has no catalog entry, so an understated cost total is visible
 instead of silent.
+
+Every bucket also carries a provider prefix-cache hit rate:
+``cache_hit_rate = cache_read / prompt_tokens`` where ``prompt_tokens`` is the
+prompt total (``input + cache_read + cache_write``) accumulated over
+provider-reported calls only. Estimated calls carry no cache breakdown by
+construction (pi semantics), so they are kept out of the denominator instead
+of silently diluting the rate. This rate measures the provider's prompt cache
+— a low value with many writes means the assembled context prefix is jittering
+(timestamps, random ids, ordering drift). The in-process ``NodeContextCache``
+in ``agents.context.pipeline`` is memoization of local computation and has no
+bearing on this number.
 """
 
 from __future__ import annotations
@@ -28,6 +39,8 @@ def empty_usage_bucket() -> dict[str, Any]:
         "calls": 0,
         "estimated_calls": 0,
         "unpriced_calls": 0,
+        "prompt_tokens": 0,
+        "cache_hit_rate": 0.0,
         **{key: 0 for key in _TOKEN_KEYS},
         "cost": {key: 0.0 for key in _COST_KEYS},
     }
@@ -51,6 +64,8 @@ def aggregate_llm_usage(events_path: str | Path) -> dict[str, Any]:
         _accumulate(_bucket(by_node, str(record.get("node_id") or "")), record)
         _accumulate(_bucket(by_phase, str(record.get("phase") or "")), record)
         _accumulate(_bucket(by_model, str(record.get("model") or "")), record)
+    for bucket in (totals, *by_node.values(), *by_phase.values(), *by_model.values()):
+        bucket["cache_hit_rate"] = _cache_hit_rate(bucket)
     return {"totals": totals, "by_node": by_node, "by_phase": by_phase, "by_model": by_model}
 
 
@@ -86,17 +101,32 @@ def _iter_llm_usage_events(path: Path) -> Iterator[dict[str, Any]]:
 
 def _accumulate(bucket: dict[str, Any], record: dict[str, Any]) -> None:
     bucket["calls"] += 1
-    if str(record.get("source") or "") == "estimated":
+    estimated = str(record.get("source") or "") == "estimated"
+    if estimated:
         bucket["estimated_calls"] += 1
     usage = record.get("usage")
+    usage_dict = usage if isinstance(usage, dict) else None
     for key in _TOKEN_KEYS:
-        bucket[key] += _int(usage.get(key) if isinstance(usage, dict) else 0)
+        bucket[key] += _int(usage.get(key) if usage_dict else 0)
+    # cache_hit_rate denominator: only provider-reported calls have a known
+    # cache breakdown; estimated usage would silently dilute the rate.
+    if not estimated and usage_dict is not None:
+        bucket["prompt_tokens"] += (
+            _int(usage_dict.get("input"))
+            + _int(usage_dict.get("cache_read"))
+            + _int(usage_dict.get("cache_write"))
+        )
     cost = record.get("cost")
     if not isinstance(cost, dict):
         bucket["unpriced_calls"] += 1
         return
     for key in _COST_KEYS:
         bucket["cost"][key] += _float(cost.get(key))
+
+
+def _cache_hit_rate(bucket: dict[str, Any]) -> float:
+    prompt_tokens = bucket["prompt_tokens"]
+    return bucket["cache_read"] / prompt_tokens if prompt_tokens > 0 else 0.0
 
 
 def _int(value: Any) -> int:

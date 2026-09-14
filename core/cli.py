@@ -829,6 +829,15 @@ def print_usage_report(summary: dict, events_path) -> None:
     if usage["reasoning"]:
         print(f"{Fore.WHITE}Reasoning:{Style.RESET_ALL} {usage['reasoning']:,} (subset of output)")
 
+    prompt_tokens = totals.get("prompt_tokens", 0)
+    if prompt_tokens:
+        hit = totals.get("cache_hit_rate", 0.0)
+        print(
+            f"{Fore.WHITE}Cache:{Style.RESET_ALL}     hit {hit * 100:.1f}%"
+            f" (read {usage['cache_read']:,} | write {usage['cache_write']:,} | prompt {prompt_tokens:,};"
+            f" low hit with many writes = jittering context prefix)"
+        )
+
     if totals["calls"] > totals.get("unpriced_calls", 0):
         print(f"{Fore.WHITE}Cost:{Style.RESET_ALL}      {_format_cost_detail(totals.get('cost', {}))}")
 
@@ -842,9 +851,11 @@ def print_usage_report(summary: dict, events_path) -> None:
             label = name or "(run)"
             display = label if len(label) <= 40 else label[:37] + "..."
             priced_calls = bucket["calls"] - bucket.get("unpriced_calls", 0)
+            hit = f"{bucket['cache_hit_rate'] * 100:>3.0f}%" if bucket.get("prompt_tokens") else "  -"
             print(
                 f"  {display:<42} calls {bucket['calls']:>3}"
                 f"  tokens {bucket.get('total', 0):>9,}"
+                f"  hit {hit}"
                 f"  {_format_bucket_cost(bucket.get('cost', {}), priced_calls=priced_calls)}"
             )
 
