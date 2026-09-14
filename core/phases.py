@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable
 
 from app_type_handler import create_app_type_handler
 from agents.context.pipeline import context_pipeline
+from agents.skills.planning import plan_and_store_stage_skills
 from core import sessions
 from core.service import get_runtime
 from core.path_compat import normalize_windows_extended_prefix_text
@@ -112,6 +113,12 @@ class WorkflowPhaseRunner:
                 node_id=node_id,
             )
             return True
+
+        await plan_and_store_stage_skills(
+            node_id=node_id,
+            requirement_data=requirement_data,
+            log_cb=self._log,
+        )
 
         await self._log("InterfaceDesigner", "Running interface design.", node_id=node_id)
         interface_result = await self.interface_designer.run(

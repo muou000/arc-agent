@@ -24,7 +24,7 @@ flowchart LR
 
 - **需求树驱动**：非叶节点只做 UI 壳层设计，叶节点拥有完整的 UI → API → FUNC → DB 接口链。
 - **测试先行**：先生成测试清单，再由 TDD 智能体实现代码，测试预算耗尽即停，避免无效 Token 消耗。
-- **技能系统**（`skills/`）：按节点特征（叶/非叶、是否涉及认证会话、是否有失败历史）动态激活小规模技能集，控制上下文体积。
+- **技能系统**（`skills/`）：DESIGN 阶段前由模型按节点规划各 stage agent 应读取的技能（skill 目录为跨节点稳定前缀，需求快照驱动按节点差异化选择）；认证一致性与失败修复两类安全底线确定性注入，规划失败时不注入任何可选技能。
 - **可追溯性**（`arcbench_agent_runtime/`）：requirements / scenarios / interfaces / tests / call_edges / node_states / node_contracts 七张表落盘于 `.arc/traceability/`，事件流写入 `.arc/runner-events.jsonl`，满足比赛"可复现、可审计"的要求。
 - **断点续跑**：编译队列持久化于 `.arc/processing_queue.json`，支持 `--resume`、`--retry-failed`、`--retry <NODE_ID>`。
 
@@ -38,6 +38,7 @@ flowchart LR
    - 编译工作流纯函数测试。
 2. **Auto TDD re-prompt**（`core/tdd_retry.py`）：运行结束后扫描 runner 事件中的 `test/failed` 节点，自动构造 TDD 优先的修复提示，为失败节点的重试提供上下文。
 3. **A/B 评测**（`core/evals.py` + `arc eval` 子命令）：将 baseline 与 candidate 两个编译配置对同一需求树各运行 N 次，产出 pass rate / tokens / cache hit rate / latency / est. cost 五指标提升报告（对齐 ARC-Bench 参考实现 pi 的 `evalHarnessTable` 工作流），详见下文「A/B 评测」。
+4. **模型驱动的按节点技能规划**（`agents/skills/planning.py`）：每个节点进入 DESIGN 前用一次轻量 LLM 调用（skill 目录 + 需求快照 → 单 JSON）为三个 stage agent 规划应读取的技能，写入 node session 供 resume/重试复用；关键词可选逻辑已移除，规划失败或模型选空时不注入可选技能。
 
 ## 目录结构
 

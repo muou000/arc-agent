@@ -13,6 +13,7 @@ from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
+from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
 from agents.tools.traceability import build_traceability_tools
@@ -106,6 +107,7 @@ class TestDrivenDeveloper:
         selected_skill_names = implementation_skills(
             interface_contract=interface_contract,
             previous_failure_summary=previous_failure_summary,
+            extra_skills=load_skill_plan_extras(node_id, "implementation"),
         )
 
         async def run_tests(test_type: str | None = None, test_files: list[str] | None = None) -> str:

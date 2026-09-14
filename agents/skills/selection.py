@@ -1,4 +1,16 @@
-"""Select the small set of stage skills that ARC requires for one invocation."""
+"""Select stage skills: deterministic safety floor union model-planned extras.
+
+Optional guidance skills are no longer keyword-matched. They come exclusively
+from the model-driven planner (``agents/skills/planning.py``), which decides
+per node which skill instruction files each stage agent should read. Only the
+safety-critical floor stays deterministic here:
+
+- ``auth-session-consistency`` when the node/contract carries auth context.
+- ``tdd-test-failure-repair`` once a previous implementation failure exists.
+
+When planning failed or the model returned nothing suitable, only the floor
+is injected — there is deliberately no keyword fallback.
+"""
 
 from __future__ import annotations
 
@@ -24,68 +36,6 @@ _AUTH_TERMS = (
     "account state",
 )
 
-# React/frontend implementation signals: the node owns user-facing UI code.
-_FRONTEND_TERMS = (
-    "react",
-    "component",
-    "page",
-    "form",
-    "header",
-    "navigation",
-    "layout",
-    "button",
-    "input",
-    "modal",
-    "table",
-    "list",
-    "card",
-    "frontend",
-    "ui",
-    "tailwind",
-    "css",
-    "style",
-    "visual",
-    "responsive",
-    "accessib",
-    "aria",
-    "label",
-    "selector",
-)
-
-# Visual/design signals: the node carries a screenshot or explicit styling work.
-_VISUAL_TERMS = (
-    "visual_reference",
-    "screenshot",
-    "image",
-    "design",
-    "style",
-    "layout",
-    "color",
-    "typography",
-    "spacing",
-    "theme",
-    "aesthetic",
-    "brand",
-)
-
-# TDD/repair signals: the node is entering implementation with tests to satisfy.
-_TDD_TERMS = (
-    "test",
-    "spec",
-    "assert",
-    "expect",
-    "coverage",
-    "scenario",
-    "given",
-    "when",
-    "then",
-    "vitest",
-    "playwright",
-    "e2e",
-    "unit",
-    "integration",
-)
-
 
 def _contains_term(value: object, terms: tuple[str, ...]) -> bool:
     """Return True when any term appears in the casefolded JSON/text dump."""
@@ -98,52 +48,47 @@ def _contains_term(value: object, terms: tuple[str, ...]) -> bool:
     return any(term in normalized for term in terms)
 
 
-def interface_design_skills(requirement_data: dict[str, Any]) -> list[str]:
-    """Return the relevant design skill and, for leaf auth work, its cross-cutting skill."""
+def interface_design_skills(
+    requirement_data: dict[str, Any],
+    extra_skills: list[str] | None = None,
+) -> list[str]:
+    """Auth safety floor for leaf design work union the model-planned extras."""
 
+    names: list[str] = []
     is_leaf = not requirement_data.get("children_ids")
-    names = ["non-leaf-ui-only-design" if not is_leaf else "leaf-full-design"]
     if is_leaf and has_auth_context(requirement_data):
         names.append("auth-session-consistency")
-    # Non-leaf nodes are UI/composition-only; give them the design-taste skill so
-    # the visual shell does not read as a generic template.
-    if not is_leaf and _contains_term(requirement_data, _VISUAL_TERMS):
-        names.append("frontend-design")
-    # Leaf nodes with a visual reference also benefit from design guidance while
-    # they materialize the UI skeleton.
-    if is_leaf and _contains_term(requirement_data, _VISUAL_TERMS):
-        names.append("frontend-design")
+    names.extend(extra_skills or [])
     return available_skill_names(names)
 
 
-def test_generation_skills(requirement_data: dict[str, Any]) -> list[str]:
-    """Return test selection guidance plus auth guidance only when the node needs it."""
+def test_generation_skills(
+    requirement_data: dict[str, Any],
+    extra_skills: list[str] | None = None,
+) -> list[str]:
+    """Auth safety floor union the model-planned extras (incl. layer selection)."""
 
-    names = ["leaf-test-layer-selection"]
+    names: list[str] = []
     if has_auth_context(requirement_data):
         names.append("auth-session-consistency")
-    # Scenario-driven E2E work benefits from stable-selector and a11y guidance so
-    # generated tests use accessible names the implementation can satisfy.
-    if _contains_term(requirement_data, _FRONTEND_TERMS):
-        names.append("web-design-guidelines")
+    names.extend(extra_skills or [])
     return available_skill_names(names)
 
 
-def implementation_skills(*, interface_contract: str, previous_failure_summary: str) -> list[str]:
-    """Expose repair guidance only after a real failure, plus relevant auth guidance."""
+def implementation_skills(
+    *,
+    interface_contract: str,
+    previous_failure_summary: str,
+    extra_skills: list[str] | None = None,
+) -> list[str]:
+    """Repair/auth safety floor union the model-planned extras."""
 
     names: list[str] = []
     if previous_failure_summary.strip():
         names.append("tdd-test-failure-repair")
     if has_auth_context(interface_contract):
         names.append("auth-session-consistency")
-    # React implementation work gets performance + composition guidance.
-    if _contains_term(interface_contract, _FRONTEND_TERMS):
-        names.append("vercel-react-best-practices")
-        names.append("vercel-composition-patterns")
-    # Any implementation pass with tests to satisfy gets the TDD discipline.
-    if _contains_term(interface_contract, _TDD_TERMS):
-        names.append("test-driven-development")
+    names.extend(extra_skills or [])
     return available_skill_names(names)
 
 
