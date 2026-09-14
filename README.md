@@ -100,6 +100,9 @@ ARC_SKIP_BROWSER_INSTALL=1  # 跳过编译前检查的 Playwright 浏览器安�
 ARC_AGENT_RECURSION_LIMIT=300          # 单个阶段 agent 会话的最大步数（LangGraph recursion limit），最小 20
 ARC_VISUAL_PRECOMPUTE=1                # 编译前并发预分析需求参考图（设 0/false/no/off 关闭）
 ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
+ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_format）开关：auto（默认，对自定义
+                                       # OPENAI_BASE_URL 端点做一次进程内缓存的工具调用能力探测）、
+                                       # on（强制启用）、off（强制关闭，等价旧行为）
 
 # 每节点 worktree 并行（默认开启）
 # 每个运行中的任务在自己的 git worktree、独立 web 端口和独立 E2 数据库中执行，
