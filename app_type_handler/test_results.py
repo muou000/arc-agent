@@ -125,10 +125,12 @@ _ENVIRONMENT_FAILURE_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "missing dependency",
         re.compile(r"(?:Cannot find module|Cannot find package)\s+'([^']+)'"),
     ),
-    # ERR_MODULE_NOT_FOUND lines that carry no quoted specifier at all; lines
-    # with a specifier are handled by the capture patterns above (and by the
-    # relative-specifier guard in classify_test_failure).
-    ("missing dependency", re.compile(r"ERR_MODULE_NOT_FOUND[^\r\n'\"]*$", re.MULTILINE)),
+    # Bare ERR_MODULE_NOT_FOUND hits without a quoted specifier on the rest of
+    # the line (e.g. ``Error [ERR_MODULE_NOT_FOUND]: ...`` or ``code:
+    # 'ERR_MODULE_NOT_FOUND'``). Lines whose specifier is quoted are matched by
+    # the capture patterns above instead - and judged by the relative-specifier
+    # guard in classify_test_failure.
+    ("missing dependency", re.compile(r"ERR_MODULE_NOT_FOUND(?![^\r\n]*['\"][^'\"]+['\"])")),
     (
         "unresolved import",
         re.compile(r"(?:Failed to resolve import|Could not resolve)\s+\"?([^\"\s]+)\"?"),

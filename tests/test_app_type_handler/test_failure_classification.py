@@ -42,6 +42,12 @@ from app_type_handler.test_results import classify_test_failure
             'Error [ERR_MODULE_NOT_FOUND]: Cannot find package \'dotenv\'',
             "missing dependency",
         ),
+        (
+            # No quoted specifier on the line: the bare-code fallback must fire
+            # even though the error name itself sits inside quotes.
+            "node:internal/modules/run_main:123\n  code: 'ERR_MODULE_NOT_FOUND'",
+            "missing dependency",
+        ),
         # Test runner never installed
         (
             "Exit Code: 1\nSTDERR:\n'vite' is not recognized as an internal or "
@@ -114,6 +120,10 @@ def test_environment_failures_are_detected(output: str, expected_reason: str) ->
         'Could not resolve "./pages/HomePage" from "src/App.tsx"',
         "Error [ERR_MODULE_NOT_FOUND]: Cannot find module './lib/env.mjs' "
         "imported from /ws/backend/src/app.js",
+        # ERR_MODULE_NOT_FOUND whose specifier is relative: the capture branch
+        # sees it (and the relative guard skips it); the bare-code fallback
+        # must not fire just because the line contains quotes.
+        "Error [ERR_MODULE_NOT_FOUND]: Cannot find module '../src/database/test_harness'",
         "Error: Cannot find module '..\\src\\database\\test_harness'",
         # A passing run is never an environment failure.
         "Exit Code: 0\nSTDOUT:\n  ✓ renders the home page",
