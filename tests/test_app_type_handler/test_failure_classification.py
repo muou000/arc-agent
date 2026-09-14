@@ -1,12 +1,17 @@
 """Environment failures must stop the TDD loop, assertion failures must not.
 
-A node whose workspace is broken - a missing dependency, a test runner that was
+A node whose workspace is broken - a missing package, a test runner that was
 never installed - fails every attempt for the same reason. The agent has no way
 to install packages mid-compile, so retrying burns the whole budget (~10 model
 turns per layer, three layers per node, 117 leaves) on an un-fixable failure.
 
-`classify_test_failure` separates that case from an ordinary assertion failure,
-which the agent *can* fix by editing the implementation.
+`classify_test_failure` separates that case from an ordinary failure the agent
+*can* fix by editing. Unresolved relative specifiers count as fixable: they
+point at workspace files the agent can create or import paths it can correct
+(observed on the 2026-09-14 ticket-booking run: `Cannot find module
+'../src/database/test_harness'` and `Failed to resolve import
+"./helpers/auth.fixtures"` were both repairable test defects, but the
+environment label closed the layer before the repair could be validated).
 """
 
 from __future__ import annotations
@@ -34,8 +39,8 @@ from app_type_handler.test_results import classify_test_failure
             "unresolved import",
         ),
         (
-            'Could not resolve "./pages/HomePage" from "src/App.tsx"',
-            "unresolved import",
+            'Error [ERR_MODULE_NOT_FOUND]: Cannot find package \'dotenv\'',
+            "missing dependency",
         ),
         # Test runner never installed
         (
@@ -99,6 +104,17 @@ def test_environment_failures_are_detected(output: str, expected_reason: str) ->
         "Test Files  1 failed (1)\n     Tests  3 failed (3)",
         "AssertionError: expected 'Login' to equal 'Log in'",
         "Exit Code: 1\nSTDOUT:\n  ✗ REQ-5.2.7 unavailable ticket class",
+        # Unresolved relative specifiers are fixable with a file edit: create
+        # the missing local module or correct the import path (2026-09-14
+        # ticket-booking run, both cases repaired by the agent afterwards).
+        "Error: Cannot find module '../src/database/test_harness'\n"
+        "Require stack:\n- /ws/backend/tests/features/authService.test.js",
+        'Error: Failed to resolve import "./helpers/auth.fixtures" from '
+        '"tests/features/registerPage.test.tsx". Does the file exist?',
+        'Could not resolve "./pages/HomePage" from "src/App.tsx"',
+        "Error [ERR_MODULE_NOT_FOUND]: Cannot find module './lib/env.mjs' "
+        "imported from /ws/backend/src/app.js",
+        "Error: Cannot find module '..\\src\\database\\test_harness'",
         # A passing run is never an environment failure.
         "Exit Code: 0\nSTDOUT:\n  ✓ renders the home page",
         # Empty / missing output tells us nothing.
