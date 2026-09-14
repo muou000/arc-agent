@@ -16,6 +16,7 @@ from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
+from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, test_generation_skills
 from agents.tools.traceability import build_traceability_tools
 
@@ -76,7 +77,10 @@ class TestGenerator:
             or os.getcwd()
         ).expanduser().resolve())
         app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
-        selected_skill_names = test_generation_skills(requirement_data)
+        selected_skill_names = test_generation_skills(
+            requirement_data,
+            extra_skills=load_skill_plan_extras(node_id, "test_generation"),
+        )
         context_pipeline.configure(
             workspace_dir=self.context_workspace_root or workspace_root,
             app_type=app_type,
