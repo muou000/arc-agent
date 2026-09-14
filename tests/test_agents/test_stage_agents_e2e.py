@@ -147,3 +147,50 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
     assert "T-ADD" in output_text
     # The scripted test asset really landed in the workspace.
     assert (tmp_project_dir / "tests" / "unit" / "test_calc.py").read_text(encoding="utf-8") == test_code
+
+
+# ---------------------------------------------------------------------------
+# merge-conflict retry context (prompt-side guard)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_conflict_context_requires_the_retry_flag(tmp_project_dir: Path, arc_runtime) -> None:
+    """The DESIGN prompt only receives conflict paths when the one-shot
+    retry flag is set: a fresh DESIGN pass must not be steered around a
+    previous run's stale paths."""
+    from core import sessions
+
+    node_id = "REQ-CONFLICT-1"
+    sessions.merge_node_session(
+        node_id,
+        {"merge_conflict_context": {"paths": ["shared.js"], "phase": "design"}},
+    )
+    assert InterfaceDesigner._load_merge_conflict_context(node_id) is None
+
+    sessions.merge_node_session(node_id, {"merge_conflict_retry_used": True})
+    assert InterfaceDesigner._load_merge_conflict_context(node_id) == {
+        "paths": ["shared.js"],
+        "phase": "design",
+    }
+
+
+def test_merge_conflict_context_validates_the_paths_shape(tmp_project_dir: Path, arc_runtime) -> None:
+    from core import sessions
+
+    node_id = "REQ-CONFLICT-2"
+    sessions.merge_node_session(
+        node_id,
+        {"merge_conflict_retry_used": True, "merge_conflict_context": {"paths": "shared.js"}},
+    )
+    assert InterfaceDesigner._load_merge_conflict_context(node_id) is None
+
+    sessions.merge_node_session(
+        node_id,
+        {"merge_conflict_retry_used": True, "merge_conflict_context": {"paths": ["ok.ts", 3]}},
+    )
+    assert InterfaceDesigner._load_merge_conflict_context(node_id) is None
+
+    sessions.merge_node_session(node_id, {"merge_conflict_context": "not-a-dict"})
+    assert InterfaceDesigner._load_merge_conflict_context(node_id) is None
+
+    assert InterfaceDesigner._load_merge_conflict_context("REQ-CONFLICT-NEVER") is None

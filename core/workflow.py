@@ -616,6 +616,12 @@ class ARCWorkflowManager:
                     if requeued:
                         await self._close_task_workspace(ctx)
                         return
+                # Requeue declined (already used, not a DESIGN conflict, or
+                # the requeue itself failed): fall through to the failure
+                # branch. The method tail still closes ctx with
+                # preserve=True there, so a declined requeue never leaks the
+                # worktree - it is preserved for --retry exactly like any
+                # other failed merge.
                 task_ok = False
 
         if task_ok:
@@ -761,18 +767,12 @@ class ARCWorkflowManager:
         designs around them. The conflicting paths are stored in the node
         session for the DESIGN prompt; a second conflict (or an IMPLEMENT
         conflict) fails the node as before.
-        """
 
-        try:
-            await asyncio.to_thread(self._worktree_manager.reset_branch_to_integration, ctx.handle)
-        except WorktreeError as exc:
-            await self._log(
-                "Compiler",
-                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead: {exc}",
-                "error",
-                node_id,
-            )
-            return False
+        Every decline path leaves the task workspace exactly as a regular
+        conflict failure left it: quarantined, branch intact, preserved for
+        ``--retry``. The queue is validated *before* the branch reset so a
+        decline never discards the node's conflicted commits.
+        """
 
         design_task = None
         implement_task = None
@@ -787,6 +787,17 @@ class ARCWorkflowManager:
             await self._log(
                 "Compiler",
                 f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete.",
+                "error",
+                node_id,
+            )
+            return False
+
+        try:
+            await asyncio.to_thread(self._worktree_manager.reset_branch_to_integration, ctx.handle)
+        except WorktreeError as exc:
+            await self._log(
+                "Compiler",
+                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead: {exc}",
                 "error",
                 node_id,
             )
@@ -1295,6 +1306,12 @@ class ARCWorkflowManager:
                 "phase_status": {"design": "pending", "test": "pending", "implement": "pending"},
                 "resume_context": {},
                 "result_state": "",
+                # A manual retry is a fresh DESIGN pass: restore the node's
+                # one-shot conflict retry budget and drop stale conflict
+                # paths so the prompt is not misdirected (None replaces the
+                # dict wholesale; deep-merge would keep a {} patch intact).
+                "merge_conflict_context": None,
+                "merge_conflict_retry_used": False,
             },
         )
         context_pipeline.cache.invalidate_file_layers(node_id)
@@ -1338,6 +1355,10 @@ class ARCWorkflowManager:
                 "resume_context": {},
                 "result_state": "",
                 "recent_failure_summary": "",
+                # Fresh DESIGN pass: restore the conflict-retry budget and
+                # drop stale conflict paths (see _reset_node_from_design_retry).
+                "merge_conflict_context": None,
+                "merge_conflict_retry_used": False,
             },
         )
         context_pipeline.cache.invalidate_db_layers(node_id)

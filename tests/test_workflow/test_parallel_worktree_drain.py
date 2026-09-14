@@ -32,6 +32,7 @@ from core.workflow import (
     PHASE_IMPLEMENT,
     TASK_COMPLETED,
     TASK_FAILED,
+    TASK_PENDING,
 )
 
 
@@ -599,3 +600,81 @@ def test_requeued_design_retry_sees_the_merged_sibling_files(
 
     assert retry_worktree, "the retry ran"
     assert queue_state["node_states"]["RA"] == NODE_PASSED
+
+
+def test_declined_requeue_fails_node_without_leaking_the_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the conflict requeue is declined (here: the node's queue tasks
+    are incomplete), the node fails through the regular failure branch and
+    the method tail still closes the task workspace: the worktree is
+    preserved for --retry, the port slot is released, nothing leaks."""
+    from core import sessions
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "3")
+    manager = _make_parallel_manager(tmp_path)
+    logs = _collect_logs(manager)
+    queue_state = _queue_state(manager, _requirement_tree())
+    # Drop RA's IMPLEMENT task so _requeue_design_after_merge_conflict
+    # declines after the branch reset.
+    queue_state["tasks"] = [t for t in queue_state["tasks"] if t["task_id"] != "RA:IMPLEMENT"]
+
+    sibling_wrote = asyncio.Event()
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        node_id = task["node_id"]
+        if task["phase"] == PHASE_DESIGN and ctx is not None:
+            if node_id == "RB":
+                Path(ctx.handle.path, "shared.js").write_text("from RB;\n", encoding="utf-8")
+                sibling_wrote.set()
+            elif node_id == "RA":
+                await sibling_wrote.wait()
+                Path(ctx.handle.path, "shared.js").write_text("from RA;\n", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    states = queue_state["node_states"]
+    assert states["RB"] == NODE_PASSED
+    assert states["RA"] == NODE_FAILED, "the declined requeue fails the node"
+    assert any("its queue tasks are incomplete" in message for message in logs), logs
+    # The node failed with a merge conflict, so its worktree is preserved
+    # for inspection/--retry (not leaked, not removed).
+    workspace = Path(manager.workspace_path)
+    preserved = list((workspace / ".arc" / "worktrees").iterdir())
+    assert len(preserved) == 1 and "RA" in preserved[0].name
+    assert manager._port_slots == {}, "the port slot was released by the closing path"
+    # The requeue was declined before recording session keys.
+    session = sessions.load_node_session("RA")
+    assert not session.get("merge_conflict_retry_used")
+
+
+def test_manual_retry_restores_the_conflict_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual --retry resets the node for a fresh DESIGN pass: the
+    one-shot merge-conflict retry budget must be restored and stale
+    conflict paths dropped, otherwise the retried run both starts with a
+    burned budget and reads misleading prompt guidance."""
+    from core import sessions
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    manager = _make_parallel_manager(tmp_path)
+    queue_state = _queue_state(manager, _requirement_tree())
+    sessions.merge_node_session(
+        "RA",
+        {
+            "merge_conflict_retry_used": True,
+            "merge_conflict_context": {"paths": ["shared.js"], "phase": "design"},
+        },
+    )
+
+    manager._apply_retry_plan(queue_state, retry_node_ids=["RA"])
+
+    session = sessions.load_node_session("RA")
+    assert not session.get("merge_conflict_retry_used"), "the budget is restored"
+    assert not session.get("merge_conflict_context"), "stale conflict paths are dropped"
+    tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
+    assert tasks["RA:DESIGN"] == TASK_PENDING and tasks["RA:IMPLEMENT"] == TASK_PENDING

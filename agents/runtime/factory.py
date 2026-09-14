@@ -362,10 +362,18 @@ def build_stage_agent(
 
     file_claim_gate = None
     if node_id and claims_workspace_root:
-        # Parallel-worktree ownership guard: the registry is shared by every
-        # in-flight node through the integration workspace, while the git
-        # tracked/untracked check runs against this agent's own workspace
-        # root (the task worktree in parallel mode).
+        # Parallel-worktree ownership guard for new files. The two roots are
+        # deliberately different:
+        # - ``claims_workspace_root`` is the *integration* workspace, where
+        #   the shared claim registry lives; every in-flight node resolves
+        #   the same registry through it. In parallel mode the per-task
+        #   runner always injects it (``context_workspace_root``); in serial
+        #   mode it equals the one shared workspace.
+        # - ``agent_root`` is *this agent's* filesystem root — the task
+        #   worktree in parallel mode — and defines what "tracked" means.
+        #   A sibling's committed-but-unmerged file is untracked here
+        #   precisely because its branch is invisible in this worktree;
+        #   that is the arbitration the claims provide.
         from core.file_claims import FileClaimGate, get_file_claim_registry
 
         file_claim_gate = FileClaimGate(

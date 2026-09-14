@@ -9,19 +9,32 @@ node fails. This module prevents that class of failure at write time:
 
 - ``FileClaimRegistry`` maps workspace-relative paths to the node id that
   first created them as a *new* (git-untracked) file. It is shared by every
-  in-flight task in the process and persisted under
-  ``<workspace>/.arc/file_claims.json`` (git-ignored runtime state) so a
-  resumed process can rebuild it.
-- ``FileClaimGate`` is the per-agent enforcement helper: before a
-  ``write_file``/``edit_file`` lands, the gate asks git whether the path is
-  tracked. Tracked files (template files, merged sibling work, the node's
-  own committed phases) are never claimed - the shared-surface and
+  in-flight task in the process. The in-process map is the enforcement
+  source of truth; the on-disk snapshot under
+  ``<workspace>/.arc/file_claims.json`` (git-ignored runtime state) is
+  written only at mutation endpoints (node release / registry reset), never
+  on the per-write hot path, and exists for crash diagnostics - a fresh
+  compile always resets the registry because no task is in flight.
+- ``FileClaimGate`` is the per-agent enforcement helper. It loads the set of
+  git-tracked paths of the agent's own workspace root once (a single
+  ``git ls-files`` snapshot; the tracked set cannot change while an agent
+  runs, since its own writes stay uncommitted until the phase integrates).
+  Tracked files (template files, merged sibling work, the node's own
+  committed phases) are never claimed - the shared-surface and
   additive-merge rules already govern them. Untracked paths are claimed for
   the current node; a path already claimed by a *sibling* node is rejected
   with a message that tells the model to pick a node-owned path instead.
 
-The registry is best-effort prevention; merge conflicts that still slip
-through are handled by the workflow's conflict-aware DESIGN retry.
+Two roots with distinct semantics: the registry is keyed on the
+*integration* workspace (``claims_workspace_root``, shared by all nodes),
+while the tracked/untracked check runs against the *agent's* filesystem root
+(the task worktree in parallel mode). A sibling's committed-but-unmerged
+file is untracked in this worktree precisely because its branch is
+invisible here - that is the arbitration the claims provide.
+
+The registry is best-effort prevention (any git failure fails open: no
+claims, no blocking); merge conflicts that still slip through are handled
+by the workflow's conflict-aware DESIGN retry.
 """
 
 from __future__ import annotations
@@ -58,6 +71,8 @@ class FileClaimRegistry:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            # A corrupt snapshot never blocks enforcement: the in-process
+            # map is the source of truth and starts empty either way.
             return
         if isinstance(payload, dict) and all(
             isinstance(key, str) and isinstance(value, str) for key, value in payload.items()
@@ -65,6 +80,13 @@ class FileClaimRegistry:
             self._claims = dict(payload)
 
     def _save_locked(self) -> None:
+        """Snapshot the claims map to disk (called at mutation endpoints).
+
+        Persistence is diagnostic only - a fresh compile resets the
+        registry - so the write is deliberately kept off the per-write hot
+        path and tolerates every filesystem failure silently.
+        """
+
         if not self._root.is_dir():
             # Never fabricate the workspace root (tests construct registries
             # against placeholder roots); claims stay in-process only.
@@ -79,8 +101,6 @@ class FileClaimRegistry:
             )
             tmp_path.replace(path)
         except OSError:
-            # Persistence is a resume nicety, not a correctness requirement;
-            # the in-process map keeps enforcing claims either way.
             pass
 
     def reset(self) -> None:
@@ -91,11 +111,12 @@ class FileClaimRegistry:
             self._save_locked()
 
     def claim(self, rel_path: str, node_id: str) -> str | None:
-        """Claim ``rel_path`` for ``node_id``.
+        """Claim ``rel_path`` for ``node_id`` (in-process only).
 
         Returns the owning node id when a *different* node already claimed
         the path (the write must be blocked); ``None`` when this node may
-        write, including when it already owns the claim.
+        write, including when it already owns the claim. The on-disk
+        snapshot is refreshed by ``release_node``/``reset``, not here.
         """
 
         if not rel_path or not node_id:
@@ -106,7 +127,6 @@ class FileClaimRegistry:
                 return owner
             if owner is None:
                 self._claims[rel_path] = node_id
-                self._save_locked()
             return None
 
     def release_node(self, node_id: str) -> list[str]:
@@ -114,7 +134,8 @@ class FileClaimRegistry:
 
         Called when the node's task workspace closes: after a successful
         merge the files are tracked in git (claims are moot), and after a
-        terminal failure the paths should be free for other nodes.
+        terminal failure the paths should be free for other nodes. This is
+        also the point where the claim map is persisted to disk.
         """
 
         with self._lock:
@@ -150,28 +171,31 @@ def normalize_claim_path(virtual_path: str) -> str:
     return normalized
 
 
-def _git_tracked(agent_root: str, rel_path: str) -> bool:
-    """Whether ``rel_path`` is tracked by git in the agent's workspace root.
+def _load_tracked_paths(agent_root: str) -> set[str] | None:
+    """Snapshot the git-tracked paths of ``agent_root`` (repo-root relative).
 
-    Fails open (treated as tracked, so no claim is made) when git cannot
-    run or the root is not a git repository: claiming only has meaning for
-    worktree-parallel compilation inside a real repo, and it must never
-    block workspaces that do not use git (tests, plain directories).
+    Returns ``None`` when git cannot run or the root is not a repository:
+    the gate then fails open (every path treated as tracked, so no claim is
+    made and nothing is blocked). Membership is checked in Python instead of
+    per-path ``git ls-files --error-unmatch`` so glob-special path segments
+    (e.g. Next.js dynamic routes ``[id]``) keep their literal meaning.
     """
 
     try:
         result = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "--", rel_path],
+            ["git", "ls-files", "-z"],
             cwd=agent_root,
             capture_output=True,
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return True
-    stderr = result.stderr or b""
-    if result.returncode != 0 and b"not a git repository" in stderr.lower():
-        return True
-    return result.returncode == 0
+        return None
+    if result.returncode != 0:
+        return None
+    raw: bytes = result.stdout or b""
+    return {
+        entry for entry in (chunk.decode("utf-8", "surrogateescape") for chunk in raw.split(b"\0")) if entry
+    }
 
 
 class FileClaimGate:
@@ -183,34 +207,39 @@ class FileClaimGate:
         *,
         node_id: str,
         agent_root: str,
-        tracked_check: Callable[[str, str], bool] | None = None,
+        tracked_loader: Callable[[str], set[str] | None] | None = None,
     ) -> None:
         self._registry = registry
         self._node_id = node_id
         self._agent_root = str(Path(agent_root).expanduser().resolve())
-        self._tracked_check = tracked_check or _git_tracked
-        self._tracked_cache: dict[str, bool] = {}
-        self._cache_lock = threading.Lock()
+        self._tracked_loader = tracked_loader or _load_tracked_paths
+        self._tracked: set[str] | None | None = None
+        self._tracked_loaded = False
+        self._lock = threading.Lock()
+
+    def _tracked_paths(self) -> set[str] | None:
+        if not self._tracked_loaded:
+            # One snapshot per agent: the tracked set cannot change while the
+            # agent runs (its own writes stay uncommitted until integrate).
+            self._tracked = self._tracked_loader(self._agent_root)
+            self._tracked_loaded = True
+        return self._tracked
 
     def check_and_claim(self, virtual_path: str) -> str | None:
         """Validate a write to ``virtual_path`` and claim new-file paths.
 
         Returns a blocking message when a sibling node already claimed the
-        path; ``None`` when the write may proceed. Only paths untracked in
-        this agent's workspace root are claimable; the git-tracked status of
-        a path cannot change during one agent run, so it is cached.
+        path; ``None`` when the write may proceed.
         """
 
         rel_path = normalize_claim_path(virtual_path)
         if not rel_path:
             return None
-        with self._cache_lock:
-            tracked = self._tracked_cache.get(rel_path)
+        tracked = self._tracked_paths()
         if tracked is None:
-            tracked = self._tracked_check(self._agent_root, rel_path)
-            with self._cache_lock:
-                self._tracked_cache[rel_path] = tracked
-        if tracked:
+            # Git unavailable: fail open, never block on tooling state.
+            return None
+        if rel_path in tracked:
             # Tracked in git: a template file, shared surface, or a sibling's
             # already-merged work. Ownership of those is governed by the
             # stage prompts and the additive merge resolver, not by claims.
