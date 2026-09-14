@@ -161,6 +161,30 @@ def test_map_prefers_the_agent_workspace_root(pipeline: ContextPipeline, tmp_pro
     assert "frontend/src/api/index.ts" not in static, "main-workspace-only files must not leak into a worktree map"
 
 
+def test_map_cache_isolates_per_map_root(pipeline: ContextPipeline, tmp_project_dir: Path, tmp_path: Path) -> None:
+    # Regression: the layer key must carry the map root, otherwise the same
+    # node built against a second worktree (e.g. --retry-failed in one
+    # process) would hit the first root's cached map.
+    _write_map_workspace(tmp_project_dir)
+    _configure(pipeline, tmp_project_dir)
+    other_root = tmp_path / "worktree-b"
+    pages = other_root / "frontend" / "src" / "pages"
+    pages.mkdir(parents=True, exist_ok=True)
+    (pages / "BPage.tsx").write_text(
+        "export default function BPage() { return null; }\n", encoding="utf-8"
+    )
+
+    first = pipeline.get_static_context("REQ-1", "InterfaceDesigner")
+    second = pipeline.get_static_context("REQ-1", "InterfaceDesigner", map_workspace_dir=str(other_root))
+    third = pipeline.get_static_context("REQ-1", "InterfaceDesigner")
+
+    assert "frontend/src/api/index.ts" in first
+    assert "BPage.tsx" in second, "a different map root must not hit the first root's cache"
+    assert "frontend/src/api/index.ts" not in second
+    assert "frontend/src/api/index.ts" in third, "switching back must not hit the other root's cache"
+    assert "BPage.tsx" not in third
+
+
 def test_map_rolls_up_large_inventories(pipeline: ContextPipeline, arc_runtime, tmp_project_dir: Path) -> None:
     _write_map_workspace(tmp_project_dir)
     _configure(pipeline, tmp_project_dir)

@@ -679,7 +679,7 @@ class ContextPipeline:
         ]
         project_structure = self.cache.get_or_compute(
             node_id,
-            f"project_structure::{agent_type}",
+            self._project_structure_layer(agent_type, map_workspace_dir),
             lambda: self._get_project_structure(agent_type, map_workspace_dir),
         )
         if project_structure:
@@ -761,6 +761,16 @@ class ContextPipeline:
 
         return "\n\n".join(part for part in context_parts if part)
 
+    def _project_structure_layer(self, agent_type: str, map_workspace_dir: str | None) -> str:
+        # The layer key carries the resolved map root: under
+        # ``ARC_NODE_WORKTREES`` (and a same-process ``--retry-failed``
+        # landing a node in a new worktree) the same node must never hit a
+        # cached map that was built against a different filesystem root.
+        # ``invalidate_file_layers`` still matches by the
+        # ``project_structure::`` prefix, so refresh semantics are unchanged.
+        root = str(Path(map_workspace_dir or self.config.workspace_dir).resolve())
+        return f"project_structure::{agent_type}::{root}"
+
     def get_static_context(
         self,
         node_id: str,
@@ -771,7 +781,7 @@ class ContextPipeline:
             self.cache.get_or_compute(node_id, "tech_stack_context", self._get_tech_stack_context),
             self.cache.get_or_compute(
                 node_id,
-                f"project_structure::{agent_type}",
+                self._project_structure_layer(agent_type, map_workspace_dir),
                 lambda: self._get_project_structure(agent_type, map_workspace_dir),
             ),
         ]
