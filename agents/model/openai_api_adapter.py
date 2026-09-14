@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -315,8 +316,19 @@ _STRUCTURED_OUTPUT_PROBE_TIMEOUT = 10.0
 # A definitive rejection must name the tool-calling surface; a bare 400 could be
 # an unrelated request problem (bad model name, malformed payload).
 _TOOL_CALL_ERROR_PATTERN = re.compile(r"tool|function", re.IGNORECASE)
-_STRUCTURED_OUTPUT_SUPPORT_CACHE: dict[tuple[str, str, str], bool] = {}
+# Probe decisions are scoped to the endpoint AND the credential that produced
+# them (gateways may answer differently per key), keyed by a key fingerprint
+# so the raw secret never lands in cache contents or debug dumps.
+_STRUCTURED_OUTPUT_SUPPORT_CACHE: dict[tuple[str, str, str, str], bool] = {}
+# One in-flight probe per cache key: concurrent first-time callers wait for the
+# probe instead of each hitting the network (per-key, so unrelated endpoints
+# never block each other).
+_STRUCTURED_OUTPUT_SUPPORT_LOCKS: dict[tuple[str, str, str, str], threading.Lock] = {}
 _STRUCTURED_OUTPUT_SUPPORT_LOCK = threading.Lock()
+
+
+def _structured_output_key_fingerprint(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
 
 
 def probe_tool_call_support(
@@ -413,7 +425,8 @@ def structured_output_supported(model: str | object) -> bool:
     1. ``ARC_STRUCTURED_OUTPUT``=on/off forces the decision without probing.
     2. No custom base URL, an official OpenAI host, or a non-string model
        object: supported.
-    3. Otherwise one cached probe per (base URL, model, API mode).
+    3. Otherwise one cached probe per (base URL, model, API mode, credential
+       fingerprint); concurrent first-time callers share a single probe.
 
     The probe fails open: when capability is inconclusive (auth, throttling,
     outage), structured output stays enabled because ARC agents already require
@@ -440,38 +453,53 @@ def structured_output_supported(model: str | object) -> bool:
         return True
 
     api_mode = resolve_openai_api_mode(None)
-    cache_key = (base_url, model_name, api_mode)
-    with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
-        cached = _STRUCTURED_OUTPUT_SUPPORT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    probe_result = probe_tool_call_support(
-        base_url=base_url,
-        model=model_name,
-        api_mode=api_mode,
-        api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    cache_key = (
+        base_url,
+        model_name,
+        api_mode,
+        _structured_output_key_fingerprint(api_key),
     )
-    if probe_result is False:
-        supported = False
-        logger.warning(
-            "Structured output disabled: endpoint %s rejected tool calling (model=%s).",
-            base_url,
-            model_name,
-        )
-    else:
-        # True = probe succeeded; None = inconclusive, fail open.
-        supported = True
-        logger.info(
-            "Structured output enabled for %s (model=%s, probe %s).",
-            base_url,
-            model_name,
-            "succeeded" if probe_result is True else "inconclusive",
-        )
-
+    # Per-key single-flight: the first caller probes while holding the key's
+    # lock; concurrent callers for the same key wait and then read the cached
+    # decision instead of issuing duplicate probes.
     with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
-        _STRUCTURED_OUTPUT_SUPPORT_CACHE[cache_key] = supported
-    return supported
+        key_lock = _STRUCTURED_OUTPUT_SUPPORT_LOCKS.get(cache_key)
+        if key_lock is None:
+            key_lock = threading.Lock()
+            _STRUCTURED_OUTPUT_SUPPORT_LOCKS[cache_key] = key_lock
+    with key_lock:
+        with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
+            cached = _STRUCTURED_OUTPUT_SUPPORT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        probe_result = probe_tool_call_support(
+            base_url=base_url,
+            model=model_name,
+            api_mode=api_mode,
+            api_key=api_key,
+        )
+        if probe_result is False:
+            supported = False
+            logger.warning(
+                "Structured output disabled: endpoint %s rejected tool calling (model=%s).",
+                base_url,
+                model_name,
+            )
+        else:
+            # True = probe succeeded; None = inconclusive, fail open.
+            supported = True
+            logger.info(
+                "Structured output enabled for %s (model=%s, probe %s).",
+                base_url,
+                model_name,
+                "succeeded" if probe_result is True else "inconclusive",
+            )
+
+        with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
+            _STRUCTURED_OUTPUT_SUPPORT_CACHE[cache_key] = supported
+        return supported
 
 
 def reset_structured_output_support_cache_for_tests() -> None:
@@ -479,6 +507,7 @@ def reset_structured_output_support_cache_for_tests() -> None:
 
     with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
         _STRUCTURED_OUTPUT_SUPPORT_CACHE.clear()
+        _STRUCTURED_OUTPUT_SUPPORT_LOCKS.clear()
 
 
 def normalize_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model: str) -> Exception:

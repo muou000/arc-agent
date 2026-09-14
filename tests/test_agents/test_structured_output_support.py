@@ -279,6 +279,72 @@ def test_cache_reset_allows_reprobe(monkeypatch: pytest.MonkeyPatch):
     assert structured_output_supported("deepseek-v4-flash") is True
 
 
+def test_api_key_change_reprobes(monkeypatch: pytest.MonkeyPatch):
+    """A probe decision is scoped to the credential that produced it."""
+
+    monkeypatch.setenv("OPENAI_BASE_URL", _CUSTOM_BASE_URL)
+    transport = _RecordingTransport(lambda request: _json_response(200, _TOOL_CALL_PAYLOAD))
+    monkeypatch.setattr(
+        openai_api_adapter,
+        "probe_tool_call_support",
+        lambda **kwargs: probe_tool_call_support(transport=transport, **kwargs),
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-key-a")
+    assert structured_output_supported("deepseek-v4-flash") is True
+    assert structured_output_supported("deepseek-v4-flash") is True
+    assert len(transport.requests) == 1
+
+    # A different credential must not reuse the previous decision.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-key-b")
+    assert structured_output_supported("deepseek-v4-flash") is True
+    assert len(transport.requests) == 2
+
+
+def test_concurrent_first_call_single_flight(monkeypatch: pytest.MonkeyPatch):
+    """Concurrent first-time callers share one probe (per-key single-flight)."""
+
+    import threading
+
+    monkeypatch.setenv("OPENAI_BASE_URL", _CUSTOM_BASE_URL)
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    request_count = {"count": 0}
+    count_lock = threading.Lock()
+
+    def slow_responder(request: httpx.Request) -> httpx.Response:
+        with count_lock:
+            request_count["count"] += 1
+        probe_started.set()
+        assert release_probe.wait(timeout=10.0)
+        return _json_response(200, _TOOL_CALL_PAYLOAD)
+
+    monkeypatch.setattr(
+        openai_api_adapter,
+        "probe_tool_call_support",
+        lambda **kwargs: probe_tool_call_support(transport=_RecordingTransport(slow_responder), **kwargs),
+    )
+
+    results: list[bool] = []
+
+    def _caller():
+        results.append(structured_output_supported("deepseek-v4-flash"))
+
+    first = threading.Thread(target=_caller)
+    first.start()
+    assert probe_started.wait(timeout=5.0)
+
+    second = threading.Thread(target=_caller)
+    second.start()
+    # The second caller must be waiting on the per-key lock, not probing.
+    release_probe.set()
+    first.join(timeout=10.0)
+    second.join(timeout=10.0)
+
+    assert results == [True, True]
+    assert request_count["count"] == 1
+
+
 def test_resolve_response_format_wiring(monkeypatch: pytest.MonkeyPatch):
     class _Format:
         pass
