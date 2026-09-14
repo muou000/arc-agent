@@ -304,6 +304,11 @@ class ContextPipeline:
             if not file_path or not req_ids:
                 continue
             key = file_path.lstrip("/").removeprefix("./")
+            # Interface records may carry the virtual ``/workspace/...``
+            # prefix; strip it here so the map can match by exact
+            # workspace-relative key (fuzzy suffix matching downstream
+            # would risk attributing an owner to an unrelated file).
+            key = key.removeprefix("workspace/")
             existing = owners.setdefault(key, [])
             for req_id in req_ids:
                 if req_id not in existing:

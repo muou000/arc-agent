@@ -112,11 +112,21 @@ def test_map_annotates_interface_owners(pipeline: ContextPipeline, arc_runtime, 
         content="{}",
         file_path="/workspace/frontend/src/pages/LoginPage.tsx",
     )
+    # A record whose path merely *ends like* the real file's path must not
+    # be attributed to it (regression: bidirectional suffix matching).
+    store.upsert_interface(
+        interface_id="IF-SUFFIX",
+        req_ids=["REQ-9.9"],
+        type="ui_component",
+        content="{}",
+        file_path="pages/LoginPage.tsx",
+    )
 
     structure = pipeline.get_static_context("REQ-2.2", "InterfaceDesigner")
 
     line = next(item for item in structure.splitlines() if item.startswith("- frontend/src/pages/LoginPage.tsx"))
     assert "[REQ-1.1]" in line, "the map must attribute files to the node that placed them"
+    assert "REQ-9.9" not in structure, "suffix-colliding records must not leak into unrelated files"
 
 
 def test_map_refreshes_after_file_layer_invalidation(pipeline: ContextPipeline, tmp_project_dir: Path) -> None:

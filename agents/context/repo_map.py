@@ -155,17 +155,11 @@ def _anchor_lines(workspace: Path, specs: list[GlueAnchorSpec]) -> tuple[list[st
 
 
 def _owner_tag(relative: str, owners_by_path: dict[str, list[str]]) -> str:
+    # Keys are pre-normalized by the pipeline (leading '/', './' and the
+    # virtual 'workspace/' prefix stripped), so exact lookup is the only
+    # match: fuzzy suffix matching could attribute an owner to an
+    # unrelated file whose path merely ends the same way.
     req_ids = owners_by_path.get(relative)
-    if req_ids is None:
-        # Interface records may carry virtual ``/workspace/...`` or ``./``
-        # prefixed paths; fall back to suffix matching for those.
-        for known, value in owners_by_path.items():
-            normalized = _normalize_relative(known)
-            if not normalized or normalized == relative:
-                continue
-            if relative.endswith(f"/{normalized}") or normalized.endswith(f"/{relative}"):
-                req_ids = value
-                break
     if not req_ids:
         return ""
     return f" [{', '.join(req_ids[:4])}]"
