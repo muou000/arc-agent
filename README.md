@@ -102,12 +102,17 @@ ARC_VISUAL_PRECOMPUTE=1                # 编译前并发预分析需求参考图
 ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
 
 # 每节点 worktree 并行（默认开启）
-# 每个运行中的任务在自己的 git worktree、独立 web 端口和独立 E2E 数据库中执行，
+# 每个运行中的任务在自己的 git worktree、独立 web 端口和独立 E2 数据库中执行，
 # 阶段完成后分支合并回主工作区。任务按顶层子树亲和调度：同一子树的任务在共享的
 # worktree 目录中顺序执行（兄弟节点不再竞争同一批骨架文件），不同子树并行，空闲
 # 槽位会从其他子树窃取任务。跨子树的共享 glue 文件冲突（如 app.js 路由注册）在
 # 双方均为纯追加时由合并层机械消解，并在合并提交前通过后端健康检查；其余冲突将
 # 该节点标记为失败并保留其 worktree 供排查。
+# 两个补充防线：新文件的跨节点占用注册（写时声明，agent 试图创建兄弟节点已占用的
+# 新文件时直接拒绝并给出改道指引，状态存于 .arc/file_claims.json）；DESIGN 阶段的
+# 合并冲突不再立即失败——首次冲突将节点重排队一次，重试从已合并的 integration
+# HEAD 出发（兄弟文件已在磁盘可见），冲突路径注入 prompt 指引绕行，二次冲突才终判
+# 失败。IMPLEMENT 阶段冲突维持立即失败语义。
 # 设 0/false/no/off 恢复共享工作区的严格串行调度。
 ARC_NODE_WORKTREES=1                   # 每节点隔离 worktree 并行（默认开启；设 0/false/no/off 关闭）
 ARC_MAX_CONCURRENT_TASKS=3             # 同时运行的任务数（仅并行模式生效，默认 3，上限 8）

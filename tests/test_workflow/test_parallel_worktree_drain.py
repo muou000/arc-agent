@@ -42,12 +42,20 @@ class _Traceability:
             for node_id in node_ids
         }
         self.states: dict[str, str] = {}
+        self.cleared_design_artifacts: list[str] = []
+        self.reset_test_statuses: list[str] = []
 
     def get_requirement(self, node_id: str) -> dict[str, Any] | None:
         return self.requirements.get(node_id)
 
     def upsert_node_state(self, node_id: str, state: str) -> None:
         self.states[node_id] = state
+
+    def clear_node_design_artifacts(self, node_id: str) -> None:
+        self.cleared_design_artifacts.append(node_id)
+
+    def reset_test_pass_statuses_for_requirement(self, node_id: str) -> None:
+        self.reset_test_statuses.append(node_id)
 
 
 class _Events:
@@ -412,3 +420,182 @@ def test_additive_resolution_passes_gate_and_lands_union(
     assert all(queue_state["node_states"][node] == NODE_PASSED for node in ("RA", "RB"))
     glue = (Path(manager.workspace_path) / "backend" / "glue.js").read_text(encoding="utf-8")
     assert "// RA\n" in glue and "// RB\n" in glue, "both appends must land"
+
+
+# ---------------------------------------------------------------------------
+# conflict-aware DESIGN retry (add/add conflicts on new files)
+# ---------------------------------------------------------------------------
+
+
+def _collect_logs(manager: ARCWorkflowManager) -> list[str]:
+    messages: list[str] = []
+
+    async def log(agent: str, message: str, status: str | None = None, node_id: str | None = None) -> None:
+        del agent, status, node_id
+        messages.append(message)
+
+    manager.log_cb = log
+    return messages
+
+
+def test_design_merge_conflict_requeues_once_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DESIGN add/add conflict re-queues the node once; the retry starts
+    from the merged integration state and must deliver disjoint work."""
+    from core import sessions
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "3")
+    manager = _make_parallel_manager(tmp_path)
+    logs = _collect_logs(manager)
+    queue_state = _queue_state(manager, _requirement_tree())
+
+    sibling_wrote = asyncio.Event()
+    design_runs: dict[str, int] = {}
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        node_id = task["node_id"]
+        if task["phase"] == PHASE_DESIGN:
+            design_runs[node_id] = design_runs.get(node_id, 0) + 1
+            if ctx is not None and node_id == "RB":
+                # RB integrates first, so its shared.js owns the path.
+                Path(ctx.handle.path, "shared.js").write_text("from RB;\n", encoding="utf-8")
+                sibling_wrote.set()
+            elif ctx is not None and node_id == "RA":
+                await sibling_wrote.wait()
+                if design_runs.get("RA", 0) == 1:
+                    Path(ctx.handle.path, "shared.js").write_text("from RA;\n", encoding="utf-8")
+                else:
+                    # The retry must stay off the sibling-owned path.
+                    Path(ctx.handle.path, "ra-owned.js").write_text("from RA retry;\n", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    states = queue_state["node_states"]
+    assert states["RB"] == NODE_PASSED, "the winning sibling passes"
+    assert states["RA"] == NODE_PASSED, "the conflicted node recovers on its one retry"
+    assert design_runs.get("RA") == 2, "RA's DESIGN ran exactly twice"
+    workspace = Path(manager.workspace_path)
+    assert (workspace / "shared.js").read_text(encoding="utf-8") == "from RB;\n"
+    assert (workspace / "ra-owned.js").read_text(encoding="utf-8") == "from RA retry;\n"
+    assert not list((workspace / ".arc" / "worktrees").iterdir()), "no worktree is left behind"
+
+    session = sessions.load_node_session("RA")
+    assert session.get("merge_conflict_retry_used") is True
+    assert session.get("merge_conflict_context") == {"paths": ["shared.js"], "phase": "design"}
+    assert any("Re-queued RA DESIGN once" in message for message in logs), logs
+    assert manager.runtime.traceability.cleared_design_artifacts == ["RA"]
+
+    tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
+    assert tasks["RA:DESIGN"] == TASK_COMPLETED and tasks["RA:IMPLEMENT"] == TASK_COMPLETED
+
+
+def test_second_design_merge_conflict_fails_the_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the one-shot retry conflicts again - here against a *new* file
+    landed by the sibling's IMPLEMENT while the retry was in flight - the
+    node fails for good and its worktree is preserved."""
+    from core import sessions
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "3")
+    manager = _make_parallel_manager(tmp_path)
+    logs = _collect_logs(manager)
+    queue_state = _queue_state(manager, _requirement_tree())
+
+    sibling_wrote = asyncio.Event()
+    sibling_implement_integrated = asyncio.Event()
+    design_runs: dict[str, int] = {}
+
+    original_integrate = manager._integrate_task_workspace
+
+    async def integrate_and_signal(ctx: Any, node_id: str, phase: str, requirement_data: dict[str, Any]) -> Any:
+        result = await original_integrate(ctx, node_id, phase, requirement_data)
+        if node_id == "RB" and phase == PHASE_IMPLEMENT:
+            sibling_implement_integrated.set()
+        return result
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        node_id = task["node_id"]
+        if task["phase"] == PHASE_DESIGN:
+            design_runs[node_id] = design_runs.get(node_id, 0) + 1
+            if ctx is not None and node_id == "RB":
+                Path(ctx.handle.path, "shared.js").write_text("from RB;\n", encoding="utf-8")
+                sibling_wrote.set()
+            elif ctx is not None and node_id == "RA":
+                if design_runs.get("RA", 0) == 1:
+                    await sibling_wrote.wait()
+                    Path(ctx.handle.path, "shared.js").write_text("from RA;\n", encoding="utf-8")
+                else:
+                    # The retry stays off shared.js but collides on a new
+                    # file that RB's IMPLEMENT lands while it is in flight.
+                    await sibling_implement_integrated.wait()
+                    Path(ctx.handle.path, "late.js").write_text("from RA retry;\n", encoding="utf-8")
+        elif ctx is not None and task["phase"] == PHASE_IMPLEMENT and node_id == "RB":
+            Path(ctx.handle.path, "late.js").write_text("from RB implement;\n", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(manager, "_integrate_task_workspace", integrate_and_signal)
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    states = queue_state["node_states"]
+    assert states["RB"] == NODE_PASSED
+    assert states["RA"] == NODE_FAILED, "the second conflict is terminal"
+    assert design_runs.get("RA") == 2, "the retry happened exactly once"
+    workspace = Path(manager.workspace_path)
+    assert (workspace / "shared.js").read_text(encoding="utf-8") == "from RB;\n"
+    assert (workspace / "late.js").read_text(encoding="utf-8") == "from RB implement;\n"
+
+    session = sessions.load_node_session("RA")
+    assert session.get("merge_conflict_retry_used") is True
+    assert sum(1 for message in logs if "Re-queued RA DESIGN once" in message) == 1
+
+    tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
+    assert tasks["RA:DESIGN"] == TASK_FAILED and tasks["RA:IMPLEMENT"] == TASK_FAILED
+    # The terminal failure preserves the node's worktree for inspection.
+    preserved = list((workspace / ".arc" / "worktrees").iterdir())
+    assert len(preserved) == 1 and "RA" in preserved[0].name
+
+
+def test_requeued_design_retry_sees_the_merged_sibling_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry's worktree starts at the current integration HEAD, so the
+    sibling's merged files are on disk for the retrying agent to read."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "3")
+    manager = _make_parallel_manager(tmp_path)
+    queue_state = _queue_state(manager, _requirement_tree())
+
+    sibling_wrote = asyncio.Event()
+    design_runs: dict[str, int] = {}
+    retry_worktree: dict[str, str] = {}
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        node_id = task["node_id"]
+        if task["phase"] == PHASE_DESIGN:
+            design_runs[node_id] = design_runs.get(node_id, 0) + 1
+            if ctx is not None and node_id == "RB":
+                Path(ctx.handle.path, "shared.js").write_text("from RB;\n", encoding="utf-8")
+                sibling_wrote.set()
+            elif ctx is not None and node_id == "RA":
+                await sibling_wrote.wait()
+                if design_runs.get("RA", 0) == 1:
+                    Path(ctx.handle.path, "shared.js").write_text("from RA;\n", encoding="utf-8")
+                else:
+                    retry_worktree["path"] = ctx.handle.path
+                    # The winning sibling's file must already exist there.
+                    assert (Path(ctx.handle.path) / "shared.js").read_text(encoding="utf-8") == "from RB;\n"
+                    Path(ctx.handle.path, "ra-owned.js").write_text("retry;\n", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert retry_worktree, "the retry ran"
+    assert queue_state["node_states"]["RA"] == NODE_PASSED

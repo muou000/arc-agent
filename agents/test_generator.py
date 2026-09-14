@@ -107,6 +107,8 @@ class TestGenerator:
             permitted_skill_names=selected_skill_names,
             memory=[],
             tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+            node_id=node_id,
+            claims_workspace_root=self.context_workspace_root or workspace_root,
         )
 
         message = get_user_prompt(

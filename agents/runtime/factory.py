@@ -328,6 +328,8 @@ def build_stage_agent(
     memory: list[str] | None = None,
     tools: list[object] | None = None,
     checkpointer: Any = _UNSET,
+    node_id: str | None = None,
+    claims_workspace_root: str | None = None,
 ):
     """Create an agent instance with ARC's first-batch filesystem policy.
 
@@ -358,6 +360,20 @@ def build_stage_agent(
     _register_arc_tool_exclusions(model=model, resolved_model=resolved_model)
     resolved_skills = _resolve_source_paths(skills, root, skills_root, default=[f"{SKILLS_PREFIX}/"])
 
+    file_claim_gate = None
+    if node_id and claims_workspace_root:
+        # Parallel-worktree ownership guard: the registry is shared by every
+        # in-flight node through the integration workspace, while the git
+        # tracked/untracked check runs against this agent's own workspace
+        # root (the task worktree in parallel mode).
+        from core.file_claims import FileClaimGate, get_file_claim_registry
+
+        file_claim_gate = FileClaimGate(
+            get_file_claim_registry(claims_workspace_root),
+            node_id=node_id,
+            agent_root=str(root),
+        )
+
     return create_deep_agent(
         name=name,
         model=resolved_model,
@@ -367,7 +383,7 @@ def build_stage_agent(
             ToolUsageMiddleware(),
             TruncatedToolCallGuardMiddleware(),
             ToolArgumentSanitizerMiddleware(),
-            StageDisciplineMiddleware(stage=stage),
+            StageDisciplineMiddleware(stage=stage, file_claim_gate=file_claim_gate),
             DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
         ],
         tools=tools or [],

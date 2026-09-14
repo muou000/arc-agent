@@ -96,11 +96,14 @@ class InterfaceDesigner:
             permitted_skill_names=selected_skill_names,
             memory=[],
             tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+            node_id=node_id,
+            claims_workspace_root=self.context_workspace_root or workspace_root,
         )
         message = get_user_prompt(
             node_id=node_id,
             requirement_data=requirement_data,
             dynamic_context=context_text,
+            merge_conflict=self._load_merge_conflict_context(node_id),
         )
         await self._log(f"skill-permitted: {', '.join(selected_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking interface design.", node_id=node_id)
@@ -124,6 +127,22 @@ class InterfaceDesigner:
             node_id=node_id,
         )
         return bundle
+
+    @staticmethod
+    def _load_merge_conflict_context(node_id: str) -> dict[str, Any] | None:
+        """Conflict paths recorded when this node's DESIGN merge conflicted.
+
+        The workflow re-queues a conflicted DESIGN once and stores the
+        conflicting paths (owned by a parallel sibling) in the node session
+        so this retry can steer new files away from them.
+        """
+
+        from core import sessions
+
+        context = sessions.load_node_session(node_id).get("merge_conflict_context")
+        if not isinstance(context, dict):
+            return None
+        return context
 
     def _normalize_design_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         interfaces = payload.get("interfaces")
