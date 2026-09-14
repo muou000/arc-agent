@@ -351,8 +351,9 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
     """A broken workspace must not burn the budget on every layer.
 
     The agent cannot install a missing dependency mid-compile, so retrying the
-    same doomed command is pure waste. Before the short-circuit, one such node
-    cost TDD_RUN_TESTS_BUDGET run_tests calls per layer, on every leaf.
+    same doomed command is pure waste. The executor grants exactly one
+    repair-and-revalidate attempt: an unrepaired retry executes once more,
+    fails environmentally again, and then the layer is closed for good.
     """
 
     node_id = "REQ-TDD-ENV"
@@ -372,8 +373,9 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
     final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
 
     assert final_ok is False
-    # One Unit attempt, then the loop stops - Integration is never reached.
-    assert fake.calls == [("Unit", [UNIT_TEST_FILE])]
+    # One failing attempt, one unrepaired re-validation, then the layer closes -
+    # Integration is never reached and no further doomed command runs.
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE]), ("Unit", [UNIT_TEST_FILE])]
     # NOTE: the agent *session* still runs to the end of its script. Ending the
     # LangGraph loop early needs a runtime hook that does not exist yet, so the
     # model keeps polling `run_tests` and getting "budget exhausted". Those
@@ -386,9 +388,61 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
         str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
     )
     assert "has advanced the active layer" not in all_tool_results
+    # The first failing run offers the repair-and-revalidate contract; the
+    # second (still environmental) run closes the layer for good.
+    assert "one repair-and-revalidate attempt" in all_tool_results
+    assert "Do not retry run_tests" in all_tool_results
     node_session = sessions.load_node_session(node_id)
     assert "environment failure" in node_session["recent_failure_summary"]
     assert "missing dependency" in node_session["recent_failure_summary"]
+
+
+def test_environment_failure_repair_revalidates_and_passes(tmp_project_dir: Path, arc_runtime) -> None:
+    """An environment failure the agent can repair must be re-validated.
+
+    Observed on the 2026-09-14 ticket-booking run: the agent diagnosed and
+    repaired the reported environment failure, but the old executor had
+    already burned the layer budget, so the repair was never validated and
+    the node failed. The re-validation attempt must run the repaired
+    workspace and let the node succeed.
+    """
+
+    node_id = "REQ-TDD-ENV-REPAIR"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="e1"),
+            # The failing run unlocks writes; the agent repairs the reported
+            # missing local module.
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/src/testing-library-dom.js", "content": "module.exports = {};\n"},
+                call_id="w1",
+            ),
+            # Re-validation of the repaired workspace.
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="e2"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    fake = FakeAppHandler([failing_test_output(detail=MISSING_DEP_OUTPUT), passing_test_output()])
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE]), ("Unit", [UNIT_TEST_FILE])]
+    assert model.call_count == 4
+    all_tool_results = "\n".join(
+        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
+    )
+    assert "one repair-and-revalidate attempt" in all_tool_results
+    # The repair really landed in the workspace and the node recovered.
+    assert (tmp_project_dir / "src" / "testing-library-dom.js").exists()
+    assert arc_runtime.traceability.get_test("T1")["passed"] is True
+    node_session = sessions.load_node_session(node_id)
+    assert node_session["recent_failure_summary"] == ""
 
 
 def test_assertion_failure_still_consumes_the_full_budget(tmp_project_dir: Path, arc_runtime) -> None:

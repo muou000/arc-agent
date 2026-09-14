@@ -470,22 +470,54 @@ class WorkflowPhaseRunner:
                 node_id=node_id,
             )
             result_by_type[selected_type] = output
-            if not passed and environment_failure is None:
-                environment_failure = classify_test_failure(output) or None
-                if environment_failure:
+            if passed:
+                if environment_failure is not None:
+                    # The reported environment failure was repaired (e.g. the
+                    # agent created a missing local module or fixed an import);
+                    # the normal layer flow resumes.
                     await self._log(
                         "TestDrivenDeveloper",
                         (
-                            f"`run_tests` {selected_type} failed for an environmental reason "
-                            f"({environment_failure}); the workspace is broken, not the "
-                            "implementation. Stopping the TDD loop instead of retrying."
+                            f"`run_tests` {selected_type} passed after the reported environment "
+                            f"failure ({environment_failure}) was repaired; resuming normal TDD flow."
+                        ),
+                        node_id=node_id,
+                    )
+                    environment_failure = None
+            else:
+                failure_now = classify_test_failure(output) or None
+                if environment_failure is None:
+                    if failure_now:
+                        environment_failure = failure_now
+                        await self._log(
+                            "TestDrivenDeveloper",
+                            (
+                                f"`run_tests` {selected_type} failed for an environmental reason "
+                                f"({environment_failure}); the workspace is broken, not the "
+                                "implementation. Allowing one repair-and-revalidate attempt."
+                            ),
+                            status="error",
+                            node_id=node_id,
+                        )
+                elif failure_now:
+                    # Still environmental after the one re-validation attempt:
+                    # spend the rest of this layer's budget up front so the
+                    # outer loop breaks instead of re-running a doomed command.
+                    await self._log(
+                        "TestDrivenDeveloper",
+                        (
+                            f"`run_tests` {selected_type} still fails for an environmental reason "
+                            f"({failure_now}); stopping the TDD loop instead of retrying."
                         ),
                         status="error",
                         node_id=node_id,
                     )
-                    # Spend the rest of this layer's budget up front so the outer
-                    # loop breaks instead of re-running a doomed command.
                     usage_by_type[selected_type] = TDD_RUN_TESTS_BUDGET
+                else:
+                    # The run now fails on assertions, not the environment: the
+                    # earlier environment failure was repaired, so the normal
+                    # retry loop resumes.
+                    environment_failure = None
             next_index = ordered_types.index(selected_type) + 1
             next_type = ordered_types[next_index] if next_index < len(ordered_types) else None
             if passed and next_type:
@@ -512,14 +544,29 @@ class WorkflowPhaseRunner:
                     f"- {selected_type} passed.\n"
                     "- This is the last scheduled test layer. You may return IMPLEMENTED only if all earlier scheduled layers also passed.\n"
                 )
-            elif environment_failure:
+            elif environment_failure and usage_by_type[selected_type] >= TDD_RUN_TESTS_BUDGET:
                 output += (
                     "\n\nARC_TEST_LAYER_STATUS:\n"
-                    f"- {selected_type} could not run: {environment_failure}.\n"
+                    f"- {selected_type} is still failing for an environmental reason "
+                    f"({environment_failure}).\n"
                     "- This is an environment failure (a missing dependency or a broken "
                     "install), not an assertion failure.\n"
                     "- Do not retry run_tests and do not edit the tests to work around it. "
                     "Return a short report naming the missing dependency instead.\n"
+                )
+            elif environment_failure:
+                output += (
+                    "\n\nARC_TEST_LAYER_STATUS:\n"
+                    f"- {selected_type} could not run: {environment_failure}.\n"
+                    "- This looks like an environment failure (a missing dependency or a "
+                    "broken install), not an assertion failure.\n"
+                    "- You get exactly one repair-and-revalidate attempt: if the root cause is "
+                    "fixable with a file edit (create the missing local module, correct a wrong "
+                    "relative import, add a missing npm script), make that edit and call "
+                    "run_tests once more.\n"
+                    "- If the failure names a package that must be installed, you cannot fix it "
+                    "mid-run: do not retry run_tests; return a short report naming the missing "
+                    "dependency instead.\n"
                 )
             return output
 
