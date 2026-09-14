@@ -415,12 +415,13 @@ class ARCWorkflowManager:
         workspace and one web port. With worktrees enabled, up to
         ARC_MAX_CONCURRENT_TASKS tasks run at once, each against its own
         worktree, port slot and E2E database. Ordering is still honoured: a
-        node's DESIGN precedes its IMPLEMENT, and an IMPLEMENT waits for every
-        descendant node's IMPLEMENT (children before their parent). Tasks are
-        picked with subtree affinity (one in-flight task per top-level
-        subtree, longest-remaining group first), so a subtree's tasks stay
-        sequential inside their shared worktree while different subtrees
-        overlap.
+        node's DESIGN precedes its IMPLEMENT, a node's DESIGN waits for its
+        parent's DESIGN (children design against the parent's merged shell),
+        and an IMPLEMENT waits for every descendant node's IMPLEMENT (children
+        before their parent). Tasks are picked with subtree affinity (one
+        in-flight task per top-level subtree, longest-remaining group first),
+        so a subtree's tasks stay sequential inside their shared worktree while
+        different subtrees overlap.
         """
 
         max_concurrency = self._max_concurrent_tasks()
@@ -983,6 +984,7 @@ class ARCWorkflowManager:
         expected_task_ids = [task["task_id"] for task in expected_tasks]
         node_ids = self._collect_node_ids(expected_tasks)
         descendants = self._build_descendants_map(requirement_tree)
+        parents = self._build_parents_map(requirement_tree)
         affinity = self._build_affinity_map(requirement_tree)
         existing_queue = read_json_file(self.queue_path)
         if self._is_compatible_queue(existing_queue, root_id, expected_task_ids):
@@ -992,6 +994,8 @@ class ARCWorkflowManager:
                 queue_state["node_states"].setdefault(node_id, NODE_UNSEEN)
             # Queues saved before per-node worktree parallelism lack the map.
             queue_state.setdefault("descendants", descendants)
+            # Queues saved before parent-serial DESIGN lack the map.
+            queue_state.setdefault("parents", parents)
             queue_state.setdefault("affinity", affinity)
             self._apply_saved_states_to_tasks(queue_state)
             return queue_state
@@ -1005,6 +1009,7 @@ class ARCWorkflowManager:
             "tasks": expected_tasks,
             "node_states": {node_id: NODE_UNSEEN for node_id in node_ids},
             "descendants": descendants,
+            "parents": parents,
             "affinity": affinity,
             "last_task_id": None,
         }
@@ -1029,6 +1034,25 @@ class ARCWorkflowManager:
 
         walk(root_node, [])
         return descendants
+
+    @staticmethod
+    def _build_parents_map(root_node: dict[str, Any]) -> dict[str, str]:
+        """Map every node id to its immediate parent id (the root has none)."""
+
+        parents: dict[str, str] = {}
+
+        def walk(node: dict[str, Any], parent_id: str) -> None:
+            node_id = str(node.get("id", "")).strip()
+            if not node_id:
+                return
+            if parent_id:
+                parents[node_id] = parent_id
+            for child in node.get("children", []) or []:
+                if isinstance(child, dict):
+                    walk(child, node_id)
+
+        walk(root_node, "")
+        return parents
 
     @staticmethod
     def _build_affinity_map(root_node: dict[str, Any]) -> dict[str, str]:
@@ -1188,33 +1212,46 @@ class ARCWorkflowManager:
     def _task_dependencies_met(queue_state: dict[str, Any], task: dict[str, Any]) -> bool:
         """Guard the ordering the queue relies on but never encoded as edges.
 
-        A node's IMPLEMENT waits for its own DESIGN and for every descendant
-        node's IMPLEMENT (children before their parent; a failed descendant
-        does not block its parent, matching the historical rule that an
-        earlier failed IMPLEMENT does not either). Sibling subtrees impose no
-        order on each other, which is what makes parallel draining sound.
+        A node's DESIGN waits for its parent's DESIGN (children design against
+        the parent's merged shell, so a parent's rewrite of shared surfaces can
+        never conflict with a child's additive edits in flight; a failed parent
+        does not block its children, matching the failed-descendant rule
+        below). A node's IMPLEMENT waits for its own DESIGN and for every
+        descendant node's IMPLEMENT (children before their parent; a failed
+        descendant does not block its parent, matching the historical rule that
+        an earlier failed IMPLEMENT does not either). Sibling subtrees impose
+        no order on each other, which is what makes parallel draining sound.
         """
 
-        if task["phase"] != PHASE_IMPLEMENT:
-            return True
         node_id = task["node_id"]
-        for other in queue_state["tasks"]:
-            if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
-                if other["status"] != TASK_COMPLETED:
-                    return False
-                break
-        descendants = set(queue_state.get("descendants", {}).get(node_id, []))
-        if not descendants:
-            return True
-        descendant_tasks = [
-            other
-            for other in queue_state["tasks"]
-            if other["phase"] == PHASE_IMPLEMENT and other["node_id"] in descendants
-        ]
-        return all(
-            other["status"] in {TASK_COMPLETED, TASK_FAILED}
-            for other in descendant_tasks
-        )
+        phase = task["phase"]
+        if phase == PHASE_DESIGN:
+            parent_id = str((queue_state.get("parents") or {}).get(node_id, "") or "")
+            if parent_id:
+                for other in queue_state["tasks"]:
+                    if other["phase"] == PHASE_DESIGN and other["node_id"] == parent_id:
+                        if other["status"] not in {TASK_COMPLETED, TASK_FAILED}:
+                            return False
+                        break
+        elif phase == PHASE_IMPLEMENT:
+            for other in queue_state["tasks"]:
+                if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
+                    if other["status"] != TASK_COMPLETED:
+                        return False
+                    break
+            descendants = set(queue_state.get("descendants", {}).get(node_id, []))
+            if not descendants:
+                return True
+            descendant_tasks = [
+                other
+                for other in queue_state["tasks"]
+                if other["phase"] == PHASE_IMPLEMENT and other["node_id"] in descendants
+            ]
+            return all(
+                other["status"] in {TASK_COMPLETED, TASK_FAILED}
+                for other in descendant_tasks
+            )
+        return True
 
     @staticmethod
     def _mark_remaining_node_tasks_failed(queue_state: dict[str, Any], node_id: str) -> None:

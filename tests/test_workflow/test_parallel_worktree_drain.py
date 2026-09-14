@@ -33,6 +33,7 @@ from core.workflow import (
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
+    TASK_RUNNING,
 )
 
 
@@ -678,3 +679,98 @@ def test_manual_retry_restores_the_conflict_retry_budget(
     assert not session.get("merge_conflict_context"), "stale conflict paths are dropped"
     tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
     assert tasks["RA:DESIGN"] == TASK_PENDING and tasks["RA:IMPLEMENT"] == TASK_PENDING
+
+
+# ---------------------------------------------------------------------------
+# parent-serial DESIGN (children design against the parent's merged shell)
+# ---------------------------------------------------------------------------
+
+
+def _gate_queue_state(parent_status: str, *, with_parents: bool = True) -> dict[str, Any]:
+    tasks = [
+        {"task_id": "R:DESIGN", "node_id": "R", "phase": PHASE_DESIGN, "status": parent_status},
+        {"task_id": "RA:DESIGN", "node_id": "RA", "phase": PHASE_DESIGN, "status": TASK_PENDING},
+    ]
+    state: dict[str, Any] = {"tasks": tasks}
+    if with_parents:
+        state["parents"] = {"RA": "R"}
+    return state
+
+
+def test_design_gate_blocks_until_the_parent_design_settles() -> None:
+    parent = _gate_queue_state(TASK_RUNNING)["tasks"][0]
+    child = _gate_queue_state(TASK_RUNNING)["tasks"][1]
+    state = {"tasks": [parent, child], "parents": {"RA": "R"}}
+
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is False, "parent still running"
+
+    parent["status"] = TASK_PENDING
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is False, "parent still pending"
+
+    parent["status"] = TASK_COMPLETED
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is True
+
+    parent["status"] = TASK_FAILED
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is True, (
+        "a failed parent must not deadlock its children"
+    )
+
+
+def test_design_gate_lets_the_root_and_unmapped_nodes_through() -> None:
+    state = _gate_queue_state(TASK_PENDING)
+    root = state["tasks"][0]
+    assert ARCWorkflowManager._task_dependencies_met(state, root) is True, "the root has no parent"
+
+    orphan = {"task_id": "X:DESIGN", "node_id": "X", "phase": PHASE_DESIGN, "status": TASK_PENDING}
+    assert ARCWorkflowManager._task_dependencies_met(state, orphan) is True
+
+
+def test_design_gate_fails_open_for_queues_saved_before_parents() -> None:
+    state = _gate_queue_state(TASK_RUNNING, with_parents=False)
+    child = state["tasks"][1]
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is True
+
+
+def test_child_design_waits_for_parent_design_and_leaves_stay_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain must not start a child's DESIGN before its parent's DESIGN
+    integrated (the ticket-booking run failed exactly this way: the parent's
+    rewrite of shared surfaces merged while the children's additive edits to
+    the same files were in flight). Sibling leaf DESIGNs still overlap."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "3")
+    manager = _make_parallel_manager(tmp_path)
+    queue_state = _queue_state(manager, _requirement_tree())
+
+    events: list[tuple[str, str]] = []
+    active: set[str] = set()
+    leaf_overlap = False
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        nonlocal leaf_overlap
+        task_id = task["task_id"]
+        if task["phase"] == PHASE_DESIGN and task["node_id"] != "R" and active:
+            leaf_overlap = True
+        events.append(("start", task_id))
+        active.add(task_id)
+        # Long enough that the sibling's worktree prepare cannot run out the
+        # overlap window.
+        await asyncio.sleep(0.05)
+        active.discard(task_id)
+        events.append(("end", task_id))
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    order = dict.fromkeys(event for event in events)
+    root_design_end = list(order).index(("end", "R:DESIGN"))
+    for leaf in ("RA:DESIGN", "RB:DESIGN"):
+        assert list(order).index(("start", leaf)) > root_design_end, (
+            "a child DESIGN must not start before the parent DESIGN integrated"
+        )
+    assert leaf_overlap, "sibling leaf DESIGNs must still run in parallel"
+    assert all(queue_state["node_states"][node] == NODE_PASSED for node in ("R", "RA", "RB"))
+    tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
+    assert all(status == TASK_COMPLETED for status in tasks.values())
