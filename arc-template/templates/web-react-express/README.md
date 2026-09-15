@@ -98,7 +98,7 @@ npm run test:all
 
 - Runtime database helpers live under `backend/src/database`.
 - The default database file is `database.db`, unless `ARC_DB_FILE` or `DATABASE_FILE` is set.
-- `initializeDatabase()` always resolves to an open handle for the current database path, even when `closeDb()`/`setDbPath()` race an in-flight initialization; it never returns a closed handle.
+- Runtime contract: `initializeDatabase()` always resolves to an open handle for the current database path, even when `closeDb()`/`setDbPath()` race an in-flight initialization; it never returns a closed handle, and a genuine init failure surfaces instead of burning retries. The provisioned template may predate this fix; ARC applies it to the workspace at scaffold time via `app_type_handler/template_patches.py`.
 - Test helpers create isolated SQLite files under `.arc-test-db`.
 - `npm run db:seed` runs the template seed entrypoint.
 - `npm run db:prepare:e2e` prepares an isolated E2E database.

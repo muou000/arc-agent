@@ -79,6 +79,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 ### App-type handler 和模板
 
 - `app_type_handler` 的注册表、模板目录、`template.yaml`、package manifest、测试路径和运行命令必须保持一致。模板以 `ARC_AGENT_TEMPLATES_ROOT`（平台烤入的官方模板）为权威来源，未设置时使用仓库内 `arc-template/templates/` 副本（内容与官方模板保持一致，有意偏离需说明理由并同步测试）；运行时契约（端口来源环境变量、Playwright 浏览器安装、前端测试 peer 依赖）必须与官方模板兼容，不得假设副本特有的脚本或依赖。
+- 仓库内模板只镜像官方模板，不承载修复：平台烤入的模板不会被仓库副本的改动影响，因此必须随模板到达每个生成工作区的修复要写成 `app_type_handler/template_patches.py` 的定向补丁，并在拷贝模板后（`WebAppType.post_template_setup`）应用到工作区。补丁必须标记守卫——目标已含修复时空操作，形状不认识时保留原文件并告警，不做整文件覆盖或半途写入；改动时同步 `tests/test_template_database_contract.py`、`tests/test_template_contract/` 和 `tests/test_app_type_handler/test_workspace_gates.py`。
 - 修改 Web 模板时，检查前端构建、后端健康端点、单端口运行、数据库测试隔离和 Playwright/Vitest 契约；修改 Android/CLI handler 时，确认对应模板和环境门禁真实存在，不要只增加注册表项。
 - 模板契约变更必须同步更新 `tests/test_template_contract/` 和模板 README。依赖或 lockfile 变更应说明原因，并确认不是无关版本漂移。
 

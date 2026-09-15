@@ -23,10 +23,15 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE_BACKEND = (
-    REPO_ROOT / "arc-template" / "templates" / "web-react-express" / "backend"
+from app_type_handler.template_patches import (
+    ALREADY_APPLIED,
+    APPLIED,
+    apply_template_patches,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TEMPLATE_ROOT = REPO_ROOT / "arc-template" / "templates" / "web-react-express"
+TEMPLATE_BACKEND = TEMPLATE_ROOT / "backend"
 
 
 def _resolve(binary: str) -> str:
@@ -83,20 +88,28 @@ def _wait_for_health(port: int, *, timeout: float = 15.0) -> bool:
 
 @pytest.fixture(scope="module")
 def installed_backend(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
-    """Copy the backend template, run ``npm install``, and yield the directory."""
+    """Copy the whole template, apply the bundled fixes, and run ``npm install``.
 
-    scratch = tmp_path_factory.mktemp("template-backend-")
-    shutil.copytree(TEMPLATE_BACKEND, scratch / "backend")
+    The compiler ships the provisioned template plus the directed patches in
+    ``app_type_handler/template_patches``, so a scratch copy without the
+    patches would test a bootstrap no generated workspace ever sees. The whole
+    template root is copied, exactly like ``copy_template`` does.
+    """
+
+    workspace = tmp_path_factory.mktemp("template-backend-") / "workspace"
+    shutil.copytree(TEMPLATE_ROOT, workspace)
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+    assert all(outcome.status in {APPLIED, ALREADY_APPLIED} for outcome in outcomes), outcomes
     proc = subprocess.run(
         [_NPM_BIN, "install", "--no-audit", "--no-fund", "--prefer-offline"],
-        cwd=str(scratch / "backend"),
+        cwd=str(workspace / "backend"),
         capture_output=True,
         text=True,
         timeout=300,
     )
     if proc.returncode != 0:
         pytest.skip(f"npm install failed: {proc.stderr or proc.stdout}")
-    yield scratch / "backend"
+    yield workspace / "backend"
 
 
 _DB_INIT_SEMANTICS_CHECK = """\
