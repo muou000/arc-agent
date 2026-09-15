@@ -382,7 +382,8 @@ def build_stage_agent(
             agent_root=str(root),
         )
 
-    return create_deep_agent(
+    stage_discipline = StageDisciplineMiddleware(stage=stage, file_claim_gate=file_claim_gate)
+    agent = create_deep_agent(
         name=name,
         model=resolved_model,
         backend=backend,
@@ -391,7 +392,7 @@ def build_stage_agent(
             ToolUsageMiddleware(),
             TruncatedToolCallGuardMiddleware(),
             ToolArgumentSanitizerMiddleware(),
-            StageDisciplineMiddleware(stage=stage, file_claim_gate=file_claim_gate),
+            stage_discipline,
             DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
         ],
         tools=tools or [],
@@ -410,6 +411,10 @@ def build_stage_agent(
         response_format=_resolve_response_format(response_format, model=model),
         checkpointer=resolved_checkpointer,
     )
+    # Surface run-local discipline state (e.g. materialized write paths) to
+    # the stage adapter that owns this agent.
+    agent.arc_stage_discipline = stage_discipline
+    return agent
 
 
 def _apply_unambiguous_read_file_format() -> None:

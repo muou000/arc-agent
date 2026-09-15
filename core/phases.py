@@ -138,6 +138,26 @@ class WorkflowPhaseRunner:
             if normalized_path:
                 files_written.append(normalized_path)
         if not interfaces:
+            materialized_paths = [
+                str(path).strip()
+                for path in interface_result.get("materialized_paths") or []
+                if str(path).strip()
+            ]
+            if materialized_paths:
+                # Hard gate: the design pass materialized skeleton files but
+                # recorded no interface contracts. An empty traceability
+                # interface registry leaves TestGenerator and TDD blind to the
+                # design (and has historically deadlocked them), so fail the
+                # DESIGN phase instead of proceeding silently.
+                await self._log(
+                    "InterfaceDesigner",
+                    "DESIGN failed: "
+                    + f"{len(materialized_paths)} skeleton file(s) were materialized (e.g. {materialized_paths[0]}) "
+                    + "but the response recorded no interface contracts; downstream stages would be blind to the design.",
+                    status="error",
+                    node_id=node_id,
+                )
+                return False
             await self._log(
                 "InterfaceDesigner",
                 "Interface design returned no current-node owned interface definitions.",
