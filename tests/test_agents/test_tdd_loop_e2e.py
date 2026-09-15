@@ -752,6 +752,110 @@ def test_subset_pass_does_not_close_layer_until_full_run(tmp_project_dir: Path, 
     assert arc_runtime.traceability.get_test("T2")["passed"] is True
 
 
+def test_subset_pass_reports_not_yet_run_files_separately(tmp_project_dir: Path, arc_runtime) -> None:
+    """Never-run files must not be reported as "still red" (PR review).
+
+    A passing subset run on file 1 leaves file 2 unverified (None state).
+    Reporting file 2 as red would send the agent repairing a file with no
+    failure evidence; it is pending work, not a repair target.
+    """
+
+    node_id = "REQ-TDD-MICRO-PENDING"
+    other_unit_file = "tests/unit/test_extra.py"
+    tests = [
+        {"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T2", "type": "Unit", "file_path": other_unit_file},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    # Session: baseline both red -> repair file 1 (subset pass) -> full run.
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {"test_files": [UNIT_TEST_FILE]}, call_id="r1"),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="r2"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    fake = FakeAppHandler(
+        [
+            # Baselines: file1 red, file2 red.
+            failing_test_output(detail="AssertionError: file1 missing"),
+            failing_test_output(detail="AssertionError: file2 missing"),
+            # Subset run on file1: pass (file2 stays red from its baseline).
+            passing_test_output(),
+            # Full-layer run: pass.
+            passing_test_output(),
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    all_tool_results = tool_results_text(model)
+    # File 2 was baseline-verified red, so the subset pass reports it as a
+    # repair target - but nothing may be labeled "not been run yet" here.
+    assert "still red" in all_tool_results
+    assert "not been run yet" not in all_tool_results
+
+
+def test_subset_pass_after_insession_advance_reports_pending_files(tmp_project_dir: Path, arc_runtime) -> None:
+    """Files of an in-session advanced layer start as None, not red.
+
+    When Unit passes and the layer advances mid-session, the Integration
+    files have never been baseline-verified. A passing subset run on one of
+    them must report the others as "not been run yet" - never as "still red",
+    which would imply verified failures (PR review finding).
+    """
+
+    node_id = "REQ-TDD-MICRO-ADVANCE"
+    integration_extra_file = "tests/integration/test_extra_flow.py"
+    tests = [
+        {"test_id": "T-U", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T-I1", "type": "Integration", "file_path": INTEGRATION_TEST_FILE},
+        {"test_id": "T-I2", "type": "Integration", "file_path": integration_extra_file},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    model = FauxChatModel(
+        responses=[
+            # Unit passes in-session -> advance to Integration (files: None).
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="u1"),
+            # Subset run on the first Integration file: passes; the second
+            # stays None (never verified in this flow).
+            faux_tool_call("run_tests", {"test_type": "Integration", "test_files": [INTEGRATION_TEST_FILE]}, call_id="i1"),
+            # Full-layer Integration run closes the layer.
+            faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="i2"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    # Unit baseline (red), Unit agent run (pass), Integration subset (pass),
+    # Integration full run (pass).
+    fake = FakeAppHandler(
+        [
+            failing_test_output(),
+            passing_test_output(),
+            passing_test_output(),
+            passing_test_output(),
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    all_tool_results = tool_results_text(model)
+    # The subset pass on file 1 of the advanced layer reports file 2 as
+    # pending work, not as a verified failure.
+    assert "not been run yet: tests/integration/test_extra_flow.py" in all_tool_results
+    # And it must NOT be reported as "still red" anywhere in that result.
+    assert "still red: tests/integration/test_extra_flow.py" not in all_tool_results
+    assert arc_runtime.traceability.get_test("T-I1")["passed"] is True
+    assert arc_runtime.traceability.get_test("T-I2")["passed"] is True
+
+
 # ---------------------------------------------------------------------------
 # Stall governance: repeated identical fingerprints force hypothesis rotation
 # ---------------------------------------------------------------------------

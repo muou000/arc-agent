@@ -560,7 +560,11 @@ class WorkflowPhaseRunner:
             # every run_tests result, so each file's red -> green transition is
             # an explicit, verifiable step rather than batch soup.
             layer_file_states = file_state_by_type[selected_type]
-            still_red = sorted(path for path, state in layer_file_states.items() if state != "green")
+            # Only verified failures are "still red" - never-run files (None)
+            # are pending work, not repair targets; reporting them as red
+            # would send the agent after files with no failure evidence yet.
+            still_red = sorted(path for path, state in layer_file_states.items() if state == "red")
+            not_yet_run = sorted(path for path, state in layer_file_states.items() if state is None)
             output += (
                 "\n\nARC_TEST_FILE_STATUS:\n"
                 f"- Layer `{selected_type}` per-file state:\n"
@@ -600,13 +604,19 @@ class WorkflowPhaseRunner:
                     "fix approach within the same layer; "
                     "(4) only then make the repair and re-run.\n"
                 )
-            if passed and still_red:
-                # A passing run on a subset of files: the still-red files keep
-                # their red state and stay the repair target.
-                output += (
-                    f"- {len(still_red)} file(s) in this layer are still red: {', '.join(still_red)}. "
-                    "The layer passes only when every file is green and a final full-layer run passes.\n"
-                )
+            if passed and (still_red or not_yet_run):
+                # A passing run on a subset of files: verified-red files stay
+                # repair targets, never-run files are simply the next work.
+                if still_red:
+                    output += (
+                        f"- {len(still_red)} file(s) in this layer are still red: {', '.join(still_red)}. "
+                        "The layer passes only when every file is green and a final full-layer run passes.\n"
+                    )
+                if not_yet_run:
+                    output += (
+                        f"- {len(not_yet_run)} file(s) in this layer have not been run yet: "
+                        f"{', '.join(not_yet_run)}.\n"
+                    )
             if full_layer_passed[selected_type] and next_type:
                 # Advance immediately instead of waiting for the session to
                 # end. Otherwise a model that keeps polling `run_tests` after a
