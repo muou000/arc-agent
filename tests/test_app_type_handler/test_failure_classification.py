@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from app_type_handler.test_results import classify_test_failure
+from app_type_handler.test_results import classify_test_failure, failure_fingerprint
 
 
 @pytest.mark.parametrize(
@@ -157,3 +157,57 @@ def test_long_environment_detail_is_truncated() -> None:
 
     assert reason.startswith("browser binaries not installed: ")
     assert len(reason) <= 160
+
+
+# ---------------------------------------------------------------------------
+# failure_fingerprint: stall-governance input
+# ---------------------------------------------------------------------------
+
+
+def test_fingerprint_pairs_exit_code_with_first_error_line() -> None:
+    output = (
+        "Exit Code: 1\n"
+        "STDERR:\n"
+        "Some runner noise\n"
+        "AssertionError: expected 'Login' to equal 'Log in'\n"
+        "more stack\n"
+    )
+    assert failure_fingerprint(output) == "1|AssertionError: expected 'Login' to equal 'Log in'"
+
+
+def test_fingerprint_is_stable_for_identical_failures() -> None:
+    """The stall detector compares consecutive fingerprints; identical failures
+    (including identical trailing stack traces) must produce identical output."""
+    output = (
+        "Exit Code: 1\n"
+        "FAIL tests/unit/test_calc.py\n"
+        "AssertionError: add(1, 1) returned 0\n"
+        "at Object.<anonymous> (test_calc.js:5:9)\n"
+    )
+    assert failure_fingerprint(output) == failure_fingerprint(output)
+
+
+def test_fingerprint_distinguishes_different_failures() -> None:
+    """Different assertion messages are different stalls only when they repeat;
+    the fingerprint itself must tell them apart."""
+    first = failure_fingerprint("Exit Code: 1\nAssertionError: expected 'Login' to equal 'Log in'")
+    second = failure_fingerprint("Exit Code: 1\nAssertionError: add(1, 1) returned 0")
+    assert first != second
+
+
+def test_fingerprint_handles_output_without_error_lines() -> None:
+    """A failing run with no recognizable error line still yields a fingerprint
+    (exit code plus empty key line) instead of raising."""
+    assert failure_fingerprint("Exit Code: 1\nSTDERR:\n(none)") == "1|"
+
+
+def test_fingerprint_handles_empty_output() -> None:
+    assert failure_fingerprint("") == "-1|"
+
+
+def test_fingerprint_truncates_runaway_key_lines() -> None:
+    """The fingerprint is echoed into tool results and sessions; keep it short."""
+    long_line = "AssertionError: " + "x" * 500
+    fingerprint = failure_fingerprint(f"Exit Code: 1\n{long_line}")
+    assert fingerprint.startswith("1|AssertionError: ")
+    assert len(fingerprint) <= 162  # "1|" + 160-char cap

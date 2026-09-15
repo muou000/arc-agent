@@ -11,11 +11,13 @@ from core import sessions
 from core.service import get_runtime
 from core.path_compat import normalize_windows_extended_prefix_text
 from core.visual_analysis import analyze_and_attach_visual_references
-from app_type_handler.test_results import classify_test_failure, parse_test_results
+from app_type_handler.test_results import classify_test_failure, failure_fingerprint, parse_test_results
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 TDD_RUN_TESTS_BUDGET = 10
+#: Consecutive identical failure fingerprints before stall governance fires.
+TDD_STALL_THRESHOLD = 3
 ALLOWED_INTERFACE_TYPES = {"UI", "API", "FUNC", "DB"}
 TDD_BATCH_ORDER = ("Unit", "Integration", "E2E")
 
@@ -329,6 +331,25 @@ class WorkflowPhaseRunner:
         usage_by_type = {test_type: 0 for test_type in ordered_types}
         result_by_type: dict[str, str] = {}
         environment_failure: str | None = None
+        # Baseline RED verification: per-file state seeded before the first
+        # agent session of each layer. ``red`` files failed the baseline run
+        # (legitimate failing tests, the RED evidence for that file), ``green``
+        # files already passed (tautology fast path), and ``None`` means no
+        # verified state yet (never run, or the baseline stopped at an
+        # environment failure).
+        file_state_by_type: dict[str, dict[str, str | None]] = {
+            test_type: {path: None for path in collect_test_files(groups[test_type.lower()])}
+            for test_type in ordered_types
+        }
+        # A layer passes only through a passing run that covered EVERY
+        # registered file of the layer (an agent full-layer run or the
+        # system-run regression below). A passing subset run no longer closes
+        # the layer: every file must be verified green and confirmed together.
+        full_layer_passed = {test_type: False for test_type in ordered_types}
+        # Failure-fingerprint history per layer for stall governance: each
+        # failed run_tests call appends its fingerprint; three identical
+        # consecutive fingerprints force a hypothesis-rotation directive.
+        fingerprint_history: dict[str, list[str]] = {test_type: [] for test_type in ordered_types}
         await self._log(
             "TestDrivenDeveloper",
             "Running leaf TDD sessions in ordered layers with independent budgets: " + " -> ".join(ordered_types) + ".",
@@ -471,6 +492,17 @@ class WorkflowPhaseRunner:
             )
             result_by_type[selected_type] = output
             if passed:
+                for path in selected_files:
+                    file_state_by_type[selected_type][path] = "green"
+                # A layer passes only through a passing run that covered every
+                # registered file; a passing subset run keeps the layer open.
+                registered_layer_files = {
+                    str(item.get("file_path", "") or "").strip()
+                    for item in groups[selected_type.lower()]
+                    if str(item.get("file_path", "") or "").strip()
+                }
+                if registered_layer_files and set(selected_files) >= registered_layer_files:
+                    full_layer_passed[selected_type] = True
                 if environment_failure is not None:
                     # The reported environment failure was repaired (e.g. the
                     # agent created a missing local module or fixed an import);
@@ -485,6 +517,10 @@ class WorkflowPhaseRunner:
                     )
                     environment_failure = None
             else:
+                for path in selected_files:
+                    if file_state_by_type[selected_type].get(path) != "green":
+                        file_state_by_type[selected_type][path] = "red"
+                fingerprint_history[selected_type].append(failure_fingerprint(output))
                 failure_now = classify_test_failure(output) or None
                 if environment_failure is None:
                     if failure_now:
@@ -520,7 +556,58 @@ class WorkflowPhaseRunner:
                     environment_failure = None
             next_index = ordered_types.index(selected_type) + 1
             next_type = ordered_types[next_index] if next_index < len(ordered_types) else None
-            if passed and next_type:
+            # Micro-loop status: per-file red/green state the agent sees on
+            # every run_tests result, so each file's red -> green transition is
+            # an explicit, verifiable step rather than batch soup.
+            layer_file_states = file_state_by_type[selected_type]
+            still_red = sorted(path for path, state in layer_file_states.items() if state != "green")
+            output += (
+                "\n\nARC_TEST_FILE_STATUS:\n"
+                f"- Layer `{selected_type}` per-file state:\n"
+                + "\n".join(
+                    f"  - {path}: {state or 'not yet run'}"
+                    for path, state in layer_file_states.items()
+                )
+                + "\n"
+            )
+            # Stall governance: three consecutive identical failure fingerprints
+            # mean the last repairs did not change the failure - the agent is
+            # stuck on one hypothesis. Force an explicit rotation.
+            recent = fingerprint_history[selected_type][-TDD_STALL_THRESHOLD:]
+            stalled = (
+                not passed
+                and len(fingerprint_history[selected_type]) >= TDD_STALL_THRESHOLD
+                and len(set(recent)) == 1
+            )
+            if stalled:
+                await self._log(
+                    "TestDrivenDeveloper",
+                    (
+                        f"`run_tests` {selected_type} failure fingerprint stalled for "
+                        f"{len(recent)} consecutive attempts; requiring hypothesis rotation."
+                    ),
+                    status="error",
+                    node_id=node_id,
+                )
+                output += (
+                    "- STALL DETECTED: the same failure fingerprint has repeated "
+                    f"{len(recent)} times in a row. Your recent edits are not changing the failure. "
+                    "Before the next run_tests call, you MUST rotate your hypothesis: "
+                    "(1) re-classify the failure (implementation logic, boundary wiring, selector/render "
+                    "state, persistence/test database, framework/config, or test content); "
+                    "(2) list the hypotheses you have already tried; "
+                    "(3) pick a DIFFERENT layer of the UI/API/FUNC/DB chain to edit, or a different "
+                    "fix approach within the same layer; "
+                    "(4) only then make the repair and re-run.\n"
+                )
+            if passed and still_red:
+                # A passing run on a subset of files: the still-red files keep
+                # their red state and stay the repair target.
+                output += (
+                    f"- {len(still_red)} file(s) in this layer are still red: {', '.join(still_red)}. "
+                    "The layer passes only when every file is green and a final full-layer run passes.\n"
+                )
+            if full_layer_passed[selected_type] and next_type:
                 # Advance immediately instead of waiting for the session to
                 # end. Otherwise a model that keeps polling `run_tests` after a
                 # pass re-runs the passing layer until its budget is gone and
@@ -529,24 +616,28 @@ class WorkflowPhaseRunner:
                 # batch, then the session burned minutes on "the system says it
                 # will advance but never does").
                 active_test_type = next_type
+                # The next layer's files were never baseline-verified in this
+                # session; the outer scheduler will baseline them before their
+                # first agent session (in-session advances pin the active
+                # layer, and the baseline loop only runs per layer).
                 output += (
-                    "\n\nARC_TEST_LAYER_STATUS:\n"
-                    f"- {selected_type} passed.\n"
+                    "\nARC_TEST_LAYER_STATUS:\n"
+                    f"- {selected_type} passed (full layer).\n"
                     f"- The system has advanced the active layer to `{next_type}`; "
                     f"`run_tests(test_type='{next_type}')` now targets it.\n"
                     f"- The {selected_type} layer is closed: further `{selected_type}` calls are rejected "
                     "without consuming budget.\n"
                     "- Do not return IMPLEMENTED until all scheduled layers have been attempted and passed.\n"
                 )
-            elif passed:
+            elif full_layer_passed[selected_type]:
                 output += (
-                    "\n\nARC_TEST_LAYER_STATUS:\n"
-                    f"- {selected_type} passed.\n"
+                    "\nARC_TEST_LAYER_STATUS:\n"
+                    f"- {selected_type} passed (full layer).\n"
                     "- This is the last scheduled test layer. You may return IMPLEMENTED only if all earlier scheduled layers also passed.\n"
                 )
             elif environment_failure and usage_by_type[selected_type] >= TDD_RUN_TESTS_BUDGET:
                 output += (
-                    "\n\nARC_TEST_LAYER_STATUS:\n"
+                    "\nARC_TEST_LAYER_STATUS:\n"
                     f"- {selected_type} is still failing for an environmental reason "
                     f"({environment_failure}).\n"
                     "- This layer is closed: the one repair-and-revalidate attempt has been used.\n"
@@ -555,7 +646,7 @@ class WorkflowPhaseRunner:
                 )
             elif environment_failure:
                 output += (
-                    "\n\nARC_TEST_LAYER_STATUS:\n"
+                    "\nARC_TEST_LAYER_STATUS:\n"
                     f"- {selected_type} could not run: {environment_failure}.\n"
                     "- This is your one repair-and-revalidate attempt for this environment failure.\n"
                     "- First decide the root cause. If it is fixable with a file edit (create a "
@@ -582,6 +673,125 @@ class WorkflowPhaseRunner:
                     node_id=node_id,
                 )
                 break
+            if full_layer_passed[ordered_type]:
+                # The layer was already closed inside an earlier session's
+                # in-session advance (a passing full-layer run): no baseline,
+                # no regression, no second session.
+                continue
+            # ---- Baseline RED verification (system-run, no agent budget). ----
+            # Run each file of the layer once before the first agent session:
+            # a green baseline closes the file (tautology fast path - the
+            # agent must not "fix" tests that already pass); an environmental
+            # baseline failure is handed to the first agent session under the
+            # same repair-and-revalidate contract as an in-session one; a red
+            # baseline is the per-file RED evidence injected into the first
+            # session. Files already verified green/red by an earlier layer's
+            # in-session advance keep their state and skip the baseline run.
+            layer_files = collect_test_files(groups[ordered_type.lower()])
+            unverified_files = [path for path in layer_files if file_state_by_type[ordered_type].get(path) is None]
+            baseline_red_evidence: list[str] = []
+            baseline_env_failure: str | None = None
+            for baseline_file in unverified_files:
+                baseline_output = await self.app_handler.run_test_group(
+                    ordered_type,
+                    [baseline_file],
+                    web_port=self.web_port,
+                )
+                baseline_exit = int(parse_test_results(baseline_output).get("exit_code", -1))
+                await self._log(
+                    "TestDrivenDeveloper",
+                    (
+                        f"Baseline RED check `{ordered_type}` {baseline_file}: "
+                        f"{'green (already passing)' if baseline_exit == 0 else 'red (failing)'} "
+                        f"with Exit Code: {baseline_exit}."
+                    ),
+                    status="ok" if baseline_exit == 0 else "warning",
+                    node_id=node_id,
+                )
+                if baseline_exit == 0:
+                    file_state_by_type[ordered_type][baseline_file] = "green"
+                    continue
+                file_state_by_type[ordered_type][baseline_file] = "red"
+                baseline_env = classify_test_failure(baseline_output)
+                if baseline_env:
+                    # Broken workspace before any agent budget is spent: hand
+                    # the failure to the first session instead of burning its
+                    # run_tests calls discovering it.
+                    baseline_env_failure = baseline_env
+                    await self._log(
+                        "TestDrivenDeveloper",
+                        (
+                            f"Baseline RED check `{ordered_type}` {baseline_file} failed for an "
+                            f"environmental reason ({baseline_env}); handing the repair contract "
+                            "to the first agent session."
+                        ),
+                        status="error",
+                        node_id=node_id,
+                    )
+                    break
+                baseline_red_evidence.append(
+                    f"{baseline_file}:\n{summarize_batch_output(baseline_output, max_lines=12)}"
+                )
+            baseline_red_summary = ""
+            if baseline_red_evidence:
+                baseline_red_summary = (
+                    "### Baseline RED Evidence (system-verified before this session)\n"
+                    "The following test files were run by the system and verifiably fail RIGHT NOW. "
+                    "This is the RED state for this layer: implement/repair until each listed file turns green.\n"
+                    + "\n\n".join(baseline_red_evidence)
+                )
+            if baseline_env_failure is not None:
+                baseline_red_summary = (
+                    "### Baseline RED Evidence (system-verified before this session)\n"
+                    f"The baseline run failed for an environmental reason: {baseline_env_failure}.\n"
+                    "The same repair-and-revalidate contract as an in-session environment failure "
+                    "applies: make one file edit that fixes the root cause (create a missing local "
+                    "module, correct a wrong relative import, add a missing npm script) and call "
+                    "run_tests once to re-validate. If the failure names a package that must be "
+                    "installed, end your turn with a short report naming the missing dependency.\n"
+                )
+            elif baseline_env_failure is None and all(
+                state == "green" for state in file_state_by_type[ordered_type].values()
+            ) and file_state_by_type[ordered_type]:
+                # Tautology fast path: every file of this layer already passed
+                # either its baseline run or an in-session run. The system runs
+                # one full-layer regression itself - an agent session that only
+                # re-runs passing tests buys nothing.
+                regression_output = await self.app_handler.run_test_group(
+                    ordered_type,
+                    layer_files,
+                    web_port=self.web_port,
+                )
+                result_by_type[ordered_type] = regression_output
+                if int(parse_test_results(regression_output).get("exit_code", -1)) == 0:
+                    full_layer_passed[ordered_type] = True
+                    await self._log(
+                        "TestDrivenDeveloper",
+                        (
+                            f"Baseline RED check: all `{ordered_type}` files already pass; "
+                            "system-run full-layer regression passed (tautology fast path, no agent session)."
+                        ),
+                        node_id=node_id,
+                    )
+                    continue
+                await self._log(
+                    "TestDrivenDeveloper",
+                    (
+                        f"Baseline RED check: `{ordered_type}` files passed individually but the "
+                        "full-layer regression failed; opening an agent session for the combined failure."
+                    ),
+                    status="warning",
+                    node_id=node_id,
+                )
+                for path in layer_files:
+                    if file_state_by_type[ordered_type].get(path) != "green":
+                        file_state_by_type[ordered_type][path] = "red"
+                baseline_red_summary = (
+                    "### Baseline RED Evidence (system-verified before this session)\n"
+                    "Every test file in this layer passed its individual run, but the full-layer run "
+                    "failed when the files execute together. The combined failure output:\n"
+                    f"{summarize_batch_output(regression_output, max_lines=20)}"
+                )
             # Between sessions the outer loop owns the layer transitions: it
             # re-pins the active layer and visits each layer exactly once, so
             # a layer the executor closed or advanced past in-session never
@@ -589,7 +799,7 @@ class WorkflowPhaseRunner:
             # that are still failing and not yet out of budget).
             active_test_type = ordered_type
             previous_failure_summary = str(sessions.load_node_session(node_id).get("recent_failure_summary", "") or "")
-            while parse_test_results(result_by_type.get(ordered_type, "")).get("exit_code") != 0:
+            while not full_layer_passed[ordered_type]:
                 if environment_failure:
                     break
                 used_before = usage_by_type.get(ordered_type, 0)
@@ -614,12 +824,31 @@ class WorkflowPhaseRunner:
                         ),
                         node_id=node_id,
                     )
+                # First session of the layer carries the baseline RED evidence
+                # so the agent starts from verified failures; follow-up
+                # sessions carry the freshest failure evidence instead.
+                session_failure_context = (
+                    baseline_red_summary
+                    if used_before == 0
+                    else previous_failure_summary
+                )
+                stall_context = ""
+                recent = fingerprint_history[ordered_type][-TDD_STALL_THRESHOLD:]
+                if len(fingerprint_history[ordered_type]) >= TDD_STALL_THRESHOLD and len(set(recent)) == 1:
+                    stall_context = (
+                        "\n\n### Stall Governance Handoff\n"
+                        f"The last {len(recent)} run_tests failures in this layer share the same fingerprint. "
+                        "Do not continue the previous session's approach: re-classify the failure, list the "
+                        "hypotheses already tried, and edit a different layer of the UI/API/FUNC/DB chain "
+                        "(or a different fix approach within the same layer) before the next run_tests call.\n"
+                        f"Repeated fingerprint: {recent[-1]}"
+                    )
                 output = await self.test_driven_developer.run(
                     node_id=node_id,
                     test_files=collect_test_files(tests),
                     test_type=ordered_type,
                     node_tests=tests,
-                    previous_failure_summary=previous_failure_summary,
+                    previous_failure_summary=(session_failure_context + stall_context).strip(),
                     run_tests_budget=None,
                     run_tests_usage=None,
                     run_tests_executor=run_requested_tests,
@@ -631,7 +860,7 @@ class WorkflowPhaseRunner:
                     or summarize_batch_output(latest_result or output)
                 )
                 used_after = usage_by_type.get(ordered_type, 0)
-                if parse_test_results(latest_result).get("exit_code") == 0:
+                if full_layer_passed[ordered_type]:
                     break
                 if used_after >= TDD_RUN_TESTS_BUDGET:
                     break
@@ -648,7 +877,7 @@ class WorkflowPhaseRunner:
                     break
             active_test_type = None
             if (
-                parse_test_results(result_by_type.get(ordered_type, "")).get("exit_code") != 0
+                not full_layer_passed[ordered_type]
                 and not environment_failure
             ):
                 await self._log(
@@ -663,7 +892,7 @@ class WorkflowPhaseRunner:
         failed_types: list[str] = []
         for test_type in ordered_types:
             latest_result = result_by_type.get(test_type, "")
-            group_passed = parse_test_results(latest_result).get("exit_code") == 0
+            group_passed = full_layer_passed[test_type]
             status_by_test_id = {
                 str(test.get("test_id", "")).strip(): group_passed
                 for test in groups[test_type.lower()]

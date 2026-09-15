@@ -13,9 +13,9 @@ Use this skill after `run_tests` reports a failing current batch.
 2. Classify the failure before editing: implementation logic, boundary wiring, selector/render state, persistence/test database, framework/config, generated test defect, or test content.
 3. Re-read the failing test file and the nearest owner implementation file before making another edit.
 4. Compare the failure against the current UI/API/FUNC/DB interface chain; if a downstream layer is missing or disconnected, repair the chain rather than patching only the surface assertion.
-5. If the same fingerprint repeats, replace the current hypothesis or move one layer outward instead of patching neighboring files from momentum.
+5. If the same fingerprint repeats, replace the current hypothesis or move one layer outward instead of patching neighboring files from momentum. If ARC_TEST_FILE_STATUS reports STALL DETECTED (same fingerprint 3 times in a row), rotation is mandatory: re-classify the failure, list the hypotheses already tried, and edit a different layer of the UI/API/FUNC/DB chain or a different fix approach within the same layer.
 6. If product behavior is wrong, edit product code. If a generated test is invalid, contradictory, brittle, or incompatible with the runner, edit the test while preserving requirement intent. If runner setup is wrong, edit build/test configuration.
-7. Make one minimal contract-preserving fix, then call `run_tests` again.
+7. Make one minimal contract-preserving fix, then call `run_tests` again. Work file-by-file when the layer has several red files: verify each red file green with `run_tests(test_files=[...])`, then close the layer with one passing full-layer run.
 8. Do not stop after failing runs while the active layer's tool budget remains. Do not declare blocked, failed, impossible, or out-of-scope as a final answer.
 9. Say `IMPLEMENTED` only when the system indicates the active layer passed and no scheduled layer remains blocked by the current session.
 10. Each current-node test layer has an independent `run_tests` budget of 10 calls. After a failure, spend enough effort to localize and repair the cause before consuming the next call.

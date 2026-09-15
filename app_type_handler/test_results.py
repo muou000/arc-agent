@@ -187,6 +187,10 @@ _ENVIRONMENT_FAILURE_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 _DETAIL_LIMIT = 120
 
+#: Cap for the fingerprint's key line; the fingerprint is echoed into tool
+#: results and node sessions, so it stays short on purpose.
+_FINGERPRINT_LINE_LIMIT = 160
+
 
 def classify_test_failure(test_output: str) -> str:
     """Return a short reason when a failed run is environmental, else ``""``.
@@ -213,6 +217,32 @@ def classify_test_failure(test_output: str) -> str:
             detail = " ".join(detail.split())[:_DETAIL_LIMIT].strip()
             return f"{reason}: {detail}" if detail else reason
     return ""
+
+
+def failure_fingerprint(test_output: str) -> str:
+    """Build a short, repeatable fingerprint of *why* a test run failed.
+
+    The TDD loop uses this to detect stalled repairs: when several consecutive
+    ``run_tests`` failures carry the same fingerprint, the agent is patching
+    neighbors of the failure instead of changing its hypothesis. The
+    fingerprint pairs the exit code with the first error-bearing line so
+    unrelated flapping (port numbers, timings, temp paths) does not hide a
+    real stall. Truncated to a bounded length because it is echoed into
+    tool results and node sessions.
+    """
+
+    output = test_output or ""
+    exit_code = _extract_overall_exit_code(output)
+    key_line = ""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if "error" in lowered or "failed" in lowered or "expect" in lowered or "assert" in lowered:
+            key_line = stripped
+            break
+    return f"{exit_code}|{key_line[:_FINGERPRINT_LINE_LIMIT]}"
 
 
 def _is_relative_specifier(specifier: str) -> bool:
