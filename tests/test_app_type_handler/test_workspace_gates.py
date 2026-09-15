@@ -27,6 +27,7 @@ from app_type_handler import create_app_type_handler, template_patches, web as w
 from app_type_handler.template_patches import (
     ALREADY_APPLIED,
     APPLIED,
+    SKIPPED,
     UNRECOGNIZED,
     apply_template_patches,
 )
@@ -786,6 +787,117 @@ def test_templates_without_registered_fixes_are_untouched(tmp_path) -> None:
     assert apply_template_patches(str(tmp_path), "cli-python") == []
 
 
+def test_repo_template_readme_documents_the_runtime_contract(monkeypatch) -> None:
+    """The contract line must survive in the repo README even though the fix
+    itself is delivered by patches: a maintainer reading the shipped template
+    has to see what behavior ARC guarantees and where the fix lives.
+    """
+
+    monkeypatch.delenv("ARC_AGENT_TEMPLATES_ROOT", raising=False)
+    readme = (
+        Path(web_handler.WebAppType.template_dir()) / "README.md"
+    ).read_text(encoding="utf-8")
+
+    assert "never returns a closed handle" in readme
+    assert "template_patches.py" in readme
+
+
+def test_patch_dependencies_must_be_registered_in_order() -> None:
+    """A dependent registered before its prerequisite is a broken registration.
+
+    The dependent's search shapes assume the prerequisite's output; validating
+    registration order turns a silent skip into an actionable error.
+    """
+
+    dependent = next(
+        patch
+        for patch in template_patches.TEMPLATE_PATCHES
+        if patch.name == "init-db-rethrow-genuine-init-failures"
+    )
+    reordered = (dependent, *template_patches.TEMPLATE_PATCHES[:1])
+
+    monkeypatched = pytest.MonkeyPatch()
+    monkeypatched.setattr(template_patches, "TEMPLATE_PATCHES", reordered)
+    try:
+        with pytest.raises(ValueError, match="registered before its dependent"):
+            template_patches.patches_for("web-react-express")
+    finally:
+        monkeypatched.undo()
+
+
+def test_a_dependent_patch_is_unrecognized_when_its_prerequisite_fails(tmp_path) -> None:
+    """The rethrow fix must not run on a bootstrap the base fix never reached.
+
+    Its search shape only exists after the first patch applied, so an
+    unrecognized prerequisite must make the dependent unrecognized as well -
+    that is what stops a half-fixed bootstrap from compiling.
+    """
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
+    bootstrap = workspace / "backend" / "src" / "database" / "init_db.js"
+    bootstrap.write_text("// rewritten upstream\n", encoding="utf-8")
+
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+
+    assert [outcome.status for outcome in outcomes] == [UNRECOGNIZED, UNRECOGNIZED]
+    assert "prerequisite" in outcomes[1].detail
+    assert bootstrap.read_text(encoding="utf-8") == "// rewritten upstream\n"
+
+
+def test_a_template_without_the_target_files_skips_instead_of_failing(tmp_path) -> None:
+    """A template that never shipped init_db.js has nothing to patch.
+
+    Skipped patches must not fail the scaffold - that template never carried
+    the file the fix repairs - but a dependent of a skipped patch skips too.
+    """
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+
+    assert [outcome.status for outcome in outcomes] == [SKIPPED, SKIPPED]
+    assert "no target files" in outcomes[0].detail
+    assert "prerequisite" in outcomes[1].detail
+
+
+def test_post_template_setup_fails_when_a_patch_cannot_be_classified(tmp_path) -> None:
+    """An unclassifiable target must fail the scaffold, not just log a warning.
+
+    The fixes are load-bearing for every node's TDD loop; continuing would
+    surface them as per-node test errors and a polluted run instead of one
+    actionable startup failure.
+    """
+
+    templates_root = tmp_path / "templates"
+    templates_root.mkdir()
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, templates_root / "web-react-express")
+    workspace = tmp_path / "workspace"
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
+    bootstrap = workspace / "backend" / "src" / "database" / "init_db.js"
+    bootstrap.write_text("// rewritten upstream\n", encoding="utf-8")
+    monkeypatched = pytest.MonkeyPatch()
+    monkeypatched.setenv("ARC_AGENT_TEMPLATES_ROOT", str(templates_root))
+    handler = _make_handler(workspace)
+    messages: list[tuple] = []
+
+    def recording_log(agent_name, message, status=None, node_id=None):
+        messages.append((agent_name, message, status))
+
+    handler.log_cb = recording_log
+
+    try:
+        assert asyncio.run(handler.post_template_setup()) is False
+    finally:
+        monkeypatched.undo()
+
+    assert any(status == "error" and "did not apply cleanly" in message for _, message, status in messages)
+    warnings = [message for _, message, status in messages if status == "warning"]
+    assert warnings, "each unapplied patch must be logged as a warning before the abort"
+    assert all("was not applied" in message for message in warnings)
+
+
 def test_shipped_template_fixes_recognize_a_crlf_copy_that_already_has_them(tmp_path) -> None:
     """A CRLF template must be recognized as fixed, not reported as unknown.
 
@@ -847,9 +959,10 @@ def test_shipped_template_fixes_leave_no_trace_when_staging_fails(
 ) -> None:
     """A failure while producing content must leave every target as it was.
 
-    The patch touches two files, so a naive write loop would leave the first one
-    patched and the second one not - the half-applied state the module promises
-    to avoid.
+    The staged-write path must fail without touching a single target, and the
+    dependent patch must not run against a prerequisite that did not resolve:
+    both effects together are what keep a failed scaffold unwritten rather than
+    half-fixed.
     """
 
     workspace = tmp_path / "workspace"
@@ -861,7 +974,7 @@ def test_shipped_template_fixes_leave_no_trace_when_staging_fails(
 
     def flaky_write(path: str, text: str) -> None:
         written.append(path)
-        if len(written) == 2:
+        if len(written) == 1:
             raise OSError("disk full")
         real_write(path, text)
 

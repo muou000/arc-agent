@@ -20,6 +20,7 @@ from .path_validation import is_scoped_test_path, normalize_safe_relative_path
 from .template_patches import (
     ALREADY_APPLIED,
     APPLIED,
+    SKIPPED,
     UNRECOGNIZED,
     apply_template_patches,
 )
@@ -1530,7 +1531,9 @@ class WebAppType(AppTypeHandler):
         """
 
         await self._copy_requirement_assets()
-        await self._apply_template_patches()
+        patches_ok = await self._apply_template_patches()
+        if not patches_ok:
+            return False
         unconfigured: list[str] = []
         for relative_path, markers in PORT_TEMPLATE_CONTRACT:
             file_path = os.path.join(self.workspace_path, *relative_path.split("/"))
@@ -1562,16 +1565,20 @@ class WebAppType(AppTypeHandler):
         )
         return True
 
-    async def _apply_template_patches(self) -> None:
-        """Deliver template fixes that the provisioned template may not carry.
+    async def _apply_template_patches(self) -> bool:
+        """Deliver template fixes the provisioned template may not carry.
 
         The platform provisions the template (see ``template_patches``), so a
         fix that must reach every generated workspace cannot be a repo template
         edit. It is applied to the copied workspace here, before any node runs.
 
-        An unrecognized target shape is reported instead of forced: overwriting
-        a template that evolved upstream would trade a visible skip for an
-        invisible regression.
+        Returns False when a patch targets a file this template ships but whose
+        shape matches nothing known: the fix is load-bearing for every node's
+        TDD loop, and continuing would only move the failure into the compile.
+        Overwriting the unrecognized file would trade that visible stop for an
+        invisible regression, so the scaffold fails instead. A patch whose
+        targets are entirely absent is reported and skipped - that template
+        never had the file the fix repairs.
         """
 
         outcomes = apply_template_patches(
@@ -1579,10 +1586,11 @@ class WebAppType(AppTypeHandler):
             TEMPLATE_ID_BY_APP_TYPE.get(self.name, ""),
         )
         if not outcomes:
-            return
+            return True
 
         applied = [outcome.patch_name for outcome in outcomes if outcome.status == APPLIED]
         already = [outcome.patch_name for outcome in outcomes if outcome.status == ALREADY_APPLIED]
+        skipped = [outcome.patch_name for outcome in outcomes if outcome.status == SKIPPED]
         if applied:
             await self._log(
                 "System",
@@ -1595,16 +1603,38 @@ class WebAppType(AppTypeHandler):
                 + ", ".join(already)
                 + ".",
             )
-        for outcome in outcomes:
-            if outcome.status != UNRECOGNIZED:
-                continue
+        if skipped:
+            await self._log(
+                "System",
+                "Template patch(es) skipped - their target files are absent from this "
+                "template: " + ", ".join(skipped) + ".",
+            )
+
+        unrecognized = [
+            outcome
+            for outcome in outcomes
+            if outcome.status == UNRECOGNIZED
+        ]
+        for outcome in unrecognized:
             await self._log(
                 "System",
                 f"Template patch {outcome.patch_name!r} was not applied: {outcome.detail}. "
-                "The workspace keeps the template as-is; confirm the fix is not needed there.",
+                "The workspace keeps the template as-is.",
                 "warning",
                 None,
             )
+        if unrecognized:
+            await self._log(
+                "System",
+                "Template patches did not apply cleanly; aborting before the node loop. "
+                "The affected fixes will not reach this workspace, and continuing would "
+                "surface the failure as per-node test errors instead of a single "
+                "actionable startup error.",
+                "error",
+                None,
+            )
+            return False
+        return True
 
     async def install_dependencies(self) -> bool:
         targets = (

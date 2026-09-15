@@ -14,11 +14,20 @@ Every edit is *directed* and *marker-guarded*:
 - directed: it replaces one known pre-fix code shape, never a whole file;
 - already fixed: the fix marker is present, so the edit is a no-op;
 - unknown shape: neither the pre-fix nor the fixed shape is recognizable, so
-  the file is reported and left untouched instead of being clobbered - a
-  template that evolved upstream must not be silently overwritten.
+  the file is reported and left untouched instead of being clobbered - the
+  caller fails the scaffold, because a template that evolved upstream must not
+  be silently overwritten nor silently compiled against;
+- absent targets: the template ships none of a patch's target files, so there
+  is nothing to patch and the patch is skipped.
+
+A patch may declare prerequisite patches (``requires``); a prerequisite that
+was not applied or already present makes the dependent patch unrecognized,
+because its search shapes assume the prerequisite's output. Registration order
+is validated so a dependent can never be registered before its prerequisite.
 
 A patch is applied atomically: if any of its edits cannot be classified, none
-of them is written, so a workspace can never end up half-patched.
+of them is written, and the writes that do happen are staged and swapped
+together, so a workspace can never end up half-patched.
 """
 
 from __future__ import annotations
@@ -45,6 +54,10 @@ class TemplatePatch:
     template_id: str
     summary: str
     edits: tuple[TemplateEdit, ...]
+    # Patch names that must be applied (or already present) before this one.
+    # A dependent's search shapes assume its prerequisites' output, so a
+    # missing prerequisite makes it unclassifiable rather than silently skipped.
+    requires: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -52,13 +65,14 @@ class PatchOutcome:
     """What happened to one patch on one workspace."""
 
     patch_name: str
-    status: str  # "applied" | "already-applied" | "unrecognized"
+    status: str  # "applied" | "already-applied" | "unrecognized" | "skipped"
     detail: str
 
 
 APPLIED = "applied"
 ALREADY_APPLIED = "already-applied"
 UNRECOGNIZED = "unrecognized"
+SKIPPED = "skipped"
 
 
 _INIT_DB_PATH = "backend/src/database/init_db.js"
@@ -322,14 +336,36 @@ TEMPLATE_PATCHES: tuple[TemplatePatch, ...] = (
                 applied_marker="Distinguishing invalidation from failure",
             ),
         ),
+        requires=("init-db-never-return-closed-handle",),
     ),
 )
 
 
 def patches_for(template_id: str) -> tuple[TemplatePatch, ...]:
-    """Patches registered for one template, in application order."""
+    """Patches registered for one template, in application order.
 
-    return tuple(patch for patch in TEMPLATE_PATCHES if patch.template_id == template_id)
+    Registration order is part of the contract: a dependent patch's search
+    shapes assume its prerequisites' output, so a dependency registered after
+    its dependent is a broken registration and raises instead of silently
+    skipping the dependent.
+    """
+
+    selected = tuple(patch for patch in TEMPLATE_PATCHES if patch.template_id == template_id)
+    positions = {patch.name: position for position, patch in enumerate(selected)}
+    for patch in selected:
+        for prerequisite in patch.requires:
+            prerequisite_position = positions.get(prerequisite)
+            if prerequisite_position is None:
+                raise ValueError(
+                    f"Template patch {patch.name!r} requires {prerequisite!r}, "
+                    "which is not registered for the same template"
+                )
+            if prerequisite_position > positions[patch.name]:
+                raise ValueError(
+                    f"Template patch {prerequisite!r} must be registered before its "
+                    f"dependent {patch.name!r}"
+                )
+    return selected
 
 
 def _read_text(path: str) -> str:
@@ -446,9 +482,10 @@ def _write_changes(updates: dict[str, str], originals: dict[str, str]) -> str | 
 def apply_template_patches(workspace_path: str, template_id: str) -> list[PatchOutcome]:
     """Apply the registered patches to a freshly copied workspace.
 
-    Returns one outcome per patch. A patch is either applied, already applied,
-    or left alone because its target no longer matches a known shape; the
-    caller decides how loudly to report the last case.
+    Returns one outcome per patch: applied, already applied, unrecognized (a
+    target exists but matches no known shape, or a prerequisite is missing), or
+    skipped (the template ships none of the patch's target files, so there is
+    nothing to patch). The caller decides how loudly to report each case.
 
     Classification happens before anything is written, only the files a patch
     actually changes are written, and those writes are staged and swapped
@@ -457,11 +494,49 @@ def apply_template_patches(workspace_path: str, template_id: str) -> list[PatchO
     """
 
     outcomes: list[PatchOutcome] = []
+    resolved: dict[str, str] = {}
     for patch in patches_for(template_id):
+        skipped_prerequisites = [name for name in patch.requires if resolved.get(name) == SKIPPED]
+        missing_prerequisites = [
+            prerequisite
+            for prerequisite in patch.requires
+            if resolved.get(prerequisite) not in {APPLIED, ALREADY_APPLIED}
+            and prerequisite not in skipped_prerequisites
+        ]
+        if skipped_prerequisites:
+            # The prerequisite's targets are absent from this template, so the
+            # dependent's are too (they edit the same files); there is nothing
+            # to patch here either.
+            outcomes.append(
+                PatchOutcome(
+                    patch.name,
+                    SKIPPED,
+                    "prerequisite patch(es) had no target files either: "
+                    + ", ".join(skipped_prerequisites),
+                )
+            )
+            resolved[patch.name] = SKIPPED
+            continue
+        if missing_prerequisites:
+            # A prerequisite that shipped but did not resolve (unrecognized,
+            # or a write failure) means this patch's search shapes cannot be
+            # trusted either; classify it as unrecognized so the scaffold
+            # stops rather than compiling half-fixed files.
+            outcomes.append(
+                PatchOutcome(
+                    patch.name,
+                    UNRECOGNIZED,
+                    "prerequisite patch(es) were neither applied nor present: "
+                    + ", ".join(missing_prerequisites),
+                )
+            )
+            continue
+
         originals: dict[str, str] = {}
         patched: dict[str, str] = {}
         unavailable: set[str] = set()
         failures: list[str] = []
+        seen_any_target = False
 
         for edit in patch.edits:
             path = os.path.join(workspace_path, *edit.relative_path.split("/"))
@@ -472,6 +547,7 @@ def apply_template_patches(workspace_path: str, template_id: str) -> list[PatchO
                     unavailable.add(path)
                     failures.append(f"{edit.relative_path} is missing")
                     continue
+                seen_any_target = True
                 try:
                     originals[path] = _read_text(path)
                 except OSError as exc:
@@ -485,6 +561,12 @@ def apply_template_patches(workspace_path: str, template_id: str) -> list[PatchO
             elif status == APPLIED:
                 patched[path] = _patched_text(current, edit)
 
+        if not seen_any_target:
+            outcomes.append(
+                PatchOutcome(patch.name, SKIPPED, "no target files present in this template")
+            )
+            resolved[patch.name] = SKIPPED
+            continue
         if failures:
             outcomes.append(PatchOutcome(patch.name, UNRECOGNIZED, "; ".join(failures)))
             continue
@@ -492,6 +574,7 @@ def apply_template_patches(workspace_path: str, template_id: str) -> list[PatchO
             outcomes.append(
                 PatchOutcome(patch.name, ALREADY_APPLIED, "; ".join(edit.relative_path for edit in patch.edits))
             )
+            resolved[patch.name] = ALREADY_APPLIED
             continue
 
         error = _write_changes(patched, originals)
@@ -501,5 +584,6 @@ def apply_template_patches(workspace_path: str, template_id: str) -> list[PatchO
         outcomes.append(
             PatchOutcome(patch.name, APPLIED, "; ".join(edit.relative_path for edit in patch.edits))
         )
+        resolved[patch.name] = APPLIED
 
     return outcomes
