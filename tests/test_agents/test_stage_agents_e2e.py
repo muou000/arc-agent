@@ -261,6 +261,8 @@ def test_interface_designer_recovers_interfaces_from_fenced_json_in_summary(
     # No repair call needed: the recovery lifted the records from the prose.
     assert model.call_count == 2
     assert [item["interface_id"] for item in bundle["interfaces"]] == ["IF-CALC"]
+    # The inner summary replaces the raw JSON blob parked in `summary`.
+    assert bundle["summary"] == "Nested response that must never be consumed as the real summary."
     assert bundle["files_written"] == ["src/contracts/calc.py"]
     assert bundle["materialized_paths"] == ["/workspace/src/contracts/calc.py"]
 
@@ -318,7 +320,69 @@ def test_interface_designer_recovers_interfaces_from_bare_json_summary(
 
     assert model.call_count == 2
     assert [item["interface_id"] for item in bundle["interfaces"]] == ["IF-CALC"]
+    assert bundle["summary"] == "inner"
     assert bundle["files_written"] == ["src/contracts/calc.py"]
+
+
+def test_interface_designer_repairs_claimed_files_without_writes(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A write-less pass claiming files_written must still re-serialize.
+
+    A leaf whose only contracts are reused parent/dependency interfaces can
+    legitimately record no files; if it then returns an empty interfaces
+    array while claiming files_written, the self-reported evidence is enough
+    to trigger the one-shot repair re-ask. The workflow hard gate stays
+    keyed on the discipline's ground truth, so no fabricated failure here.
+    """
+    node_id = "REQ-DESIGN-CLAIMED"
+    seed_requirement(arc_runtime, node_id)
+
+    reused_record = {
+        "interface_id": "ROOT-UI-APPHEADER",
+        "req_id": "ROOT",
+        "type": "UI",
+        "name": "AppHeader",
+        "file_path": "frontend/src/components/AppHeader.tsx",
+        "first_line": "1",
+        "responsibility": "Reused parent-owned header surface.",
+        "callers": [],
+        "callees": [],
+    }
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "InterfaceDesignResponse",
+                {
+                    "summary": "Only reuses the parent header surface.",
+                    "interfaces": [],
+                    "files_written": ["frontend/src/components/AppHeader.tsx"],
+                },
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "InterfaceDesignResponse",
+                {
+                    "summary": "Reused parent header surface recorded.",
+                    "interfaces": [reused_record],
+                    "files_written": [],
+                },
+                call_id="c2",
+            ),
+        ]
+    )
+
+    bundle = asyncio.run(
+        make_designer(tmp_project_dir, model).run(
+            node_id=node_id,
+            requirement_data={"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    # No writes happened, yet the repair pass fired on the claimed evidence.
+    assert model.call_count == 2
+    assert [item["interface_id"] for item in bundle["interfaces"]] == ["ROOT-UI-APPHEADER"]
+    assert bundle["materialized_paths"] == []
 
 
 def test_test_generator_writes_test_asset_and_returns_manifest(

@@ -126,21 +126,28 @@ class InterfaceDesigner:
         )
         bundle = await self._normalize_with_recovery(payload, node_id=node_id, agent=agent)
         materialized_paths = bundle.get("materialized_paths") or []
-        if not bundle["interfaces"] and materialized_paths:
+        # Serialization-failure evidence: real writes observed by the
+        # discipline, or the model's own files_written claim. A write-less
+        # pass that only records reused parent/dependency interfaces must
+        # still serialize them, so the self-reported evidence is enough to
+        # re-ask; the workflow-level hard gate stays keyed on the
+        # discipline's ground truth only.
+        evidence_paths = materialized_paths or list(bundle["files_written"])
+        if not bundle["interfaces"] and evidence_paths:
             # The structured response recorded no interface contracts while
-            # the discipline observed real file writes. Without interface
-            # records the traceability store stays empty and downstream
-            # stages go blind, so re-ask once on the same thread before
-            # letting the workflow hard-fail the node.
+            # the pass has recorded files. Without interface records the
+            # traceability store stays empty and downstream stages go blind,
+            # so re-ask once on the same thread before letting the workflow
+            # hard-fail the node.
             await self._log(
-                f"Response recorded no interface contracts for {len(materialized_paths)} materialized file(s); "
+                f"Response recorded no interface contracts for {len(evidence_paths)} file(s); "
                 "requesting one-shot contract re-serialization.",
                 status="warning",
                 node_id=node_id,
             )
             repair_payload = await ainvoke_stage_agent(
                 agent,
-                message=self._repair_message(materialized_paths),
+                message=self._repair_message(evidence_paths),
                 context=agent_context,
                 thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:InterfaceDesigner",
                 label=self.agent_name,
@@ -183,7 +190,10 @@ class InterfaceDesigner:
         2. Raw-message scan (gated on the ``_raw_final_message`` marker the
            adapter preserves): a quote-aware salvage of contract-shaped
            objects from the final text, covering plain-text answers and
-           damaged or truncated JSON the strict parse rejects.
+           damaged or truncated JSON the strict parse rejects. The marker is
+           only set when the structured contract was never delivered, so a
+           deliberate empty structured response is never second-guessed —
+           even when the pass materialized no files.
 
         Both shapes were observed live with deepseek-v4-flash (2026-09-15).
         """
@@ -201,6 +211,10 @@ class InterfaceDesigner:
                     node_id=node_id,
                 )
                 bundle["interfaces"] = recovered["interfaces"]
+                if recovered.get("summary"):
+                    # The recovered JSON carries the model's real summary;
+                    # prefer it over the raw JSON blob parked in `summary`.
+                    bundle["summary"] = recovered["summary"]
                 if not bundle["files_written"] and recovered.get("files_written"):
                     bundle["files_written"] = recovered["files_written"]
                 return bundle
@@ -255,6 +269,9 @@ class InterfaceDesigner:
             return {"interfaces": [item for item in parsed if isinstance(item, dict)]}
         if isinstance(parsed, dict):
             recovered: dict[str, Any] = {}
+            summary = parsed.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                recovered["summary"] = summary.strip()
             interfaces = parsed.get("interfaces")
             if isinstance(interfaces, list):
                 recovered["interfaces"] = [item for item in interfaces if isinstance(item, dict)]
@@ -277,11 +294,11 @@ class InterfaceDesigner:
             return []
 
     @staticmethod
-    def _repair_message(materialized_paths: list[str]) -> str:
-        listed = "\n".join(f"- {path}" for path in materialized_paths)
+    def _repair_message(recorded_paths: list[str]) -> str:
+        listed = "\n".join(f"- {path}" for path in recorded_paths)
         return "\n".join(
             [
-                "Your design pass materialized the file(s) below, but the final response recorded an empty `interfaces` array.",
+                "Your design pass recorded the file(s) below, but the final response recorded an empty `interfaces` array.",
                 "None of these contracts reached the traceability store, so downstream stages cannot see the design; prose in `summary` is not a substitute for structured records.",
                 "Return now a single `InterfaceDesignResponse` whose `interfaces` array contains one complete record for every contract embodied by these files (plus any reused interface this node depends on), using the schema fields from your original instructions.",
                 "Return the structured fields themselves. Do NOT wrap the JSON in markdown code fences and do NOT nest the response JSON inside the `summary` string.",
