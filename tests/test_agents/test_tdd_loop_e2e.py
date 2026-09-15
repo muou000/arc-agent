@@ -4,8 +4,9 @@ Drives ``WorkflowPhaseRunner._run_tdd_for_node`` (``core/phases.py``) and the
 ``TestDrivenDeveloper`` adapter (``agents/test_driven_developer.py``) with a
 scripted ``FauxChatModel`` plus a ``FakeAppHandler`` that returns canned
 ``run_test_group`` outputs. The deep-agents loop, the ``run_tests`` tool
-executor, the per-layer budgets, the traceability bookkeeping and the node
-session updates all run for real — no tokens, no npm.
+executor, the per-layer budgets, the baseline RED verification, the per-file
+micro-loop tracking, the stall governance, the traceability bookkeeping and
+the node session updates all run for real — no tokens, no npm.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from typing import Any
 
 from agents.test_driven_developer import TestDrivenDeveloper
 from core import sessions
-from core.phases import TDD_RUN_TESTS_BUDGET, WorkflowPhaseRunner
+from core.phases import TDD_RUN_TESTS_BUDGET, TDD_STALL_THRESHOLD, WorkflowPhaseRunner
 from tests.helpers.faux import (
     FakeAppHandler,
     FauxChatModel,
@@ -93,6 +94,12 @@ def track_tdd_sessions(tdd: TestDrivenDeveloper) -> list[str]:
     return session_types
 
 
+def tool_results_text(model: FauxChatModel) -> str:
+    return "\n".join(
+        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Happy path: write -> run_tests (fail) -> fix -> run_tests (pass) -> IMPLEMENTED
 # ---------------------------------------------------------------------------
@@ -121,7 +128,8 @@ def test_tdd_loop_fail_then_fix_then_pass(tmp_project_dir: Path, arc_runtime) ->
             faux_text("IMPLEMENTED"),
         ]
     )
-    fake = FakeAppHandler([failing_test_output(), passing_test_output()])
+    # Baseline RED (failing), agent failing run, agent passing run.
+    fake = FakeAppHandler([failing_test_output(), failing_test_output(), passing_test_output()])
     tdd = make_tdd(tmp_project_dir, model, fake)
     runner = make_runner(tmp_project_dir, tdd, fake)
 
@@ -135,12 +143,24 @@ def test_tdd_loop_fail_then_fix_then_pass(tmp_project_dir: Path, arc_runtime) ->
     assert final_ok is True
     assert model.call_count == 5
     assert model.get_pending_response_count() == 0
-    # The failing run + the passing run both reach the fake app handler.
-    assert fake.calls == [("Unit", [UNIT_TEST_FILE]), ("Unit", [UNIT_TEST_FILE])]
+    # Baseline RED (single file), then the two agent runs.
+    assert fake.calls == [
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [UNIT_TEST_FILE]),
+    ]
 
     # The agent's fix really landed in the workspace.
     assert "return a + b" in (tmp_project_dir / "src" / "calc.py").read_text(encoding="utf-8")
     assert "Exit Code: 0" in (tdd.get_last_run_tests_result() or "")
+
+    # Baseline RED evidence reaches the first agent session.
+    first_call_messages = "\n".join(str(m.content) for m in model.calls[0])
+    assert "Baseline RED Evidence" in first_call_messages
+    assert UNIT_TEST_FILE in first_call_messages
+
+    # Per-file status is reported on every run_tests result.
+    assert "ARC_TEST_FILE_STATUS" in tool_results_text(model)
 
     # Traceability + node session bookkeeping.
     assert arc_runtime.traceability.get_test("T1")["passed"] is True
@@ -177,7 +197,11 @@ def test_tdd_layer_order_and_cross_layer_rejection(tmp_project_dir: Path, arc_ru
             faux_text("IMPLEMENTED"),
         ]
     )
-    fake = FakeAppHandler([passing_test_output(), passing_test_output()])
+    # Unit baseline (failing), Unit agent run (passing), Integration baseline
+    # (failing), Integration agent run (passing).
+    fake = FakeAppHandler(
+        [failing_test_output(), passing_test_output(), failing_test_output(), passing_test_output()]
+    )
     runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
 
     final_ok = asyncio.run(
@@ -193,12 +217,12 @@ def test_tdd_layer_order_and_cross_layer_rejection(tmp_project_dir: Path, arc_ru
     assert final_ok is True
     assert fake.calls == [
         ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Integration", [INTEGRATION_TEST_FILE]),
         ("Integration", [INTEGRATION_TEST_FILE]),
     ]
     # The out-of-layer run_tests call was rejected with an explicit gate message.
-    all_tool_results = "\n".join(
-        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
-    )
+    all_tool_results = tool_results_text(model)
     assert "The active TDD layer is `Integration`" in all_tool_results
     assert arc_runtime.traceability.get_test("T-U")["passed"] is True
     assert arc_runtime.traceability.get_test("T-I")["passed"] is True
@@ -216,7 +240,10 @@ def test_tdd_budget_exhaustion_fails_node(tmp_project_dir: Path, arc_runtime) ->
     script = [faux_tool_call("run_tests", {}, call_id=f"c{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
     script.append(faux_text("STILL FAILING"))
     model = FauxChatModel(responses=script)
-    fake = FakeAppHandler([failing_test_output(detail=f"failure {i}") for i in range(TDD_RUN_TESTS_BUDGET)])
+    # Baseline + 10 budgeted runs all fail with distinct fingerprints
+    # (assertion details vary) so stall governance does not close the loop early.
+    outputs = [failing_test_output(detail=f"failure {i}") for i in range(TDD_RUN_TESTS_BUDGET + 1)]
+    fake = FakeAppHandler(outputs)
     runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
 
     final_ok = asyncio.run(
@@ -227,7 +254,7 @@ def test_tdd_budget_exhaustion_fails_node(tmp_project_dir: Path, arc_runtime) ->
     )
 
     assert final_ok is False
-    assert len(fake.calls) == TDD_RUN_TESTS_BUDGET
+    assert len(fake.calls) == TDD_RUN_TESTS_BUDGET + 1
     assert model.call_count == TDD_RUN_TESTS_BUDGET + 1
     assert arc_runtime.traceability.get_test("T1")["passed"] is False
     node_session = sessions.load_node_session(node_id)
@@ -244,7 +271,7 @@ def test_tdd_session_without_run_tests_fails_node(tmp_project_dir: Path, arc_run
     node_id = "REQ-TDD-4"
     seed_node(arc_runtime, node_id, [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}])
     model = FauxChatModel(responses=[faux_text("GIVING UP")])
-    fake = FakeAppHandler()
+    fake = FakeAppHandler([failing_test_output()])
     runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
 
     final_ok = asyncio.run(
@@ -255,7 +282,8 @@ def test_tdd_session_without_run_tests_fails_node(tmp_project_dir: Path, arc_run
     )
 
     assert final_ok is False
-    assert fake.calls == []
+    # Only the baseline RED run happened; the agent session ran no tests.
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])]
     node_session = sessions.load_node_session(node_id)
     assert "GIVING UP" in node_session["recent_failure_summary"]
 
@@ -292,7 +320,8 @@ def test_run_implement_phase_marks_node_completed(tmp_project_dir: Path, arc_run
             faux_text("IMPLEMENTED"),
         ]
     )
-    fake = FakeAppHandler([passing_test_output()])
+    # Baseline RED (failing) then the agent's passing run.
+    fake = FakeAppHandler([failing_test_output(), passing_test_output()])
     tdd = make_tdd(tmp_project_dir, model, fake)
     runner = make_runner(tmp_project_dir, tdd, fake)
 
@@ -367,15 +396,17 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
     script = [faux_tool_call("run_tests", {}, call_id=f"c{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
     script.append(faux_text("BLOCKED"))
     model = FauxChatModel(responses=script)
+    # Baseline env failure, agent env failure, unrepaired re-validation.
     fake = FakeAppHandler([failing_test_output(detail=MISSING_DEP_OUTPUT) for _ in range(3)])
     runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
 
     final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
 
     assert final_ok is False
-    # One failing attempt, one unrepaired re-validation, then the layer closes -
-    # Integration is never reached and no further doomed command runs.
-    assert fake.calls == [("Unit", [UNIT_TEST_FILE]), ("Unit", [UNIT_TEST_FILE])]
+    # Baseline + one failing attempt + one unrepaired re-validation, then the
+    # layer closes - Integration is never reached and no further doomed
+    # command runs.
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * 3
     # NOTE: the agent *session* still runs to the end of its script. Ending the
     # LangGraph loop early needs a runtime hook that does not exist yet, so the
     # model keeps polling `run_tests` and getting "budget exhausted". Those
@@ -384,10 +415,13 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
     assert model.call_count <= TDD_RUN_TESTS_BUDGET + 1
     # A broken workspace must not advance the layer either: every later layer
     # would fail the same way, and the environment-failure gate stops the loop.
-    all_tool_results = "\n".join(
-        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
-    )
+    all_tool_results = tool_results_text(model)
     assert "has advanced the active layer" not in all_tool_results
+    # The baseline RED evidence tells the first session about the environment
+    # failure and its repair contract.
+    first_call_messages = "\n".join(str(m.content) for m in model.calls[0])
+    assert "environmental reason" in first_call_messages
+    assert "repair" in first_call_messages
     # The first failing run offers the repair-and-revalidate contract; the
     # second (still environmental) run closes the layer for good. The two
     # status headers must be unambiguous about which state the layer is in.
@@ -427,17 +461,16 @@ def test_environment_failure_repair_revalidates_and_passes(tmp_project_dir: Path
             faux_text("IMPLEMENTED"),
         ]
     )
-    fake = FakeAppHandler([failing_test_output(detail=MISSING_DEP_OUTPUT), passing_test_output()])
+    # Baseline env failure, agent env failure, repaired re-validation pass.
+    fake = FakeAppHandler([failing_test_output(detail=MISSING_DEP_OUTPUT), failing_test_output(detail=MISSING_DEP_OUTPUT), passing_test_output()])
     runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
 
     final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
 
     assert final_ok is True
-    assert fake.calls == [("Unit", [UNIT_TEST_FILE]), ("Unit", [UNIT_TEST_FILE])]
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * 3
     assert model.call_count == 4
-    all_tool_results = "\n".join(
-        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
-    )
+    all_tool_results = tool_results_text(model)
     assert "This is your one repair-and-revalidate attempt" in all_tool_results
     # The repair really landed in the workspace and the node recovered.
     assert (tmp_project_dir / "src" / "testing-library-dom.js").exists()
@@ -450,7 +483,9 @@ def test_assertion_failure_still_consumes_the_full_budget(tmp_project_dir: Path,
     """Control: the short-circuit must not fire on ordinary test failures.
 
     An assertion failure is something the agent can fix by editing the
-    implementation, so it keeps its full retry budget.
+    implementation, so it keeps its full retry budget. Distinct failure
+    details keep the fingerprints distinct so stall governance stays out of
+    the way; its dedicated tests cover the repeated-fingerprint contract.
     """
 
     node_id = "REQ-TDD-ASSERT"
@@ -460,15 +495,17 @@ def test_assertion_failure_still_consumes_the_full_budget(tmp_project_dir: Path,
     script = [faux_tool_call("run_tests", {}, call_id=f"c{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
     script.append(faux_text("STILL FAILING"))
     model = FauxChatModel(responses=script)
-    fake = FakeAppHandler(
-        [failing_test_output(detail="AssertionError: expected 'Login' to equal 'Log in'") for _ in range(TDD_RUN_TESTS_BUDGET)]
-    )
+    outputs = [
+        failing_test_output(detail=f"AssertionError: expected '{i}' to equal '{i + 1}'")
+        for i in range(TDD_RUN_TESTS_BUDGET + 1)
+    ]
+    fake = FakeAppHandler(outputs)
     runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
 
     final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
 
     assert final_ok is False
-    assert len(fake.calls) == TDD_RUN_TESTS_BUDGET
+    assert len(fake.calls) == TDD_RUN_TESTS_BUDGET + 1
     node_session = sessions.load_node_session(node_id)
     assert "environment failure" not in node_session["recent_failure_summary"]
 
@@ -505,7 +542,11 @@ def test_tdd_pass_advances_active_layer_immediately(tmp_project_dir: Path, arc_r
             faux_text("IMPLEMENTED"),
         ]
     )
-    fake = FakeAppHandler([passing_test_output(), passing_test_output()])
+    # Unit baseline (failing), Unit agent run (passing), in-session
+    # Integration run (passing; closes the layer so no outer baseline).
+    fake = FakeAppHandler(
+        [failing_test_output(), passing_test_output(), passing_test_output()]
+    )
     tdd = make_tdd(tmp_project_dir, model, fake)
     session_types = track_tdd_sessions(tdd)
     runner = make_runner(tmp_project_dir, tdd, fake)
@@ -513,8 +554,10 @@ def test_tdd_pass_advances_active_layer_immediately(tmp_project_dir: Path, arc_r
     final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
 
     assert final_ok is True
-    # Exactly one run per layer: the re-run request never reached the handler.
+    # Unit baseline + Unit agent run; the in-session Integration run passed
+    # the full layer, so the outer scheduler must not baseline or re-run it.
     assert fake.calls == [
+        ("Unit", [UNIT_TEST_FILE]),
         ("Unit", [UNIT_TEST_FILE]),
         ("Integration", [INTEGRATION_TEST_FILE]),
     ]
@@ -522,9 +565,7 @@ def test_tdd_pass_advances_active_layer_immediately(tmp_project_dir: Path, arc_r
     # not open a follow-up Integration session for it.
     assert session_types == ["Unit"]
     assert model.call_count == 4
-    all_tool_results = "\n".join(
-        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
-    )
+    all_tool_results = tool_results_text(model)
     assert "has advanced the active layer to `Integration`" in all_tool_results
     assert "The active TDD layer is `Integration`" in all_tool_results
     assert arc_runtime.traceability.get_test("T-U")["passed"] is True
@@ -563,7 +604,10 @@ def test_tdd_budget_exhaustion_advances_to_next_layer(tmp_project_dir: Path, arc
         faux_text("IMPLEMENTED"),
     ]
     model = FauxChatModel(responses=script)
-    outputs = [failing_test_output(detail=f"unit failure {i}") for i in range(TDD_RUN_TESTS_BUDGET)]
+    # Unit baseline + 10 unit agent runs (all failing) + in-session
+    # Integration run (failing) + follow-up session Integration run (passing).
+    outputs = [failing_test_output(detail=f"unit baseline {i}") for i in range(1)]
+    outputs += [failing_test_output(detail=f"unit failure {i}") for i in range(TDD_RUN_TESTS_BUDGET)]
     outputs += [
         failing_test_output(detail="AssertionError: integration mismatch"),
         passing_test_output(),
@@ -577,7 +621,7 @@ def test_tdd_budget_exhaustion_advances_to_next_layer(tmp_project_dir: Path, arc
 
     # Unit is failed and stays failed; Integration passed on its own budget.
     assert final_ok is False
-    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * TDD_RUN_TESTS_BUDGET + [
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * (TDD_RUN_TESTS_BUDGET + 1) + [
         ("Integration", [INTEGRATION_TEST_FILE]),
         ("Integration", [INTEGRATION_TEST_FILE]),
     ]
@@ -585,12 +629,381 @@ def test_tdd_budget_exhaustion_advances_to_next_layer(tmp_project_dir: Path, arc
     # must not reopen the closed Unit layer, and Integration keeps its own
     # session with its remaining budget (per-layer budget semantics intact).
     assert session_types == ["Unit", "Integration"]
-    all_tool_results = "\n".join(
-        str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
-    )
+    all_tool_results = tool_results_text(model)
     assert "The Unit layer is closed" in all_tool_results
     assert "has advanced the active layer to `Integration`" in all_tool_results
     assert arc_runtime.traceability.get_test("T-U")["passed"] is False
     assert arc_runtime.traceability.get_test("T-I")["passed"] is True
     node_session = sessions.load_node_session(node_id)
     assert "Unit:" in node_session["recent_failure_summary"]
+
+
+# ---------------------------------------------------------------------------
+# Baseline RED verification: tautology fast path skips the agent session
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_all_green_closes_layer_without_agent_session(tmp_project_dir: Path, arc_runtime) -> None:
+    """A layer whose every file already passes must not open an agent session.
+
+    The baseline RED check runs each file once; when everything is green the
+    system runs one full-layer regression itself and closes the layer (the
+    tautology fast path). An agent session here would only re-run passing
+    tests and risk "fixing" them.
+    """
+
+    node_id = "REQ-TDD-FAST"
+    tests = [
+        {"test_id": "T-U", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T-I", "type": "Integration", "file_path": INTEGRATION_TEST_FILE},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    model = FauxChatModel(responses=[])  # no session may be opened
+    # Two per-file baselines + one full-layer regression, per layer.
+    fake = FakeAppHandler([passing_test_output()] * 6)
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    session_types = track_tdd_sessions(tdd)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert session_types == []
+    assert fake.calls == [
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [UNIT_TEST_FILE]),  # full-layer regression
+        ("Integration", [INTEGRATION_TEST_FILE]),
+        ("Integration", [INTEGRATION_TEST_FILE]),  # full-layer regression
+    ]
+    assert arc_runtime.traceability.get_test("T-U")["passed"] is True
+    assert arc_runtime.traceability.get_test("T-I")["passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Micro-loop: a passing subset run marks files green but does not close the layer
+# ---------------------------------------------------------------------------
+
+
+def test_subset_pass_does_not_close_layer_until_full_run(tmp_project_dir: Path, arc_runtime) -> None:
+    """The layer closes only on a passing run that covers every file.
+
+    The micro-loop contract: the agent may repair file-by-file with
+    ``run_tests(test_files=[...])``; each passing subset run turns those files
+    green, but the layer stays open until one passing full-layer run.
+    """
+
+    node_id = "REQ-TDD-MICRO"
+    other_unit_file = "tests/unit/test_extra.py"
+    tests = [
+        {"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T2", "type": "Unit", "file_path": other_unit_file},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    model = FauxChatModel(
+        responses=[
+            # Initial implementation pass.
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/src/calc.py", "content": "def add(a, b):\n    return a + b\n"},
+                call_id="w1",
+            ),
+            # Repair file 1 alone; it passes (subset).
+            faux_tool_call("run_tests", {"test_files": [UNIT_TEST_FILE]}, call_id="r1"),
+            # Repair file 2 alone; it passes (subset).
+            faux_tool_call("run_tests", {"test_files": [other_unit_file]}, call_id="r2"),
+            # Full-layer run closes the layer.
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="r3"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    # Baselines: file1 red, file2 red; subset runs: file1 green, file2 green;
+    # full run: green.
+    fake = FakeAppHandler(
+        [
+            failing_test_output(detail="AssertionError: file1 missing"),
+            failing_test_output(detail="AssertionError: file2 missing"),
+            passing_test_output(),
+            passing_test_output(),
+            passing_test_output(),
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert fake.calls == [
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [other_unit_file]),
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [other_unit_file]),
+        ("Unit", [UNIT_TEST_FILE, other_unit_file]),
+    ]
+    all_tool_results = tool_results_text(model)
+    # The subset pass reports the still-red file and the open layer.
+    assert "still red" in all_tool_results
+    assert "ARC_TEST_FILE_STATUS" in all_tool_results
+    # The full-layer run reports the layer as passed.
+    assert "passed (full layer)" in all_tool_results
+    assert arc_runtime.traceability.get_test("T1")["passed"] is True
+    assert arc_runtime.traceability.get_test("T2")["passed"] is True
+
+
+def test_subset_pass_reports_not_yet_run_files_separately(tmp_project_dir: Path, arc_runtime) -> None:
+    """Never-run files must not be reported as "still red" (PR review).
+
+    A passing subset run on file 1 leaves file 2 unverified (None state).
+    Reporting file 2 as red would send the agent repairing a file with no
+    failure evidence; it is pending work, not a repair target.
+    """
+
+    node_id = "REQ-TDD-MICRO-PENDING"
+    other_unit_file = "tests/unit/test_extra.py"
+    tests = [
+        {"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T2", "type": "Unit", "file_path": other_unit_file},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    # Session: baseline both red -> repair file 1 (subset pass) -> full run.
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {"test_files": [UNIT_TEST_FILE]}, call_id="r1"),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="r2"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    fake = FakeAppHandler(
+        [
+            # Baselines: file1 red, file2 red.
+            failing_test_output(detail="AssertionError: file1 missing"),
+            failing_test_output(detail="AssertionError: file2 missing"),
+            # Subset run on file1: pass (file2 stays red from its baseline).
+            passing_test_output(),
+            # Full-layer run: pass.
+            passing_test_output(),
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    all_tool_results = tool_results_text(model)
+    # File 2 was baseline-verified red, so the subset pass reports it as a
+    # repair target - but nothing may be labeled "not been run yet" here.
+    assert "still red" in all_tool_results
+    assert "not been run yet" not in all_tool_results
+
+
+def test_subset_pass_after_insession_advance_reports_pending_files(tmp_project_dir: Path, arc_runtime) -> None:
+    """Files of an in-session advanced layer start as None, not red.
+
+    When Unit passes and the layer advances mid-session, the Integration
+    files have never been baseline-verified. A passing subset run on one of
+    them must report the others as "not been run yet" - never as "still red",
+    which would imply verified failures (PR review finding).
+    """
+
+    node_id = "REQ-TDD-MICRO-ADVANCE"
+    integration_extra_file = "tests/integration/test_extra_flow.py"
+    tests = [
+        {"test_id": "T-U", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T-I1", "type": "Integration", "file_path": INTEGRATION_TEST_FILE},
+        {"test_id": "T-I2", "type": "Integration", "file_path": integration_extra_file},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    model = FauxChatModel(
+        responses=[
+            # Unit passes in-session -> advance to Integration (files: None).
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="u1"),
+            # Subset run on the first Integration file: passes; the second
+            # stays None (never verified in this flow).
+            faux_tool_call("run_tests", {"test_type": "Integration", "test_files": [INTEGRATION_TEST_FILE]}, call_id="i1"),
+            # Full-layer Integration run closes the layer.
+            faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="i2"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    # Unit baseline (red), Unit agent run (pass), Integration subset (pass),
+    # Integration full run (pass).
+    fake = FakeAppHandler(
+        [
+            failing_test_output(),
+            passing_test_output(),
+            passing_test_output(),
+            passing_test_output(),
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    all_tool_results = tool_results_text(model)
+    # The subset pass on file 1 of the advanced layer reports file 2 as
+    # pending work, not as a verified failure.
+    assert "not been run yet: tests/integration/test_extra_flow.py" in all_tool_results
+    # And it must NOT be reported as "still red" anywhere in that result.
+    assert "still red: tests/integration/test_extra_flow.py" not in all_tool_results
+    assert arc_runtime.traceability.get_test("T-I1")["passed"] is True
+    assert arc_runtime.traceability.get_test("T-I2")["passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Stall governance: repeated identical fingerprints force hypothesis rotation
+# ---------------------------------------------------------------------------
+
+
+def test_stall_detection_forces_hypothesis_rotation(tmp_project_dir: Path, arc_runtime) -> None:
+    """Three identical consecutive fingerprints must trigger STALL DETECTED.
+
+    The run_tests result tells the agent to stop patching neighbors and
+    rotate its hypothesis; a follow-up session carries the same governance
+    context so the rotation survives session boundaries.
+    """
+
+    node_id = "REQ-TDD-STALL"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+
+    # Session 1: three failed runs with the SAME fingerprint (budget 3/10),
+    # so the session ends without the layer passing. Session 2 (opened with
+    # the stall handoff) rotates and passes.
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {}, call_id="s1"),
+            faux_tool_call("run_tests", {}, call_id="s2"),
+            faux_tool_call("run_tests", {}, call_id="s3"),
+            faux_text("session one ends, still failing"),
+            faux_tool_call("run_tests", {}, call_id="s4"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    # Baseline + three same-fingerprint failures + one pass.
+    same_failure = failing_test_output(detail="AssertionError: expected 'Login' to equal 'Log in'")
+    fake = FakeAppHandler([same_failure, same_failure, same_failure, same_failure, passing_test_output()])
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    session_types = track_tdd_sessions(tdd)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    # Two sessions: the first ends failing, the second carries the stall handoff.
+    assert session_types == ["Unit", "Unit"]
+    all_tool_results = tool_results_text(model)
+    assert "STALL DETECTED" in all_tool_results
+    assert "rotate your hypothesis" in all_tool_results
+    # The follow-up session's task message carries the stall governance handoff.
+    second_session_messages = "\n".join(str(m.content) for m in model.calls[4])
+    assert "Stall Governance Handoff" in second_session_messages
+    assert arc_runtime.traceability.get_test("T1")["passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Baseline RED: the first session starts from system-verified failures
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_red_evidence_reaches_first_session(tmp_project_dir: Path, arc_runtime) -> None:
+    """The first agent session's task must include the baseline RED evidence.
+
+    The RED phase is verified by the system, not assumed: each file was run
+    once before the session and its failure output is quoted back to the
+    agent as the repair queue.
+    """
+
+    node_id = "REQ-TDD-RED"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {}, call_id="r1"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    detail = "AssertionError: add(1, 1) returned 0"
+    fake = FakeAppHandler([failing_test_output(detail=detail), passing_test_output()])
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    first_call_messages = "\n".join(str(m.content) for m in model.calls[0])
+    assert "Baseline RED Evidence" in first_call_messages
+    assert "verifiably fail RIGHT NOW" in first_call_messages
+    assert detail in first_call_messages
+
+
+# ---------------------------------------------------------------------------
+# All-green layer without a closing full run: system regression closes it
+# ---------------------------------------------------------------------------
+
+
+def test_all_green_without_full_run_closes_layer_via_system_regression(tmp_project_dir: Path, arc_runtime) -> None:
+    """A layer whose files all turned green individually must not open a new
+    agent session just to run the closing full-layer pass.
+
+    The agent may verify each file with subset runs and end its turn; the
+    scheduler then runs the full-layer regression itself and closes the layer.
+    (PR review: without this, the follow-up session was pure overhead - and a
+    session that ended before re-running tests could fail the layer even
+    though every file was green.)
+    """
+
+    node_id = "REQ-TDD-SEAL"
+    other_unit_file = "tests/unit/test_extra.py"
+    tests = [
+        {"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T2", "type": "Unit", "file_path": other_unit_file},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    # Session 1: the agent repairs each file with subset runs (both pass) and
+    # ends its turn WITHOUT a closing full-layer run.
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {"test_files": [UNIT_TEST_FILE]}, call_id="r1"),
+            faux_tool_call("run_tests", {"test_files": [other_unit_file]}, call_id="r2"),
+            faux_text("both files repaired, ending turn"),
+        ]
+    )
+    # Baselines (red, red), subset runs (pass, pass), system regression (pass).
+    fake = FakeAppHandler(
+        [
+            failing_test_output(detail="AssertionError: file1 missing"),
+            failing_test_output(detail="AssertionError: file2 missing"),
+            passing_test_output(),
+            passing_test_output(),
+            passing_test_output(),
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    session_types = track_tdd_sessions(tdd)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    # Exactly one agent session; the closing full-layer run is system-side.
+    assert session_types == ["Unit"]
+    assert fake.calls == [
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [other_unit_file]),
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [other_unit_file]),
+        ("Unit", [UNIT_TEST_FILE, other_unit_file]),
+    ]
+    assert arc_runtime.traceability.get_test("T1")["passed"] is True
+    assert arc_runtime.traceability.get_test("T2")["passed"] is True
+    node_session = sessions.load_node_session(node_id)
+    assert node_session["recent_failure_summary"] == ""

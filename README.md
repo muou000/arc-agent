@@ -23,7 +23,7 @@ flowchart LR
 核心设计要点（继承自 ARC 基座）：
 
 - **需求树驱动**：非叶节点只做 UI 壳层设计，叶节点拥有完整的 UI → API → FUNC → DB 接口链。
-- **测试先行**：先生成测试清单，再由 TDD 智能体实现代码，测试预算耗尽即停，避免无效 Token 消耗。
+- **测试先行 + 基线 RED 验证**：先生成测试清单，再由 TDD 智能体实现代码。每层首个 agent session 之前，系统逐文件预跑一次基线验证（不消耗 agent 预算）：全绿层由系统直接整层回归关闭（tautology 快速通道），环境失败提前注入修复契约，红灯文件作为系统验证过的 RED 证据交给首个 session。TDD 循环以测试文件为微循环原子（逐文件 red→green，整层回归收口），同一失败指纹连续重复 3 次即触发假设轮换治理，测试预算耗尽即停。
 - **技能系统**（`skills/`）：DESIGN 阶段前由模型按节点规划各 stage agent 应读取的技能（skill 目录为跨节点稳定前缀，需求快照驱动按节点差异化选择）；认证一致性与失败修复两类安全底线确定性注入，规划失败时不注入任何可选技能。
 - **可追溯性**（`arcbench_agent_runtime/`）：requirements / scenarios / interfaces / tests / call_edges / node_states / node_contracts 七张表落盘于 `.arc/traceability/`，事件流写入 `.arc/runner-events.jsonl`，满足比赛"可复现、可审计"的要求。
 - **断点续跑**：编译队列持久化于 `.arc/processing_queue.json`，支持 `--resume`、`--retry-failed`、`--retry <NODE_ID>`。
