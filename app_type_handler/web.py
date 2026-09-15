@@ -9,6 +9,7 @@ import subprocess
 import signal
 import hashlib
 import inspect
+import threading
 import urllib.request
 
 from dataclasses import dataclass
@@ -1037,6 +1038,89 @@ async def _seed_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -
     return _extract_exit_code(seed_output) == 0, seed_output
 
 
+# How much of a failed backend's console output is echoed into the test
+# failure body. Startup crashes (the Express 5 wildcard-route throw, a bad
+# import) print a stack trace well under this size; the cap keeps a chatty
+# server that never became ready from flooding the TDD repair context.
+_BACKEND_STARTUP_OUTPUT_LIMIT = 4000
+
+# The tail buffer keeps this many raw bytes per stream so a startup crash is
+# still observable when the process wrote a lot before dying. Ring size is
+# deliberately larger than the echo limit: the newest bytes survive, and the
+# memory cost per backend runtime is bounded.
+_BACKEND_OUTPUT_TAIL_BYTES = 64 * 1024
+
+
+class _ProcessOutputTail:
+    """Background consumer of one subprocess pipe, keeping the newest bytes.
+
+    The backend runtime's pipes must be read continuously for the whole
+    process lifetime: a server that prints more than the OS pipe buffer would
+    otherwise block on its next write and appear to hang. The newest
+    ``_BACKEND_OUTPUT_TAIL_BYTES`` are retained so a failed startup can still
+    echo the crashing output into the test failure body.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._chunks: bytearray = bytearray()
+
+    async def consume(self, stream: asyncio.StreamReader | None) -> None:
+        if stream is None:
+            return
+        while True:
+            try:
+                chunk = await stream.read(65536)
+            except (OSError, ValueError):
+                return
+            if not chunk:
+                return
+            with self._lock:
+                self._chunks.extend(chunk)
+                if len(self._chunks) > _BACKEND_OUTPUT_TAIL_BYTES:
+                    del self._chunks[:-_BACKEND_OUTPUT_TAIL_BYTES]
+
+    def text(self) -> str:
+        with self._lock:
+            raw = bytes(self._chunks)
+        return raw.decode("utf-8", errors="replace")
+
+
+def _start_output_tails(
+    process: asyncio.subprocess.Process,
+) -> tuple[_ProcessOutputTail, _ProcessOutputTail]:
+    """Spawn detached consumers for both pipes of a freshly started runtime."""
+
+    stdout_tail = _ProcessOutputTail()
+    stderr_tail = _ProcessOutputTail()
+    for tail, stream in ((stdout_tail, process.stdout), (stderr_tail, process.stderr)):
+        try:
+            asyncio.get_running_loop().create_task(tail.consume(stream))
+        except RuntimeError:
+            continue
+    return stdout_tail, stderr_tail
+
+
+async def _format_backend_output(
+    stdout_tail: _ProcessOutputTail,
+    stderr_tail: _ProcessOutputTail,
+) -> str:
+    """Render the retained console output of a backend, newest bytes first."""
+
+    # Give a still-alive writer a moment to flush its dying words into the
+    # tail; a crashed process has nothing more to say and costs only the poll.
+    for _ in range(10):
+        await asyncio.sleep(0.1)
+    sections: list[str] = []
+    stdout_text = _tail(stdout_tail.text(), _BACKEND_STARTUP_OUTPUT_LIMIT)
+    stderr_text = _tail(stderr_tail.text(), _BACKEND_STARTUP_OUTPUT_LIMIT)
+    if stdout_text:
+        sections.append(f"STDOUT:\n{stdout_text}")
+    if stderr_text:
+        sections.append(f"STDERR:\n{stderr_text}")
+    return "\n".join(sections)
+
+
 async def _start_backend_runtime(
     workspace_path: str,
     runtime_env: dict[str, str],
@@ -1063,8 +1147,8 @@ async def _start_backend_runtime(
         backend_process = await asyncio.create_subprocess_shell(
             start_command,
             cwd=backend_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env={
                 **os.environ,
                 **runtime_env,
@@ -1073,6 +1157,11 @@ async def _start_backend_runtime(
     except Exception as exc:
         return None, start_command, f"Failed to start backend runtime with `{start_command}`: {str(exc)}", ""
 
+    # Consume the pipes from the first moment: a chatty server would otherwise
+    # block on a full OS pipe buffer during the startup wait itself. The tails
+    # also retain the newest output for the failure body below.
+    stdout_tail, stderr_tail = _start_output_tails(backend_process)
+
     server_ready = await _wait_for_http_server("127.0.0.1", resolved_port, timeout=20.0)
     if not server_ready:
         cleanup_note = ""
@@ -1080,11 +1169,13 @@ async def _start_backend_runtime(
             cleanup_note = await _terminate_process(backend_process, port=resolved_port)
         except Exception as cleanup_exc:
             cleanup_note = f"Backend runtime cleanup after failed startup also failed: {cleanup_exc}"
+        captured_output = await _format_backend_output(stdout_tail, stderr_tail)
         return None, start_command, (
             f"Failed to start backend runtime with `{start_command}` on port {resolved_port} "
             "within 20 seconds.\n"
             f"{startup_cleanup_note}\n"
-            f"{cleanup_note}"
+            f"{cleanup_note}\n"
+            f"=== Backend Process Output ===\n{captured_output or '(the process produced no output)'}"
         ), ""
 
     instance_fingerprint = _format_backend_instance_fingerprint(
@@ -1345,6 +1436,7 @@ class WebAppType(AppTypeHandler):
             "For web apps, the hosted runtime is backend-led: enter `frontend` and run `npm run build`, then enter `backend` and run `npm run start` to serve the built frontend dist.",
             f"The backend process is responsible for hosting `frontend/dist` on the single web port `{resolved_port}`; do not assume a separate frontend dev server is part of the runtime.",
             "E2E and runtime verification should target the backend-hosted origin after the frontend build completes.",
+            "The backend runs Express 5, where a bare wildcard route string (`app.get('*', ...)`, `app.use('*')`) throws `TypeError: Cannot read properties of undefined (reading 'type')` at route registration and crashes the server at startup. For SPA fallback use the template pattern in `backend/src/app.js` (a regex like `/^(?!\\/api(?:\\/$|\\/)).*/`) or the named wildcard `'/{*splat}'`; never `'*'` or `'/*'`.",
         ]
 
     @classmethod
