@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from app_type_handler import base as base_handler
-from app_type_handler import create_app_type_handler, web as web_handler
+from app_type_handler import create_app_type_handler, template_patches, web as web_handler
 from app_type_handler.template_patches import (
     ALREADY_APPLIED,
     APPLIED,
@@ -784,3 +784,91 @@ def test_shipped_template_fixes_refuse_an_unknown_shape_atomically(tmp_path) -> 
 
 def test_templates_without_registered_fixes_are_untouched(tmp_path) -> None:
     assert apply_template_patches(str(tmp_path), "cli-python") == []
+
+
+def test_shipped_template_fixes_recognize_a_crlf_copy_that_already_has_them(tmp_path) -> None:
+    """A CRLF template must be recognized as fixed, not reported as unknown.
+
+    The markers are single lines, so their matching cannot depend on the file's
+    line endings; a CRLF-only difference that turned an already-patched file
+    into an unrecognized one would silently drop the fix on such templates.
+    """
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
+    for name in ("backend/src/database/init_db.js", "README.md"):
+        path = workspace / name
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("\n", "\r\n"),
+            encoding="utf-8",
+            newline="",
+        )
+
+    first = apply_template_patches(str(workspace), "web-react-express")
+    assert [outcome.status for outcome in first] == [APPLIED, APPLIED]
+
+    second = apply_template_patches(str(workspace), "web-react-express")
+    assert [outcome.status for outcome in second] == [ALREADY_APPLIED, ALREADY_APPLIED]
+
+
+def test_fix_markers_are_single_lines_so_line_endings_cannot_hide_them() -> None:
+    """`_classify` matches markers against the raw text, so they must be one line."""
+
+    for patch in template_patches.TEMPLATE_PATCHES:
+        for edit in patch.edits:
+            assert "\n" not in edit.applied_marker
+
+
+def test_shipped_template_fixes_refuse_a_half_repaired_file(tmp_path) -> None:
+    """A file carrying both the fix marker and the pre-fix shape is ambiguous.
+
+    This module never produces that state, so seeing it means something else
+    edited the file. Guessing which of the two shapes is current is how a broken
+    bootstrap would be reported as fixed.
+    """
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
+    bootstrap = workspace / "backend" / "src" / "database" / "init_db.js"
+    pre_fix_with_stray_marker = (
+        bootstrap.read_text(encoding="utf-8") + "\nconst MAX_INIT_ATTEMPTS = 5;\n"
+    )
+    bootstrap.write_text(pre_fix_with_stray_marker, encoding="utf-8")
+
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+
+    assert [outcome.status for outcome in outcomes] == [UNRECOGNIZED, UNRECOGNIZED]
+    assert "init_db.js" in outcomes[0].detail
+    assert bootstrap.read_text(encoding="utf-8") == pre_fix_with_stray_marker
+
+
+def test_shipped_template_fixes_leave_no_trace_when_staging_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """A failure while producing content must leave every target as it was.
+
+    The patch touches two files, so a naive write loop would leave the first one
+    patched and the second one not - the half-applied state the module promises
+    to avoid.
+    """
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
+    before = _patched_file_contents(workspace)
+
+    real_write = template_patches._write_text
+    written: list[str] = []
+
+    def flaky_write(path: str, text: str) -> None:
+        written.append(path)
+        if len(written) == 2:
+            raise OSError("disk full")
+        real_write(path, text)
+
+    monkeypatch.setattr(template_patches, "_write_text", flaky_write)
+
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+
+    assert [outcome.status for outcome in outcomes] == [UNRECOGNIZED, UNRECOGNIZED]
+    assert _patched_file_contents(workspace) == before
+    assert list(workspace.rglob("*.arc-patch-tmp")) == []

@@ -346,13 +346,24 @@ def _write_text(path: str, text: str) -> None:
 
 
 def _classify(text: str, edit: TemplateEdit) -> tuple[str, str]:
-    """Report how one edit relates to a file's current content."""
+    """Report how one edit relates to a file's current content.
 
-    if edit.applied_marker in text:
-        return ALREADY_APPLIED, f"{edit.relative_path} already carries the fix"
+    The fix markers are single lines, so line endings never affect matching
+    them. A file that carries the marker and no longer contains the pre-fix
+    shape is done. For the edits that replace the pre-fix shape, a file carrying
+    both is a half-repaired state this module never produces, and guessing which
+    of the two is current is how a broken bootstrap would get reported as fixed
+    - it is surfaced instead. Edits that append after the searched text keep it
+    visible in the fixed file, so coexistence is their normal post-patch state.
+    """
+
+    marker_present = edit.applied_marker in text
     newline = "\r\n" if "\r\n" in text else "\n"
     search = edit.search if newline == "\n" else edit.search.replace("\n", "\r\n")
     occurrences = text.count(search)
+    keeps_search_visible = edit.search in edit.replace
+    if marker_present and (occurrences == 0 or keeps_search_visible):
+        return ALREADY_APPLIED, f"{edit.relative_path} already carries the fix"
     if occurrences == 0:
         return UNRECOGNIZED, (
             f"{edit.relative_path} contains neither the known pre-fix shape nor the fix marker"
@@ -360,6 +371,10 @@ def _classify(text: str, edit: TemplateEdit) -> tuple[str, str]:
     if occurrences > 1:
         return UNRECOGNIZED, (
             f"{edit.relative_path} contains the known pre-fix shape {occurrences} times"
+        )
+    if marker_present:
+        return UNRECOGNIZED, (
+            f"{edit.relative_path} carries the fix marker next to the pre-fix shape"
         )
     return APPLIED, edit.relative_path
 
@@ -371,60 +386,120 @@ def _patched_text(text: str, edit: TemplateEdit) -> str:
     return text.replace(search, replace, 1)
 
 
+def _remove(paths) -> None:
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _restore(paths: list[str], originals: dict[str, str]) -> str:
+    """Best-effort rollback of targets a failed swap already replaced."""
+
+    failed: list[str] = []
+    for path in paths:
+        temporary = f"{path}.arc-patch-tmp"
+        try:
+            _write_text(temporary, originals[path])
+            os.replace(temporary, path)
+        except OSError:
+            _remove([temporary])
+            failed.append(os.path.basename(path))
+    return "" if not failed else f"; rollback also failed for {', '.join(failed)}"
+
+
+def _write_changes(updates: dict[str, str], originals: dict[str, str]) -> str | None:
+    """Swap in new file contents, or leave every target as it was.
+
+    Returns ``None`` on success, otherwise a short reason. Each replacement is
+    staged to a sibling file first and only swapped in once every one of them
+    exists, so a failure while producing content never touches a target. A
+    failure while swapping rolls the already-swapped targets back from the
+    contents read before the patch, which makes the all-or-nothing contract true
+    rather than merely intended.
+    """
+
+    staged: list[tuple[str, str]] = []
+    for path, text in updates.items():
+        temporary = f"{path}.arc-patch-tmp"
+        try:
+            _write_text(temporary, text)
+        except OSError as exc:
+            _remove([temporary, *(temporary for temporary, _ in staged)])
+            return f"{os.path.basename(path)} could not be staged: {exc}"
+        staged.append((temporary, path))
+
+    for index, (temporary, path) in enumerate(staged):
+        try:
+            os.replace(temporary, path)
+        except OSError as exc:
+            _remove([temp for temp, _ in staged[index:]])
+            return (
+                f"{os.path.basename(path)} could not be replaced: {exc}"
+                + _restore([target for _, target in staged[:index]], originals)
+            )
+
+    return None
+
+
 def apply_template_patches(workspace_path: str, template_id: str) -> list[PatchOutcome]:
     """Apply the registered patches to a freshly copied workspace.
 
     Returns one outcome per patch. A patch is either applied, already applied,
     or left alone because its target no longer matches a known shape; the
-    caller decides how loudly to report the last case. Nothing is written when
-    any of a patch's edits is unclassifiable, so a partial patch cannot leave
-    a workspace in a state that is neither the old nor the new one.
+    caller decides how loudly to report the last case.
+
+    Classification happens before anything is written, only the files a patch
+    actually changes are written, and those writes are staged and swapped
+    together - so a workspace is never left in a state that is neither the old
+    nor the new one.
     """
 
     outcomes: list[PatchOutcome] = []
     for patch in patches_for(template_id):
-        texts: dict[str, str] = {}
+        originals: dict[str, str] = {}
+        patched: dict[str, str] = {}
+        unavailable: set[str] = set()
         failures: list[str] = []
-        already = True
 
         for edit in patch.edits:
             path = os.path.join(workspace_path, *edit.relative_path.split("/"))
-            if path not in texts:
+            if path in unavailable:
+                continue
+            if path not in originals:
                 if not os.path.isfile(path):
+                    unavailable.add(path)
                     failures.append(f"{edit.relative_path} is missing")
                     continue
                 try:
-                    texts[path] = _read_text(path)
+                    originals[path] = _read_text(path)
                 except OSError as exc:
+                    unavailable.add(path)
                     failures.append(f"{edit.relative_path} could not be read: {exc}")
                     continue
-            status, detail = _classify(texts[path], edit)
+            current = patched.get(path, originals[path])
+            status, detail = _classify(current, edit)
             if status == UNRECOGNIZED:
                 failures.append(detail)
             elif status == APPLIED:
-                already = False
-                texts[path] = _patched_text(texts[path], edit)
+                patched[path] = _patched_text(current, edit)
 
         if failures:
             outcomes.append(PatchOutcome(patch.name, UNRECOGNIZED, "; ".join(failures)))
             continue
-        if already:
+        if not patched:
             outcomes.append(
                 PatchOutcome(patch.name, ALREADY_APPLIED, "; ".join(edit.relative_path for edit in patch.edits))
             )
             continue
 
-        for path, text in texts.items():
-            try:
-                _write_text(path, text)
-            except OSError as exc:
-                outcomes.append(
-                    PatchOutcome(patch.name, UNRECOGNIZED, f"{os.path.basename(path)} could not be written: {exc}")
-                )
-                break
-        else:
-            outcomes.append(
-                PatchOutcome(patch.name, APPLIED, "; ".join(edit.relative_path for edit in patch.edits))
-            )
+        error = _write_changes(patched, originals)
+        if error:
+            outcomes.append(PatchOutcome(patch.name, UNRECOGNIZED, error))
+            continue
+        outcomes.append(
+            PatchOutcome(patch.name, APPLIED, "; ".join(edit.relative_path for edit in patch.edits))
+        )
 
     return outcomes
