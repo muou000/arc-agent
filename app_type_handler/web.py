@@ -15,8 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .base import AppTypeHandler, GlueAnchorSpec
+from .base import AppTypeHandler, GlueAnchorSpec, TEMPLATE_ID_BY_APP_TYPE
 from .path_validation import is_scoped_test_path, normalize_safe_relative_path
+from .template_patches import (
+    ALREADY_APPLIED,
+    APPLIED,
+    UNRECOGNIZED,
+    apply_template_patches,
+)
 from core.config import build_web_runtime_env, get_web_base_url, get_web_port
 from core.processes import finalize_subprocess
 
@@ -1524,6 +1530,7 @@ class WebAppType(AppTypeHandler):
         """
 
         await self._copy_requirement_assets()
+        await self._apply_template_patches()
         unconfigured: list[str] = []
         for relative_path, markers in PORT_TEMPLATE_CONTRACT:
             file_path = os.path.join(self.workspace_path, *relative_path.split("/"))
@@ -1554,6 +1561,50 @@ class WebAppType(AppTypeHandler):
             f"Configured web template for single-port backend hosting on port {get_web_port()}.",
         )
         return True
+
+    async def _apply_template_patches(self) -> None:
+        """Deliver template fixes that the provisioned template may not carry.
+
+        The platform provisions the template (see ``template_patches``), so a
+        fix that must reach every generated workspace cannot be a repo template
+        edit. It is applied to the copied workspace here, before any node runs.
+
+        An unrecognized target shape is reported instead of forced: overwriting
+        a template that evolved upstream would trade a visible skip for an
+        invisible regression.
+        """
+
+        outcomes = apply_template_patches(
+            self.workspace_path,
+            TEMPLATE_ID_BY_APP_TYPE.get(self.name, ""),
+        )
+        if not outcomes:
+            return
+
+        applied = [outcome.patch_name for outcome in outcomes if outcome.status == APPLIED]
+        already = [outcome.patch_name for outcome in outcomes if outcome.status == ALREADY_APPLIED]
+        if applied:
+            await self._log(
+                "System",
+                "Applied template patch(es): " + ", ".join(applied) + ".",
+            )
+        if already:
+            await self._log(
+                "System",
+                "Template patch(es) already present in the provisioned template: "
+                + ", ".join(already)
+                + ".",
+            )
+        for outcome in outcomes:
+            if outcome.status != UNRECOGNIZED:
+                continue
+            await self._log(
+                "System",
+                f"Template patch {outcome.patch_name!r} was not applied: {outcome.detail}. "
+                "The workspace keeps the template as-is; confirm the fix is not needed there.",
+                "warning",
+                None,
+            )
 
     async def install_dependencies(self) -> bool:
         targets = (

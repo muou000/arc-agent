@@ -17,12 +17,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 
 import pytest
 
 from app_type_handler import base as base_handler
 from app_type_handler import create_app_type_handler, web as web_handler
+from app_type_handler.template_patches import (
+    ALREADY_APPLIED,
+    APPLIED,
+    UNRECOGNIZED,
+    apply_template_patches,
+)
 
 
 def _noop_log(*_args, **_kwargs) -> None:
@@ -688,3 +695,92 @@ def test_shipped_template_playwright_config_reads_the_origin_from_the_environmen
     config = (template / "backend" / "playwright.config.js").read_text(encoding="utf-8")
 
     assert "process.env.PLAYWRIGHT_BASE_URL" in config
+
+
+# --------------------------------------------------------------------------
+# shipped template fixes are delivered at scaffold time
+# --------------------------------------------------------------------------
+#
+# The template is provisioned by the platform (`ARC_AGENT_TEMPLATES_ROOT`), so a
+# fix that must reach every generated workspace cannot be a repo template edit:
+# it lives in `app_type_handler.template_patches` and is applied to the copy.
+
+
+SHIPPED_TEMPLATE_ROOT = (
+    Path(base_handler.REPO_ROOT) / "arc-template" / "templates" / "web-react-express"
+)
+
+
+def _patched_file_contents(workspace: Path) -> dict[str, str]:
+    return {
+        name: (workspace / name).read_text(encoding="utf-8")
+        for name in ("backend/src/database/init_db.js", "README.md")
+    }
+
+
+def test_post_template_setup_applies_the_shipped_template_fixes(tmp_path, monkeypatch) -> None:
+    """A workspace scaffolded from the template carries the fixed bootstrap.
+
+    The fix exists only in `template_patches`, so without this step every
+    generated app keeps the defect and every E2E attempt in every node pays for
+    it.
+    """
+
+    templates_root = tmp_path / "templates"
+    templates_root.mkdir()
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, templates_root / "web-react-express")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("ARC_AGENT_TEMPLATES_ROOT", str(templates_root))
+    handler = _make_handler(workspace)
+
+    assert asyncio.run(handler.copy_template()) is True
+    assert asyncio.run(handler.post_template_setup()) is True
+
+    bootstrap = (workspace / "backend" / "src" / "database" / "init_db.js").read_text(
+        encoding="utf-8"
+    )
+    assert "const MAX_INIT_ATTEMPTS = 5;" in bootstrap
+    assert "function startInit() {" in bootstrap
+    assert "return initPromise;" not in bootstrap
+
+
+def test_shipped_template_fixes_are_idempotent(tmp_path) -> None:
+    """A resumed compile must neither re-apply nor rewrite anything."""
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
+
+    first = apply_template_patches(str(workspace), "web-react-express")
+    assert [outcome.status for outcome in first] == [APPLIED, APPLIED]
+    after_first = _patched_file_contents(workspace)
+
+    second = apply_template_patches(str(workspace), "web-react-express")
+    assert [outcome.status for outcome in second] == [ALREADY_APPLIED, ALREADY_APPLIED]
+    assert _patched_file_contents(workspace) == after_first
+
+
+def test_shipped_template_fixes_refuse_an_unknown_shape_atomically(tmp_path) -> None:
+    """A template that evolved upstream is reported, never overwritten.
+
+    The unrecognized file must stay byte-for-byte as it was, and a sibling file
+    edited by the same patch must not be touched either: a half-applied patch
+    would leave a workspace that is neither the old nor the new state.
+    """
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
+    bootstrap = workspace / "backend" / "src" / "database" / "init_db.js"
+    bootstrap.write_text("// rewritten upstream\n", encoding="utf-8")
+    readme = workspace / "README.md"
+    readme_before = readme.read_text(encoding="utf-8")
+
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+
+    assert [outcome.status for outcome in outcomes] == [UNRECOGNIZED, UNRECOGNIZED]
+    assert bootstrap.read_text(encoding="utf-8") == "// rewritten upstream\n"
+    assert readme.read_text(encoding="utf-8") == readme_before
+
+
+def test_templates_without_registered_fixes_are_untouched(tmp_path) -> None:
+    assert apply_template_patches(str(tmp_path), "cli-python") == []
