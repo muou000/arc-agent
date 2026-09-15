@@ -166,6 +166,16 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             self._written_paths.add(path)
             self._cache_written_path(request, path)
 
+    def materialized_paths(self) -> list[str]:
+        """Paths successfully written by this stage run, sorted.
+
+        This is the discipline's ground truth for "the agent actually
+        materialized files" — unlike the model's own ``files_written`` answer,
+        it cannot be empty when writes succeeded.
+        """
+
+        return sorted(self._written_paths)
+
     def _path_unlocked(self, path: str) -> bool:
         return self._validation_failed or path in self._failed_paths
 

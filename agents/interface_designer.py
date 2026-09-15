@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -107,26 +109,167 @@ class InterfaceDesigner:
         )
         await self._log(f"skill-permitted: {', '.join(selected_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking interface design.", node_id=node_id)
+        agent_context = AgentRuntimeContext(
+            node_id=node_id,
+            phase="DESIGN",
+            app_type=app_type,
+            workspace_root=workspace_root,
+            requirement_path=self.requirement_path,
+        )
         payload = await ainvoke_stage_agent(
             agent,
             message=message,
-            context=AgentRuntimeContext(
-                node_id=node_id,
-                phase="DESIGN",
-                app_type=app_type,
-                workspace_root=workspace_root,
-                requirement_path=self.requirement_path,
-            ),
+            context=agent_context,
             thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:InterfaceDesigner",
             label=self.agent_name,
             log_cb=self.log_cb,
         )
-        bundle = self._normalize_design_payload(payload)
+        bundle = await self._normalize_with_recovery(payload, node_id=node_id)
+        materialized_paths = self._stage_materialized_paths(agent)
+        bundle["materialized_paths"] = materialized_paths
+        if not bundle["interfaces"] and materialized_paths:
+            # The final response serialized the design into `summary` prose (or
+            # dropped the arrays entirely) while the discipline observed real
+            # file writes. Without interface records the traceability store
+            # stays empty and downstream stages go blind, so re-ask once on
+            # the same thread before letting the workflow hard-fail the node.
+            await self._log(
+                f"Response recorded no interface contracts for {len(materialized_paths)} materialized file(s); "
+                "requesting one-shot contract re-serialization.",
+                status="warning",
+                node_id=node_id,
+            )
+            repair_payload = await ainvoke_stage_agent(
+                agent,
+                message=self._repair_message(materialized_paths),
+                context=agent_context,
+                thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:InterfaceDesigner",
+                label=self.agent_name,
+                log_cb=self.log_cb,
+            )
+            repaired = await self._normalize_with_recovery(repair_payload, node_id=node_id)
+            if repaired["interfaces"]:
+                bundle["interfaces"] = repaired["interfaces"]
+                if not bundle["files_written"]:
+                    bundle["files_written"] = repaired["files_written"]
+            else:
+                await self._log(
+                    "Contract re-serialization returned no interface records either.",
+                    status="error",
+                    node_id=node_id,
+                )
         await self._log(
             f"Interface design returned {len(bundle.get('interfaces', []))} interface(s).",
             node_id=node_id,
         )
         return bundle
+
+    _FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+
+    async def _normalize_with_recovery(self, payload: dict[str, Any], node_id: str) -> dict[str, Any]:
+        """Normalize a design payload, lifting contracts buried in prose.
+
+        The model sometimes serializes the whole response as a fenced JSON
+        block nested inside the `summary` prose instead of the structured
+        fields (observed live with deepseek-v4-flash on 2026-09-15: both leaf
+        nodes did this on the contract re-serialization pass). Without this
+        recovery the records are dropped and the workflow hard-fails a node
+        whose design actually completed.
+        """
+
+        bundle = self._normalize_design_payload(payload)
+        if not bundle["interfaces"] and bundle["summary"]:
+            recovered = self._recover_fenced_payload(bundle["summary"])
+            if recovered.get("interfaces"):
+                await self._log(
+                    f"Recovered {len(recovered['interfaces'])} interface record(s) from JSON embedded in `summary`.",
+                    node_id=node_id,
+                )
+                bundle["interfaces"] = recovered["interfaces"]
+                if not bundle["files_written"] and recovered.get("files_written"):
+                    bundle["files_written"] = recovered["files_written"]
+            elif bundle["summary"].lstrip().startswith("{"):
+                await self._log(
+                    "`summary` holds a JSON object that could not be parsed "
+                    "(likely truncated by the max output token limit); no interface records recovered.",
+                    status="warning",
+                    node_id=node_id,
+                )
+        return bundle
+
+    @classmethod
+    def _recover_fenced_payload(cls, summary: str) -> dict[str, Any]:
+        """Extract interface records embedded in `summary` prose.
+
+        Handles fenced JSON blocks (```json ... ```) and bare JSON objects the
+        model emitted instead of the structured tool call. Returns a dict that
+        may carry `interfaces` and/or `files_written`; empty when no parseable
+        block contains contract records.
+        """
+
+        for match in cls._FENCED_JSON_BLOCK_RE.finditer(summary or ""):
+            recovered = cls._payload_from_json_text(match.group(1))
+            if recovered:
+                return recovered
+        text = (summary or "").strip()
+        if text.startswith("{"):
+            return cls._payload_from_json_text(text)
+        return {}
+
+    @staticmethod
+    def _payload_from_json_text(text: str) -> dict[str, Any]:
+        candidate = text.strip()
+        if not candidate.startswith("{"):
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start == -1 or end <= start:
+                return {}
+            candidate = candidate[start : end + 1]
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        if isinstance(parsed, list):
+            return {"interfaces": [item for item in parsed if isinstance(item, dict)]}
+        if isinstance(parsed, dict):
+            recovered: dict[str, Any] = {}
+            interfaces = parsed.get("interfaces")
+            if isinstance(interfaces, list):
+                recovered["interfaces"] = [item for item in interfaces if isinstance(item, dict)]
+            files_written = parsed.get("files_written")
+            if isinstance(files_written, list):
+                recovered["files_written"] = [
+                    str(path).strip() for path in files_written if str(path).strip()
+                ]
+            return recovered
+        return {}
+
+    @staticmethod
+    def _stage_materialized_paths(agent: Any) -> list[str]:
+        discipline = getattr(agent, "arc_stage_discipline", None)
+        if discipline is None:
+            return []
+        try:
+            return list(discipline.materialized_paths())
+        except Exception:
+            return []
+
+    @staticmethod
+    def _repair_message(materialized_paths: list[str]) -> str:
+        listed = "\n".join(f"- {path}" for path in materialized_paths)
+        return "\n".join(
+            [
+                "Your design pass materialized the file(s) below, but the final response recorded an empty `interfaces` array.",
+                "None of these contracts reached the traceability store, so downstream stages cannot see the design; prose in `summary` is not a substitute for structured records.",
+                "Return now a single `InterfaceDesignResponse` whose `interfaces` array contains one complete record for every contract embodied by these files (plus any reused interface this node depends on), using the schema fields from your original instructions.",
+                "Return the structured fields themselves. Do NOT wrap the JSON in markdown code fences and do NOT nest the response JSON inside the `summary` string.",
+                "Keep each record compact so the response fits within output limits: `specification` and `responsibility` at most ~200 characters each, and omit narrative fields that would only restate the requirement prose.",
+                "Keep `interface_id` values stable and globally unique, and list exactly the materialized files in `files_written`.",
+                "",
+                "Materialized files:",
+                listed,
+            ]
+        )
 
     @staticmethod
     def _load_merge_conflict_context(node_id: str) -> dict[str, Any] | None:
