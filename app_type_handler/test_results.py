@@ -191,6 +191,21 @@ _DETAIL_LIMIT = 120
 #: results and node sessions, so it stays short on purpose.
 _FINGERPRINT_LINE_LIMIT = 160
 
+#: Lines that mention error-ish keywords but are not the failure itself:
+#: success markers (mirroring parse_test_results), jest/vitest diff rows, and
+#: zero-failure summary rows. Selecting one of these as the key line would
+#: either fabricate a fingerprint for a healthy section of the output or give
+#: every distinct failure in a run the same generic fingerprint.
+_FINGERPRINT_SKIP_LINE_PREFIXES = ("✓", "√", "✔", "PASS ", "Expected", "Received")
+_FINGERPRINT_ZERO_FAILURE_PATTERN = re.compile(r"\b0\s+(?:errors?|failed|failures?)\b", re.IGNORECASE)
+
+#: Ports, line:column references and similar colon-number pairs drift between
+#: runs of the same failure (restarted dev server, shifted stack frames).
+#: Masking them keeps the fingerprint stable across reruns of one failure while
+#: leaving assertion values (``add(1, 1) returned 0``) intact, so distinct
+#: failures keep distinct fingerprints.
+_FINGERPRINT_NOISE_PATTERN = re.compile(r":\d+(?::\d+)?")
+
 
 def classify_test_failure(test_output: str) -> str:
     """Return a short reason when a failed run is environmental, else ``""``.
@@ -225,10 +240,11 @@ def failure_fingerprint(test_output: str) -> str:
     The TDD loop uses this to detect stalled repairs: when several consecutive
     ``run_tests`` failures carry the same fingerprint, the agent is patching
     neighbors of the failure instead of changing its hypothesis. The
-    fingerprint pairs the exit code with the first error-bearing line so
-    unrelated flapping (port numbers, timings, temp paths) does not hide a
-    real stall. Truncated to a bounded length because it is echoed into
-    tool results and node sessions.
+    fingerprint pairs the exit code with the first error-bearing line, masked
+    against run-to-run noise (ports, ``line:column`` references) and skipping
+    lines that merely *mention* failure keywords (success markers, diff rows,
+    zero-failure summaries). Truncated to a bounded length because it is echoed
+    into tool results and node sessions.
     """
 
     output = test_output or ""
@@ -238,9 +254,13 @@ def failure_fingerprint(test_output: str) -> str:
         stripped = line.strip()
         if not stripped:
             continue
+        if stripped.startswith(_FINGERPRINT_SKIP_LINE_PREFIXES):
+            continue
+        if _FINGERPRINT_ZERO_FAILURE_PATTERN.search(stripped):
+            continue
         lowered = stripped.lower()
         if "error" in lowered or "failed" in lowered or "expect" in lowered or "assert" in lowered:
-            key_line = stripped
+            key_line = _FINGERPRINT_NOISE_PATTERN.sub(":#", stripped)
             break
     return f"{exit_code}|{key_line[:_FINGERPRINT_LINE_LIMIT]}"
 

@@ -838,3 +838,68 @@ def test_baseline_red_evidence_reaches_first_session(tmp_project_dir: Path, arc_
     assert "Baseline RED Evidence" in first_call_messages
     assert "verifiably fail RIGHT NOW" in first_call_messages
     assert detail in first_call_messages
+
+
+# ---------------------------------------------------------------------------
+# All-green layer without a closing full run: system regression closes it
+# ---------------------------------------------------------------------------
+
+
+def test_all_green_without_full_run_closes_layer_via_system_regression(tmp_project_dir: Path, arc_runtime) -> None:
+    """A layer whose files all turned green individually must not open a new
+    agent session just to run the closing full-layer pass.
+
+    The agent may verify each file with subset runs and end its turn; the
+    scheduler then runs the full-layer regression itself and closes the layer.
+    (PR review: without this, the follow-up session was pure overhead - and a
+    session that ended before re-running tests could fail the layer even
+    though every file was green.)
+    """
+
+    node_id = "REQ-TDD-SEAL"
+    other_unit_file = "tests/unit/test_extra.py"
+    tests = [
+        {"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T2", "type": "Unit", "file_path": other_unit_file},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    # Session 1: the agent repairs each file with subset runs (both pass) and
+    # ends its turn WITHOUT a closing full-layer run.
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {"test_files": [UNIT_TEST_FILE]}, call_id="r1"),
+            faux_tool_call("run_tests", {"test_files": [other_unit_file]}, call_id="r2"),
+            faux_text("both files repaired, ending turn"),
+        ]
+    )
+    # Baselines (red, red), subset runs (pass, pass), system regression (pass).
+    fake = FakeAppHandler(
+        [
+            failing_test_output(detail="AssertionError: file1 missing"),
+            failing_test_output(detail="AssertionError: file2 missing"),
+            passing_test_output(),
+            passing_test_output(),
+            passing_test_output(),
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    session_types = track_tdd_sessions(tdd)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    # Exactly one agent session; the closing full-layer run is system-side.
+    assert session_types == ["Unit"]
+    assert fake.calls == [
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [other_unit_file]),
+        ("Unit", [UNIT_TEST_FILE]),
+        ("Unit", [other_unit_file]),
+        ("Unit", [UNIT_TEST_FILE, other_unit_file]),
+    ]
+    assert arc_runtime.traceability.get_test("T1")["passed"] is True
+    assert arc_runtime.traceability.get_test("T2")["passed"] is True
+    node_session = sessions.load_node_session(node_id)
+    assert node_session["recent_failure_summary"] == ""

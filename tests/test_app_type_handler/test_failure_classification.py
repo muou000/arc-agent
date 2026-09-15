@@ -211,3 +211,39 @@ def test_fingerprint_truncates_runaway_key_lines() -> None:
     fingerprint = failure_fingerprint(f"Exit Code: 1\n{long_line}")
     assert fingerprint.startswith("1|AssertionError: ")
     assert len(fingerprint) <= 162  # "1|" + 160-char cap
+
+
+def test_fingerprint_skips_success_and_diff_lines() -> None:
+    """Success markers, jest/vitest diff rows and zero-failure summaries
+    mention error-ish keywords without being the failure; selecting one would
+    give every distinct failure in a run the same generic fingerprint."""
+    output = (
+        "Exit Code: 1\n"
+        "  ✓ renders the cart summary\n"
+        "  Expected: 2\n"
+        "  Received: 3\n"
+        "  0 failed, 3 passed\n"
+        "AssertionError: cart total mismatch\n"
+    )
+    assert failure_fingerprint(output) == "1|AssertionError: cart total mismatch"
+
+
+def test_fingerprint_masks_ports_and_line_numbers() -> None:
+    """The same connection failure on a restarted server (different port) or a
+    shifted stack frame must keep the same fingerprint so the stall detector
+    still sees the repeat."""
+    first = failure_fingerprint("Exit Code: 1\nError: connect ECONNREFUSED 127.0.0.1:3001")
+    second = failure_fingerprint("Exit Code: 1\nError: connect ECONNREFUSED 127.0.0.1:5173")
+    assert first == second == "1|Error: connect ECONNREFUSED 127.0.0.1:#"
+
+    shifted = failure_fingerprint("Exit Code: 1\nTypeError: cannot read props at App.js:42:17")
+    original = failure_fingerprint("Exit Code: 1\nTypeError: cannot read props at App.js:39:11")
+    assert shifted == original
+
+
+def test_fingerprint_keeps_assertion_values_distinct() -> None:
+    """Masking must not blur real assertion differences, or every failure in a
+    layer looks like a stall of the first one."""
+    first = failure_fingerprint("Exit Code: 1\nAssertionError: expected 'Login' to equal 'Log in'")
+    second = failure_fingerprint("Exit Code: 1\nAssertionError: add(1, 1) returned 0")
+    assert first != second

@@ -802,6 +802,46 @@ class WorkflowPhaseRunner:
             while not full_layer_passed[ordered_type]:
                 if environment_failure:
                     break
+                # All files green but the layer was never closed by a full run
+                # (e.g. the agent verified each file individually and ended
+                # its turn): close it with a system-run regression instead of
+                # opening a fresh agent session just to run one command.
+                layer_states = file_state_by_type[ordered_type]
+                if layer_states and all(state == "green" for state in layer_states.values()):
+                    regression_output = await self.app_handler.run_test_group(
+                        ordered_type,
+                        collect_test_files(groups[ordered_type.lower()]),
+                        web_port=self.web_port,
+                    )
+                    result_by_type[ordered_type] = regression_output
+                    if int(parse_test_results(regression_output).get("exit_code", -1)) == 0:
+                        full_layer_passed[ordered_type] = True
+                        await self._log(
+                            "TestDrivenDeveloper",
+                            (
+                                f"All `{ordered_type}` files are green; system-run full-layer "
+                                "regression passed, closing the layer without a new agent session."
+                            ),
+                            node_id=node_id,
+                        )
+                        break
+                    await self._log(
+                        "TestDrivenDeveloper",
+                        (
+                            f"All `{ordered_type}` files are green individually but the system-run "
+                            "full-layer regression failed; opening an agent session for the combined failure."
+                        ),
+                        status="warning",
+                        node_id=node_id,
+                    )
+                    for path in layer_states:
+                        layer_states[path] = "red"
+                    baseline_red_summary = (
+                        "### Baseline RED Evidence (system-verified before this session)\n"
+                        "Every test file in this layer passed its individual run, but the full-layer run "
+                        "failed when the files execute together. The combined failure output:\n"
+                        f"{summarize_batch_output(regression_output, max_lines=20)}"
+                    )
                 used_before = usage_by_type.get(ordered_type, 0)
                 if used_before >= TDD_RUN_TESTS_BUDGET:
                     break
