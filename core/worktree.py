@@ -37,6 +37,13 @@ Branches stay per node; each new node's branch starts at the latest
 integration HEAD. A directory holding a conflicting or crashed task is
 quarantined and later tasks fall back to their own node-keyed directory.
 
+Parent and child DESIGN phases are serialized by the workflow's dependency
+gate (a child's DESIGN waits for its parent's DESIGN to settle), so a child
+always branches from an integration HEAD that already contains the parent's
+shell: the child's additive edits to shared surfaces (app entry, route
+registration, layout) merge cleanly instead of colliding with a concurrent
+parent rewrite.
+
 Worktrees live under ``<workspace>/.arc/worktrees/<group-or-node-id>``. The runtime's
 managed ``.gitignore`` block already ignores ``.arc/*`` (everything except
 ``.arc/traceability/``), so the parent repository never stages a worktree, and

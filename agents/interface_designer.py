@@ -15,7 +15,7 @@ from agents.context.prompts.interface_designer import get_system_prompt, get_use
 from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
-from agents.runtime.runners import ainvoke_stage_agent
+from agents.runtime.runners import ainvoke_stage_agent, salvage_json_objects
 from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
 from agents.tools.traceability import build_traceability_tools
@@ -124,15 +124,14 @@ class InterfaceDesigner:
             label=self.agent_name,
             log_cb=self.log_cb,
         )
-        bundle = await self._normalize_with_recovery(payload, node_id=node_id)
-        materialized_paths = self._stage_materialized_paths(agent)
-        bundle["materialized_paths"] = materialized_paths
+        bundle = await self._normalize_with_recovery(payload, node_id=node_id, agent=agent)
+        materialized_paths = bundle.get("materialized_paths") or []
         if not bundle["interfaces"] and materialized_paths:
-            # The final response serialized the design into `summary` prose (or
-            # dropped the arrays entirely) while the discipline observed real
-            # file writes. Without interface records the traceability store
-            # stays empty and downstream stages go blind, so re-ask once on
-            # the same thread before letting the workflow hard-fail the node.
+            # The structured response recorded no interface contracts while
+            # the discipline observed real file writes. Without interface
+            # records the traceability store stays empty and downstream
+            # stages go blind, so re-ask once on the same thread before
+            # letting the workflow hard-fail the node.
             await self._log(
                 f"Response recorded no interface contracts for {len(materialized_paths)} materialized file(s); "
                 "requesting one-shot contract re-serialization.",
@@ -147,7 +146,7 @@ class InterfaceDesigner:
                 label=self.agent_name,
                 log_cb=self.log_cb,
             )
-            repaired = await self._normalize_with_recovery(repair_payload, node_id=node_id)
+            repaired = await self._normalize_with_recovery(repair_payload, node_id=node_id, agent=agent)
             if repaired["interfaces"]:
                 bundle["interfaces"] = repaired["interfaces"]
                 if not bundle["files_written"]:
@@ -166,19 +165,35 @@ class InterfaceDesigner:
 
     _FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
-    async def _normalize_with_recovery(self, payload: dict[str, Any], node_id: str) -> dict[str, Any]:
+    async def _normalize_with_recovery(
+        self,
+        payload: dict[str, Any],
+        node_id: str,
+        agent: Any = None,
+    ) -> dict[str, Any]:
         """Normalize a design payload, lifting contracts buried in prose.
 
-        The model sometimes serializes the whole response as a fenced JSON
-        block nested inside the `summary` prose instead of the structured
-        fields (observed live with deepseek-v4-flash on 2026-09-15: both leaf
-        nodes did this on the contract re-serialization pass). Without this
-        recovery the records are dropped and the workflow hard-fails a node
-        whose design actually completed.
+        Two recovery layers, ordered strict-first:
+
+        1. Summary-embedded scan (only when StageDisciplineMiddleware
+           observed real file writes): the structured tool call ran but
+           serialized the design into the ``summary`` prose instead of the
+           ``interfaces`` array. Ground truth from real writes keeps a
+           deliberate empty structured response from being second-guessed.
+        2. Raw-message scan (gated on the ``_raw_final_message`` marker the
+           adapter preserves): a quote-aware salvage of contract-shaped
+           objects from the final text, covering plain-text answers and
+           damaged or truncated JSON the strict parse rejects.
+
+        Both shapes were observed live with deepseek-v4-flash (2026-09-15).
         """
 
         bundle = self._normalize_design_payload(payload)
-        if not bundle["interfaces"] and bundle["summary"]:
+        materialized_paths = self._stage_materialized_paths(agent)
+        bundle["materialized_paths"] = materialized_paths
+        if bundle["interfaces"]:
+            return bundle
+        if materialized_paths and bundle["summary"]:
             recovered = self._recover_fenced_payload(bundle["summary"])
             if recovered.get("interfaces"):
                 await self._log(
@@ -188,13 +203,20 @@ class InterfaceDesigner:
                 bundle["interfaces"] = recovered["interfaces"]
                 if not bundle["files_written"] and recovered.get("files_written"):
                     bundle["files_written"] = recovered["files_written"]
-            elif bundle["summary"].lstrip().startswith("{"):
+                return bundle
+            if bundle["summary"].lstrip().startswith("{"):
                 await self._log(
                     "`summary` holds a JSON object that could not be parsed "
-                    "(likely truncated by the max output token limit); no interface records recovered.",
-                    status="warning",
+                    "(likely truncated by the max output token limit); trying the raw-message scan.",
                     node_id=node_id,
                 )
+        recovered_raw = self._recover_interfaces_from_raw(payload)
+        if recovered_raw:
+            await self._log(
+                f"Recovered {len(recovered_raw)} interface(s) from the final message JSON.",
+                node_id=node_id,
+            )
+            bundle["interfaces"] = recovered_raw
         return bundle
 
     @classmethod
@@ -270,6 +292,70 @@ class InterfaceDesigner:
                 listed,
             ]
         )
+
+    @staticmethod
+    def _recover_interfaces_from_raw(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Fenced-JSON fallback for contracts the structured tool call missed.
+
+        Models sometimes answer the DESIGN turn with prose plus a ```json```
+        block instead of calling the structured-output tool (observed on the
+        ticket-booking benchmark: both parallel leaves "returned 0 interfaces"
+        while the full contract array sat inside the final message). When the
+        structured result is empty and the raw final message was preserved,
+        recover the JSON objects embedded in that text. The scanner is
+        quote-aware and only keeps objects that still parse, so damaged prose
+        never becomes a contract; entries without an ``interface_id`` are
+        dropped later by the workflow's ``_prepare_interfaces``.
+        """
+
+        if not payload.get("_raw_final_message"):
+            return []
+        summary_text = str(payload.get("summary") or "")
+        raw_text = str(payload.get("_raw_final_message") or "")
+        # The fallback branch of extract_payload always puts the full final
+        # text into ``summary``; unwrapping the raw debug dump too keeps the
+        # scan source aligned with the marker this method gates on, so an
+        # adapter that only populates ``_raw_final_message`` still recovers.
+        final_text = summary_text if summary_text.strip() else InterfaceDesigner._text_from_raw_dump(raw_text)
+        if not final_text.strip():
+            return []
+        return [
+            item
+            for item in salvage_json_objects(final_text)
+            if any(key in item for key in ("interface_id", "file_path", "specification", "responsibility"))
+        ]
+
+    @staticmethod
+    def _text_from_raw_dump(raw_text: str) -> str:
+        """Unwrap the escaped message dump so the scanner can see its braces.
+
+        ``_stringify_final_message`` stores a JSON-encoded debug dump; the
+        fenced JSON inside it is escaped into a string value that the
+        quote-aware scanner would skip. Decode it first and return the
+        assistant content (string or text-block list) when possible.
+        """
+
+        try:
+            dumped = json.loads(raw_text)
+        except json.JSONDecodeError:
+            return raw_text
+        if not isinstance(dumped, dict):
+            return raw_text
+        content = dumped.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            texts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str) and text.strip():
+                        texts.append(text)
+                elif isinstance(block, str) and block.strip():
+                    texts.append(block)
+            if texts:
+                return "\n".join(texts)
+        return raw_text
 
     @staticmethod
     def _load_merge_conflict_context(node_id: str) -> dict[str, Any] | None:

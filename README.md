@@ -100,14 +100,20 @@ ARC_SKIP_BROWSER_INSTALL=1  # 跳过编译前检查的 Playwright 浏览器安�
 ARC_AGENT_RECURSION_LIMIT=300          # 单个阶段 agent 会话的最大步数（LangGraph recursion limit），最小 20
 ARC_VISUAL_PRECOMPUTE=1                # 编译前并发预分析需求参考图（设 0/false/no/off 关闭）
 ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
+ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_format）开关：auto（默认，对自定义
+                                       # OPENAI_BASE_URL 端点做一次进程内缓存的工具调用能力探测）、
+                                       # on（强制启用）、off（强制关闭，等价旧行为）
 
 # 每节点 worktree 并行（默认开启）
 # 每个运行中的任务在自己的 git worktree、独立 web 端口和独立 E2 数据库中执行，
 # 阶段完成后分支合并回主工作区。任务按顶层子树亲和调度：同一子树的任务在共享的
 # worktree 目录中顺序执行（兄弟节点不再竞争同一批骨架文件），不同子树并行，空闲
-# 槽位会从其他子树窃取任务。跨子树的共享 glue 文件冲突（如 app.js 路由注册）在
-# 双方均为纯追加时由合并层机械消解，并在合并提交前通过后端健康检查；其余冲突将
-# 该节点标记为失败并保留其 worktree 供排查。
+# 槽位会从其他子树窃取任务。父子之间 DESIGN 串行：子节点的 DESIGN 等到父节点
+# DESIGN 完成并合并后才调度，子节点从包含父壳层（app 入口、布局、共享面）的
+# integration HEAD 分支出工作区，对共享面做增量注册不再与父节点的改写冲突
+# （父节点 DESIGN 失败不阻塞子节点）。跨子树的共享 glue 文件冲突（如 app.js 路由
+# 注册）在双方均为纯追加时由合并层机械消解，并在合并提交前通过后端健康检查；其余
+# 冲突将该节点标记为失败并保留其 worktree 供排查。
 # 两个补充防线：新文件的跨节点占用注册（写时声明，agent 试图创建兄弟节点已占用的
 # 新文件时直接拒绝并给出改道指引，状态存于 .arc/file_claims.json）；DESIGN 阶段的
 # 合并冲突不再立即失败——首次冲突将节点重排队一次，重试从已合并的 integration

@@ -46,18 +46,19 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 # `core.workflow` calls `load_project_env()` at import time, which copies the
 # repository `.env` into `os.environ`. That file points the model client at a
 # non-OpenAI endpoint, and `load_project_env` mirrors `OPENAI_BASE_URL` into
-# `OPENAI_API_BASE`. `agents.runtime.factory._resolve_response_format` reads that
-# variable and silently drops the structured `response_format` whenever the base
-# URL is not an OpenAI one, so an agent test that runs *after* a test importing
-# `core.workflow` would change behaviour mid-suite - the same scripted
-# conversation then needs an extra model call and fails only in full-suite runs.
-# Scrubbing these for every test keeps results independent of collection order.
+# `OPENAI_API_BASE`. `agents.runtime.factory._resolve_response_format` consults
+# that variable (via `structured_output_supported`) to decide whether agents get
+# a structured `response_format`; a leaked base URL would flip that decision
+# mid-suite - and with capability probing enabled it would even trigger a real
+# HTTP probe inside a unit test. Scrubbing these for every test keeps results
+# independent of collection order and network-free.
 MODEL_ENV_VARS_TO_CLEAR = (
     "OPENAI_API_BASE",
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
     "MODEL",
     "ARC_OPENAI_API_MODE",
+    "ARC_STRUCTURED_OUTPUT",
 )
 
 

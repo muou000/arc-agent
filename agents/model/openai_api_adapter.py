@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -303,6 +304,219 @@ def should_disable_streaming_for_openai_mode(api_mode: str | None = None) -> boo
     if not base_url:
         return False
     return not _is_official_openai_base_url(base_url)
+
+
+# Structured output (pydantic ``response_format`` on stage agents) is implemented
+# by langchain as a tool-calling strategy, so the only endpoint capability it
+# needs is standard tool calling. Custom ``OPENAI_BASE_URL`` endpoints are probed
+# once per process instead of being disabled by hostname whitelist.
+_STRUCTURED_OUTPUT_ON_VALUES = {"1", "true", "yes", "on", "force"}
+_STRUCTURED_OUTPUT_OFF_VALUES = {"0", "false", "no", "off"}
+_STRUCTURED_OUTPUT_PROBE_TIMEOUT = 10.0
+# A definitive rejection must name the tool-calling surface; a bare 400 could be
+# an unrelated request problem (bad model name, malformed payload).
+_TOOL_CALL_ERROR_PATTERN = re.compile(r"tool|function", re.IGNORECASE)
+# Probe decisions are scoped to the endpoint AND the credential that produced
+# them (gateways may answer differently per key), keyed by a key fingerprint
+# so the raw secret never lands in cache contents or debug dumps.
+_STRUCTURED_OUTPUT_SUPPORT_CACHE: dict[tuple[str, str, str, str], bool] = {}
+# One in-flight probe per cache key: concurrent first-time callers wait for the
+# probe instead of each hitting the network (per-key, so unrelated endpoints
+# never block each other).
+_STRUCTURED_OUTPUT_SUPPORT_LOCKS: dict[tuple[str, str, str, str], threading.Lock] = {}
+_STRUCTURED_OUTPUT_SUPPORT_LOCK = threading.Lock()
+
+
+def _structured_output_key_fingerprint(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+
+
+def probe_tool_call_support(
+    *,
+    base_url: str,
+    model: str,
+    api_mode: OpenAIAPIMode,
+    api_key: str = "",
+    timeout: float = _STRUCTURED_OUTPUT_PROBE_TIMEOUT,
+    transport: httpx.BaseTransport | None = None,
+) -> bool | None:
+    """Send one minimal forced tool call to ``base_url`` and classify the result.
+
+    Returns True when the endpoint answers with the forced tool call, False when
+    it definitively rejects tool calling, and None when the capability cannot be
+    determined (auth failures, throttling, outages, ambiguous request errors).
+    ``transport`` is an injection point for offline tests.
+    """
+
+    if api_mode == "responses":
+        url = base_url.rstrip("/") + "/responses"
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": "Call the arc_capability_ping tool.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "arc_capability_ping",
+                    "description": "No-op capability probe tool.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "arc_capability_ping"},
+        }
+    else:
+        url = base_url.rstrip("/") + "/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Call the arc_capability_ping tool."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "arc_capability_ping",
+                        "description": "No-op capability probe tool.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "arc_capability_ping"}},
+        }
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        with httpx.Client(timeout=timeout, transport=transport) as client:
+            response = client.post(url, json=payload, headers=headers)
+    except (httpx.HTTPError, OSError):
+        return None
+
+    if response.status_code != 200:
+        if response.status_code in {400, 404, 422}:
+            try:
+                body = response.text
+            except Exception:
+                # Undecodable gateway error page: classification is impossible.
+                return None
+            if _TOOL_CALL_ERROR_PATTERN.search(body):
+                return False
+        return None
+
+    try:
+        data = response.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        # A 200 whose body is not a JSON object says nothing about tool support.
+        return None
+
+    if api_mode == "responses":
+        output = data.get("output")
+        if not isinstance(output, list):
+            return False
+        return any(isinstance(item, dict) and item.get("type") == "function_call" for item in output)
+
+    choices = data.get("choices")
+    message = (
+        choices[0].get("message")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+        else None
+    )
+    if not isinstance(message, dict):
+        return False
+    return bool(message.get("tool_calls"))
+
+
+def structured_output_supported(model: str | object) -> bool:
+    """Decide whether a pydantic ``response_format`` may be passed to agents.
+
+    Resolution order:
+    1. ``ARC_STRUCTURED_OUTPUT``=on/off forces the decision without probing.
+    2. No custom base URL, an official OpenAI host, or a non-string model
+       object: supported.
+    3. Otherwise one cached probe per (base URL, model, API mode, credential
+       fingerprint); concurrent first-time callers share a single probe.
+
+    The probe fails open: when capability is inconclusive (auth, throttling,
+    outage), structured output stays enabled because ARC agents already require
+    tool calling to function at all.
+    """
+
+    override = os.getenv("ARC_STRUCTURED_OUTPUT", "").strip().lower()
+    if override in _STRUCTURED_OUTPUT_ON_VALUES:
+        return True
+    if override in _STRUCTURED_OUTPUT_OFF_VALUES:
+        return False
+    if override:
+        logger.warning(
+            "Invalid ARC_STRUCTURED_OUTPUT=%r; expected on/off. Falling back to capability probing.",
+            override,
+        )
+
+    base_url = _get_openai_base_url()
+    if not base_url or _is_official_openai_base_url(base_url):
+        return True
+
+    model_name = model if isinstance(model, str) else str(getattr(model, "model_name", "") or "")
+    if not model_name:
+        return True
+
+    api_mode = resolve_openai_api_mode(None)
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    cache_key = (
+        base_url,
+        model_name,
+        api_mode,
+        _structured_output_key_fingerprint(api_key),
+    )
+    # Per-key single-flight: the first caller probes while holding the key's
+    # lock; concurrent callers for the same key wait and then read the cached
+    # decision instead of issuing duplicate probes.
+    with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
+        key_lock = _STRUCTURED_OUTPUT_SUPPORT_LOCKS.get(cache_key)
+        if key_lock is None:
+            key_lock = threading.Lock()
+            _STRUCTURED_OUTPUT_SUPPORT_LOCKS[cache_key] = key_lock
+    with key_lock:
+        with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
+            cached = _STRUCTURED_OUTPUT_SUPPORT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        probe_result = probe_tool_call_support(
+            base_url=base_url,
+            model=model_name,
+            api_mode=api_mode,
+            api_key=api_key,
+        )
+        if probe_result is False:
+            supported = False
+            logger.warning(
+                "Structured output disabled: endpoint %s rejected tool calling (model=%s).",
+                base_url,
+                model_name,
+            )
+        else:
+            # True = probe succeeded; None = inconclusive, fail open.
+            supported = True
+            logger.info(
+                "Structured output enabled for %s (model=%s, probe %s).",
+                base_url,
+                model_name,
+                "succeeded" if probe_result is True else "inconclusive",
+            )
+
+        with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
+            _STRUCTURED_OUTPUT_SUPPORT_CACHE[cache_key] = supported
+        return supported
+
+
+def reset_structured_output_support_cache_for_tests() -> None:
+    """Drop cached probe decisions so a test can assert probing behaviour."""
+
+    with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
+        _STRUCTURED_OUTPUT_SUPPORT_CACHE.clear()
+        _STRUCTURED_OUTPUT_SUPPORT_LOCKS.clear()
 
 
 def normalize_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model: str) -> Exception:

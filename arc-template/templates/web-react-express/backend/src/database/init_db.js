@@ -4,6 +4,11 @@ const sqlite3 = require('sqlite3').verbose();
 
 const DEFAULT_DB_FILENAME = 'database.db';
 
+// Upper bound for initializeDatabase() attempts when a concurrent closeDb() /
+// setDbPath() invalidates an in-flight initialization. Genuine init errors
+// still surface (rethrown) once attempts are exhausted.
+const MAX_INIT_ATTEMPTS = 5;
+
 let db = null;
 let initPromise = null;
 let currentDbPath = resolveDbPath(
@@ -54,24 +59,9 @@ function runStatement(database, sql) {
   });
 }
 
-async function initializeDatabase(options = {}) {
-  if (options.dbPath) {
-    await setDbPath(options.dbPath);
-  }
-  if (options.reset) {
-    await resetDatabaseFile();
-  }
-  if (initPromise) {
-    // Memoized path: callers await this function and then use the result as a
-    // database handle. Returning the init promise would hand them a
-    // Promise<void>, so every second DB operation failed with
-    // "Cannot read properties of undefined (reading 'exec')".
-    await initPromise;
-    return getDb();
-  }
-
+function startInit() {
   const database = getDb();
-  initPromise = (async () => {
+  const promise = (async () => {
     await runStatement(database, 'PRAGMA foreign_keys = ON;');
 
     /**
@@ -81,27 +71,91 @@ async function initializeDatabase(options = {}) {
      * 3. Keep schema evolution idempotent and centralized in this file.
      * 4. Reuse `db_runtime.js` for CRUD helpers and `test_harness.js` for test DB lifecycle instead of re-implementing one-off connection logic elsewhere.
      */
-  })();
 
-  try {
-    await initPromise;
-  } catch (error) {
-    initPromise = null;
-    throw error;
+    return database;
+  })();
+  // If a concurrent closeDb() invalidates the handle mid-init, absorb the
+  // rejection so it cannot become an unhandled rejection; initializeDatabase()
+  // callers still observe it through their own await and retry against the
+  // current generation.
+  promise.catch(() => {});
+  initPromise = promise;
+  return promise;
+}
+
+async function initializeDatabase(options = {}) {
+  if (options.dbPath) {
+    await setDbPath(options.dbPath);
+  }
+  if (options.reset) {
+    await resetDatabaseFile();
   }
 
-  return database;
+  // Invariant: every resolved return value is an open handle for the current
+  // generation. A concurrent closeDb()/setDbPath() can invalidate an in-flight
+  // init; re-validate before handing the handle out and retry against the
+  // current state instead of silently returning a closed database (which made
+  // the next DB operation fail with "SQLITE_MISUSE: Database is closed").
+  //
+  // Distinguishing invalidation from failure: every operation that changes
+  // `db` (closeDb, setDbPath, a newer startInit) also nulls or replaces
+  // `initPromise`. So when the promise we awaited is still the current
+  // initPromise, nothing invalidated our generation and the rejection is a
+  // genuine init failure — surface it immediately instead of burning retries.
+  let lastError = null;
+  for (let attempt = 0; attempt < MAX_INIT_ATTEMPTS; attempt += 1) {
+    const pending = initPromise;
+    if (pending) {
+      try {
+        const database = await pending;
+        if (db === database) {
+          return database;
+        }
+        // Generation was swapped while waiting; fall through and re-check.
+      } catch (error) {
+        if (initPromise === pending) {
+          initPromise = null;
+          throw error;
+        }
+        lastError = error;
+      }
+      continue;
+    }
+
+    const promise = startInit();
+    try {
+      const database = await promise;
+      if (db === database) {
+        return database;
+      }
+    } catch (error) {
+      if (initPromise === promise) {
+        initPromise = null;
+        throw error;
+      }
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error('Database initialization did not produce a usable handle');
 }
 
 function closeDb() {
+  const pendingInit = initPromise;
+  initPromise = null;
+  if (pendingInit) {
+    // The in-flight init may reject with SQLITE_MISUSE once its handle is
+    // closed underneath it. Absorb that rejection here so it never surfaces
+    // as an unhandled rejection; initializeDatabase() awaiters observe the
+    // same error through their own await and retry against the current state.
+    pendingInit.catch(() => {});
+  }
   if (!db) {
-    initPromise = null;
     return Promise.resolve();
   }
 
   const currentDb = db;
   db = null;
-  initPromise = null;
   return new Promise((resolve, reject) => {
     currentDb.close((err) => {
       if (err) {
