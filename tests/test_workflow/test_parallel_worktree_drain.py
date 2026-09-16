@@ -17,6 +17,7 @@ contract required before concurrent tasks may run:
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -207,6 +208,121 @@ def test_parent_implement_waits_for_descendant_implements(
     parent_start = events.index(("start", "R:IMPLEMENT"))
     for node_id in ("RA", "RB", "RA1"):
         assert events.index(("end", f"{node_id}:IMPLEMENT")) < parent_start
+
+
+def test_implement_waits_for_declared_dependency_in_the_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A node whose requirement declares a dependency implements only after the
+    dependency's IMPLEMENT finished: its scenarios may read runtime state the
+    dependency creates (run6's login node needs the account REQ-1 registers)."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][1]["dependencies"] = ["RA"]
+    queue_state = _queue_state(manager, tree)
+    for task in queue_state["tasks"]:
+        if task["phase"] == PHASE_DESIGN:
+            task["status"] = TASK_COMPLETED
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        events.append(("start", task["task_id"]))
+        await asyncio.sleep(0.01)
+        events.append(("end", task["task_id"]))
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert events.index(("start", "RB:IMPLEMENT")) > events.index(("end", "RA:IMPLEMENT"))
+    assert queue_state["node_states"]["RA"] == NODE_PASSED
+    assert queue_state["node_states"]["RB"] == NODE_PASSED
+
+
+def test_declared_dependency_cycle_is_broken_and_the_drain_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cyclic dependency must not deadlock the drain: the closing edge is
+    dropped (and reported) instead of leaving both tasks PENDING forever."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][0]["dependencies"] = ["RB"]
+    tree["children"][1]["dependencies"] = ["RA"]
+    queue_state = _queue_state(manager, tree)
+
+    assert queue_state["dependencies"] == {"RA": ["RB"]}
+    assert queue_state["dropped_dependency_edges"] == [("RB", "RA", "cycle")]
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
+
+
+def test_resumed_queue_with_dangling_dependency_edge_is_filtered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restored queue whose dependency map references a node this queue
+    cannot schedule (hand-edited or foreign file) must drop that edge: the
+    gate blocks on a dependency without an IMPLEMENT task, so keeping it would
+    leave the dependent PENDING forever with no failure to report."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    queue_state = _queue_state(manager, tree)
+    legacy_queue = {**queue_state, "dependencies": {"RB": ["RA", "RGHOST"], "RGHOST": ["RA"]}}
+    legacy_queue["dropped_dependency_edges"] = []
+    Path(manager.queue_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(manager.queue_path).write_text(json.dumps(legacy_queue), encoding="utf-8")
+
+    resumed = manager._load_or_create_processing_queue(tree, require_compatible_existing_queue=True)
+
+    assert resumed["dependencies"] == {"RB": ["RA"]}
+    assert sorted(resumed["dropped_dependency_edges"]) == [
+        ("RB", "RGHOST", "no-implement-task"),
+        ("RGHOST", "", "no-implement-task"),
+    ]
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(resumed))
+
+    assert all(task["status"] == TASK_COMPLETED for task in resumed["tasks"])
+
+
+def test_resumed_queue_without_dependency_map_still_drains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Queues saved before dependency gating lack the map; the resumed run
+    rebuilds it from the tree instead of failing the compatibility check."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][1]["dependencies"] = ["RA"]
+    queue_state = _queue_state(manager, tree)
+    legacy_queue = {**queue_state}
+    legacy_queue.pop("dependencies")
+    legacy_queue.pop("dropped_dependency_edges")
+    Path(manager.queue_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(manager.queue_path).write_text(json.dumps(legacy_queue), encoding="utf-8")
+
+    resumed = manager._load_or_create_processing_queue(tree, require_compatible_existing_queue=True)
+
+    assert resumed["dependencies"] == {"RB": ["RA"]}
+    assert resumed["dropped_dependency_edges"] == []
+    assert resumed["tasks"][0]["task_id"] == "R:DESIGN"
 
 
 def test_merge_conflict_fails_only_the_conflicting_node(
