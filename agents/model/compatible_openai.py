@@ -69,7 +69,93 @@ def _chat_result_from_sse_text(payload: str) -> ChatResult:
         invalid_tool_calls=parsed["invalid_tool_calls"],
         response_metadata=metadata,
     )
+    if parsed["usage"] is not None:
+        # Mirrors langchain's `_create_usage_metadata_responses` so this
+        # fallback feeds the same UsageMetadata shape as the parsed-object
+        # path; without it every SSE-text call is recorded as estimated usage
+        # with a zero cache breakdown in llm_usage events.
+        message.usage_metadata = _usage_metadata_from_responses(parsed["usage"])
     return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+def _usage_metadata_from_responses(token_usage: dict[str, Any]) -> dict[str, Any]:
+    """Responses-API ``usage`` payload -> langchain ``UsageMetadata`` mapping.
+
+    Handles both the official field names (``input_tokens_details`` /
+    ``output_tokens_details``) and OpenAI-compatible gateway spellings
+    (``prompt_tokens_details`` / ``completion_tokens_details``,
+    ``cached_tokens`` / ``prompt_cache_hit_tokens``), mirroring the aliases
+    ``usage_capture._usage_from_token_usage`` already accepts.
+
+    ``input_tokens`` keeps the provider's prompt total (cache tokens are a
+    subset, reported under ``input_token_details``) — the same convention as
+    langchain's own ``_create_usage_metadata``/``_create_usage_metadata_responses``.
+    The ARC ``llm_usage`` event's ``input`` field is a different, pi-derived
+    convention (prompt total minus cache read/write, computed downstream in
+    ``usage_capture``), so the two numbers intentionally differ.
+    """
+
+    def _int(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    input_details = (
+        token_usage.get("input_tokens_details")
+        if isinstance(token_usage.get("input_tokens_details"), dict)
+        else token_usage.get("prompt_tokens_details")
+    ) or {}
+    output_details = (
+        token_usage.get("output_tokens_details")
+        if isinstance(token_usage.get("output_tokens_details"), dict)
+        else token_usage.get("completion_tokens_details")
+    ) or {}
+    cache_read = _int(
+        input_details.get("cached_tokens")
+        or input_details.get("cache_read_tokens")
+        or input_details.get("prompt_cache_hit_tokens")
+    )
+    cache_write = _int(
+        input_details.get("cache_write_tokens")
+        or input_details.get("cache_creation_tokens")
+        or input_details.get("prompt_cache_write_tokens")
+    )
+    input_tokens = _int(
+        token_usage.get("input_tokens")
+        if token_usage.get("input_tokens") is not None
+        else token_usage.get("prompt_tokens")
+    )
+    output_tokens = _int(
+        token_usage.get("output_tokens")
+        if token_usage.get("output_tokens") is not None
+        else token_usage.get("completion_tokens")
+    )
+    usage_metadata: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": _int(token_usage.get("total_tokens")) or input_tokens + output_tokens,
+    }
+    input_token_details: dict[str, int] = {}
+    if cache_read:
+        input_token_details["cache_read"] = cache_read
+    if cache_write:
+        input_token_details["cache_creation"] = cache_write
+    if input_token_details:
+        usage_metadata["input_token_details"] = input_token_details
+    reasoning = _int(output_details.get("reasoning_tokens") or output_details.get("reasoning"))
+    if reasoning:
+        usage_metadata["output_token_details"] = {"reasoning": reasoning}
+    return usage_metadata
+
+
+def _has_input_token_details(usage: dict[str, Any]) -> bool:
+    """Whether a terminal-event usage block carries an input-token breakdown."""
+
+    return isinstance(
+        usage.get("input_tokens_details") or usage.get("prompt_tokens_details"),
+        dict,
+    )
 
 
 def _parse_responses_sse(payload: str) -> dict[str, Any]:
@@ -78,6 +164,7 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
     invalid_tool_calls: list[dict[str, Any]] = []
     response_status = ""
     incomplete_details: dict[str, Any] | None = None
+    token_usage: dict[str, Any] | None = None
     current_event = ""
 
     for raw_line in str(payload or "").splitlines():
@@ -107,6 +194,19 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
                 # or the truncation guard would misfire on a finished response.
                 details = response.get("incomplete_details")
                 incomplete_details = details if isinstance(details, dict) else None
+                usage = response.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                # A replayed stream may emit response.completed (carrying the
+                # authoritative, cache-detailed usage) before a terminal
+                # response.incomplete whose usage block is truncated or empty.
+                # The detailed usage must not be downgraded by that replay;
+                # otherwise the last event wins, mirroring the status rule.
+                if token_usage is not None and _has_input_token_details(
+                    token_usage
+                ) and not _has_input_token_details(usage):
+                    continue
+                token_usage = usage
             continue
         if current_event != "response.output_item.done":
             continue
@@ -124,6 +224,7 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
         "invalid_tool_calls": invalid_tool_calls,
         "response_status": response_status,
         "incomplete_details": incomplete_details,
+        "usage": token_usage,
     }
 
 
