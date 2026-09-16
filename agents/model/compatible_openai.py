@@ -69,7 +69,94 @@ def _chat_result_from_sse_text(payload: str) -> ChatResult:
         invalid_tool_calls=parsed["invalid_tool_calls"],
         response_metadata=metadata,
     )
+    if parsed["usage"] is not None:
+        # Mirrors langchain's `_create_usage_metadata_responses` so this
+        # fallback feeds the same UsageMetadata shape as the parsed-object
+        # path; without it every SSE-text call is recorded as estimated usage
+        # with a zero cache breakdown in llm_usage events.
+        message.usage_metadata = _usage_metadata_from_responses(parsed["usage"])
     return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+def _usage_metadata_from_responses(token_usage: dict[str, Any]) -> dict[str, Any]:
+    """Responses-API ``usage`` payload -> langchain ``UsageMetadata`` mapping.
+
+    Handles both the official field names (``input_tokens_details`` /
+    ``output_tokens_details``) and OpenAI-compatible gateway spellings
+    (``prompt_tokens_details`` / ``completion_tokens_details``, plus the
+    DeepSeek-style top-level ``prompt_cache_hit_tokens``), mirroring the
+    aliases ``usage_capture._usage_from_token_usage`` already accepts.
+
+    ``input_tokens`` keeps the provider's prompt total (cache tokens are a
+    subset, reported under ``input_token_details``) — the same convention as
+    langchain's own ``_create_usage_metadata``/``_create_usage_metadata_responses``.
+    This is the single authoritative prompt-total field: consumers must read
+    ``input_tokens`` as the full prompt size and subtract the cache details
+    themselves if they need the uncached share. The ARC ``llm_usage`` event's
+    ``input`` field is exactly that derived share (prompt total minus cache
+    read/write, computed once downstream in ``usage_capture``); the
+    ``test_sse_usage_to_llm_usage_event_contract`` test pins the end-to-end
+    conversion so the two conventions cannot drift apart silently.
+    """
+
+    def _int(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    input_details = (
+        token_usage.get("input_tokens_details")
+        if isinstance(token_usage.get("input_tokens_details"), dict)
+        else token_usage.get("prompt_tokens_details")
+    ) or {}
+    output_details = (
+        token_usage.get("output_tokens_details")
+        if isinstance(token_usage.get("output_tokens_details"), dict)
+        else token_usage.get("completion_tokens_details")
+    ) or {}
+    cache_read = _int(
+        input_details.get("cached_tokens")
+        # DeepSeek-style gateways report the cache-hit count at the usage top
+        # level instead of inside a details object (same alias as
+        # usage_capture._usage_from_token_usage).
+        or token_usage.get("prompt_cache_hit_tokens")
+    )
+    cache_write = _int(
+        input_details.get("cache_write_tokens")
+        or input_details.get("cache_creation_tokens")
+    )
+    input_tokens = _int(
+        token_usage.get("input_tokens")
+        if token_usage.get("input_tokens") is not None
+        else token_usage.get("prompt_tokens")
+    )
+    output_tokens = _int(
+        token_usage.get("output_tokens")
+        if token_usage.get("output_tokens") is not None
+        else token_usage.get("completion_tokens")
+    )
+    # A provider's explicit total wins; when absent (or the contradictory
+    # zero-with-nonzero-input shape some gateways emit mid-retry) it falls
+    # back to input+output. ARC's only consumer (usage_capture) never reads
+    # total_tokens - it recomputes total = input + output + cache itself -
+    # so a zero here cannot leak into llm_usage events.
+    usage_metadata: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": _int(token_usage.get("total_tokens")) or input_tokens + output_tokens,
+    }
+    input_token_details: dict[str, int] = {}
+    if cache_read:
+        input_token_details["cache_read"] = cache_read
+    if cache_write:
+        input_token_details["cache_creation"] = cache_write
+    if input_token_details:
+        usage_metadata["input_token_details"] = input_token_details
+    reasoning = _int(output_details.get("reasoning_tokens") or output_details.get("reasoning"))
+    if reasoning:
+        usage_metadata["output_token_details"] = {"reasoning": reasoning}
+    return usage_metadata
 
 
 def _parse_responses_sse(payload: str) -> dict[str, Any]:
@@ -78,6 +165,8 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
     invalid_tool_calls: list[dict[str, Any]] = []
     response_status = ""
     incomplete_details: dict[str, Any] | None = None
+    completed_usage: dict[str, Any] | None = None
+    fallback_usage: dict[str, Any] | None = None
     current_event = ""
 
     for raw_line in str(payload or "").splitlines():
@@ -107,6 +196,17 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
                 # or the truncation guard would misfire on a finished response.
                 details = response.get("incomplete_details")
                 incomplete_details = details if isinstance(details, dict) else None
+                usage = response.get("usage")
+                if isinstance(usage, dict):
+                    if current_event == "response.completed":
+                        # A completed event is the authoritative billing record:
+                        # it wins regardless of arrival order and never gets
+                        # downgraded by a later truncated incomplete replay.
+                        completed_usage = usage
+                    elif completed_usage is None:
+                        # An incomplete event's usage is a fallback for streams
+                        # that never produced a completed event.
+                        fallback_usage = usage
             continue
         if current_event != "response.output_item.done":
             continue
@@ -124,6 +224,7 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
         "invalid_tool_calls": invalid_tool_calls,
         "response_status": response_status,
         "incomplete_details": incomplete_details,
+        "usage": completed_usage if completed_usage is not None else fallback_usage,
     }
 
 

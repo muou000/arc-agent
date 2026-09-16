@@ -5,10 +5,12 @@ import sys
 import asyncio
 import shutil
 import sqlite3
+import logging
 import subprocess
 import signal
 import hashlib
 import inspect
+import threading
 import urllib.request
 
 from dataclasses import dataclass
@@ -26,6 +28,8 @@ from .template_patches import (
 )
 from core.config import build_web_runtime_env, get_web_base_url, get_web_port
 from core.processes import finalize_subprocess
+
+logger = logging.getLogger(__name__)
 
 async def _emit_log(log_cb: Callable[..., Awaitable[None] | None], *args) -> None:
     result = log_cb(*args)
@@ -845,6 +849,7 @@ async def _terminate_process(process: asyncio.subprocess.Process | None, *, port
         else {}
     )
     await finalize_subprocess(process, force_kill=False)
+    await _await_output_tail_drains(process)
 
     if port is None:
         return "No port cleanup required."
@@ -854,6 +859,36 @@ async def _terminate_process(process: asyncio.subprocess.Process | None, *, port
         context="Backend runtime cleanup",
         allowed_processes=owned_processes,
     )
+
+
+async def _await_output_tail_drains(
+    process: asyncio.subprocess.Process | None,
+    timeout: float = 2.0,
+) -> None:
+    """Wait for the anchored pipe drains of a terminated process to finish.
+
+    The process death closes the pipes, so the drain tasks normally exit on
+    their next read; awaiting them here keeps teardown deterministic (no
+    pending-task warnings when the surrounding event loop closes right after)
+    and bounds how long a stuck drain can outlive its process.
+    """
+
+    if process is None:
+        return
+    drains = getattr(process, "_arc_output_tails", None)
+    if not drains:
+        return
+    pending = [task for task in drains[2] if not task.done()]
+    if not pending:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        for task in pending:
+            task.cancel()
 
 
 def _read_package_scripts(package_dir: str) -> dict[str, str]:
@@ -1037,11 +1072,147 @@ async def _seed_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -
     return _extract_exit_code(seed_output) == 0, seed_output
 
 
+# How much of a failed backend's console output is echoed into the test
+# failure body. Startup crashes (the Express 5 wildcard-route throw, a bad
+# import) print a stack trace well under this size; the cap keeps a chatty
+# server that never became ready from flooding the TDD repair context.
+_BACKEND_STARTUP_OUTPUT_LIMIT = 4000
+
+# The tail buffer keeps this many raw bytes per stream so a startup crash is
+# still observable when the process wrote a lot before dying. Ring size is
+# deliberately larger than the echo limit: the newest bytes survive, and the
+# memory cost per backend runtime is bounded.
+_BACKEND_OUTPUT_TAIL_BYTES = 64 * 1024
+
+
+class _ProcessOutputTail:
+    """Background consumer of one subprocess pipe, keeping the newest bytes.
+
+    The backend runtime's pipes must be read continuously for the whole
+    process lifetime: a server that prints more than the OS pipe buffer would
+    otherwise block on its next write and appear to hang. The newest
+    ``_BACKEND_OUTPUT_TAIL_BYTES`` are retained so a failed startup can still
+    echo the crashing output into the test failure body.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._chunks: bytearray = bytearray()
+
+    async def consume(self, stream: asyncio.StreamReader | None) -> None:
+        if stream is None:
+            return
+        while True:
+            try:
+                chunk = await stream.read(65536)
+            except (OSError, ValueError):
+                # A closed/invalid pipe ends the drain; the retained tail stays.
+                return
+            except asyncio.CancelledError:
+                # Cancellation is a stop request, not an error: exit without
+                # swallowing it, so `Task.cancel()` keeps its meaning for
+                # test-harness teardowns and loop shutdown paths.
+                raise
+            if not chunk:
+                # Cancelled reads surface as EOF (the StreamReader ends its
+                # pending waiters with an empty result); a real EOF ends here
+                # too. Either way the newest bytes are already retained.
+                return
+            with self._lock:
+                self._chunks.extend(chunk)
+                if len(self._chunks) > _BACKEND_OUTPUT_TAIL_BYTES:
+                    del self._chunks[:-_BACKEND_OUTPUT_TAIL_BYTES]
+
+    def text(self) -> str:
+        with self._lock:
+            raw = bytes(self._chunks)
+        text = raw.decode("utf-8", errors="replace")
+        # The ring cut can split a multi-byte UTF-8 sequence at the buffer
+        # head, decoding to a stray U+FFFD that would lead the echoed output.
+        # Drop that one leading replacement character; every later character
+        # is a complete sequence.
+        if text.startswith("\ufffd"):
+            text = text[1:]
+        return text
+
+
+def _start_output_tails(
+    process: asyncio.subprocess.Process,
+) -> tuple[_ProcessOutputTail, _ProcessOutputTail]:
+    """Spawn consumers for both pipes of a freshly started runtime.
+
+    The consuming tasks and their tails are anchored on the ``Process`` object
+    itself: asyncio keeps only weak references to running tasks, so a task
+    created here and dropped would be garbage-collected mid-session and the
+    pipes would fill up again. Attaching to the process (which every caller
+    holds for the runtime's whole lifetime) keeps the drains alive until the
+    process is torn down.
+    """
+
+    stdout_tail = _ProcessOutputTail()
+    stderr_tail = _ProcessOutputTail()
+    drains: list[asyncio.Task[None]] = []
+    for tail, stream in ((stdout_tail, process.stdout), (stderr_tail, process.stderr)):
+        try:
+            drains.append(asyncio.get_running_loop().create_task(tail.consume(stream)))
+        except RuntimeError:
+            # Only reachable if a future caller invokes this outside a running
+            # loop (today every call site is inside an async function, which
+            # always has one). Never silent: an undrained pipe would freeze a
+            # chatty backend, and that failure mode must be diagnosable.
+            logger.warning(
+                "No running event loop to anchor the %s pipe drain; the backend "
+                "runtime's output pipe may block once the OS buffer fills.",
+                stream,
+            )
+            continue
+    # Strong reference for the process lifetime: the caller holds the Process
+    # (E2E session state, test locals), which transitively keeps the drain
+    # tasks alive — the running loop alone would not. The attribute must stay
+    # populated for as long as the Process object lives: a second
+    # _terminate_process call on the same object still reads it, and dropping
+    # it mid-flight would orphan still-pending drains back to weak references.
+    process._arc_output_tails = (stdout_tail, stderr_tail, drains)  # type: ignore[attr-defined]
+    return stdout_tail, stderr_tail
+
+
+async def _format_backend_output(
+    stdout_tail: _ProcessOutputTail,
+    stderr_tail: _ProcessOutputTail,
+) -> str:
+    """Render the retained console output of a backend, newest bytes first.
+
+    Callers invoke this after ``_terminate_process`` has already awaited the
+    drain tasks (process death closed the pipes, every buffered byte is in
+    the tails), so no flush wait is needed here.
+    """
+
+    sections: list[str] = []
+    stdout_text = _tail(stdout_tail.text(), _BACKEND_STARTUP_OUTPUT_LIMIT)
+    stderr_text = _tail(stderr_tail.text(), _BACKEND_STARTUP_OUTPUT_LIMIT)
+    if stdout_text:
+        sections.append(f"STDOUT:\n{stdout_text}")
+    if stderr_text:
+        sections.append(f"STDERR:\n{stderr_text}")
+    return "\n".join(sections)
+
+
 async def _start_backend_runtime(
     workspace_path: str,
     runtime_env: dict[str, str],
     web_port: int | None = None,
 ) -> tuple[asyncio.subprocess.Process | None, str, str, str]:
+    """Start the backend runtime and wait until it serves HTTP.
+
+    The returned ``Process`` carries the anchored pipe drains
+    (``_arc_output_tails``); the caller owns that object for the runtime's
+    whole lifetime and must clean it up through ``_terminate_process`` -
+    the single teardown path that releases the port and awaits the drains.
+    Every current call site (probe_backend_health, run_test_file,
+    run_test_group's session) funnels there; a new call site bypassing it
+    would leave the drains pending on a dead process.
+    """
+
     backend_path = os.path.join(workspace_path, "backend")
     resolved_port = int(web_port) if web_port is not None else get_web_port()
     start_command = _resolve_backend_start_command(backend_path)
@@ -1063,8 +1234,8 @@ async def _start_backend_runtime(
         backend_process = await asyncio.create_subprocess_shell(
             start_command,
             cwd=backend_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env={
                 **os.environ,
                 **runtime_env,
@@ -1073,6 +1244,11 @@ async def _start_backend_runtime(
     except Exception as exc:
         return None, start_command, f"Failed to start backend runtime with `{start_command}`: {str(exc)}", ""
 
+    # Consume the pipes from the first moment: a chatty server would otherwise
+    # block on a full OS pipe buffer during the startup wait itself. The tails
+    # also retain the newest output for the failure body below.
+    stdout_tail, stderr_tail = _start_output_tails(backend_process)
+
     server_ready = await _wait_for_http_server("127.0.0.1", resolved_port, timeout=20.0)
     if not server_ready:
         cleanup_note = ""
@@ -1080,11 +1256,13 @@ async def _start_backend_runtime(
             cleanup_note = await _terminate_process(backend_process, port=resolved_port)
         except Exception as cleanup_exc:
             cleanup_note = f"Backend runtime cleanup after failed startup also failed: {cleanup_exc}"
+        captured_output = await _format_backend_output(stdout_tail, stderr_tail)
         return None, start_command, (
             f"Failed to start backend runtime with `{start_command}` on port {resolved_port} "
             "within 20 seconds.\n"
             f"{startup_cleanup_note}\n"
-            f"{cleanup_note}"
+            f"{cleanup_note}\n"
+            f"=== Backend Process Output ===\n{captured_output or '(the process produced no output)'}"
         ), ""
 
     instance_fingerprint = _format_backend_instance_fingerprint(
@@ -1345,6 +1523,7 @@ class WebAppType(AppTypeHandler):
             "For web apps, the hosted runtime is backend-led: enter `frontend` and run `npm run build`, then enter `backend` and run `npm run start` to serve the built frontend dist.",
             f"The backend process is responsible for hosting `frontend/dist` on the single web port `{resolved_port}`; do not assume a separate frontend dev server is part of the runtime.",
             "E2E and runtime verification should target the backend-hosted origin after the frontend build completes.",
+            "The backend runs Express 5, where a bare wildcard route string (`app.get('*', ...)`, `app.use('*')`) throws `TypeError: Cannot read properties of undefined (reading 'type')` at route registration and crashes the server at startup. For SPA fallback use the template pattern in `backend/src/app.js` (a regex like `/^(?!\\/api(?:\\/$|\\/)).*/`) or the named wildcard `'/{*splat}'`; never `'*'` or `'/*'`.",
         ]
 
     @classmethod
@@ -1968,9 +2147,21 @@ class WebAppType(AppTypeHandler):
             return ""
         self._e2e_runtime_session = None
         try:
-            return await _terminate_process(session.process, port=session.port)
+            note = await _terminate_process(session.process, port=session.port)
         except Exception as exc:
             return f"Backend runtime cleanup failed: {exc}"
+        # A server that crashed mid-session (the chatty-output scenario the
+        # drains defend against) leaves its dying words only in the tail
+        # buffers; surface them here so the teardown note carries the crash
+        # evidence, mirroring the startup-failure body.
+        anchor = getattr(session.process, "_arc_output_tails", None)
+        if anchor is not None:
+            captured = await _format_backend_output(anchor[0], anchor[1])
+            if captured:
+                note = (
+                    f"{note}\n=== Backend Process Output (session teardown) ===\n{captured}"
+                )
+        return note
 
     async def shutdown_e2e_runtime(self) -> None:
         note = await self._terminate_e2e_session("E2E runtime session shutdown")
