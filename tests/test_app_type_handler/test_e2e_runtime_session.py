@@ -363,6 +363,51 @@ def test_shutdown_e2e_runtime_terminates_the_session(tmp_path) -> None:
         assert terminated == [session.process.pid]
 
 
+def test_session_teardown_surfaces_retained_crash_output(tmp_path) -> None:
+    """A mid-session server crash must surface through the teardown note.
+
+    The drain tails are the only place a crashed session server's output
+    survives; `_terminate_e2e_session` appends the retained tail to its
+    cleanup note so report bodies carry the crash evidence.
+    """
+
+    handler = _make_handler(tmp_path)
+    session = _make_session("unused.sqlite", "fp")
+    stdout_tail = web_handler._ProcessOutputTail()
+    stderr_tail = web_handler._ProcessOutputTail()
+    with stderr_tail._lock:
+        stderr_tail._chunks.extend(
+            b"TypeError: Cannot read properties of undefined (reading 'type')\n"
+        )
+    session.process._arc_output_tails = (stdout_tail, stderr_tail, [])  # type: ignore[attr-defined]
+    handler._e2e_runtime_session = session
+
+    async def _fake_terminate(process, port=None) -> str:
+        return "released"
+
+    with mock.patch.object(web_handler, "_terminate_process", _fake_terminate):
+        note = asyncio.run(handler._terminate_e2e_session("Session teardown"))
+
+    assert "Backend Process Output (session teardown)" in note
+    assert "STDERR:" in note
+    assert "TypeError: Cannot read properties of undefined" in note
+
+
+def test_session_teardown_without_anchor_keeps_plain_note(tmp_path) -> None:
+    handler = _make_handler(tmp_path)
+    session = _make_session("unused.sqlite", "fp")
+    handler._e2e_runtime_session = session
+
+    async def _fake_terminate(process, port=None) -> str:
+        return "released"
+
+    with mock.patch.object(web_handler, "_terminate_process", _fake_terminate):
+        note = asyncio.run(handler._terminate_e2e_session("Session teardown"))
+
+    assert note == "released"
+    assert "Backend Process Output" not in note
+
+
 def test_backend_fingerprint_ignores_non_server_paths(tmp_path) -> None:
     backend = tmp_path / "backend"
     (backend / "src").mkdir(parents=True)

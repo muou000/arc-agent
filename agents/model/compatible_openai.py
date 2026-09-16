@@ -136,6 +136,11 @@ def _usage_metadata_from_responses(token_usage: dict[str, Any]) -> dict[str, Any
         if token_usage.get("output_tokens") is not None
         else token_usage.get("completion_tokens")
     )
+    # A provider's explicit total wins; when absent (or the contradictory
+    # zero-with-nonzero-input shape some gateways emit mid-retry) it falls
+    # back to input+output. ARC's only consumer (usage_capture) never reads
+    # total_tokens - it recomputes total = input + output + cache itself -
+    # so a zero here cannot leak into llm_usage events.
     usage_metadata: dict[str, Any] = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,

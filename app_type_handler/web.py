@@ -5,6 +5,7 @@ import sys
 import asyncio
 import shutil
 import sqlite3
+import logging
 import subprocess
 import signal
 import hashlib
@@ -27,6 +28,8 @@ from .template_patches import (
 )
 from core.config import build_web_runtime_env, get_web_base_url, get_web_port
 from core.processes import finalize_subprocess
+
+logger = logging.getLogger(__name__)
 
 async def _emit_log(log_cb: Callable[..., Awaitable[None] | None], *args) -> None:
     result = log_cb(*args)
@@ -1153,6 +1156,15 @@ def _start_output_tails(
         try:
             drains.append(asyncio.get_running_loop().create_task(tail.consume(stream)))
         except RuntimeError:
+            # Only reachable if a future caller invokes this outside a running
+            # loop (today every call site is inside an async function, which
+            # always has one). Never silent: an undrained pipe would freeze a
+            # chatty backend, and that failure mode must be diagnosable.
+            logger.warning(
+                "No running event loop to anchor the %s pipe drain; the backend "
+                "runtime's output pipe may block once the OS buffer fills.",
+                stream,
+            )
             continue
     # Strong reference for the process lifetime: the caller holds the Process
     # (E2E session state, test locals), which transitively keeps the drain
@@ -2135,9 +2147,21 @@ class WebAppType(AppTypeHandler):
             return ""
         self._e2e_runtime_session = None
         try:
-            return await _terminate_process(session.process, port=session.port)
+            note = await _terminate_process(session.process, port=session.port)
         except Exception as exc:
             return f"Backend runtime cleanup failed: {exc}"
+        # A server that crashed mid-session (the chatty-output scenario the
+        # drains defend against) leaves its dying words only in the tail
+        # buffers; surface them here so the teardown note carries the crash
+        # evidence, mirroring the startup-failure body.
+        anchor = getattr(session.process, "_arc_output_tails", None)
+        if anchor is not None:
+            captured = await _format_backend_output(anchor[0], anchor[1])
+            if captured:
+                note = (
+                    f"{note}\n=== Backend Process Output (session teardown) ===\n{captured}"
+                )
+        return note
 
     async def shutdown_e2e_runtime(self) -> None:
         note = await self._terminate_e2e_session("E2E runtime session shutdown")
