@@ -167,3 +167,58 @@ def test_output_tail_drains_are_anchored_to_the_process() -> None:
     assert anchored_tasks, "the consuming asyncio tasks must be kept referenced"
     assert all(task.done() or not task.cancelled() for task in anchored_tasks)
     assert stdout_tail.text().startswith("hi")
+
+
+def test_output_tail_ring_cut_does_not_lead_with_garbage() -> None:
+    """A ring-buffer cut splitting a UTF-8 sequence must not prefix U+FFFD.
+
+    The 64KB ring keeps the newest bytes; the cut can split a multi-byte
+    character at the buffer head, and the stray replacement character would
+    lead the echoed output when the 4KB window reaches the buffer start.
+    """
+
+    char = "你".encode("utf-8")  # 3 bytes each
+    tail = web_handler._ProcessOutputTail()
+    # Simulate the post-cut ring state: the buffer begins with the trailing
+    # 2 bytes of a character whose first byte was dropped by the ring cut.
+    with tail._lock:
+        tail._chunks.extend(char[:2] + char * 100)
+
+    text = tail.text()
+
+    assert not text.startswith("\ufffd")
+    assert text.startswith("你")
+    assert len(text) == 100
+
+
+def test_output_tail_cancel_propagates() -> None:
+    """Cancelling a drain task must surface as cancellation, not a silent exit."""
+
+    import asyncio as _asyncio
+
+    async def _start_and_cancel() -> bool:
+        process = await _asyncio.create_subprocess_exec(
+            "cmd",
+            "/c",
+            "pause > nul",
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        try:
+            _stdout_tail, _stderr_tail = web_handler._start_output_tails(process)
+            drains = getattr(process, "_arc_output_tails")[2]
+            assert drains
+            drains[0].cancel()
+            try:
+                await _asyncio.wait_for(_asyncio.shield(drains[0]), timeout=5.0)
+                return False  # returned normally: cancellation was swallowed
+            except _asyncio.CancelledError:
+                return True
+        finally:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+
+    assert _asyncio.run(_start_and_cancel())

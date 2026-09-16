@@ -187,7 +187,7 @@ def test_missing_usage_keeps_the_estimate_fallback() -> None:
 
 
 def test_latest_terminal_event_usage_wins() -> None:
-    """A replayed stream must not leave a stale usage block behind."""
+    """Without a completed event, the latest incomplete usage is the fallback."""
 
     stale = _sse(
         "response.incomplete",
@@ -197,9 +197,9 @@ def test_latest_terminal_event_usage_wins() -> None:
         },
     )
     final = _sse(
-        "response.completed",
+        "response.incomplete",
         {
-            "status": "completed",
+            "status": "incomplete",
             "usage": {"prompt_tokens": 200, "completion_tokens": 50, "total_tokens": 250},
         },
     )
@@ -211,12 +211,12 @@ def test_latest_terminal_event_usage_wins() -> None:
     assert usage["output"] == 50
 
 
-def test_incomplete_replay_does_not_downgrade_detailed_usage() -> None:
-    """A terminal incomplete after a completed event must not drop cache hits.
+def test_incomplete_replay_does_not_override_completed_usage() -> None:
+    """A completed event is the authoritative usage record.
 
     A replaying proxy may emit response.completed (with the authoritative
     cache-detailed usage) and then response.incomplete whose usage block is
-    truncated or detail-free. The detailed usage survives; only the status
+    truncated or detail-free. The completed usage survives; only the status
     follows the latest event.
     """
 
@@ -246,9 +246,45 @@ def test_incomplete_replay_does_not_downgrade_detailed_usage() -> None:
 
     # Status follows the latest terminal event (truncation stays observable)...
     assert message.response_metadata["status"] == "incomplete"
-    # ...but the cache-detailed usage of the completed event is kept.
+    # ...but the completed event's cache-detailed usage is kept.
     usage = extract_usage_from_chat_result(result)
     assert usage is not None
     assert usage["cache_read"] == 11000
     assert usage["input"] == 1000  # 12000 prompt - 11000 cached
     assert usage["output"] == 300
+
+
+def test_later_completed_usage_replaces_detailed_incomplete() -> None:
+    """A completed event with a detail-free usage still beats an incomplete one.
+
+    Some gateways omit the input-token breakdown on the final completed
+    event; the completed record is the authoritative billing data even then,
+    so a stale incomplete usage block (however detailed) must not win.
+    """
+
+    incomplete = _sse(
+        "response.incomplete",
+        {
+            "status": "incomplete",
+            "usage": {
+                "prompt_tokens": 12000,
+                "completion_tokens": 300,
+                "total_tokens": 12300,
+                "prompt_tokens_details": {"cached_tokens": 11000},
+            },
+        },
+    )
+    completed = _sse(
+        "response.completed",
+        {
+            "status": "completed",
+            "usage": {"prompt_tokens": 900, "completion_tokens": 30, "total_tokens": 930},
+        },
+    )
+
+    usage = extract_usage_from_chat_result(_chat_result_from_sse_text(incomplete + completed))
+
+    assert usage is not None
+    assert usage["input"] == 900
+    assert usage["output"] == 30
+    assert usage["cache_read"] == 0

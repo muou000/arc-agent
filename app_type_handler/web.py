@@ -1072,8 +1072,17 @@ class _ProcessOutputTail:
             try:
                 chunk = await stream.read(65536)
             except (OSError, ValueError):
+                # A closed/invalid pipe ends the drain; the retained tail stays.
                 return
+            except asyncio.CancelledError:
+                # Cancellation is a stop request, not an error: exit without
+                # swallowing it, so `Task.cancel()` keeps its meaning for
+                # test-harness teardowns and loop shutdown paths.
+                raise
             if not chunk:
+                # Cancelled reads surface as EOF (the StreamReader ends its
+                # pending waiters with an empty result); a real EOF ends here
+                # too. Either way the newest bytes are already retained.
                 return
             with self._lock:
                 self._chunks.extend(chunk)
@@ -1083,7 +1092,14 @@ class _ProcessOutputTail:
     def text(self) -> str:
         with self._lock:
             raw = bytes(self._chunks)
-        return raw.decode("utf-8", errors="replace")
+        text = raw.decode("utf-8", errors="replace")
+        # The ring cut can split a multi-byte UTF-8 sequence at the buffer
+        # head, decoding to a stray U+FFFD that would lead the echoed output.
+        # Drop that one leading replacement character; every later character
+        # is a complete sequence.
+        if text.startswith("\ufffd"):
+            text = text[1:]
+        return text
 
 
 def _start_output_tails(

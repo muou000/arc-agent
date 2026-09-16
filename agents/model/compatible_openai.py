@@ -149,22 +149,14 @@ def _usage_metadata_from_responses(token_usage: dict[str, Any]) -> dict[str, Any
     return usage_metadata
 
 
-def _has_input_token_details(usage: dict[str, Any]) -> bool:
-    """Whether a terminal-event usage block carries an input-token breakdown."""
-
-    return isinstance(
-        usage.get("input_tokens_details") or usage.get("prompt_tokens_details"),
-        dict,
-    )
-
-
 def _parse_responses_sse(payload: str) -> dict[str, Any]:
     text_by_output_index: dict[int, list[str]] = {}
     tool_calls: list[dict[str, Any]] = []
     invalid_tool_calls: list[dict[str, Any]] = []
     response_status = ""
     incomplete_details: dict[str, Any] | None = None
-    token_usage: dict[str, Any] | None = None
+    completed_usage: dict[str, Any] | None = None
+    fallback_usage: dict[str, Any] | None = None
     current_event = ""
 
     for raw_line in str(payload or "").splitlines():
@@ -195,18 +187,16 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
                 details = response.get("incomplete_details")
                 incomplete_details = details if isinstance(details, dict) else None
                 usage = response.get("usage")
-                if not isinstance(usage, dict):
-                    continue
-                # A replayed stream may emit response.completed (carrying the
-                # authoritative, cache-detailed usage) before a terminal
-                # response.incomplete whose usage block is truncated or empty.
-                # The detailed usage must not be downgraded by that replay;
-                # otherwise the last event wins, mirroring the status rule.
-                if token_usage is not None and _has_input_token_details(
-                    token_usage
-                ) and not _has_input_token_details(usage):
-                    continue
-                token_usage = usage
+                if isinstance(usage, dict):
+                    if current_event == "response.completed":
+                        # A completed event is the authoritative billing record:
+                        # it wins regardless of arrival order and never gets
+                        # downgraded by a later truncated incomplete replay.
+                        completed_usage = usage
+                    elif completed_usage is None:
+                        # An incomplete event's usage is a fallback for streams
+                        # that never produced a completed event.
+                        fallback_usage = usage
             continue
         if current_event != "response.output_item.done":
             continue
@@ -224,7 +214,7 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
         "invalid_tool_calls": invalid_tool_calls,
         "response_status": response_status,
         "incomplete_details": incomplete_details,
-        "usage": token_usage,
+        "usage": completed_usage if completed_usage is not None else fallback_usage,
     }
 
 
