@@ -27,12 +27,6 @@ from agents.tools.traceability import build_traceability_tools
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
-# Validation retries the constrained repair schema may spend inside one agent
-# session before giving up (langchain's ToolStrategy default retries forever,
-# bounded only by the recursion limit — a stuck model would burn the whole
-# step budget re-submitting the same blank sheet).
-_REPAIR_VALIDATION_RETRIES = 2
-
 
 class InterfaceDesignResponse(BaseModel):
     summary: str = Field(default="", description="Short design-stage summary.")
@@ -43,46 +37,30 @@ class InterfaceDesignResponse(BaseModel):
 def _dynamic_repair_response_format(min_items: int) -> Any | None:
     """Repair response format with a semantic floor on the ``interfaces`` array.
 
-    A pydantic schema whose ``interfaces`` array carries ``min_items`` (via
-    ``min_length``) as its lower bound, wrapped in langchain's ``ToolStrategy``
-    with a bounded validation-retry budget: a flash-class model that "legally
-    hands in a blank sheet" (schema-valid ``[]``, observed 2026-09-16 on
-    deepseek-v4-flash) violates the constraint and is re-asked up to
-    ``_REPAIR_VALIDATION_RETRIES`` times before the payload is returned as-is
-    for the caller's fallback layers. The floor also reaches
-    provider-native constrained decoding when the endpoint supports
-    ``response_format: json_schema, strict`` (``json_schema_structured_output_supported``,
-    probed once per process): the constraint then holds at decode time and the
-    blank sheet becomes impossible in the first place.
+    A pydantic schema whose ``interfaces`` array carries a ``minItems`` lower
+    bound (via ``min_length``), wrapped in langchain's ``ToolStrategy`` with
+    ``handle_errors=False``: a flash-class model that "legally hands in a
+    blank sheet" (schema-valid ``[]``, observed 2026-09-16 on
+    deepseek-v4-flash) raises ``StructuredOutputValidationError`` out of the
+    agent session instead of being retried in-session. The repair pass
+    catches that error, salvages any valid partial rows from the failed
+    tool call, and continues with the batched/mechanical fallback layers —
+    there is deliberately no in-agent validation-retry budget here, because
+    langchain's default ``handle_errors=True`` retries forever (bounded only
+    by the recursion limit; a stuck model would burn the whole step budget
+    re-submitting the same blank sheet).
+
+    The floor also reaches provider-native constrained decoding when the
+    endpoint supports ``response_format: json_schema, strict``
+    (``json_schema_structured_output_supported``, probed once per process):
+    the constraint then holds at decode time and the blank sheet becomes
+    impossible in the first place.
     """
 
     if min_items <= 0:
         return None
     if not json_schema_structured_output_supported(_designer_model_hint()):
         return None
-    schema = create_model(
-        "InterfaceDesignRepairResponse",
-        __base__=BaseModel,
-        summary=(str, Field(default="", description="Short design-stage summary.")),
-        interfaces=(
-            list[dict[str, Any]],
-            Field(
-                min_length=min_items,
-                description=f"Interface contracts for the current node; at least {min_items} records are required.",
-            ),
-        ),
-        files_written=(list[str], Field(default_factory=list, description="Workspace-relative files written or edited.")),
-    )
-
-    # ToolStrategy's default ``handle_errors=True`` retries validation errors
-    # forever inside the agent loop (bounded only by the recursion limit); a
-    # stuck model then burns the whole step budget on the same blank sheet.
-    # ``handle_errors=False`` instead RAISES StructuredOutputValidationError
-    # out of the agent session on the first violation, which ainvoke surfaces
-    # as an exception; the repair pass catches it (see ``_fill_skeletons_pass``)
-    # and moves on to the batched/mechanical layers. One in-session correction
-    # round is kept by re-asking the model ourselves before that: the
-    # whole-list pass and the batched retry each get their own fresh budget.
     schema = create_model(
         "InterfaceDesignRepairResponse",
         __base__=BaseModel,
@@ -108,6 +86,21 @@ def _designer_model_hint() -> str:
     """
 
     return str(os.environ.get("MODEL", "") or "").strip() or "openai:gpt-5.4"
+
+
+def _is_reused_record(record: dict[str, Any], node_id: str) -> bool:
+    """Whether a model-returned row represents a reused foreign contract.
+
+    Reused parent/dependency interfaces legitimately carry their own
+    ``req_id`` (the node that owns them). Such rows must never satisfy a
+    current-node skeleton row: they describe another node's contract that
+    this design merely extends or calls, and their ``file_path`` can be a
+    shared surface the current node also touched.
+    """
+
+    req_id = str(record.get("req_id") or "").strip()
+    relation = str(record.get("relation") or "").strip().lower()
+    return (req_id != "" and req_id != node_id) or relation in {"reused", "dependency", "parent"}
 
 
 class InterfaceDesigner:
@@ -210,7 +203,6 @@ class InterfaceDesigner:
                 agent_context=agent_context,
                 evidence_paths=evidence_paths,
                 materialized_paths=materialized_paths,
-                workspace_root=workspace_root,
                 app_type=app_type,
                 selected_skill_names=selected_skill_names,
             )
@@ -264,7 +256,6 @@ class InterfaceDesigner:
         agent_context: AgentRuntimeContext,
         evidence_paths: list[str],
         materialized_paths: list[str],
-        workspace_root: str = "",
         app_type: str = "",
         selected_skill_names: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -294,10 +285,13 @@ class InterfaceDesigner:
                 status="warning",
                 node_id=node_id,
             )
+            # The rebuilt agent must be anchored to the same root the
+            # skeletons were derived against (the agent's filesystem root),
+            # not whatever the caller happened to pass through.
             fill_agent = self._constrained_repair_agent(
                 agent,
                 node_id=node_id,
-                workspace_root=workspace_root,
+                workspace_root=agent_context.workspace_root,
                 app_type=app_type,
                 selected_skill_names=selected_skill_names,
                 min_items=len(skeletons),
@@ -523,7 +517,11 @@ class InterfaceDesigner:
         for record in records:
             if str(record.get("interface_id") or "").strip() == skeleton.interface_id:
                 return record
-            if str(record.get("file_path") or "").replace("\\", "/").lstrip("/") == skeleton.file_path:
+            # Path matching is a fallback for rows the model minted its own
+            # id for — but only for rows that claim this node's ownership.
+            # A reused parent/dependency row carrying a stale file_path must
+            # not mask a real gap and silently skip the mechanical row.
+            if str(record.get("file_path") or "").replace("\\", "/").lstrip("/") == skeleton.file_path and not _is_reused_record(record, skeleton.req_id):
                 return record
         return None
 

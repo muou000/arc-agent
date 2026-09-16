@@ -258,3 +258,65 @@ def test_merge_matches_model_rows_by_file_path_when_ids_differ(tmp_path: Path) -
     # The mechanical identity wins over the model-minted id.
     assert merged[0]["interface_id"] == "REQ-2-FUNC-AuthService"
     assert merged[0]["responsibility"] == "Session verification logic."
+
+
+def test_reused_row_with_matching_path_never_masks_a_skeleton(tmp_path: Path) -> None:
+    """A reused foreign contract must not fill a current-node skeleton row.
+
+    PR #33 review: a reused parent/dependency row whose (stale or shared)
+    ``file_path`` happens to equal a skeleton's path used to satisfy the
+    skeleton through path matching, hiding a real gap from the mechanical
+    fallback and silently undercounting for the hard gate.
+    """
+
+    _write(tmp_path, "backend/src/services/auth_service.js", SERVICE_FILE)
+    skeletons = _skeletons(tmp_path, ["/workspace/backend/src/services/auth_service.js"])
+
+    reused_rows = [
+        # Foreign req_id, path pointing at this node's file.
+        {
+            "interface_id": "ROOT-UI-Other",
+            "req_id": "ROOT",
+            "type": "UI",
+            "file_path": "backend/src/services/auth_service.js",
+            "responsibility": "Reused parent header.",
+        },
+        # Explicit reuse relation, same path.
+        {
+            "interface_id": "IF-DEP",
+            "req_id": "REQ-2",
+            "relation": "reused",
+            "type": "UI",
+            "file_path": "backend/src/services/auth_service.js",
+            "responsibility": "Reused dependency.",
+        },
+    ]
+
+    merged = merge_filled_contracts(skeletons, reused_rows)
+
+    by_id = {record["interface_id"]: record for record in merged}
+    # The skeleton row is NOT hijacked: it stays unfilled...
+    assert by_id["REQ-2-FUNC-AuthService"]["responsibility"] == ""
+    # ...while both reused rows still pass through as their own records.
+    assert by_id["ROOT-UI-Other"]["responsibility"] == "Reused parent header."
+    assert by_id["IF-DEP"]["responsibility"] == "Reused dependency."
+
+
+def test_single_line_block_comment_keeps_trailing_code(tmp_path: Path) -> None:
+    """Code after ``*/`` on the comment's own line must survive extraction.
+
+    PR #33 review: ``/* header */ const a = 1;`` used to drop the entire
+    line, losing the file's first meaningful code line.
+    """
+
+    from agents.design.contract_skeleton import _code_lines
+
+    assert _code_lines("/* header */ const a = 1;") == ["const a = 1;"]
+    assert _code_lines("/* multi\nline */ const app = 2;") == ["const app = 2;"]
+    assert _code_lines("// plain comment") == []
+    assert _code_lines("const a = 1; // trailing") == ["const a = 1; // trailing"]
+
+    # End to end: the first meaningful line survives a leading banner comment.
+    _write(tmp_path, "backend/src/routes/tiny_routes.js", "/* eslint-disable */ const express = require('express');\nconst router = express.Router();\nrouter.get('/x', (req, res) => res.json({}));\nmodule.exports = router;\n")
+    skeletons = _skeletons(tmp_path, ["/workspace/backend/src/routes/tiny_routes.js"])
+    assert skeletons[0].first_line == "const express = require('express');"

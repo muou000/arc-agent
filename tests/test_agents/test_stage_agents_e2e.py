@@ -336,6 +336,78 @@ def test_interface_designer_batches_partial_fill_gaps_before_fallback(
     assert by_id[f"{node_id}-UI-CalcPage"]["file_path"] == "frontend/src/pages/CalcPage.tsx"
 
 
+def test_interface_designer_reused_row_cannot_mask_a_skeleton_gap(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A reused interface with a colliding file_path must not hide a gap.
+
+    PR #33 review: the fill pass matched model rows to skeletons by
+    ``file_path`` alone, so a reused parent/dependency row whose stale path
+    happened to equal a materialized file satisfied that skeleton and the
+    mechanical fallback silently skipped it — an undercount the workflow
+    hard gate could not see. The reused row must stay its own record while
+    the skeleton still gets its mechanical row.
+    """
+    node_id = "REQ-DESIGN-REUSED-PATH"
+    seed_requirement(arc_runtime, node_id)
+
+    def _write(path: str, content: str, call_id: str):
+        return faux_tool_call("write_file", {"file_path": f"/workspace/{path}", "content": content}, call_id=call_id)
+
+    model = FauxChatModel(
+        responses=[
+            _write("backend/src/services/calc_service.js", "module.exports = { add };\n", "c1"),
+            # Main pass: prose-only, arrays empty.
+            faux_tool_call(
+                "InterfaceDesignResponse",
+                {"summary": "Designed in prose.", "interfaces": [], "files_written": []},
+                call_id="c2",
+            ),
+            # Fill pass: only a REUSED row whose file_path collides with the
+            # service skeleton's path — no valid fill for the skeleton itself.
+            faux_tool_call(
+                "InterfaceDesignRepairResponse",
+                {
+                    "summary": "Reused only.",
+                    "interfaces": [
+                        {
+                            "interface_id": "ROOT-UI-AppHeader",
+                            "req_id": "ROOT",
+                            "type": "UI",
+                            "file_path": "backend/src/services/calc_service.js",
+                            "responsibility": "Reused parent header.",
+                        }
+                    ],
+                    "files_written": [],
+                },
+                call_id="c3",
+            ),
+            # Batched retry over the gap: model stays blank.
+            faux_tool_call(
+                "InterfaceDesignRepairResponse",
+                {"summary": "Still nothing.", "interfaces": [], "files_written": []},
+                call_id="c4",
+            ),
+        ]
+    )
+
+    bundle = asyncio.run(
+        make_designer(tmp_project_dir, model).run(
+            node_id=node_id,
+            requirement_data={"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    by_id = {item["interface_id"]: item for item in bundle["interfaces"]}
+    # The skeleton was NOT satisfied by the colliding reused row: its
+    # mechanical record landed (marked), so the hard gate sees a full count.
+    assert by_id[f"{node_id}-FUNC-CalcService"]["skeleton_derived"] is True
+    assert by_id[f"{node_id}-FUNC-CalcService"]["type"] == "FUNC"
+    # The reused row survives as its own record, semantics intact.
+    assert by_id["ROOT-UI-AppHeader"]["responsibility"] == "Reused parent header."
+    assert by_id["ROOT-UI-AppHeader"]["type"] == "UI"
+
+
 def test_interface_designer_recovers_interfaces_from_fenced_json_in_summary(
     tmp_project_dir: Path, arc_runtime
 ) -> None:

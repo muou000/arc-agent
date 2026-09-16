@@ -74,7 +74,13 @@ _REQ_BADGE_RE = re.compile(r"/\*\*?\s*(?:\*\s*)*REQ-[A-Za-z0-9_-]+\s+(.{3,60}?)[
 
 
 def _code_lines(content: str) -> list[str]:
-    """Drop comment lines so names and anchors come from real code only."""
+    """Drop comment text so names and anchors come from real code only.
+
+    Handles single-line block comments with trailing code
+    (``/* header */ const a = 1;``) and multi-line blocks whose closing line
+    carries code after ``*/``; the code tail is kept and comment tails after
+    ``//`` are left alone (they are part of the code line's own text).
+    """
 
     kept: list[str] = []
     in_block = False
@@ -83,17 +89,27 @@ def _code_lines(content: str) -> list[str]:
         if in_block:
             if "*/" in stripped:
                 in_block = False
-                stripped = stripped.split("*/", 1)[1].strip()
-                if stripped:
-                    kept.append(stripped)
+                after_close = stripped.split("*/", 1)[1].strip()
+                if after_close and not _is_comment_text(after_close):
+                    kept.append(after_close)
             continue
-        if stripped.startswith("/*") and "*/" not in stripped:
-            in_block = True
+        if stripped.startswith("/*"):
+            if "*/" in stripped:
+                # Single-line block comment; keep any code after the closer.
+                after_close = stripped.split("*/", 1)[1].strip()
+                if after_close and not _is_comment_text(after_close):
+                    kept.append(after_close)
+            else:
+                in_block = True
             continue
-        if stripped.startswith("//") or stripped.startswith("*") or stripped.startswith("/*"):
+        if _is_comment_text(stripped):
             continue
         kept.append(line.rstrip())
     return kept
+
+
+def _is_comment_text(text: str) -> bool:
+    return text.startswith("//") or text.startswith("*") or text.startswith("/*")
 
 
 @dataclass
@@ -390,6 +406,24 @@ def _normalize_id_segment(text: str) -> str:
     return cleaned or "Contract"
 
 
+def _is_reused_row(record: dict[str, Any], node_id: str = "") -> bool:
+    """Whether a model-returned row represents a reused foreign contract.
+
+    Reused parent/dependency interfaces carry their owning node's ``req_id``
+    or an explicit reuse relation. Such rows must not satisfy a current-node
+    skeleton row through path matching: their ``file_path`` can be a shared
+    surface the current node also touched, and letting them match would mask
+    a real gap. ``node_id`` is the current node; when empty only the
+    explicit relation markers are checked.
+    """
+
+    relation = str(record.get("relation") or "").strip().lower()
+    if relation in {"reused", "dependency", "parent"}:
+        return True
+    req_id = str(record.get("req_id") or "").strip()
+    return bool(node_id) and req_id != "" and req_id != node_id
+
+
 def merge_filled_contracts(
     skeletons: list[ContractSkeleton],
     model_records: list[dict[str, Any]],
@@ -399,17 +433,20 @@ def merge_filled_contracts(
     The model's job is only the two semantic fields (``responsibility`` and
     ``specification``); identity fields come from the skeleton. For each
     skeleton the model record may arrive by ``interface_id`` or by
-    ``file_path`` matching. A record with an unknown id or path is still
-    returned (the model may add reused parent/dependency interfaces), with its
-    own fields. Unknown-type model records that match no skeleton keep their
-    declared ``type``; every skeleton-derived record keeps the mechanical
+    ``file_path`` matching — the path fallback only accepts rows that claim
+    the current node's ownership, so a reused parent/dependency row with a
+    stale path cannot hijack a skeleton row. A record with an unknown id and
+    no file path is dropped (bare semantic blobs would masquerade as filled
+    rows); a reused record anchored to a real file path passes through.
+    Unknown-type model records that match no skeleton keep their declared
+    ``type``; every skeleton-derived record keeps the mechanical
     type/identity and never inherits an invented file path.
     """
 
     by_id = {str(item.get("interface_id") or "").strip(): item for item in model_records if isinstance(item, dict) and str(item.get("interface_id") or "").strip()}
     by_path: dict[str, dict[str, Any]] = {}
     for item in model_records:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or _is_reused_row(item):
             continue
         path = _strip_workspace_prefix(str(item.get("file_path") or ""))
         if path and path not in by_path:
@@ -421,6 +458,10 @@ def merge_filled_contracts(
         record = by_id.get(skeleton.interface_id)
         if record is None and skeleton.file_path in by_path:
             record = by_path[skeleton.file_path]
+        if record is not None and _is_reused_row(record, skeleton.req_id):
+            # A reused foreign contract never fills a current-node skeleton
+            # row, even when its file_path matches a shared surface.
+            record = None
         if record is not None:
             consumed.add(id(record))
         semantics = record or {}
