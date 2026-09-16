@@ -86,6 +86,13 @@ def _usage_metadata_from_responses(token_usage: dict[str, Any]) -> dict[str, Any
     (``prompt_tokens_details`` / ``completion_tokens_details``,
     ``cached_tokens`` / ``prompt_cache_hit_tokens``), mirroring the aliases
     ``usage_capture._usage_from_token_usage`` already accepts.
+
+    ``input_tokens`` keeps the provider's prompt total (cache tokens are a
+    subset, reported under ``input_token_details``) — the same convention as
+    langchain's own ``_create_usage_metadata``/``_create_usage_metadata_responses``.
+    The ARC ``llm_usage`` event's ``input`` field is a different, pi-derived
+    convention (prompt total minus cache read/write, computed downstream in
+    ``usage_capture``), so the two numbers intentionally differ.
     """
 
     def _int(value: Any) -> int:
@@ -142,6 +149,15 @@ def _usage_metadata_from_responses(token_usage: dict[str, Any]) -> dict[str, Any
     return usage_metadata
 
 
+def _has_input_token_details(usage: dict[str, Any]) -> bool:
+    """Whether a terminal-event usage block carries an input-token breakdown."""
+
+    return isinstance(
+        usage.get("input_tokens_details") or usage.get("prompt_tokens_details"),
+        dict,
+    )
+
+
 def _parse_responses_sse(payload: str) -> dict[str, Any]:
     text_by_output_index: dict[int, list[str]] = {}
     tool_calls: list[dict[str, Any]] = []
@@ -179,8 +195,18 @@ def _parse_responses_sse(payload: str) -> dict[str, Any]:
                 details = response.get("incomplete_details")
                 incomplete_details = details if isinstance(details, dict) else None
                 usage = response.get("usage")
-                if isinstance(usage, dict):
-                    token_usage = usage
+                if not isinstance(usage, dict):
+                    continue
+                # A replayed stream may emit response.completed (carrying the
+                # authoritative, cache-detailed usage) before a terminal
+                # response.incomplete whose usage block is truncated or empty.
+                # The detailed usage must not be downgraded by that replay;
+                # otherwise the last event wins, mirroring the status rule.
+                if token_usage is not None and _has_input_token_details(
+                    token_usage
+                ) and not _has_input_token_details(usage):
+                    continue
+                token_usage = usage
             continue
         if current_event != "response.output_item.done":
             continue

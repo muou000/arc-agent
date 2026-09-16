@@ -1089,15 +1089,28 @@ class _ProcessOutputTail:
 def _start_output_tails(
     process: asyncio.subprocess.Process,
 ) -> tuple[_ProcessOutputTail, _ProcessOutputTail]:
-    """Spawn detached consumers for both pipes of a freshly started runtime."""
+    """Spawn consumers for both pipes of a freshly started runtime.
+
+    The consuming tasks and their tails are anchored on the ``Process`` object
+    itself: asyncio keeps only weak references to running tasks, so a task
+    created here and dropped would be garbage-collected mid-session and the
+    pipes would fill up again. Attaching to the process (which every caller
+    holds for the runtime's whole lifetime) keeps the drains alive until the
+    process is torn down.
+    """
 
     stdout_tail = _ProcessOutputTail()
     stderr_tail = _ProcessOutputTail()
+    drains: list[asyncio.Task[None]] = []
     for tail, stream in ((stdout_tail, process.stdout), (stderr_tail, process.stderr)):
         try:
-            asyncio.get_running_loop().create_task(tail.consume(stream))
+            drains.append(asyncio.get_running_loop().create_task(tail.consume(stream)))
         except RuntimeError:
             continue
+    # Strong reference for the process lifetime: the caller holds the Process
+    # (E2E session state, test locals), which transitively keeps the drain
+    # tasks alive — the running loop alone would not.
+    process._arc_output_tails = (stdout_tail, stderr_tail, drains)  # type: ignore[attr-defined]
     return stdout_tail, stderr_tail
 
 

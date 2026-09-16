@@ -137,3 +137,33 @@ def test_runtime_contract_warns_about_express5_wildcard_routes() -> None:
     assert "Express 5" in text
     assert "'*'" in text
     assert "'/{*splat}'" in text
+
+
+def test_output_tail_drains_are_anchored_to_the_process() -> None:
+    """The drain tasks must stay referenced for the process's whole lifetime.
+
+    asyncio keeps only weak references to running tasks: a task whose only
+    reference is the local variable in `_start_output_tails` can be
+    garbage-collected mid-session, and the pipes fill up again. The drains
+    are therefore anchored on the Process object the caller holds.
+    """
+
+    import asyncio as _asyncio
+
+    async def _start_and_collect() -> list:
+        process = await _asyncio.create_subprocess_exec(
+            "cmd", "/c", "echo hi", stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE
+        )
+        stdout_tail, stderr_tail = web_handler._start_output_tails(process)
+        anchored = getattr(process, "_arc_output_tails", None)
+        await process.wait()
+        return [stdout_tail, stderr_tail, anchored]
+
+    stdout_tail, stderr_tail, anchored = _asyncio.run(_start_and_collect())
+
+    assert anchored is not None, "drains must be anchored on the Process object"
+    anchored_tails, anchored_tasks = anchored[0:2], anchored[2]
+    assert stdout_tail in anchored_tails and stderr_tail in anchored_tails
+    assert anchored_tasks, "the consuming asyncio tasks must be kept referenced"
+    assert all(task.done() or not task.cancelled() for task in anchored_tasks)
+    assert stdout_tail.text().startswith("hi")

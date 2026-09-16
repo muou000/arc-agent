@@ -209,3 +209,46 @@ def test_latest_terminal_event_usage_wins() -> None:
     assert usage is not None
     assert usage["input"] == 200
     assert usage["output"] == 50
+
+
+def test_incomplete_replay_does_not_downgrade_detailed_usage() -> None:
+    """A terminal incomplete after a completed event must not drop cache hits.
+
+    A replaying proxy may emit response.completed (with the authoritative
+    cache-detailed usage) and then response.incomplete whose usage block is
+    truncated or detail-free. The detailed usage survives; only the status
+    follows the latest event.
+    """
+
+    completed = _sse(
+        "response.completed",
+        {
+            "status": "completed",
+            "usage": {
+                "prompt_tokens": 12000,
+                "completion_tokens": 300,
+                "total_tokens": 12300,
+                "prompt_tokens_details": {"cached_tokens": 11000},
+            },
+        },
+    )
+    incomplete = _sse(
+        "response.incomplete",
+        {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"prompt_tokens": 100, "completion_tokens": 3, "total_tokens": 103},
+        },
+    )
+
+    result = _chat_result_from_sse_text(completed + incomplete)
+    message = result.generations[0].message
+
+    # Status follows the latest terminal event (truncation stays observable)...
+    assert message.response_metadata["status"] == "incomplete"
+    # ...but the cache-detailed usage of the completed event is kept.
+    usage = extract_usage_from_chat_result(result)
+    assert usage is not None
+    assert usage["cache_read"] == 11000
+    assert usage["input"] == 1000  # 12000 prompt - 11000 cached
+    assert usage["output"] == 300
