@@ -288,3 +288,65 @@ def test_later_completed_usage_replaces_detailed_incomplete() -> None:
     assert usage["input"] == 900
     assert usage["output"] == 30
     assert usage["cache_read"] == 0
+
+
+def test_sse_usage_to_llm_usage_event_contract() -> None:
+    """Pin the full SSE usage -> UsageMetadata -> LLMUsageRecord conversion.
+
+    ``usage_metadata.input_tokens`` is the single authoritative prompt-total
+    field (cache tokens a subset under ``input_token_details``); the
+    ``LLMUsageRecord`` carried by ``llm_usage`` events derives its
+    ``input_tokens`` from it by subtracting the cache share exactly once.
+    This end-to-end test keeps the two conventions from drifting apart.
+    """
+
+    from agents.model.usage_capture import (
+        LLMUsageRecord,
+        llm_usage_context,
+        record_chat_result_usage,
+        set_llm_usage_sink,
+    )
+
+    payload = _sse(
+        "response.completed",
+        {
+            "status": "completed",
+            "usage": {
+                "input_tokens": 5000,
+                "output_tokens": 800,
+                "total_tokens": 5800,
+                "input_tokens_details": {"cached_tokens": 4000, "cache_write_tokens": 500},
+                "output_tokens_details": {"reasoning_tokens": 200},
+            },
+        },
+    )
+    result = _chat_result_from_sse_text(payload)
+    message = result.generations[0].message
+
+    # Convention 1 (langchain UsageMetadata): prompt total, cache as subset.
+    assert message.usage_metadata is not None
+    assert message.usage_metadata["input_tokens"] == 5000
+    assert message.usage_metadata["input_token_details"]["cache_read"] == 4000
+    assert message.usage_metadata["input_token_details"]["cache_creation"] == 500
+
+    records: list[LLMUsageRecord] = []
+    set_llm_usage_sink(records.append)
+    try:
+        with llm_usage_context("REQ-1", "DESIGN"):
+            record_chat_result_usage(
+                result, model="MiniMax-M3", api_mode="chat_completions"
+            )
+    finally:
+        set_llm_usage_sink(None)
+
+    # Convention 2 (ARC llm_usage event): input = prompt total minus cache,
+    # derived exactly once downstream - never double-subtracted.
+    assert len(records) == 1
+    record = records[0]
+    assert record.source == "reported"
+    assert record.input_tokens == 500  # 5000 - 4000 cached - 500 written
+    assert record.cache_read_tokens == 4000
+    assert record.cache_write_tokens == 500
+    assert record.reasoning_tokens == 200
+    assert record.output_tokens == 800
+    assert record.total_tokens == 500 + 800 + 4000 + 500 == 5800

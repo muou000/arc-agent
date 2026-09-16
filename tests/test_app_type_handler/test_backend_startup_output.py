@@ -222,3 +222,35 @@ def test_output_tail_cancel_propagates() -> None:
             await process.wait()
 
     assert _asyncio.run(_start_and_cancel())
+
+
+@pytest.mark.slow
+def test_terminate_process_awaits_drain_tasks(tmp_path) -> None:
+    """Teardown must not leave drain tasks pending after the process is gone.
+
+    `_terminate_process` is the convergence point of every E2E teardown path;
+    it awaits the anchored drains (process death closes the pipes, the drains
+    see EOF) so a closing event loop never trips over still-pending tasks.
+    """
+
+    _require_node()
+    workspace = _make_backend_workspace(
+        tmp_path,
+        (
+            "const http = require('http');\n"
+            "http.createServer((req, res) => res.end('ok')).listen("
+            "process.env.ARC_WEB_PORT, '127.0.0.1');\n"
+        ),
+    )
+    port = _free_port()
+
+    async def _start_terminate_and_check() -> bool:
+        process, _command, _detail, _fingerprint = await web_handler._start_backend_runtime(
+            str(workspace), {"ARC_WEB_PORT": str(port)}, web_port=port
+        )
+        assert process is not None
+        await web_handler._terminate_process(process, port=port)
+        drains = getattr(process, "_arc_output_tails", (None, None, []))[2]
+        return all(task.done() for task in drains)
+
+    assert asyncio.run(_start_terminate_and_check())

@@ -846,6 +846,7 @@ async def _terminate_process(process: asyncio.subprocess.Process | None, *, port
         else {}
     )
     await finalize_subprocess(process, force_kill=False)
+    await _await_output_tail_drains(process)
 
     if port is None:
         return "No port cleanup required."
@@ -855,6 +856,36 @@ async def _terminate_process(process: asyncio.subprocess.Process | None, *, port
         context="Backend runtime cleanup",
         allowed_processes=owned_processes,
     )
+
+
+async def _await_output_tail_drains(
+    process: asyncio.subprocess.Process | None,
+    timeout: float = 2.0,
+) -> None:
+    """Wait for the anchored pipe drains of a terminated process to finish.
+
+    The process death closes the pipes, so the drain tasks normally exit on
+    their next read; awaiting them here keeps teardown deterministic (no
+    pending-task warnings when the surrounding event loop closes right after)
+    and bounds how long a stuck drain can outlive its process.
+    """
+
+    if process is None:
+        return
+    drains = getattr(process, "_arc_output_tails", None)
+    if not drains:
+        return
+    pending = [task for task in drains[2] if not task.done()]
+    if not pending:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        for task in pending:
+            task.cancel()
 
 
 def _read_package_scripts(package_dir: str) -> dict[str, str]:

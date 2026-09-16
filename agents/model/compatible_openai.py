@@ -90,9 +90,13 @@ def _usage_metadata_from_responses(token_usage: dict[str, Any]) -> dict[str, Any
     ``input_tokens`` keeps the provider's prompt total (cache tokens are a
     subset, reported under ``input_token_details``) — the same convention as
     langchain's own ``_create_usage_metadata``/``_create_usage_metadata_responses``.
-    The ARC ``llm_usage`` event's ``input`` field is a different, pi-derived
-    convention (prompt total minus cache read/write, computed downstream in
-    ``usage_capture``), so the two numbers intentionally differ.
+    This is the single authoritative prompt-total field: consumers must read
+    ``input_tokens`` as the full prompt size and subtract the cache details
+    themselves if they need the uncached share. The ARC ``llm_usage`` event's
+    ``input`` field is exactly that derived share (prompt total minus cache
+    read/write, computed once downstream in ``usage_capture``); the
+    ``test_sse_usage_to_llm_usage_event_contract`` test pins the end-to-end
+    conversion so the two conventions cannot drift apart silently.
     """
 
     def _int(value: Any) -> int:
