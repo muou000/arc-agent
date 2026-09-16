@@ -1190,6 +1190,17 @@ async def _start_backend_runtime(
     runtime_env: dict[str, str],
     web_port: int | None = None,
 ) -> tuple[asyncio.subprocess.Process | None, str, str, str]:
+    """Start the backend runtime and wait until it serves HTTP.
+
+    The returned ``Process`` carries the anchored pipe drains
+    (``_arc_output_tails``); the caller owns that object for the runtime's
+    whole lifetime and must clean it up through ``_terminate_process`` -
+    the single teardown path that releases the port and awaits the drains.
+    Every current call site (probe_backend_health, run_test_file,
+    run_test_group's session) funnels there; a new call site bypassing it
+    would leave the drains pending on a dead process.
+    """
+
     backend_path = os.path.join(workspace_path, "backend")
     resolved_port = int(web_port) if web_port is not None else get_web_port()
     start_command = _resolve_backend_start_command(backend_path)

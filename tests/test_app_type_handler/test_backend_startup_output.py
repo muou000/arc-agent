@@ -139,6 +139,62 @@ def test_runtime_contract_warns_about_express5_wildcard_routes() -> None:
     assert "'/{*splat}'" in text
 
 
+def test_every_backend_runtime_call_site_teardowns_through_terminate_process() -> None:
+    """Structural guard: `_start_backend_runtime` products must funnel to `_terminate_process`.
+
+    The anchored pipe drains are only awaited on the `_terminate_process`
+    path. A call site that kills its backend some other way (or drops the
+    Process handle without teardown) would leave drains pending on a dead
+    process. Two legal shapes exist: a direct ``_terminate_process`` call in
+    the same function, or handing the process to ``_E2EBackendSession``
+    (whose ``_terminate_e2e_session`` teardown calls ``_terminate_process``).
+    This AST check fails when a new call site uses neither.
+    """
+
+    import ast
+
+    source_path = Path(web_handler.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    offenders: list[str] = []
+    for function_node in ast.walk(tree):
+        if not isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        starts = [
+            node
+            for node in ast.walk(function_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_start_backend_runtime"
+        ]
+        if not starts:
+            continue
+        has_terminate = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_terminate_process"
+            for node in ast.walk(function_node)
+        )
+        # The session route: the started process is stored on the session
+        # state whose teardown method funnels to _terminate_process.
+        stores_session = any(
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Attribute) and target.attr == "_e2e_runtime_session"
+                for target in node.targets
+            )
+            for node in ast.walk(function_node)
+        )
+        if not has_terminate and not stores_session:
+            offenders.append(f"{function_node.name} (line {function_node.lineno})")
+
+    assert not offenders, (
+        "these _start_backend_runtime call sites neither call _terminate_process "
+        "nor store the process on the E2E session; they must funnel teardown "
+        "through it so the anchored drains are awaited: " + ", ".join(offenders)
+    )
+
+
 def test_output_tail_drains_are_anchored_to_the_process() -> None:
     """The drain tasks must stay referenced for the process's whole lifetime.
 
