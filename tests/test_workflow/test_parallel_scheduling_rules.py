@@ -144,6 +144,176 @@ def test_affinity_map_groups_by_top_level_subtree() -> None:
     }
 
 
+# ----------------------------------------------------------------------
+# declared requirement dependencies
+# ----------------------------------------------------------------------
+
+
+def _dependency_tree() -> dict:
+    return {
+        "id": "R",
+        "children": [
+            {"id": "RA", "children": [{"id": "RA1", "children": []}]},
+            {"id": "RB", "dependencies": ["RA", "RB", "RNOPE", ""], "children": []},
+        ],
+    }
+
+
+def test_dependencies_map_keeps_known_edges_and_drops_self_and_unknown() -> None:
+    """Declared dependencies model runtime prerequisites; ids that cannot be
+    scheduled (self-reference, unknown id) are dropped instead of stalling."""
+    assert ARCWorkflowManager._build_dependencies_map(_dependency_tree()) == {"RB": ["RA"]}
+
+
+def test_break_dependency_cycles_drops_the_cycle_closing_edge() -> None:
+    """A cycle would leave every node in it unrunnable; the closing edge is
+    dropped so the drain still finishes with reported task states."""
+    kept, dropped = ARCWorkflowManager._break_dependency_cycles({"RA": ["RB"], "RB": ["RA"]})
+
+    assert kept == {"RA": ["RB"]}, "the first edge is kept"
+    assert dropped == [("RB", "RA")], "the edge that closes the cycle is dropped"
+
+
+def test_break_dependency_cycles_keeps_a_dag_untouched() -> None:
+    graph = {"RB": ["RA"], "RC": ["RB"]}
+
+    kept, dropped = ARCWorkflowManager._break_dependency_cycles(graph)
+
+    assert kept == graph
+    assert dropped == []
+
+
+def test_implement_waits_for_declared_dependency_implement() -> None:
+    queue = _queue(
+        [
+            _task("RA", PHASE_IMPLEMENT, TASK_RUNNING, 0),
+            _task("RB", PHASE_DESIGN, TASK_COMPLETED, 1),
+            _task("RB", PHASE_IMPLEMENT, TASK_PENDING, 2),
+        ],
+        {"R": ["RA", "RB"]},
+    )
+    queue["dependencies"] = {"RB": ["RA"]}
+
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
+
+
+def test_implement_unblocked_when_dependency_finished_or_failed() -> None:
+    """A failed dependency unblocks its dependents exactly like the
+    descendant rule: the queue must keep draining instead of deadlocking."""
+    for dependency_status in (TASK_COMPLETED, TASK_FAILED):
+        queue = _queue(
+            [
+                _task("RA", PHASE_IMPLEMENT, dependency_status, 0),
+                _task("RB", PHASE_DESIGN, TASK_COMPLETED, 1),
+                _task("RB", PHASE_IMPLEMENT, TASK_PENDING, 2),
+            ],
+            {"R": ["RA", "RB"]},
+        )
+        queue["dependencies"] = {"RB": ["RA"]}
+
+        assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
+
+
+def test_design_is_not_gated_on_dependencies() -> None:
+    """DESIGN runs before a dependency's contract exists (it reuses dependency
+    interfaces only when they are already present); gating it was measured at
+    ~30% more wall clock for no IMPLEMENT-ordering gain."""
+    queue = _queue(
+        [
+            _task("RA", PHASE_DESIGN, TASK_PENDING, 0),
+            _task("RB", PHASE_DESIGN, TASK_PENDING, 1),
+        ],
+        {"R": ["RA", "RB"]},
+    )
+    queue["dependencies"] = {"RB": ["RA"]}
+
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][1]) is True
+
+
+def test_implement_blocks_when_a_declared_dependency_has_no_task() -> None:
+    """A dependencies entry without a matching IMPLEMENT task means the queue
+    is inconsistent with its tree: block, like the unknown-parent rule."""
+    queue = _queue(
+        [
+            _task("RB", PHASE_DESIGN, TASK_COMPLETED, 0),
+            _task("RB", PHASE_IMPLEMENT, TASK_PENDING, 1),
+        ],
+        {},
+    )
+    queue["dependencies"] = {"RB": ["RA"]}
+
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][1]) is False
+
+
+def test_next_affinity_task_prefers_a_group_other_groups_depend_on() -> None:
+    """The hub group is small but everything waits on it: the picker counts the
+    pending work of its dependents, so it is not starved behind a larger
+    independent group."""
+    queue = {
+        "tasks": [
+            _task("RB1", PHASE_IMPLEMENT, TASK_PENDING, 0),
+            _task("RB2", PHASE_IMPLEMENT, TASK_PENDING, 1),
+            _task("RB3", PHASE_IMPLEMENT, TASK_PENDING, 2),
+            _task("RB4", PHASE_IMPLEMENT, TASK_PENDING, 3),
+            _task("RA", PHASE_IMPLEMENT, TASK_PENDING, 4),
+            _task("RC", PHASE_IMPLEMENT, TASK_PENDING, 5),
+            _task("RC2", PHASE_IMPLEMENT, TASK_PENDING, 6),
+        ],
+        "descendants": {},
+        "affinity": {"RA": "RA", "RB1": "RB", "RB2": "RB", "RB3": "RB", "RB4": "RB", "RC": "RC", "RC2": "RC"},
+        # RC depends on RA: RA's weight is 1 own + 2 dependent = 3, RB's is 4.
+        "dependencies": {"RC": ["RA"]},
+    }
+
+    pick = ARCWorkflowManager._next_affinity_task(queue, [])
+
+    assert pick["node_id"] == "RB1", "the larger independent group still goes first while it outweighs the hub"
+    queue["tasks"][0]["status"] = TASK_RUNNING
+    queue["tasks"][1]["status"] = TASK_RUNNING
+    pick = ARCWorkflowManager._next_affinity_task(queue, [queue["tasks"][0], queue["tasks"][1]])
+
+    assert pick["node_id"] == "RA", "1 own + 2 dependent pending tasks outweigh the remaining independent group"
+
+
+def test_affinity_priority_ignores_intra_group_dependency_edges() -> None:
+    """Only cross-group edges make a group a hub: an intra-group dependency is
+    already satisfied by the group's own sequential order."""
+    queue = {
+        "tasks": [
+            _task("RB1", PHASE_IMPLEMENT, TASK_PENDING, 0),
+            _task("RB2", PHASE_IMPLEMENT, TASK_PENDING, 1),
+            _task("RB3", PHASE_IMPLEMENT, TASK_PENDING, 2),
+            _task("RA", PHASE_IMPLEMENT, TASK_PENDING, 3),
+            _task("RA2", PHASE_IMPLEMENT, TASK_PENDING, 4),
+        ],
+        "descendants": {},
+        "affinity": {"RA": "RA", "RA2": "RA", "RB1": "RB", "RB2": "RB", "RB3": "RB"},
+        "dependencies": {"RA2": ["RA"]},
+    }
+
+    pick = ARCWorkflowManager._next_affinity_task(queue, [])
+
+    assert pick["node_id"] == "RB1", "no cross-group dependent: the larger group keeps the slot"
+
+
+def test_affinity_priority_without_dependency_map_matches_pending_count() -> None:
+    """Queues saved before dependency gating lack the map; weights stay the
+    pure pending counts of the historical rule."""
+    queue = {
+        "tasks": [
+            _task("RA", PHASE_IMPLEMENT, TASK_PENDING, 0),
+            _task("RB1", PHASE_IMPLEMENT, TASK_PENDING, 1),
+            _task("RB2", PHASE_IMPLEMENT, TASK_PENDING, 2),
+        ],
+        "descendants": {},
+        "affinity": {"RA": "RA", "RB1": "RB", "RB2": "RB"},
+    }
+
+    pick = ARCWorkflowManager._next_affinity_task(queue, [])
+
+    assert pick["node_id"] == "RB1"
+
+
 def test_next_affinity_task_never_picks_a_busy_group() -> None:
     """One task per group at a time: the group owns the reusable worktree."""
     queue = {
