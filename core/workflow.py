@@ -352,12 +352,18 @@ class ARCWorkflowManager:
                 status="warning",
                 node_id=node_id,
             )
-        for dependent_id, dependency_id in queue_state.get("dependency_cycle_edges") or []:
+        for dependent_id, dependency_id, reason in queue_state.get("dropped_dependency_edges") or []:
+            if reason == "cycle":
+                detail = "it would close a dependency cycle"
+            elif reason == "no-implement-task":
+                detail = "this queue has no IMPLEMENT task for it"
+            else:
+                detail = "its edge list is malformed"
             await self._log(
                 "Compiler",
                 (
-                    f"Declared dependency {dependent_id} -> {dependency_id} closes a cycle; "
-                    "ignoring it for scheduling so the queue can still drain."
+                    f"Declared dependency {dependent_id} -> {dependency_id or '(unknown)'} is ignored for "
+                    f"scheduling: {detail}. The dependent implements without waiting for it."
                 ),
                 status="warning",
                 node_id=dependent_id,
@@ -1029,7 +1035,7 @@ class ARCWorkflowManager:
         descendants = self._build_descendants_map(requirement_tree)
         parents = self._build_parents_map(requirement_tree)
         affinity = self._build_affinity_map(requirement_tree)
-        dependencies, cycle_edges = self._break_dependency_cycles(
+        dependencies, dropped_edges = self._break_dependency_cycles(
             self._build_dependencies_map(requirement_tree)
         )
         existing_queue = read_json_file(self.queue_path)
@@ -1043,9 +1049,28 @@ class ARCWorkflowManager:
             # Queues saved before parent-serial DESIGN lack the map.
             queue_state.setdefault("parents", parents)
             queue_state.setdefault("affinity", affinity)
-            # Queues saved before dependency gating lack the map.
-            queue_state.setdefault("dependencies", dependencies)
-            queue_state["dependency_cycle_edges"] = cycle_edges
+            # Queues saved before dependency gating lack the map. A restored map
+            # is the durable contract, but it is not trusted blindly: an edge
+            # that references a node this queue cannot schedule (a hand-edited
+            # or foreign queue file) would block its dependent's IMPLEMENT
+            # forever, and a foreign cycle would stall the drain; both are
+            # dropped and reported instead.
+            if "dependencies" in queue_state:
+                restored, unschedulable = self._drop_unschedulable_dependencies(
+                    queue_state["dependencies"], queue_state
+                )
+                restored, restored_cycles = self._break_dependency_cycles(restored)
+                queue_state["dependencies"] = restored
+                queue_state["dropped_dependency_edges"] = list(unschedulable) + [
+                    (dependent_id, dependency_id, "cycle")
+                    for dependent_id, dependency_id in restored_cycles
+                ]
+            else:
+                queue_state.setdefault("dependencies", dependencies)
+                queue_state["dropped_dependency_edges"] = [
+                    (dependent_id, dependency_id, "cycle")
+                    for dependent_id, dependency_id in dropped_edges
+                ]
             self._apply_saved_states_to_tasks(queue_state)
             return queue_state
         if require_compatible_existing_queue:
@@ -1061,11 +1086,55 @@ class ARCWorkflowManager:
             "parents": parents,
             "affinity": affinity,
             "dependencies": dependencies,
-            "dependency_cycle_edges": cycle_edges,
+            "dropped_dependency_edges": [
+                (dependent_id, dependency_id, "cycle")
+                for dependent_id, dependency_id in dropped_edges
+            ],
             "last_task_id": None,
         }
         self._apply_saved_states_to_tasks(queue_state)
         return queue_state
+
+    @staticmethod
+    def _drop_unschedulable_dependencies(
+        dependencies: Any,
+        queue_state: dict[str, Any],
+    ) -> tuple[dict[str, list[str]], list[tuple[str, str, str]]]:
+        """Drop dependency edges this queue cannot schedule, with a reason.
+
+        The IMPLEMENT gate blocks on an edge whose dependency has no IMPLEMENT
+        task at all (matching the unknown-parent rule), so such an edge would
+        leave the dependent PENDING forever. Edges are therefore validated
+        against the queue's own task set: both endpoints must have an IMPLEMENT
+        task here. The map is rebuilt rather than reused so a malformed value
+        (null, wrong types, unknown ids) can only ever degrade to "no
+        dependencies", never to a stalled drain.
+        """
+
+        implement_nodes = {
+            str(task.get("node_id", ""))
+            for task in queue_state.get("tasks", [])
+            if task.get("phase") == PHASE_IMPLEMENT
+        }
+        if not isinstance(dependencies, dict):
+            return {}, []
+        kept: dict[str, list[str]] = {}
+        dropped: list[tuple[str, str, str]] = []
+        for dependent_id, dependency_ids in dependencies.items():
+            dependent_id = str(dependent_id)
+            if dependent_id not in implement_nodes:
+                dropped.append((dependent_id, "", "no-implement-task"))
+                continue
+            if not isinstance(dependency_ids, list):
+                dropped.append((dependent_id, "", "malformed-edges"))
+                continue
+            for dependency_id in dependency_ids:
+                dependency_id = str(dependency_id)
+                if dependency_id not in implement_nodes:
+                    dropped.append((dependent_id, dependency_id, "no-implement-task"))
+                    continue
+                kept.setdefault(dependent_id, []).append(dependency_id)
+        return kept, dropped
 
     @staticmethod
     def _build_dependencies_map(root_node: dict[str, Any]) -> dict[str, list[str]]:
@@ -1115,9 +1184,18 @@ class ARCWorkflowManager:
 
         The gate blocks an IMPLEMENT until its dependencies' IMPLEMENTs end,
         so a cycle would leave every node in it permanently unrunnable and the
-        drain would end with PENDING tasks instead of a reported failure. Edges
-        are visited in map order (which follows the tree walk) and an edge is
-        dropped when its target can already reach its source.
+        drain would end with PENDING tasks instead of a reported failure.
+
+        Edges are visited one at a time in map order (which follows the tree
+        walk) and an edge is dropped when its target can already reach its
+        source through the edges accepted so far. Both properties that matter
+        hold at every visit, including forward edges whose cycle is only
+        completed by later edges: (1) a dropped edge always closes a cycle in
+        the original graph, because the accepted edges are a subset of it, and
+        (2) every cycle loses an edge, because its last edge in visit order
+        finds all its other edges accepted. Which edge of a cycle is dropped
+        follows the tree order and is reported to the caller; the result is
+        therefore deterministic for a given tree, never partially applied.
         """
 
         kept: dict[str, list[str]] = {}

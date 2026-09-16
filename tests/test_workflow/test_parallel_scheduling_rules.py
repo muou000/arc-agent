@@ -183,6 +183,100 @@ def test_break_dependency_cycles_keeps_a_dag_untouched() -> None:
     assert dropped == []
 
 
+def _reaches_in_graph(graph: dict, start: str, goal: str, seen: frozenset = frozenset()) -> bool:
+    if start == goal:
+        return True
+    if start in seen:
+        return False
+    return any(
+        _reaches_in_graph(graph, next_id, goal, seen | {start})
+        for next_id in graph.get(start, [])
+    )
+
+
+def _is_acyclic(graph: dict) -> bool:
+    return not any(
+        _reaches_in_graph(graph, dependency_id, dependent_id)
+        for dependent_id, dependency_ids in graph.items()
+        for dependency_id in dependency_ids
+    )
+
+
+def test_break_dependency_cycles_only_drops_edges_that_close_a_cycle() -> None:
+    """Review follow-up: the walk sees one edge at a time, so pin both
+    properties on every small graph - the result is always a DAG, and a
+    dropped edge always closes a cycle in the *original* graph (never a legal
+    dependency that merely looked reachable in a partial view)."""
+    import itertools
+
+    nodes = ("RA", "RB", "RC")
+    pairs = [(a, b) for a in nodes for b in nodes if a != b]
+    for size in range(len(pairs) + 1):
+        for edges in itertools.combinations(pairs, size):
+            dependencies: dict[str, list[str]] = {}
+            for dependent_id, dependency_id in edges:
+                dependencies.setdefault(dependent_id, []).append(dependency_id)
+
+            kept, dropped = ARCWorkflowManager._break_dependency_cycles(dependencies)
+
+            assert _is_acyclic(kept), f"cycle survived: {edges} -> {kept}"
+            for dependent_id, dependency_id in dropped:
+                assert _reaches_in_graph(dependencies, dependency_id, dependent_id), (
+                    f"dropped a legal dependency: {edges} -> {dependent_id} -> {dependency_id}"
+                )
+            survivor_edges = [
+                (dependent_id, dependency_id)
+                for dependent_id, dependency_ids in kept.items()
+                for dependency_id in dependency_ids
+            ]
+            assert sorted(survivor_edges + list(dropped)) == sorted(edges), "edges are reordered, never invented"
+
+
+def test_break_dependency_cycles_detects_a_cycle_closed_by_a_later_key() -> None:
+    """The closing edge can be a forward edge in map order (RA -> RC while the
+    back-edge RC -> RB -> RA is only added later): it is still the edge that
+    closes the cycle at the moment it is visited, so it is the one dropped."""
+    dependencies = {"RA": ["RC"], "RB": ["RA"], "RC": ["RB"]}
+
+    kept, dropped = ARCWorkflowManager._break_dependency_cycles(dependencies)
+
+    assert (kept, dropped) == ({"RA": ["RC"], "RB": ["RA"]}, [("RC", "RB")])
+
+
+def test_break_dependency_cycles_result_is_stable_for_a_given_tree_order() -> None:
+    """Which edge of a cycle is dropped follows the tree walk order; the
+    outcome is deterministic for a tree and every drop is reported."""
+    forward = {"RA": ["RC"], "RB": ["RA"], "RC": ["RB"]}
+    reversed_order = {"RC": ["RB"], "RB": ["RA"], "RA": ["RC"]}
+
+    _, forward_dropped = ARCWorkflowManager._break_dependency_cycles(dict(forward))
+    _, reversed_dropped = ARCWorkflowManager._break_dependency_cycles(dict(reversed_order))
+
+    assert forward_dropped == [("RC", "RB")]
+    assert reversed_dropped == [("RA", "RC")]
+    assert _is_acyclic(ARCWorkflowManager._break_dependency_cycles(dict(reversed_order))[0])
+
+
+def test_drop_unschedulable_dependencies_filters_unknown_nodes_and_shapes() -> None:
+    """The restored-map guard: only edges whose both endpoints have an
+    IMPLEMENT task in this queue survive; malformed values degrade to "no
+    dependencies" instead of stalling the gate."""
+    queue = _queue([_task("RA", PHASE_IMPLEMENT), _task("RB", PHASE_IMPLEMENT)], {})
+
+    kept, dropped = ARCWorkflowManager._drop_unschedulable_dependencies(
+        {"RB": ["RA", "RGHOST"], "RGHOST": ["RA"], "RA": "not-a-list"}, queue
+    )
+
+    assert kept == {"RB": ["RA"]}
+    assert dropped == [
+        ("RB", "RGHOST", "no-implement-task"),
+        ("RGHOST", "", "no-implement-task"),
+        ("RA", "", "malformed-edges"),
+    ]
+    assert ARCWorkflowManager._drop_unschedulable_dependencies(None, queue) == ({}, [])
+    assert ARCWorkflowManager._drop_unschedulable_dependencies(["RA"], queue) == ({}, [])
+
+
 def test_implement_waits_for_declared_dependency_implement() -> None:
     queue = _queue(
         [
