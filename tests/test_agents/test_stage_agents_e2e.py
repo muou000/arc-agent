@@ -104,23 +104,16 @@ def test_interface_designer_repairs_empty_interfaces_after_materializing_files(
 
     The 2026-09-14 arc-bench run deadlocked downstream stages because the
     InterfaceDesigner wrote 9 skeleton files but returned `"interfaces": []`.
-    The adapter must re-ask once on the same thread when the discipline
-    observed real writes but the response recorded no interface records.
+    The adapter re-asks on the same thread when the discipline observed real
+    writes but the response recorded no interface records; since 2026-09-16
+    the re-ask is skeleton-guided — the contract identities are derived
+    mechanically from the materialized files and the model fills the semantic
+    fields per row.
     """
     node_id = "REQ-DESIGN-REPAIR"
     seed_requirement(arc_runtime, node_id)
 
     skeleton = "from dataclasses import dataclass\n\n\n@dataclass\nclass CalcContract:\n    value: int\n"
-    interface_record = {
-        "interface_id": "IF-CALC",
-        "type": "FUNC",
-        "name": "add",
-        "responsibility": "Add two integers",
-        "file_path": "src/contracts/calc.py",
-        "first_line": "@dataclass",
-        "callers": [],
-        "callees": [],
-    }
     model = FauxChatModel(
         responses=[
             faux_tool_call(
@@ -138,16 +131,25 @@ def test_interface_designer_repairs_empty_interfaces_after_materializing_files(
                 },
                 call_id="c2",
             ),
-            # Repair pass on the same thread.
-            faux_tool_call(
-                "InterfaceDesignResponse",
+    # Skeleton-guided fill pass on the same thread (the row id matches the
+    # mechanically derived skeleton for this file). The repair agent is rebuilt
+    # with the minItems-constrained schema, so the structured tool is named
+    # after that schema.
+    faux_tool_call(
+        "InterfaceDesignRepairResponse",
+        {
+            "summary": "Filled the derived skeleton rows.",
+            "interfaces": [
                 {
-                    "summary": "Designed the calculator contract.",
-                    "interfaces": [interface_record],
-                    "files_written": ["/workspace/src/contracts/calc.py"],
-                },
-                call_id="c3",
-            ),
+                    "interface_id": "REQ-DESIGN-REPAIR-FUNC-calc",
+                    "responsibility": "Owns the calculator value contract.",
+                    "specification": "CalcContract dataclass with an int value field.",
+                }
+            ],
+            "files_written": [],
+        },
+        call_id="c3",
+    ),
         ]
     )
 
@@ -161,14 +163,32 @@ def test_interface_designer_repairs_empty_interfaces_after_materializing_files(
     assert model.call_count == 3
     # Ground truth from StageDisciplineMiddleware, not the model's claim.
     assert bundle["materialized_paths"] == ["/workspace/src/contracts/calc.py"]
-    assert [item["interface_id"] for item in bundle["interfaces"]] == ["IF-CALC"]
-    assert bundle["files_written"] == ["/workspace/src/contracts/calc.py"]
+    # The mechanical skeleton identity wins; the model contributed semantics only.
+    assert [item["interface_id"] for item in bundle["interfaces"]] == [
+        "REQ-DESIGN-REPAIR-FUNC-calc"
+    ]
+    interface = bundle["interfaces"][0]
+    assert interface["type"] == "FUNC"
+    assert interface["file_path"] == "src/contracts/calc.py"
+    assert interface["responsibility"] == "Owns the calculator value contract."
+    assert "skeleton_derived" not in interface
+    # files_written stays empty on this path (no new writes happened); the
+    # discipline's materialized marker below is the write ground truth.
+    assert bundle["files_written"] == []
 
 
-def test_interface_designer_keeps_materialized_marker_when_repair_stays_empty(
+def test_interface_designer_falls_back_to_mechanical_records_when_fill_stays_empty(
     tmp_project_dir: Path, arc_runtime
 ) -> None:
-    node_id = "REQ-DESIGN-REPAIR-FAIL"
+    """Model never fills the skeleton: conservative records must still land.
+
+    The 2026-09-16 flash-class failure shape (deepseek-v4-flash, REQ-2 with
+    12 materialized files): both the main response and every re-ask return a
+    schema-valid empty ``interfaces`` array. The repair must then materialize
+    conservative mechanical records from the skeletons — never a silent empty
+    bundle that would let the workflow hard-gate the DESIGN phase.
+    """
+    node_id = "REQ-DESIGN-REPAIR-MECHANICAL"
     seed_requirement(arc_runtime, node_id)
 
     model = FauxChatModel(
@@ -183,10 +203,31 @@ def test_interface_designer_keeps_materialized_marker_when_repair_stays_empty(
                 {"summary": "Designed in prose.", "interfaces": [], "files_written": []},
                 call_id="c2",
             ),
+            # Skeleton fill pass (constrained repair schema): still empty. The
+            # minItems floor rejects the blank sheet inside the agent loop and
+            # re-asks the model on the same session, so each scripted refusal
+            # is consumed twice (violation + re-ask) before the repair pass
+            # gives up and hands an empty payload back.
             faux_tool_call(
-                "InterfaceDesignResponse",
+                "InterfaceDesignRepairResponse",
                 {"summary": "Still nothing structured.", "interfaces": [], "files_written": []},
                 call_id="c3",
+            ),
+            faux_tool_call(
+                "InterfaceDesignRepairResponse",
+                {"summary": "Still nothing, second ask.", "interfaces": [], "files_written": []},
+                call_id="c4",
+            ),
+            # Batched retry: still empty (again asked twice by the floor).
+            faux_tool_call(
+                "InterfaceDesignRepairResponse",
+                {"summary": "Batch retry also empty.", "interfaces": [], "files_written": []},
+                call_id="c5",
+            ),
+            faux_tool_call(
+                "InterfaceDesignRepairResponse",
+                {"summary": "Batch retry also empty, second ask.", "interfaces": [], "files_written": []},
+                call_id="c6",
             ),
         ]
     )
@@ -198,10 +239,101 @@ def test_interface_designer_keeps_materialized_marker_when_repair_stays_empty(
         )
     )
 
-    assert model.call_count == 3
-    assert bundle["interfaces"] == []
-    # The workflow-level hard gate reads this marker and fails the DESIGN phase.
+    assert model.call_count == 4
+    assert [item["interface_id"] for item in bundle["interfaces"]] == [
+        f"{node_id}-FUNC-calc"
+    ]
+    interface = bundle["interfaces"][0]
+    assert interface["type"] == "FUNC"
+    assert interface["file_path"] == "src/contracts/calc.py"
+    assert interface["first_line"] == "VALUE = 1"
+    # Mechanical records are explicitly marked so downstream consumers can
+    # tell them apart from model-serialized contracts.
+    assert interface["skeleton_derived"] is True
+    assert interface["responsibility"]
+    assert interface["specification"]
+    # The workflow-level hard gate reads this marker.
     assert bundle["materialized_paths"] == ["/workspace/src/contracts/calc.py"]
+
+
+def test_interface_designer_batches_partial_fill_gaps_before_fallback(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A half-filled list triggers one batched retry, then mechanical fill.
+
+    The whole-list fill pass may succeed on part of the skeletons (small
+    outputs work, large ones collapse — REQ-1's 2026-09-16 self-rescue
+    proved compact aggregation is achievable). The gaps are re-asked in one
+    batched round; whatever is still missing is covered by conservative
+    mechanical records, keyed on the model-filled records already collected.
+    """
+    node_id = "REQ-DESIGN-PARTIAL"
+    seed_requirement(arc_runtime, node_id)
+
+    def _write(path: str, content: str, call_id: str):
+        return faux_tool_call("write_file", {"file_path": f"/workspace/{path}", "content": content}, call_id=call_id)
+
+    model = FauxChatModel(
+        responses=[
+            _write("backend/src/services/calc_service.js", "module.exports = { add };\n", "c1"),
+            _write("frontend/src/pages/CalcPage.tsx", "export default function CalcPage() {}\n", "c2"),
+            # Main pass: prose-only, arrays empty.
+            faux_tool_call(
+                "InterfaceDesignResponse",
+                {"summary": "Designed in prose.", "interfaces": [], "files_written": []},
+                call_id="c3",
+            ),
+            # Whole-list fill (constrained repair schema): only the service row answered.
+            faux_tool_call(
+                "InterfaceDesignRepairResponse",
+                {
+                    "summary": "Filled one row.",
+                    "interfaces": [
+                        {
+                            "interface_id": f"{node_id}-FUNC-CalcService",
+                            "responsibility": "Adds two numbers.",
+                            "specification": "add(a, b) returns a + b.",
+                        }
+                    ],
+                    "files_written": [],
+                },
+                call_id="c4",
+            ),
+            # Batched retry over the gap: the page row.
+            faux_tool_call(
+                "InterfaceDesignRepairResponse",
+                {
+                    "summary": "Filled the gap.",
+                    "interfaces": [
+                        {
+                            "interface_id": f"{node_id}-UI-CalcPage",
+                            "responsibility": "Calculator page surface.",
+                            "specification": "Renders the calculator UI.",
+                        }
+                    ],
+                    "files_written": [],
+                },
+                call_id="c5",
+            ),
+        ]
+    )
+
+    bundle = asyncio.run(
+        make_designer(tmp_project_dir, model).run(
+            node_id=node_id,
+            requirement_data={"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    assert model.call_count == 5
+    by_id = {item["interface_id"]: item for item in bundle["interfaces"]}
+    # The model-filled rows carry their semantics and no mechanical marker.
+    assert by_id[f"{node_id}-FUNC-CalcService"]["responsibility"] == "Adds two numbers."
+    assert by_id[f"{node_id}-UI-CalcPage"]["responsibility"] == "Calculator page surface."
+    assert "skeleton_derived" not in by_id[f"{node_id}-FUNC-CalcService"]
+    assert "skeleton_derived" not in by_id[f"{node_id}-UI-CalcPage"]
+    assert by_id[f"{node_id}-UI-CalcPage"]["type"] == "UI"
+    assert by_id[f"{node_id}-UI-CalcPage"]["file_path"] == "frontend/src/pages/CalcPage.tsx"
 
 
 def test_interface_designer_recovers_interfaces_from_fenced_json_in_summary(

@@ -23,6 +23,7 @@ flowchart LR
 核心设计要点（继承自 ARC 基座）：
 
 - **需求树驱动**：非叶节点只做 UI 壳层设计，叶节点拥有完整的 UI → API → FUNC → DB 接口链。
+- **DESIGN 空接口骨架修复**：flash 级模型常见"文件已写完、大型结构化 interfaces 数组交白卷"（schema 合法但为空）。修复轮从物化文件机械推导契约骨架（routes→API、services/repositories→FUNC、CREATE TABLE→DB、pages/组件→UI；已注册契约的共享面 edit 标记为 update），把大型自由输出降格为逐行填空（responsibility/specification ≤200 字符），单轮失败后分批（每批 3-4 行）重试一轮，仍缺失的行用可溯源的保守机械记录兜底（带 `skeleton_derived` 标记，不发明文件/表名）；端点支持 strict json_schema 时修复轮 schema 携带 minItems 下界使白卷成为约束违规。无物化文件的空响应不做二次猜测（纯复用设计不受影响）。
 - **测试先行 + 基线 RED 验证**：先生成测试清单，再由 TDD 智能体实现代码。每层首个 agent session 之前，系统逐文件预跑一次基线验证（不消耗 agent 预算）：全绿层由系统直接整层回归关闭（tautology 快速通道），环境失败提前注入修复契约，红灯文件作为系统验证过的 RED 证据交给首个 session。TDD 循环以测试文件为微循环原子（逐文件 red→green，整层回归收口），同一失败指纹连续重复 3 次即触发假设轮换治理，测试预算耗尽即停。
 - **技能系统**（`skills/`）：DESIGN 阶段前由模型按节点规划各 stage agent 应读取的技能（skill 目录为跨节点稳定前缀，需求快照驱动按节点差异化选择）；认证一致性与失败修复两类安全底线确定性注入，规划失败时不注入任何可选技能。
 - **可追溯性**（`arcbench_agent_runtime/`）：requirements / scenarios / interfaces / tests / call_edges / node_states / node_contracts 七张表落盘于 `.arc/traceability/`，事件流写入 `.arc/runner-events.jsonl`，满足比赛"可复现、可审计"的要求。
@@ -103,6 +104,11 @@ ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
 ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_format）开关：auto（默认，对自定义
                                        # OPENAI_BASE_URL 端点做一次进程内缓存的工具调用能力探测）、
                                        # on（强制启用）、off（强制关闭，等价旧行为）
+                                       # auto 模式下还会独立探测 chat_completions 的 response_format
+                                       # json_schema（strict）支持（独立缓存、fail-open）：支持时 DESIGN
+                                       # 空接口修复轮会重建 agent 并在 interfaces 数组上携带 minItems
+                                       # 语义下界，把"合法交白卷"变成约束违规；不支持时静默走骨架
+                                       # 填空修复路径
 
 # 每节点 worktree 并行（默认开启）
 # 每个运行中的任务在自己的 git worktree、独立 web 端口和独立 E2 数据库中执行，

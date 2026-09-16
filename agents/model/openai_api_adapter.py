@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import random
@@ -316,10 +317,15 @@ _STRUCTURED_OUTPUT_PROBE_TIMEOUT = 10.0
 # A definitive rejection must name the tool-calling surface; a bare 400 could be
 # an unrelated request problem (bad model name, malformed payload).
 _TOOL_CALL_ERROR_PATTERN = re.compile(r"tool|function", re.IGNORECASE)
+# Provider-native structured outputs (chat_completions ``response_format`` of
+# type ``json_schema`` with ``strict: true``) power the DESIGN stage's dynamic
+# semantic floor. A definitive rejection must name the response_format surface.
+_JSON_SCHEMA_ERROR_PATTERN = re.compile(r"response_format|json_schema|structured.?output", re.IGNORECASE)
 # Probe decisions are scoped to the endpoint AND the credential that produced
 # them (gateways may answer differently per key), keyed by a key fingerprint
 # so the raw secret never lands in cache contents or debug dumps.
 _STRUCTURED_OUTPUT_SUPPORT_CACHE: dict[tuple[str, str, str, str], bool] = {}
+_JSON_SCHEMA_SUPPORT_CACHE: dict[tuple[str, str, str, str], bool] = {}
 # One in-flight probe per cache key: concurrent first-time callers wait for the
 # probe instead of each hitting the network (per-key, so unrelated endpoints
 # never block each other).
@@ -427,6 +433,166 @@ def probe_tool_call_support(
     return bool(message.get("tool_calls"))
 
 
+_JSON_SCHEMA_PROBE_SCHEMA = {
+    "name": "arc_capability_ping",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+        },
+        "required": ["ok"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
+def probe_json_schema_support(
+    *,
+    base_url: str,
+    model: str,
+    api_mode: OpenAIAPIMode,
+    api_key: str = "",
+    timeout: float = _STRUCTURED_OUTPUT_PROBE_TIMEOUT,
+    transport: httpx.BaseTransport | None = None,
+) -> bool | None:
+    """Probe chat_completions ``response_format: json_schema`` (strict) support.
+
+    Returns True when the endpoint accepts the strict json_schema request and
+    answers with conforming JSON, False when it definitively rejects the
+    response_format surface, and None when the capability cannot be determined
+    (auth failures, throttling, outages, ambiguous request errors, non-object
+    bodies). Only ``chat_completions`` mode is probed: the Responses API path
+    is not used for the dynamic semantic floor, so callers treat any other
+    mode as unsupported. ``transport`` is an injection point for offline tests.
+    """
+
+    if api_mode != "chat_completions":
+        return None
+
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Return the JSON object {\"ok\": true}."}],
+        "response_format": {"type": "json_schema", "json_schema": _JSON_SCHEMA_PROBE_SCHEMA},
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        with httpx.Client(timeout=timeout, transport=transport) as client:
+            response = client.post(url, json=payload, headers=headers)
+    except (httpx.HTTPError, OSError):
+        return None
+
+    if response.status_code != 200:
+        if response.status_code in {400, 404, 422}:
+            try:
+                body = response.text
+            except Exception:
+                return None
+            if _JSON_SCHEMA_ERROR_PATTERN.search(body):
+                return False
+        return None
+
+    try:
+        data = response.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    choices = data.get("choices")
+    message = (
+        choices[0].get("message")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+        else None
+    )
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return False
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict)
+
+
+def json_schema_structured_output_supported(model: str | object) -> bool:
+    """Decide whether provider-native strict json_schema output may be used.
+
+    Same resolution order as ``structured_output_supported``: an explicit
+    ``ARC_STRUCTURED_OUTPUT`` override forces the decision without probing
+    (off means no structured output at all, hence no json_schema either);
+    direct/official-OpenAI hosts are supported; custom endpoints get one
+    cached probe per (base URL, model, API mode, credential fingerprint),
+    failing open when inconclusive. Independent cache: an endpoint may accept
+    plain tool calling (the agent channel) while rejecting native json_schema.
+    """
+
+    override = os.getenv("ARC_STRUCTURED_OUTPUT", "").strip().lower()
+    if override in _STRUCTURED_OUTPUT_OFF_VALUES:
+        return False
+
+    base_url = _get_openai_base_url()
+    if not base_url or _is_official_openai_base_url(base_url):
+        return True
+
+    model_name = model if isinstance(model, str) else str(getattr(model, "model_name", "") or "")
+    if not model_name:
+        return True
+
+    api_mode = resolve_openai_api_mode(None)
+    if api_mode != "chat_completions":
+        return False
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    cache_key = (
+        base_url,
+        model_name,
+        api_mode,
+        _structured_output_key_fingerprint(api_key),
+    )
+    with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
+        key_lock = _STRUCTURED_OUTPUT_SUPPORT_LOCKS.get(cache_key)
+        if key_lock is None:
+            key_lock = threading.Lock()
+            _STRUCTURED_OUTPUT_SUPPORT_LOCKS[cache_key] = key_lock
+    with key_lock:
+        with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
+            cached = _JSON_SCHEMA_SUPPORT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        probe_result = probe_json_schema_support(
+            base_url=base_url,
+            model=model_name,
+            api_mode=api_mode,
+            api_key=api_key,
+        )
+        if probe_result is False:
+            supported = False
+            logger.info(
+                "Native json_schema structured output disabled: endpoint %s rejected response_format (model=%s).",
+                base_url,
+                model_name,
+            )
+        else:
+            # True = probe succeeded; None = inconclusive, fail open.
+            supported = True
+            logger.info(
+                "Native json_schema structured output %s for %s (model=%s).",
+                "enabled" if probe_result is True else "assumed (probe inconclusive)",
+                base_url,
+                model_name,
+            )
+
+        with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
+            _JSON_SCHEMA_SUPPORT_CACHE[cache_key] = supported
+        return supported
+
+
 def structured_output_supported(model: str | object) -> bool:
     """Decide whether a pydantic ``response_format`` may be passed to agents.
 
@@ -516,6 +682,7 @@ def reset_structured_output_support_cache_for_tests() -> None:
 
     with _STRUCTURED_OUTPUT_SUPPORT_LOCK:
         _STRUCTURED_OUTPUT_SUPPORT_CACHE.clear()
+        _JSON_SCHEMA_SUPPORT_CACHE.clear()
         _STRUCTURED_OUTPUT_SUPPORT_LOCKS.clear()
 
 
