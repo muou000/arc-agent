@@ -1156,7 +1156,10 @@ def _start_output_tails(
             continue
     # Strong reference for the process lifetime: the caller holds the Process
     # (E2E session state, test locals), which transitively keeps the drain
-    # tasks alive — the running loop alone would not.
+    # tasks alive — the running loop alone would not. The attribute must stay
+    # populated for as long as the Process object lives: a second
+    # _terminate_process call on the same object still reads it, and dropping
+    # it mid-flight would orphan still-pending drains back to weak references.
     process._arc_output_tails = (stdout_tail, stderr_tail, drains)  # type: ignore[attr-defined]
     return stdout_tail, stderr_tail
 
@@ -1165,12 +1168,13 @@ async def _format_backend_output(
     stdout_tail: _ProcessOutputTail,
     stderr_tail: _ProcessOutputTail,
 ) -> str:
-    """Render the retained console output of a backend, newest bytes first."""
+    """Render the retained console output of a backend, newest bytes first.
 
-    # Give a still-alive writer a moment to flush its dying words into the
-    # tail; a crashed process has nothing more to say and costs only the poll.
-    for _ in range(10):
-        await asyncio.sleep(0.1)
+    Callers invoke this after ``_terminate_process`` has already awaited the
+    drain tasks (process death closed the pipes, every buffered byte is in
+    the tails), so no flush wait is needed here.
+    """
+
     sections: list[str] = []
     stdout_text = _tail(stdout_tail.text(), _BACKEND_STARTUP_OUTPUT_LIMIT)
     stderr_text = _tail(stderr_tail.text(), _BACKEND_STARTUP_OUTPUT_LIMIT)

@@ -254,3 +254,43 @@ def test_terminate_process_awaits_drain_tasks(tmp_path) -> None:
         return all(task.done() for task in drains)
 
     assert asyncio.run(_start_terminate_and_check())
+
+
+@pytest.mark.slow
+def test_second_terminate_is_safe_and_anchors_survive(tmp_path) -> None:
+    """A repeated _terminate_process on the same Process must stay harmless.
+
+    The drain anchor must remain populated after the first teardown: the
+    second call re-reads it (all tasks done, immediate return) and must
+    neither resurrect the dead pipes nor lose the retained tail bytes.
+    """
+
+    _require_node()
+    workspace = _make_backend_workspace(
+        tmp_path,
+        (
+            "const http = require('http');\n"
+            "http.createServer((req, res) => res.end('ok')).listen("
+            "process.env.ARC_WEB_PORT, '127.0.0.1');\n"
+            "console.error('boot marker');\n"
+        ),
+    )
+    port = _free_port()
+
+    async def _terminate_twice_and_check() -> tuple[bool, bool, str]:
+        process, _command, _detail, _fingerprint = await web_handler._start_backend_runtime(
+            str(workspace), {"ARC_WEB_PORT": str(port)}, web_port=port
+        )
+        assert process is not None
+        await web_handler._terminate_process(process, port=port)
+        anchor_after_first = getattr(process, "_arc_output_tails", None)
+        await web_handler._terminate_process(process, port=port)
+        anchor_after_second = getattr(process, "_arc_output_tails", None)
+        all_done = all(task.done() for task in anchor_after_second[2])
+        # The stderr tail still holds the boot marker recorded before teardown.
+        return all_done, anchor_after_first is anchor_after_second, anchor_after_second[1].text()
+
+    all_done, same_anchor, stderr_text = asyncio.run(_terminate_twice_and_check())
+    assert all_done
+    assert same_anchor, "the anchor tuple must survive repeated teardowns"
+    assert "boot marker" in stderr_text

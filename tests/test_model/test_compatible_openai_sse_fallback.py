@@ -177,6 +177,35 @@ def test_gateway_chat_style_usage_aliases_are_accepted() -> None:
     assert usage["output"] == 300
 
 
+def test_deepseek_top_level_cache_hit_field_is_accepted() -> None:
+    """DeepSeek-style gateways put the cache-hit count at the usage top level.
+
+    Mirrors usage_capture's ``prompt_cache_hit_tokens`` fallback (see its
+    ``test_deepseek_cache_hit_field_fallback``); reading it only inside the
+    details object would silently record zero cache hits for such gateways.
+    """
+
+    payload = _sse(
+        "response.completed",
+        {
+            "status": "completed",
+            "usage": {
+                "prompt_tokens": 8000,
+                "completion_tokens": 200,
+                "total_tokens": 8200,
+                "prompt_cache_hit_tokens": 7000,
+                "prompt_cache_miss_tokens": 1000,
+            },
+        },
+    )
+
+    usage = extract_usage_from_chat_result(_chat_result_from_sse_text(payload))
+
+    assert usage is not None
+    assert usage["cache_read"] == 7000
+    assert usage["input"] == 1000  # 8000 prompt - 7000 cached
+
+
 def test_missing_usage_keeps_the_estimate_fallback() -> None:
     payload = _sse("response.completed", {"status": "completed"})
 

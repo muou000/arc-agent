@@ -83,9 +83,9 @@ def _usage_metadata_from_responses(token_usage: dict[str, Any]) -> dict[str, Any
 
     Handles both the official field names (``input_tokens_details`` /
     ``output_tokens_details``) and OpenAI-compatible gateway spellings
-    (``prompt_tokens_details`` / ``completion_tokens_details``,
-    ``cached_tokens`` / ``prompt_cache_hit_tokens``), mirroring the aliases
-    ``usage_capture._usage_from_token_usage`` already accepts.
+    (``prompt_tokens_details`` / ``completion_tokens_details``, plus the
+    DeepSeek-style top-level ``prompt_cache_hit_tokens``), mirroring the
+    aliases ``usage_capture._usage_from_token_usage`` already accepts.
 
     ``input_tokens`` keeps the provider's prompt total (cache tokens are a
     subset, reported under ``input_token_details``) — the same convention as
@@ -117,13 +117,14 @@ def _usage_metadata_from_responses(token_usage: dict[str, Any]) -> dict[str, Any
     ) or {}
     cache_read = _int(
         input_details.get("cached_tokens")
-        or input_details.get("cache_read_tokens")
-        or input_details.get("prompt_cache_hit_tokens")
+        # DeepSeek-style gateways report the cache-hit count at the usage top
+        # level instead of inside a details object (same alias as
+        # usage_capture._usage_from_token_usage).
+        or token_usage.get("prompt_cache_hit_tokens")
     )
     cache_write = _int(
         input_details.get("cache_write_tokens")
         or input_details.get("cache_creation_tokens")
-        or input_details.get("prompt_cache_write_tokens")
     )
     input_tokens = _int(
         token_usage.get("input_tokens")
