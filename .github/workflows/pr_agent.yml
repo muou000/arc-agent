@@ -26,3 +26,6 @@ jobs:
           CONFIG__MODEL: ${{ secrets.CONFIG__MODEL }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ secrets.CONFIG__CUSTOM_MODEL_MAX_TOKENS }}
           CONFIG__RESPONSE_LANGUAGE: "zh-CN"
+          # 大 diff 超出 token 预算时按文件边界分块审查再合并结论，避免文件被整块丢弃
+          PR_REVIEWER__ENABLE_LARGE_PR_CHUNKING: "true"
+          PR_REVIEWER__MAX_NUMBER_OF_CALLS: "5"
