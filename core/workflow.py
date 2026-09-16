@@ -1577,6 +1577,9 @@ class ARCWorkflowManager:
                 "phase_status": {"design": "pending", "test": "pending", "implement": "pending"},
                 "resume_context": {},
                 "result_state": "",
+                # Fresh DESIGN pass: the baseline gate will rebuild the
+                # per-file states from the new manifest.
+                "design_baseline": {},
                 # A manual retry is a fresh DESIGN pass: restore the node's
                 # one-shot conflict retry budget and drop stale conflict
                 # paths so the prompt is not misdirected (None replaces the
@@ -1605,6 +1608,10 @@ class ARCWorkflowManager:
                 "phase_status": {"implement": "pending"},
                 "resume_context": {},
                 "result_state": "",
+                # The workspace now contains the node's own landed
+                # implementation; the DESIGN baseline states are stale for
+                # this pass, so IMPLEMENT must re-baseline from scratch.
+                "design_baseline": {},
             },
         )
         context_pipeline.cache.invalidate_db_layers(node_id)
@@ -1626,6 +1633,9 @@ class ARCWorkflowManager:
                 "resume_context": {},
                 "result_state": "",
                 "recent_failure_summary": "",
+                # Fresh DESIGN pass: the baseline gate will rebuild the
+                # per-file states from the new manifest.
+                "design_baseline": {},
                 # Fresh DESIGN pass: restore the conflict-retry budget and
                 # drop stale conflict paths (see _reset_node_from_design_retry).
                 "merge_conflict_context": None,

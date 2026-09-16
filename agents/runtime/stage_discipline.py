@@ -67,7 +67,14 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
     def _validate_tool_call(self, request: ToolCallRequest) -> str | None:
         name = str(request.tool_call.get("name", ""))
         args = request.tool_call.get("args", {}) or {}
-        if name in {"execute", "delete"}:
+        if name == "execute":
+            return "`execute` is disabled in ARC's staged file workflow."
+        if name == "delete":
+            if self._stage == "test_generation" and _is_test_asset(_discipline_path(args)):
+                # A green-baseline rejection may legitimately remove a test
+                # asset (duplicate or tautological coverage); deleting
+                # anything else stays blocked for every stage.
+                return None
             return f"`{name}` is disabled in ARC's staged file workflow."
         if self._stage == "test_generation" and name in _VALIDATION_TOOLS:
             return "TestGenerator only creates tests and its manifest; it must not run validation."

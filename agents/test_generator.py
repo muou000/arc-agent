@@ -138,6 +138,120 @@ class TestGenerator:
         await self._log(f"Test generation returned {len(tests)} test artifact(s).", node_id=node_id)
         return tests, output_text
 
+    async def repair_green_baseline(
+        self,
+        node_id: str,
+        requirement_data: dict[str, Any],
+        *,
+        green_evidence: list[dict[str, Any]],
+        previous_manifest: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]] | None, str]:
+        """Re-ask the same thread to delete or rework tests that passed the
+        system-run baseline before any implementation exists.
+
+        ``green_evidence`` carries the file paths whose baseline runs already
+        exited 0 (plus their test types and a short output summary). The
+        generated suite must be RED against the DESIGN skeleton: a test that
+        passes now verifies nothing about the node's own behavior and would be
+        silently waved through by the tautology fast path at IMPLEMENT time.
+        """
+        workspace_root = str(Path(
+            self.workspace_root
+            or context_pipeline.config.workspace_dir
+            or os.environ.get("ARC_WORKSPACE_ROOT")
+            or os.getcwd()
+        ).expanduser().resolve())
+        app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
+        agent = build_stage_agent(
+            name="test_generator",
+            stage="test_generation",
+            model=self.model,
+            system_prompt=get_system_prompt(),
+            response_format=TestGenerationResponse,
+            workspace_root=workspace_root,
+            writable_roots=[workspace_root],
+            skills=[],
+            memory=[],
+            tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+            node_id=node_id,
+            claims_workspace_root=self.context_workspace_root or workspace_root,
+        )
+        message = self._green_rejection_message(
+            node_id=node_id,
+            green_evidence=green_evidence,
+            previous_manifest=previous_manifest,
+        )
+        await self._log(
+            "Green baseline rejection: requesting rework or removal of "
+            f"{len(green_evidence)} passing test file(s).",
+            status="warning",
+            node_id=node_id,
+        )
+        raw_payload = await ainvoke_stage_agent(
+            agent,
+            message=message,
+            context=AgentRuntimeContext(
+                node_id=node_id,
+                phase="DESIGN",
+                app_type=app_type,
+                workspace_root=workspace_root,
+                requirement_path=self.requirement_path,
+            ),
+            thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:TestGenerator",
+            label=self.agent_name,
+            log_cb=self.log_cb,
+        )
+        tests = normalize_test_manifest_payload(raw_payload)
+        output_text = json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
+        await self._log(f"Green baseline rework returned {len(tests)} test artifact(s).", node_id=node_id)
+        return tests, output_text
+
+    def _green_rejection_message(
+        self,
+        *,
+        node_id: str,
+        green_evidence: list[dict[str, Any]],
+        previous_manifest: list[dict[str, Any]],
+    ) -> str:
+        evidence_lines: list[str] = []
+        for item in green_evidence:
+            path = str(item.get("file_path", "") or "").strip()
+            test_type = str(item.get("type", "") or "").strip()
+            summary = str(item.get("output_summary", "") or "").strip()
+            line = f"- `{path}` ({test_type}): passed the system-run baseline with Exit Code: 0"
+            if summary:
+                line += f" — {summary}"
+            evidence_lines.append(line)
+        return (
+            f"### Current Node\n`{node_id}`\n\n"
+            "### System Rejection: GREEN Baseline Tests\n"
+            "The system ran every test file you generated against the current workspace, "
+            "BEFORE any implementation exists (only the interface design skeletons are in place). "
+            "A generated test that already PASSES against an unimplemented node verifies nothing: "
+            "it is either asserting placeholder/scaffold behavior, duplicating coverage that cannot "
+            "fail, or testing a dependency's behavior instead of this node's owned outcome.\n\n"
+            "The following test files PASSED the baseline run and are REJECTED:\n"
+            + "\n".join(evidence_lines)
+            + "\n\n### Required Repair\n"
+            "For each rejected file, choose exactly one:\n"
+            "1. **Delete** the test file (`delete` tool) if its coverage duplicates another "
+            "current-node test or the scenario should not be node-local, and drop its manifest "
+            "entries from the returned `tests` list.\n"
+            "2. **Rewrite** the test so it drives the requirement's target behavior through the "
+            "node's own interface contract and would verifiably FAIL against the current "
+            "skeleton-only workspace.\n\n"
+            "Rules:\n"
+            "- Do not weaken or delete tests for files that are NOT listed above; their baseline "
+            "runs verifiably failed (RED), which is the correct state.\n"
+            "- Do not add setup/teardown guards, conditionals, or `skip` marks that make a test "
+            "pass on the skeleton; the target behavior must be asserted unconditionally.\n"
+            "- Do not run the tests yourself; the system re-runs the baseline after this pass.\n"
+            "- Return the FULL updated manifest (`tests`) and `files_written`/deleted paths in "
+            "`files_written` semantics of your final structured answer.\n\n"
+            "### Previous Manifest (for reference)\n"
+            f"```json\n{json.dumps(previous_manifest, ensure_ascii=False, indent=2, default=str)}\n```"
+        )
+
     async def _log(self, message: str, status: str | None = None, node_id: str | None = None) -> None:
         if self.log_cb is None:
             return

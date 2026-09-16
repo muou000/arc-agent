@@ -50,6 +50,17 @@ def get_system_prompt() -> str:
                 ],
             ),
             section(
+                "Green Baseline Rejection Protocol",
+                [
+                    "The system runs every generated test file once right after this stage, while the workspace still only contains the DESIGN skeletons. The intended state is all-RED: each generated test must verifiably FAIL before the node is implemented.",
+                    "If the system rejects files that PASSED that baseline run, repair exactly the listed files: delete a rejected file (`delete` tool) when its coverage is duplicated or not node-local, or rewrite it so it drives the requirement's target behavior through the current node's own contract and would fail on the skeleton.",
+                    "When deleting a rejected file, also remove its entries from the returned `tests` manifest; when rewriting, keep the `test_id`, `type`, and `file_path` stable unless the placement is invalid.",
+                    "Never weaken a rejected test with skip guards, conditional assertions, or try/except swallows so it passes on the skeleton; the target behavior must be asserted unconditionally.",
+                    "Files NOT listed by the rejection remain RED by design. Do not touch, weaken, or delete them.",
+                    "Do not run the tests yourself during the repair; the system re-runs the baseline after this pass.",
+                ],
+            ),
+            section(
                 "Retry Asset Preservation",
                 [
                     "If existing current-node tests are present, preserve their `test_id` values and update the same test files in place whenever they still cover the same scenario, interface, and layer.",
