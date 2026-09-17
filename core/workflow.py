@@ -1047,7 +1047,7 @@ class ARCWorkflowManager:
         parents = self._build_parents_map(requirement_tree)
         affinity = self._build_affinity_map(requirement_tree)
         declared = self._build_dependencies_map(requirement_tree)
-        dependencies, ancestor_dropped = self._drop_ancestor_dependency_edges(declared, descendants)
+        dependencies, ancestor_dropped = self._drop_ancestor_dependency_edges(declared, parents)
         dependencies, cycle_dropped = self._break_dependency_cycles(
             dependencies,
             self._structural_precedence_edges(parents, node_ids),
@@ -1081,7 +1081,7 @@ class ARCWorkflowManager:
                     queue_state["dependencies"], queue_state
                 )
                 structural = self._structural_precedence_edges(parents, node_ids)
-                restored, restored_ancestors = self._drop_ancestor_dependency_edges(restored, descendants)
+                restored, restored_ancestors = self._drop_ancestor_dependency_edges(restored, parents)
                 restored, restored_cycles = self._break_dependency_cycles(restored, structural)
                 queue_state["dependencies"] = restored
                 queue_state["dropped_dependency_edges"] = list(unschedulable) + [
@@ -1221,7 +1221,7 @@ class ARCWorkflowManager:
     @staticmethod
     def _drop_ancestor_dependency_edges(
         dependencies: dict[str, list[str]],
-        descendants: dict[str, list[str]],
+        parents: dict[str, str],
     ) -> tuple[dict[str, list[str]], list[tuple[str, str]]]:
         """Drop declared edges between an ancestor and its own descendant.
 
@@ -1231,23 +1231,29 @@ class ARCWorkflowManager:
         reverse wait, so either direction of the edge makes the pair wait on
         itself and deadlocks the drain. The edge schedules nothing beyond
         those rules, so it is dropped here with its own reason instead of
-        surfacing as an anonymous cycle later. ``descendants`` must be the
-        transitive closure (as built by _build_descendants_map): with only
-        direct children, grandparent<->grandchild edges would fall through
-        to the cycle pass and lose their classification.
+        surfacing as an anonymous cycle later.
+
+        The ancestry is derived here from ``parents`` (immediate parent per
+        node, the shape _build_parents_map guarantees) rather than accepted
+        as a precomputed descendants map: walking the parent chain per node
+        cannot misclassify a grandparent<->grandchild edge even if a future
+        map shape changes, so the classification is structural instead of a
+        convention callers must uphold.
         """
 
-        descendant_sets = {
-            node_id: set(children or []) for node_id, children in descendants.items()
-        }
+        def has_ancestor(node_id: str, candidate_id: str) -> bool:
+            parent_id = str((parents or {}).get(node_id, "") or "")
+            while parent_id:
+                if parent_id == candidate_id:
+                    return True
+                parent_id = str((parents or {}).get(parent_id, "") or "")
+            return False
+
         kept: dict[str, list[str]] = {}
         dropped: list[tuple[str, str]] = []
         for dependent_id, dependency_ids in dependencies.items():
             for dependency_id in dependency_ids:
-                if (
-                    dependency_id in descendant_sets.get(dependent_id, set())
-                    or dependent_id in descendant_sets.get(dependency_id, set())
-                ):
+                if has_ancestor(dependent_id, dependency_id) or has_ancestor(dependency_id, dependent_id):
                     dropped.append((dependent_id, dependency_id))
                     continue
                 kept.setdefault(dependent_id, []).append(dependency_id)
@@ -1545,10 +1551,13 @@ class ARCWorkflowManager:
         scenarios routinely read runtime state (accounts, routes, orders) that
         only those nodes create, so implementing earlier turns a missing
         prerequisite into a false test failure. A failed dependency unblocks
-        both phases exactly like the failed-descendant rule, so the gate costs
-        wall clock only along declared dependency chains; independent
-        subtrees still drain in parallel. Sibling subtrees otherwise impose
-        no order on each other, which is what makes parallel draining sound.
+        both phases exactly like the failed-descendant rule (a failed
+        dependency lands nothing reusable, so the dependent works against the
+        integration state as it is and must supply its own prerequisites -
+        the alternative is a stalled queue), so the gate costs wall clock only
+        along declared dependency chains; independent subtrees still drain in
+        parallel. Sibling subtrees otherwise impose no order on each other,
+        which is what makes parallel draining sound.
         """
 
         node_id = task["node_id"]

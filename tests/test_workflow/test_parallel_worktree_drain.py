@@ -1023,20 +1023,35 @@ def test_child_design_waits_for_parent_design_and_leaves_stay_parallel(
     queue_state = _queue_state(manager, _requirement_tree())
 
     events: list[tuple[str, str]] = []
-    active: set[str] = set()
+    leaf_designs_in_flight: set[str] = set()
+    second_leaf_started = asyncio.Event()
     leaf_overlap = False
 
     async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
         nonlocal leaf_overlap
         task_id = task["task_id"]
-        if task["phase"] == PHASE_DESIGN and task["node_id"] != "R" and active:
-            leaf_overlap = True
+        is_leaf_design = task["phase"] == PHASE_DESIGN and task["node_id"] != "R"
+        if is_leaf_design:
+            if leaf_designs_in_flight:
+                leaf_overlap = True
+            leaf_designs_in_flight.add(task_id)
+            if len(leaf_designs_in_flight) == 2:
+                second_leaf_started.set()
         events.append(("start", task_id))
-        active.add(task_id)
-        # Long enough that the sibling's worktree prepare cannot run out the
-        # overlap window.
-        await asyncio.sleep(0.05)
-        active.discard(task_id)
+        if is_leaf_design:
+            # Hold every leaf DESIGN until its sibling starts (bounded, so a
+            # serialization regression still fails instead of hanging): the
+            # overlap then no longer depends on a sleep outlasting the
+            # sibling's real-git worktree preparation, which occasionally
+            # exceeds it under load.
+            try:
+                await asyncio.wait_for(second_leaf_started.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(0.05)
+        if is_leaf_design:
+            leaf_designs_in_flight.discard(task_id)
         events.append(("end", task_id))
         return True
 

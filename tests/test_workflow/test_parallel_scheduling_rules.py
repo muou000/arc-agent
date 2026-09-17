@@ -217,7 +217,7 @@ def test_drop_ancestor_dependency_edges_drops_both_directions() -> None:
     reason rather than surfacing as an anonymous cycle."""
     kept, dropped = ARCWorkflowManager._drop_ancestor_dependency_edges(
         {"RA": ["RA1"], "RA1": ["RA"], "RB": ["RA"]},
-        {"R": ["RA", "RA1", "RB"], "RA": ["RA1"]},
+        {"RA": "R", "RA1": "RA", "RB": "R"},
     )
 
     assert kept == {"RB": ["RA"]}
@@ -225,10 +225,11 @@ def test_drop_ancestor_dependency_edges_drops_both_directions() -> None:
 
 
 def test_drop_ancestor_dependency_edges_covers_transitive_descendants() -> None:
-    """PR #38 review follow-up: the descendants map is a transitive closure
-    (built by _build_descendants_map), so a grandparent<->grandchild edge is
+    """PR #38 review follow-up: the ancestry is derived from the parents map
+    (immediate parent per node), so a grandparent<->grandchild edge is
     classified as ``ancestor-descendant`` here - not left to the cycle pass
-    as an anonymous drop."""
+    as an anonymous drop - without any precomputed-closure convention a
+    future map-shape change could silently break."""
     tree = {
         "id": "R",
         "children": [
@@ -236,12 +237,12 @@ def test_drop_ancestor_dependency_edges_covers_transitive_descendants() -> None:
             {"id": "RB", "children": []},
         ],
     }
-    descendants = ARCWorkflowManager._build_descendants_map(tree)
-    assert "RA1" in descendants["R"], "the map is a transitive closure"
+    parents = ARCWorkflowManager._build_parents_map(tree)
+    assert parents == {"RA": "R", "RA1": "RA", "RB": "R"}
 
     kept, dropped = ARCWorkflowManager._drop_ancestor_dependency_edges(
         {"R": ["RA1"], "RA1": ["R"], "RB": ["RA1"]},
-        descendants,
+        parents,
     )
 
     assert kept == {"RB": ["RA1"]}
