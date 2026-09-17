@@ -21,7 +21,7 @@ These files are injected into your context as `<scaffold_files>`. The bullets ab
 
 Rules:
 
-1. Never create or edit a test config, setup file, harness module, or package manifest to "set up" testing, and never install dependencies for it. If a recipe below works against the files listed above, the infrastructure is sufficient.
+1. Never create or edit a test config, setup file, harness module, or test-related `package.json` entry (test scripts, test `devDependencies`) to "set up" testing, and never install dependencies for it. This boundary covers test infrastructure only: when the application source under test genuinely needs a new runtime dependency, adding it to `dependencies` is the implementer's call in the later TDD stage, not a harness concern. If a recipe below works against the files listed above, the test infrastructure is sufficient.
 2. Do not rely on runner globals. Load Vitest with ESM `import { describe, it, expect, vi } from 'vitest'` even in the CommonJS backend package; load Playwright with `const { test, expect } = require('@playwright/test')`.
 3. Lock the final test file list (path, type, covered interface ids) before the first write; every subsequent write must land on one of those paths. Never rename, re-create, or delete-then-rewrite a test file mid-pass — pick the final name once and fix content in place.
 4. Name files after the module under test, not after requirement ids or scenario prose: `backend/tests/<domain>Repository.test.js` mirrors `backend/src/repositories/<domain>Repository.js`; a frontend file containing JSX ends in `.test.tsx`/`.spec.tsx`, one without JSX in `.test.ts`; Playwright files end in `.e2e.spec.js`. Use `.test.<ext>` consistently for Vitest files.
