@@ -159,14 +159,28 @@ def check_config() -> dict[str, Any]:
     if debug not in {"0", "1", "false", "true", "no", "yes", "off", "on", ""}:
         warnings.append(f"ARC_DEBUG has unexpected value: {debug} (expected 0 or 1)")
 
-    # Check retry count
-    retry_count = os.environ.get("ARC_STRUCTURED_OUTPUT_RETRY_COUNT", "2").strip()
-    try:
-        count = int(retry_count)
-        if count < 0 or count > 10:
-            warnings.append(f"ARC_STRUCTURED_OUTPUT_RETRY_COUNT={count} is unusual (recommended: 1-5)")
-    except ValueError:
-        warnings.append(f"ARC_STRUCTURED_OUTPUT_RETRY_COUNT must be an integer, got: {retry_count}")
+    # Check model retry/timeout knobs (adapters fall back to defaults on
+    # invalid values, but surfacing the typo here is cheaper than wondering
+    # why the override did not apply mid-run)
+    numeric_env_checks = {
+        "ARC_MODEL_TIMEOUT": (1, 3600),
+        "ARC_MODEL_CONNECT_TIMEOUT": (1, 600),
+        "ARC_MODEL_MAX_RETRIES": (0, 10),
+        "ARC_MODEL_RETRY_DELAY": (0, 3600),
+        "ARC_MODEL_RETRY_MAX_DELAY": (0, 3600),
+        "ARC_MODEL_MAX_CONSECUTIVE_FAILURES": (0, 100),
+    }
+    for name, (low, high) in numeric_env_checks.items():
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw) if name in {"ARC_MODEL_MAX_RETRIES", "ARC_MODEL_MAX_CONSECUTIVE_FAILURES"} else float(raw)
+        except ValueError:
+            warnings.append(f"{name} must be a number, got: {raw}")
+            continue
+        if value < low or value > high:
+            warnings.append(f"{name}={raw} is outside the sane range {low}-{high}")
 
     # Check .env file presence
     env_file = get_project_env_path()

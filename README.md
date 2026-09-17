@@ -99,6 +99,14 @@ ARC_SKIP_BROWSER_INSTALL=1  # 跳过编译前检查的 Playwright 浏览器安�
 
 # 可选：运行时行为调节
 ARC_AGENT_RECURSION_LIMIT=300          # 单个阶段 agent 会话的最大步数（LangGraph recursion limit），最小 20
+ARC_MODEL_TIMEOUT=600                  # 单次模型 API 请求超时秒数（非流式请求的 read 超时=完整生成时长；
+                                       # 基准中 DESIGN 大调用实测可达 ~580s，故默认保持 SDK 的 600s）
+ARC_MODEL_CONNECT_TIMEOUT=15           # TCP/TLS 连接建立超时秒数（连接被静默丢弃时快速失败，默认 15）
+ARC_MODEL_MAX_RETRIES=3                # 单次调用内原始尝试之外的重试次数（默认 3）
+ARC_MODEL_RETRY_DELAY=5                # 重试间隔秒数（固定短延迟，默认 5；服务端 Retry-After 优先，上限
+                                       # ARC_MODEL_RETRY_MAX_DELAY=60）
+ARC_MODEL_MAX_CONSECUTIVE_FAILURES=5   # 跨调用连续失败熔断阈值（默认 5）：同一端点连续 5 次模型调用失败后，
+                                       # 后续调用立即失败并提示 --resume；任一成功即重置计数（设 0 关闭）
 ARC_VISUAL_PRECOMPUTE=1                # 编译前并发预分析需求参考图（设 0/false/no/off 关闭）
 ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
 ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_format）开关：auto（默认，对自定义

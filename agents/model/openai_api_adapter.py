@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import os
-import random
 import re
 import threading
 import time
@@ -29,9 +28,13 @@ _TRUTHY = {"1", "true", "yes", "on", "responses", "response", "responses_api"}
 _FALSY = {"0", "false", "no", "off", "chat", "chat_completion", "chat_completions", "chat/completions"}
 
 _DEFAULT_MAX_RETRIES = 3
-_DEFAULT_RETRY_INITIAL_DELAY = 2.0
-_DEFAULT_RETRY_MAX_DELAY = 30.0
+_DEFAULT_RETRY_DELAY = 5.0
+_DEFAULT_RETRY_MAX_DELAY = 60.0
+_DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
+_DEFAULT_REQUEST_TIMEOUT = 600.0
+_DEFAULT_CONNECT_TIMEOUT = 15.0
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
+_REACHABILITY_PROBE_TIMEOUT = 5.0
 
 # Quota/billing exhaustion is deterministic: retrying only burns backoff time.
 # A status carrying these texts is an account or subscription limit, not a
@@ -84,15 +87,19 @@ class OpenAIAdapterConfig:
 @dataclass(frozen=True)
 class _ModelRetryPolicy:
     max_retries: int
-    initial_delay: float
+    retry_delay: float
     max_delay: float
+    max_consecutive_failures: int
 
 
 def _resolve_retry_policy() -> _ModelRetryPolicy:
     return _ModelRetryPolicy(
         max_retries=_env_int("ARC_MODEL_MAX_RETRIES", _DEFAULT_MAX_RETRIES),
-        initial_delay=_env_float("ARC_MODEL_RETRY_INITIAL_DELAY", _DEFAULT_RETRY_INITIAL_DELAY),
+        retry_delay=_env_float("ARC_MODEL_RETRY_DELAY", _DEFAULT_RETRY_DELAY),
         max_delay=_env_float("ARC_MODEL_RETRY_MAX_DELAY", _DEFAULT_RETRY_MAX_DELAY),
+        max_consecutive_failures=_env_int(
+            "ARC_MODEL_MAX_CONSECUTIVE_FAILURES", _DEFAULT_MAX_CONSECUTIVE_FAILURES
+        ),
     )
 
 
@@ -143,11 +150,23 @@ class ARCChatOpenAI(ChatOpenAI):
 
     _arc_api_mode: OpenAIAPIMode = PrivateAttr(default="chat_completions")
     _arc_model_name: str = PrivateAttr(default="")
+    _arc_base_url: str = PrivateAttr(default="")
+    _arc_api_key: str = PrivateAttr(default="")
 
-    def __init__(self, *args: Any, arc_api_mode: OpenAIAPIMode, arc_model_name: str, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        arc_api_mode: OpenAIAPIMode,
+        arc_model_name: str,
+        arc_base_url: str = "",
+        arc_api_key: str = "",
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._arc_api_mode = arc_api_mode
         self._arc_model_name = arc_model_name
+        self._arc_base_url = arc_base_url
+        self._arc_api_key = arc_api_key
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
@@ -155,6 +174,8 @@ class ARCChatOpenAI(ChatOpenAI):
             lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
+            base_url=self._arc_base_url,
+            api_key=self._arc_api_key,
         )
         record_chat_result_usage(
             result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
@@ -167,6 +188,8 @@ class ARCChatOpenAI(ChatOpenAI):
             lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
+            base_url=self._arc_base_url,
+            api_key=self._arc_api_key,
         )
         record_chat_result_usage(
             result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
@@ -179,11 +202,23 @@ class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
 
     _arc_api_mode: OpenAIAPIMode = PrivateAttr(default="responses")
     _arc_model_name: str = PrivateAttr(default="")
+    _arc_base_url: str = PrivateAttr(default="")
+    _arc_api_key: str = PrivateAttr(default="")
 
-    def __init__(self, *args: Any, arc_api_mode: OpenAIAPIMode, arc_model_name: str, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        arc_api_mode: OpenAIAPIMode,
+        arc_model_name: str,
+        arc_base_url: str = "",
+        arc_api_key: str = "",
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._arc_api_mode = arc_api_mode
         self._arc_model_name = arc_model_name
+        self._arc_base_url = arc_base_url
+        self._arc_api_key = arc_api_key
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
@@ -191,6 +226,8 @@ class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
             lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
+            base_url=self._arc_base_url,
+            api_key=self._arc_api_key,
         )
         record_chat_result_usage(
             result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
@@ -203,6 +240,8 @@ class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
             lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
+            base_url=self._arc_base_url,
+            api_key=self._arc_api_key,
         )
         record_chat_result_usage(
             result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
@@ -242,6 +281,15 @@ def build_openai_chat_model(
         "output_version": "responses/v1" if config.api_mode == "responses" else "v0",
         "arc_api_mode": config.api_mode,
         "arc_model_name": config.model_name,
+        "arc_base_url": config.base_url,
+        "arc_api_key": config.api_key,
+        # The openai SDK defaults to a 600s timeout with 2 hidden internal
+        # retries, so one ARC attempt could silently stretch to ~30 min on a
+        # dead endpoint (run7: 25 min; run8: 2x6 min hangs). Retrying is ARC's
+        # own job (the adapter retry loop sees the real attempt count), so the
+        # SDK layer is disabled here and the timeout is set explicitly.
+        "max_retries": 0,
+        "request_timeout": resolve_model_request_timeout(),
     }
     if config.base_url:
         kwargs["base_url"] = config.base_url
@@ -253,6 +301,21 @@ def build_openai_chat_model(
     with _MODEL_CACHE_LOCK:
         # Another thread may have built the same client while we were constructing.
         return _MODEL_CACHE.setdefault(cache_key, model)
+
+
+def resolve_model_request_timeout() -> httpx.Timeout:
+    """Explicit per-request timeouts for model calls (env-tunable).
+
+    ``ARC_MODEL_TIMEOUT`` bounds a full non-streaming request (read timeout =
+    generation time; the SDK default 600s is kept because benchmark DESIGN
+    calls legitimately run for minutes). ``ARC_MODEL_CONNECT_TIMEOUT`` bounds
+    connection establishment, where a silently dropped connection must fail
+    fast instead of waiting out the full request timeout.
+    """
+
+    request_timeout = _env_float("ARC_MODEL_TIMEOUT", _DEFAULT_REQUEST_TIMEOUT)
+    connect_timeout = _env_float("ARC_MODEL_CONNECT_TIMEOUT", _DEFAULT_CONNECT_TIMEOUT)
+    return httpx.Timeout(request_timeout, connect=min(connect_timeout, request_timeout))
 
 
 def reset_model_cache_for_tests() -> None:
@@ -699,38 +762,108 @@ def _raise_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model
     raise wrapped from exc
 
 
-def _call_model_with_retries(call: Callable[[], Any], *, api_mode: OpenAIAPIMode, model: str) -> Any:
-    """Invoke a model call, retrying transient failures with exponential backoff."""
+def _call_model_with_retries(
+    call: Callable[[], Any],
+    *,
+    api_mode: OpenAIAPIMode,
+    model: str,
+    base_url: str = "",
+    api_key: str = "",
+) -> Any:
+    """Invoke a model call, retrying transient failures with a short fixed delay.
+
+    Failure detection has two layers. The per-call loop bounds one invocation
+    (default 1 original + 4 retries); before re-attempting after a
+    connection-class failure it runs a cheap GET /models reachability probe,
+    so a dead endpoint is detected in seconds instead of hanging until the
+    full request timeout on every attempt. The cross-call counter bounds a
+    whole run: when the same endpoint accumulates ``max_consecutive_failures``
+    consecutive failed attempts, later calls fail fast instead of re-burning
+    the retry chain. Any success resets the counter.
+    """
 
     policy = _resolve_retry_policy()
+    endpoint_key = _model_endpoint_key(model, base_url, api_key)
+    _check_consecutive_failure_budget(endpoint_key, api_mode=api_mode, model=model, base_url=base_url, api_key=api_key)
     failed_attempts = 0
+    probe_next = False
     while True:
+        if probe_next:
+            probe_next = False
+            if not _endpoint_reachable(base_url, api_key):
+                failed_attempts += 1
+                _record_model_failure(endpoint_key)
+                _log_unreachable_probe(failed_attempts=failed_attempts, policy=policy)
+                if failed_attempts > policy.max_retries:
+                    _raise_endpoint_unreachable(
+                        api_mode=api_mode, model=model, base_url=base_url, attempts=failed_attempts
+                    )
+                _sleep(policy.retry_delay)
+                probe_next = True
+                continue
+            # The endpoint answers again; fall through to the real attempt.
         try:
-            return call()
+            result = call()
         except Exception as exc:
             failed_attempts += 1
+            _record_model_failure(endpoint_key, exc=exc)
             if not _should_retry_model_exception(exc, failed_attempts=failed_attempts, policy=policy):
                 _raise_model_api_exception(exc, api_mode=api_mode, model=model)
-            delay = _compute_retry_delay(policy, failed_attempts - 1, exc)
+            delay = _compute_retry_delay(policy, exc)
             _log_model_retry(exc, failed_attempts=failed_attempts, policy=policy, delay=delay)
             _sleep(delay)
+            probe_next = _is_connection_failure(exc)
+            continue
+        _reset_model_failures(endpoint_key)
+        return result
 
 
-async def _acall_model_with_retries(call: Callable[[], Any], *, api_mode: OpenAIAPIMode, model: str) -> Any:
+async def _acall_model_with_retries(
+    call: Callable[[], Any],
+    *,
+    api_mode: OpenAIAPIMode,
+    model: str,
+    base_url: str = "",
+    api_key: str = "",
+) -> Any:
     """Async variant of ``_call_model_with_retries``."""
 
     policy = _resolve_retry_policy()
+    endpoint_key = _model_endpoint_key(model, base_url, api_key)
+    _check_consecutive_failure_budget(
+        endpoint_key, api_mode=api_mode, model=model, base_url=base_url, api_key=api_key
+    )
     failed_attempts = 0
+    probe_next = False
     while True:
+        if probe_next:
+            probe_next = False
+            if not await _aendpoint_reachable(base_url, api_key):
+                failed_attempts += 1
+                _record_model_failure(endpoint_key)
+                _log_unreachable_probe(failed_attempts=failed_attempts, policy=policy)
+                if failed_attempts > policy.max_retries:
+                    _raise_endpoint_unreachable(
+                        api_mode=api_mode, model=model, base_url=base_url, attempts=failed_attempts
+                    )
+                await _asleep(policy.retry_delay)
+                probe_next = True
+                continue
+            # The endpoint answers again; fall through to the real attempt.
         try:
-            return await call()
+            result = await call()
         except Exception as exc:
             failed_attempts += 1
+            _record_model_failure(endpoint_key, exc=exc)
             if not _should_retry_model_exception(exc, failed_attempts=failed_attempts, policy=policy):
                 _raise_model_api_exception(exc, api_mode=api_mode, model=model)
-            delay = _compute_retry_delay(policy, failed_attempts - 1, exc)
+            delay = _compute_retry_delay(policy, exc)
             _log_model_retry(exc, failed_attempts=failed_attempts, policy=policy, delay=delay)
             await _asleep(delay)
+            probe_next = _is_connection_failure(exc)
+            continue
+        _reset_model_failures(endpoint_key)
+        return result
 
 
 def _should_retry_model_exception(
@@ -783,12 +916,166 @@ def _provider_error_text(exc: Exception) -> str:
     return "\n".join(parts)
 
 
-def _compute_retry_delay(policy: _ModelRetryPolicy, failed_attempt: int, exc: Exception) -> float:
+def _compute_retry_delay(policy: _ModelRetryPolicy, exc: Exception) -> float:
     retry_after = _parse_retry_after_header(exc)
     if retry_after is not None:
         return min(retry_after, policy.max_delay)
-    delay = policy.initial_delay * (2 ** failed_attempt)
-    return min(delay, policy.max_delay) * random.uniform(0.75, 1.0)
+    # A fixed short delay (pi uses 2s base with a 60s cap): the failure modes
+    # this loop targets (connection loss, throttling, provider 5xx) recover on
+    # their own schedule, and exponential growth mostly burns wall-clock time
+    # while the run is already blocked.
+    return min(policy.retry_delay, policy.max_delay)
+
+
+# ---------------------------------------------------------------------------
+# Cross-call consecutive-failure budget (run-level circuit breaker)
+# ---------------------------------------------------------------------------
+
+# Counts consecutive failed model attempts per endpoint identity. The run7/run8
+# post-mortems showed one dead-provider window burning 25 min: every new model
+# call re-entered the full per-call retry chain against an endpoint that was
+# not answering. The counter lets later calls fail fast instead; any success
+# resets it, mirroring pi's retry-counter reset on a successful response.
+# Failure records are (timestamp, exception) pairs; only the count matters for
+# the budget, but the last exception is kept for the fail-fast message.
+_CONSECUTIVE_FAILURES: dict[str, list[tuple[float, Exception | None]]] = {}
+_CONSECUTIVE_FAILURES_LOCK = threading.Lock()
+
+
+def _model_endpoint_key(model: str, base_url: str, api_key: str) -> str:
+    """Identity of the endpoint a failure is attributed to (secret-free)."""
+
+    return f"{model}|{(base_url or _get_openai_base_url()).rstrip('/')}|{_structured_output_key_fingerprint(api_key or os.getenv('OPENAI_API_KEY', ''))}"
+
+
+def _record_model_failure(endpoint_key: str, *, exc: Exception | None = None) -> None:
+    with _CONSECUTIVE_FAILURES_LOCK:
+        _CONSECUTIVE_FAILURES.setdefault(endpoint_key, []).append((time.monotonic(), exc))
+
+
+def _reset_model_failures(endpoint_key: str) -> None:
+    with _CONSECUTIVE_FAILURES_LOCK:
+        _CONSECUTIVE_FAILURES.pop(endpoint_key, None)
+
+
+def _consecutive_failure_count(endpoint_key: str) -> int:
+    with _CONSECUTIVE_FAILURES_LOCK:
+        return len(_CONSECUTIVE_FAILURES.get(endpoint_key, ()))
+
+
+def reset_consecutive_failure_budget_for_tests() -> None:
+    """Drop consecutive-failure state so a test can assert budget behaviour."""
+
+    with _CONSECUTIVE_FAILURES_LOCK:
+        _CONSECUTIVE_FAILURES.clear()
+
+
+def _check_consecutive_failure_budget(
+    endpoint_key: str,
+    *,
+    api_mode: OpenAIAPIMode,
+    model: str,
+    base_url: str,
+    api_key: str,
+) -> None:
+    """Fail fast when the endpoint already exhausted its failure budget."""
+
+    policy = _resolve_retry_policy()
+    if policy.max_consecutive_failures <= 0:
+        return
+    failures = _consecutive_failure_count(endpoint_key)
+    if failures < policy.max_consecutive_failures:
+        return
+    _raise_endpoint_unreachable(
+        api_mode=api_mode,
+        model=model,
+        base_url=base_url,
+        attempts=failures,
+        consecutive=True,
+    )
+
+
+def _raise_endpoint_unreachable(
+    *,
+    api_mode: OpenAIAPIMode,
+    model: str,
+    base_url: str,
+    attempts: int,
+    consecutive: bool = False,
+) -> NoReturn:
+    scope = "consecutive failed model calls" if consecutive else "attempts"
+    message = (
+        f"Model API endpoint unreachable after {attempts} {scope} using `{api_mode}` mode; "
+        f"model={model or '<unknown>'}, base_url={base_url or _get_openai_base_url() or '<default>'}. "
+        "The endpoint stopped answering; retrying would only burn more time. "
+        "Check network connectivity or the provider status, then rerun with --resume."
+    )
+    raise ARCModelAPIError(message, api_mode=api_mode, model=model, error_type="EndpointUnreachable")
+
+
+# ---------------------------------------------------------------------------
+# Reachability probe (cheap pre-flight before re-attempting after a failure)
+# ---------------------------------------------------------------------------
+
+
+def _is_connection_failure(exc: Exception) -> bool:
+    """Whether the failure suggests the endpoint itself stopped answering."""
+
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    return isinstance(getattr(exc, "__cause__", None), httpx.TransportError) or isinstance(
+        getattr(exc, "__cause__", None), (APIConnectionError, APITimeoutError)
+    )
+
+
+def probe_endpoint_reachable(
+    *,
+    base_url: str,
+    api_key: str = "",
+    timeout: float = _REACHABILITY_PROBE_TIMEOUT,
+    transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """One cheap GET /models against ``base_url``; True when it answers.
+
+    Any HTTP status (including 4xx auth errors) counts as reachable: the
+    endpoint's TCP/TLS stack and routing are alive, so the failure mode the
+    probe exists for (silent connection drop, no RST) is ruled out. Only
+    transport-level errors (connect refused, timeout, DNS) return False.
+    ``transport`` is an injection point for offline tests.
+    """
+
+    resolved = (base_url or _get_openai_base_url()).strip()
+    if not resolved:
+        # No custom endpoint to probe (official OpenAI default); a probe would
+        # only duplicate the real attempt. Assume reachable.
+        return True
+    url = resolved.rstrip("/") + "/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        with httpx.Client(timeout=timeout, transport=transport) as client:
+            client.get(url, headers=headers)
+        return True
+    except (httpx.HTTPError, OSError):
+        return False
+
+
+async def _aendpoint_reachable(base_url: str, api_key: str) -> bool:
+    # httpx sync client in a short-lived probe; the async loop must not block
+    # for the probe duration, so run it in the default executor.
+    return await asyncio.to_thread(probe_endpoint_reachable, base_url=base_url, api_key=api_key)
+
+
+def _endpoint_reachable(base_url: str, api_key: str) -> bool:
+    return probe_endpoint_reachable(base_url=base_url, api_key=api_key)
+
+
+def _log_unreachable_probe(*, failed_attempts: int, policy: _ModelRetryPolicy) -> None:
+    logger.warning(
+        "Endpoint reachability probe failed (attempt %d of %d); waiting %.1fs before re-probing.",
+        failed_attempts,
+        1 + policy.max_retries,
+        policy.retry_delay,
+    )
 
 
 def _parse_retry_after_header(exc: Exception) -> float | None:

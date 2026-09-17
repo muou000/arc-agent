@@ -200,7 +200,7 @@ def test_visual_client_is_reused_across_concurrent_requests(
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="analysis:ok"))])
 
     class FakeOpenAI:
-        def __init__(self, api_key: str, base_url: str) -> None:
+        def __init__(self, api_key: str, base_url: str, **kwargs: Any) -> None:
             self.api_key = api_key
             self.base_url = base_url
             self.chat = SimpleNamespace(completions=FakeCompletions())
@@ -229,3 +229,33 @@ def test_concurrency_knob_is_parsed_and_clamped(monkeypatch: pytest.MonkeyPatch)
     for raw, expected in cases.items():
         monkeypatch.setenv("ARC_VISUAL_ANALYSIS_CONCURRENCY", raw)
         assert visual_analysis._max_visual_analysis_concurrency() == expected
+
+
+def test_visual_client_sets_explicit_timeout_and_no_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The raw visual client must carry the same contract as the model
+    adapter: an explicit timeout and no hidden SDK retries, so a dropped
+    connection fails once instead of stretching to 600s x 3 attempts."""
+
+    import httpx
+
+    captured: dict[str, Any] = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(visual_analysis, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(visual_analysis, "resolve_model_request_timeout", lambda: httpx.Timeout(120, connect=5))
+    monkeypatch.setenv("VISUAL_BASE_URL", "https://vision.example/v1")
+    monkeypatch.setenv("VISUAL_API_KEY", "key")
+    try:
+        visual_analysis._get_visual_client()
+    finally:
+        visual_analysis.reset_visual_client_cache_for_tests()
+
+    assert captured["max_retries"] == 0
+    timeout = captured["timeout"]
+    assert timeout.read == 120
+    assert timeout.connect == 5
