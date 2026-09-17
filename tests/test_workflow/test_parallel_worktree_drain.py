@@ -268,6 +268,99 @@ def test_declared_dependency_cycle_is_broken_and_the_drain_finishes(
     assert all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
 
 
+def test_design_waits_for_declared_dependency_in_the_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run7's parallel failure mode: the login node's DESIGN ran beside the
+    registration node's IMPLEMENT and both wrote their own auth routes. A
+    dependent node's DESIGN now starts only after the dependency's IMPLEMENT
+    has finished - i.e. after its merge - so it designs against the merged
+    integration HEAD and reuses the dependency's surfaces (run8's serial
+    semantics, guaranteed under parallel draining)."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][1]["dependencies"] = ["RA"]
+    queue_state = _queue_state(manager, tree)
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        events.append(("start", task["task_id"]))
+        await asyncio.sleep(0.01)
+        events.append(("end", task["task_id"]))
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert events.index(("start", "RB:DESIGN")) > events.index(("end", "RA:IMPLEMENT"))
+    assert all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
+
+
+def test_ancestor_dependency_edge_is_dropped_and_the_drain_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child declaring a dependency on its own parent (or the reverse)
+    would deadlock the drain: the parent-child rules already sequence the
+    pair and the dependency gate adds the reverse wait. The edge is dropped
+    with a report instead of leaving the tasks PENDING forever."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][0]["children"] = [
+        {"id": "RA1", "name": "grandchild", "description": "a1", "children": []}
+    ]
+    tree["children"][0]["dependencies"] = ["RA1"]  # parent depends on its own child
+    queue_state = _queue_state(manager, tree)
+
+    assert queue_state["dependencies"] == {}
+    assert queue_state["dropped_dependency_edges"] == [("RA", "RA1", "ancestor-descendant")]
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
+
+
+def test_uncle_nephew_dependency_cycle_is_broken_and_the_drain_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared cycle that closes only through the parent-child rules: C
+    depends on B while B's own child A depends on C. Node-level cycle
+    checking does not see it, but with DESIGN gating it deadlocks the drain
+    (D:C waits for I:B which waits for I:A which waits for I:C); the closing
+    edge is dropped with a report."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][0]["children"] = [
+        {"id": "RA1", "name": "grandchild", "description": "a1", "children": []}
+    ]
+    tree["children"][0]["dependencies"] = ["RB"]  # B (RA) depends on C (RB)
+    tree["children"][1]["dependencies"] = ["RA1"]  # C (RB) depends on A (RA1, B's child)
+    queue_state = _queue_state(manager, tree)
+
+    assert queue_state["dependencies"] == {"RA": ["RB"]}
+    assert queue_state["dropped_dependency_edges"] == [("RB", "RA1", "cycle")]
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
+
+
 def test_resumed_queue_with_dangling_dependency_edge_is_filtered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -847,6 +940,66 @@ def test_design_gate_fails_open_for_queues_saved_before_parents() -> None:
     assert ARCWorkflowManager._task_dependencies_met(state, child) is True
 
 
+def test_design_gate_combines_parent_and_dependency_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #38 review follow-up: the parent rule and the dependency rule are
+    independent checks and both must hold - a child whose parent DESIGN
+    failed is unblocked by the parent rule, but a still-running declared
+    dependency keeps its DESIGN blocked; and a completed parent alone does
+    not unblock a child whose dependency is still running."""
+    # Parent failed, dependency done: the child designs against the
+    # integration state without the parent shell, reusing the dependency.
+    state = _gate_queue_state(TASK_FAILED)
+    state["tasks"] += [
+        {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+        {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_COMPLETED},
+    ]
+    state["dependencies"] = {"RA": ["RB"]}
+    child = next(t for t in state["tasks"] if t["task_id"] == "RA:DESIGN")
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is True, (
+        "failed parent unblocks; completed dependency unblocks"
+    )
+
+    # Parent failed but the dependency is still implementing: still blocked.
+    for rb_implement_status in (TASK_PENDING, TASK_RUNNING):
+        state["tasks"][3]["status"] = rb_implement_status
+        assert ARCWorkflowManager._task_dependencies_met(state, child) is False, (
+            "a failed parent must not let the dependency check pass the child through"
+        )
+
+    # Parent completed, dependency still implementing: still blocked.
+    state["tasks"][0]["status"] = TASK_COMPLETED
+    state["tasks"][3]["status"] = TASK_RUNNING
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is False
+
+
+def test_design_gate_applies_declared_dependencies_to_the_root() -> None:
+    """PR #38 review follow-up: the root has no parent, so its DESIGN goes
+    straight to the dependency check - blocked while a declared dependency's
+    IMPLEMENT runs, unblocked when it fails (the failed-dependency release
+    the IMPLEMENT rule already follows)."""
+    state = {
+        "tasks": [
+            {"task_id": "R:DESIGN", "node_id": "R", "phase": PHASE_DESIGN, "status": TASK_PENDING},
+            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_RUNNING},
+        ],
+        "dependencies": {"R": ["RB"]},
+    }
+
+    root = state["tasks"][0]
+    assert ARCWorkflowManager._task_dependencies_met(state, root) is False
+
+    state["tasks"][2]["status"] = TASK_COMPLETED
+    assert ARCWorkflowManager._task_dependencies_met(state, root) is True
+
+    state["tasks"][2]["status"] = TASK_FAILED
+    assert ARCWorkflowManager._task_dependencies_met(state, root) is True, (
+        "a failed dependency releases the dependent root, matching the IMPLEMENT rule"
+    )
+
+
 def test_design_gate_blocks_when_the_parent_design_task_is_missing() -> None:
     # A parents entry without a matching DESIGN task is an inconsistent
     # queue: block the child instead of designing against an unknown
@@ -870,20 +1023,35 @@ def test_child_design_waits_for_parent_design_and_leaves_stay_parallel(
     queue_state = _queue_state(manager, _requirement_tree())
 
     events: list[tuple[str, str]] = []
-    active: set[str] = set()
+    leaf_designs_in_flight: set[str] = set()
+    second_leaf_started = asyncio.Event()
     leaf_overlap = False
 
     async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
         nonlocal leaf_overlap
         task_id = task["task_id"]
-        if task["phase"] == PHASE_DESIGN and task["node_id"] != "R" and active:
-            leaf_overlap = True
+        is_leaf_design = task["phase"] == PHASE_DESIGN and task["node_id"] != "R"
+        if is_leaf_design:
+            if leaf_designs_in_flight:
+                leaf_overlap = True
+            leaf_designs_in_flight.add(task_id)
+            if len(leaf_designs_in_flight) == 2:
+                second_leaf_started.set()
         events.append(("start", task_id))
-        active.add(task_id)
-        # Long enough that the sibling's worktree prepare cannot run out the
-        # overlap window.
-        await asyncio.sleep(0.05)
-        active.discard(task_id)
+        if is_leaf_design:
+            # Hold every leaf DESIGN until its sibling starts (bounded, so a
+            # serialization regression still fails instead of hanging): the
+            # overlap then no longer depends on a sleep outlasting the
+            # sibling's real-git worktree preparation, which occasionally
+            # exceeds it under load.
+            try:
+                await asyncio.wait_for(second_leaf_started.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(0.05)
+        if is_leaf_design:
+            leaf_designs_in_flight.discard(task_id)
         events.append(("end", task_id))
         return True
 

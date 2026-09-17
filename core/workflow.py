@@ -47,12 +47,18 @@ QUEUE_FILENAME = "processing_queue.json"
 # files) are resolved mechanically when every side only appended lines,
 # guarded by a backend health check before the merge commit; anything else
 # fails the node with an explicit reason and preserves its worktree for
-# inspection. Declared requirement dependencies gate the IMPLEMENT phase: a
-# node's IMPLEMENT waits for the IMPLEMENT of every node its requirement
-# declares as a dependency (its scenarios may read runtime state - accounts,
-# routes, orders - that only those nodes create), and the affinity picker
-# weighs a group by the pending work that depends on it so a small hub
-# subtree is not starved behind larger independent subtrees.
+# inspection. Declared requirement dependencies gate both phases: a node's
+# DESIGN and IMPLEMENT wait for the IMPLEMENT of every node its requirement
+# declares as a dependency. An IMPLEMENT completes only after its work is
+# merged, so the dependent DESIGN runs against the dependency's real surfaces
+# (routes, session helpers) and reuses them instead of designing a duplicate,
+# and the dependent IMPLEMENT finds the runtime state (accounts, routes,
+# orders) its scenarios read. Edges that cannot participate in scheduling -
+# between an ancestor and a descendant (the parent-child rules already
+# sequence those pairs; such an edge could only deadlock the drain) or
+# closing a cycle - are dropped and reported. The affinity picker weighs a
+# group by the pending work that depends on it so a small hub subtree is not
+# starved behind larger independent subtrees.
 DEFAULT_MAX_CONCURRENT_TASKS = 1
 PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS = 3
 MAX_PARALLEL_TASKS = 8
@@ -354,7 +360,9 @@ class ARCWorkflowManager:
             )
         for dependent_id, dependency_id, reason in queue_state.get("dropped_dependency_edges") or []:
             if reason == "cycle":
-                detail = "it would close a dependency cycle"
+                detail = "it would close a dependency cycle (with the parent-child scheduling rules)"
+            elif reason == "ancestor-descendant":
+                detail = "it links an ancestor with its own descendant, whom the parent-child rules already sequence"
             elif reason == "no-implement-task":
                 detail = "this queue has no IMPLEMENT task for it"
             else:
@@ -363,7 +371,7 @@ class ARCWorkflowManager:
                 "Compiler",
                 (
                     f"Declared dependency {dependent_id} -> {dependency_id or '(unknown)'} is ignored for "
-                    f"scheduling: {detail}. The dependent implements without waiting for it."
+                    f"scheduling: {detail}. The dependent proceeds without waiting for it."
                 ),
                 status="warning",
                 node_id=dependent_id,
@@ -437,8 +445,11 @@ class ARCWorkflowManager:
         ARC_MAX_CONCURRENT_TASKS tasks run at once, each against its own
         worktree, port slot and E2E database. Ordering is still honoured: a
         node's DESIGN precedes its IMPLEMENT, a node's DESIGN waits for its
-        parent's DESIGN (children design against the parent's merged shell),
-        and an IMPLEMENT waits for every descendant node's IMPLEMENT (children
+        parent's DESIGN (children design against the parent's merged shell)
+        and for the IMPLEMENT of every declared dependency (an IMPLEMENT
+        completes only after merging, so a dependent designs against the
+        dependency's real surfaces instead of duplicating them), and an
+        IMPLEMENT waits for every descendant node's IMPLEMENT (children
         before their parent) and for the IMPLEMENT of every declared
         dependency. Tasks are picked with subtree affinity (one in-flight task
         per top-level subtree, longest-remaining group - counted with the
@@ -506,7 +517,7 @@ class ARCWorkflowManager:
         once. A freed slot prefers the free group with the most pending work
         (longest-remaining first), counted together with the pending work of
         the other groups that depend on it: a small hub subtree that many
-        groups wait on (declared dependencies gate their IMPLEMENTs) must not
+        groups wait on (declared dependencies gate both phases) must not
         be starved behind larger independent subtrees. When a group runs dry
         the slot steals work from another free group. Without an affinity map
         (queues saved before subtree affinity) every node is its own group and
@@ -1035,9 +1046,19 @@ class ARCWorkflowManager:
         descendants = self._build_descendants_map(requirement_tree)
         parents = self._build_parents_map(requirement_tree)
         affinity = self._build_affinity_map(requirement_tree)
-        dependencies, dropped_edges = self._break_dependency_cycles(
-            self._build_dependencies_map(requirement_tree)
+        declared = self._build_dependencies_map(requirement_tree)
+        dependencies, ancestor_dropped = self._drop_ancestor_dependency_edges(declared, parents)
+        dependencies, cycle_dropped = self._break_dependency_cycles(
+            dependencies,
+            self._structural_precedence_edges(parents, node_ids),
         )
+        dropped_dependency_edges = [
+            (dependent_id, dependency_id, "ancestor-descendant")
+            for dependent_id, dependency_id in ancestor_dropped
+        ] + [
+            (dependent_id, dependency_id, "cycle")
+            for dependent_id, dependency_id in cycle_dropped
+        ]
         existing_queue = read_json_file(self.queue_path)
         if self._is_compatible_queue(existing_queue, root_id, expected_task_ids):
             queue_state = existing_queue
@@ -1059,18 +1080,20 @@ class ARCWorkflowManager:
                 restored, unschedulable = self._drop_unschedulable_dependencies(
                     queue_state["dependencies"], queue_state
                 )
-                restored, restored_cycles = self._break_dependency_cycles(restored)
+                structural = self._structural_precedence_edges(parents, node_ids)
+                restored, restored_ancestors = self._drop_ancestor_dependency_edges(restored, parents)
+                restored, restored_cycles = self._break_dependency_cycles(restored, structural)
                 queue_state["dependencies"] = restored
                 queue_state["dropped_dependency_edges"] = list(unschedulable) + [
+                    (dependent_id, dependency_id, "ancestor-descendant")
+                    for dependent_id, dependency_id in restored_ancestors
+                ] + [
                     (dependent_id, dependency_id, "cycle")
                     for dependent_id, dependency_id in restored_cycles
                 ]
             else:
                 queue_state.setdefault("dependencies", dependencies)
-                queue_state["dropped_dependency_edges"] = [
-                    (dependent_id, dependency_id, "cycle")
-                    for dependent_id, dependency_id in dropped_edges
-                ]
+                queue_state["dropped_dependency_edges"] = dropped_dependency_edges
             self._apply_saved_states_to_tasks(queue_state)
             return queue_state
         if require_compatible_existing_queue:
@@ -1086,10 +1109,7 @@ class ARCWorkflowManager:
             "parents": parents,
             "affinity": affinity,
             "dependencies": dependencies,
-            "dropped_dependency_edges": [
-                (dependent_id, dependency_id, "cycle")
-                for dependent_id, dependency_id in dropped_edges
-            ],
+            "dropped_dependency_edges": dropped_dependency_edges,
             "last_task_id": None,
         }
         self._apply_saved_states_to_tasks(queue_state)
@@ -1177,14 +1197,87 @@ class ARCWorkflowManager:
         return dependencies
 
     @staticmethod
+    def _structural_precedence_edges(
+        parents: dict[str, str],
+        node_ids: list[str],
+    ) -> dict[str, set[str]]:
+        """The ordering the queue already enforces, as phase-vertex edges.
+
+        Vertices are ``D:<node>`` and ``I:<node>`` (a node's DESIGN and
+        IMPLEMENT tasks). The queue always runs a node's DESIGN before its
+        IMPLEMENT, a child's DESIGN after its parent's DESIGN, and a parent's
+        IMPLEMENT after its descendants' IMPLEMENTs; those rules are edges
+        here so declared dependencies can be checked against them.
+        """
+
+        edges: dict[str, set[str]] = {}
+        for node_id in node_ids:
+            edges.setdefault(f"D:{node_id}", set()).add(f"I:{node_id}")
+        for child_id, parent_id in parents.items():
+            edges.setdefault(f"D:{parent_id}", set()).add(f"D:{child_id}")
+            edges.setdefault(f"I:{child_id}", set()).add(f"I:{parent_id}")
+        return edges
+
+    @staticmethod
+    def _drop_ancestor_dependency_edges(
+        dependencies: dict[str, list[str]],
+        parents: dict[str, str],
+    ) -> tuple[dict[str, list[str]], list[tuple[str, str]]]:
+        """Drop declared edges between an ancestor and its own descendant.
+
+        The parent-child rules already sequence such a pair (the child's
+        DESIGN waits for the ancestor's DESIGN, the ancestor's IMPLEMENT
+        waits for the descendant's), and the dependency gate adds the
+        reverse wait, so either direction of the edge makes the pair wait on
+        itself and deadlocks the drain. The edge schedules nothing beyond
+        those rules, so it is dropped here with its own reason instead of
+        surfacing as an anonymous cycle later.
+
+        The ancestry is derived here from ``parents`` (immediate parent per
+        node, the shape _build_parents_map guarantees) rather than accepted
+        as a precomputed descendants map: walking the parent chain per node
+        cannot misclassify a grandparent<->grandchild edge even if a future
+        map shape changes, so the classification is structural instead of a
+        convention callers must uphold.
+        """
+
+        def has_ancestor(node_id: str, candidate_id: str) -> bool:
+            parent_id = str((parents or {}).get(node_id, "") or "")
+            while parent_id:
+                if parent_id == candidate_id:
+                    return True
+                parent_id = str((parents or {}).get(parent_id, "") or "")
+            return False
+
+        kept: dict[str, list[str]] = {}
+        dropped: list[tuple[str, str]] = []
+        for dependent_id, dependency_ids in dependencies.items():
+            for dependency_id in dependency_ids:
+                if has_ancestor(dependent_id, dependency_id) or has_ancestor(dependency_id, dependent_id):
+                    dropped.append((dependent_id, dependency_id))
+                    continue
+                kept.setdefault(dependent_id, []).append(dependency_id)
+        return kept, dropped
+
+    @staticmethod
     def _break_dependency_cycles(
         dependencies: dict[str, list[str]],
+        structural_edges: dict[str, set[str]] | None = None,
     ) -> tuple[dict[str, list[str]], list[tuple[str, str]]]:
-        """Drop dependency edges that close a cycle, keeping a DAG.
+        """Drop dependency edges that close a cycle, keeping an acyclic graph.
 
-        The gate blocks an IMPLEMENT until its dependencies' IMPLEMENTs end,
-        so a cycle would leave every node in it permanently unrunnable and the
-        drain would end with PENDING tasks instead of a reported failure.
+        The gate blocks a node's DESIGN and IMPLEMENT until its dependencies'
+        IMPLEMENTs end, so a cycle would leave every node in it permanently
+        unrunnable and the drain would end with PENDING tasks instead of a
+        reported failure. A declared edge means "the dependency's IMPLEMENT
+        precedes the dependent's DESIGN" (``I:<dependency>`` before
+        ``D:<dependent>``); ``structural_edges`` (from
+        _structural_precedence_edges) adds the precedence the queue enforces
+        on its own, so an edge that closes a cycle *through those rules* -
+        e.g. a node depending on a sibling that depends on one of its
+        children - is caught too, not just pure declared cycles. Without
+        structural edges the check degenerates to the historical node-level
+        graph over the declared edges alone.
 
         Edges are visited one at a time in map order (which follows the tree
         walk) and an edge is dropped when its target can already reach its
@@ -1193,13 +1286,31 @@ class ARCWorkflowManager:
         completed by later edges: (1) a dropped edge always closes a cycle in
         the original graph, because the accepted edges are a subset of it, and
         (2) every cycle loses an edge, because its last edge in visit order
-        finds all its other edges accepted. Which edge of a cycle is dropped
-        follows the tree order and is reported to the caller; the result is
-        therefore deterministic for a given tree, never partially applied.
+        finds all its other edges accepted. The structural edges are acyclic
+        by construction (design vertices precede implement vertices, ancestors
+        design first, descendants implement first), so every cycle contains a
+        declared edge and the pass above is enough. Without ``structural_edges``
+        the pass still seeds each map node's inherent ``D:N -> I:N`` edge, which
+        makes the phase graph equivalent to the historical node-level graph: a
+        phase cycle must alternate declared ``I:dep -> D:dependent`` edges with
+        ``D:N -> I:N`` edges, so the two cycle notions coincide. Which edge of
+        a cycle is dropped follows the tree order and is reported to the
+        caller; the result is therefore deterministic for a given tree, never
+        partially applied.
         """
 
-        kept: dict[str, list[str]] = {}
-        dropped: list[tuple[str, str]] = []
+        adjacency: dict[str, set[str]] = {}
+        for source, targets in (structural_edges or {}).items():
+            adjacency.setdefault(source, set()).update(targets)
+        if structural_edges is None:
+            # Degenerate mode (no tree context): seed only the inherent
+            # design-before-implement edges so declared cycles still close.
+            for node_id in {str(key) for key in dependencies} | {
+                str(value)
+                for values in dependencies.values()
+                for value in values
+            }:
+                adjacency.setdefault(f"D:{node_id}", set()).add(f"I:{node_id}")
 
         def reaches(start: str, goal: str, seen: set[str]) -> bool:
             if start == goal:
@@ -1207,17 +1318,21 @@ class ARCWorkflowManager:
             if start in seen:
                 return False
             seen.add(start)
-            for next_id in kept.get(start, []):
+            for next_id in adjacency.get(start, ()):
                 if reaches(next_id, goal, seen):
                     return True
             return False
 
+        kept: dict[str, list[str]] = {}
+        dropped: list[tuple[str, str]] = []
         for dependent_id, dependency_ids in dependencies.items():
             for dependency_id in dependency_ids:
-                if reaches(dependency_id, dependent_id, set()):
+                source, target = f"I:{dependency_id}", f"D:{dependent_id}"
+                if reaches(target, source, set()):
                     dropped.append((dependent_id, dependency_id))
                     continue
                 kept.setdefault(dependent_id, []).append(dependency_id)
+                adjacency.setdefault(source, set()).add(target)
         return kept, dropped
 
     @staticmethod
@@ -1398,7 +1513,9 @@ class ARCWorkflowManager:
         DESIGN precedes its IMPLEMENT, and children IMPLEMENT before their
         parent. With parallel draining, a task may additionally never start
         while another task for the same node is in flight, and (enforced in
-        _task_dependencies_met) an IMPLEMENT waits for its descendants.
+        _task_dependencies_met) a DESIGN waits for its parent's DESIGN and
+        for declared dependencies' IMPLEMENTs, and an IMPLEMENT waits for
+        its descendants.
         """
 
         busy_nodes = {str(task.get("node_id", "")) for task in in_flight}
@@ -1420,19 +1537,27 @@ class ARCWorkflowManager:
         the parent's merged shell, so a parent's rewrite of shared surfaces can
         never conflict with a child's additive edits in flight; a failed parent
         does not block its children, matching the failed-descendant rule
-        below). A node's IMPLEMENT waits for its own DESIGN, for every
-        descendant node's IMPLEMENT (children before their parent; a failed
-        descendant does not block its parent, matching the historical rule that
-        an earlier failed IMPLEMENT does not either), and for the IMPLEMENT of
-        every node the requirement declares as a ``dependency``: the node's
+        below) and for the IMPLEMENT of every node the requirement declares as
+        a ``dependency``: an IMPLEMENT task completes only after its work is
+        merged, so the dependent designs against the dependency's real
+        surfaces (routes, session helpers) and reuses them instead of
+        designing a duplicate - run7's parallel run had the login node write
+        its own auth routes precisely because its design ran before the
+        registration node's routes existed. A node's IMPLEMENT waits for its
+        own DESIGN, for every descendant node's IMPLEMENT (children before
+        their parent; a failed descendant does not block its parent, matching
+        the historical rule that an earlier failed IMPLEMENT does not either),
+        and for the IMPLEMENT of every declared dependency: the node's
         scenarios routinely read runtime state (accounts, routes, orders) that
         only those nodes create, so implementing earlier turns a missing
-        prerequisite into a false test failure. DESIGN is deliberately not
-        gated on dependencies: designs run before their dependencies' contracts
-        exist and reuse them only when present (measured cost of gating DESIGN
-        is ~30% more wall clock for no additional IMPLEMENT ordering). Sibling
-        subtrees otherwise impose no order on each other, which is what makes
-        parallel draining sound.
+        prerequisite into a false test failure. A failed dependency unblocks
+        both phases exactly like the failed-descendant rule (a failed
+        dependency lands nothing reusable, so the dependent works against the
+        integration state as it is and must supply its own prerequisites -
+        the alternative is a stalled queue), so the gate costs wall clock only
+        along declared dependency chains; independent subtrees still drain in
+        parallel. Sibling subtrees otherwise impose no order on each other,
+        which is what makes parallel draining sound.
         """
 
         node_id = task["node_id"]
@@ -1451,19 +1576,15 @@ class ARCWorkflowManager:
                 # instead of designing against an unknown baseline.
                 if parent_design_status not in {TASK_COMPLETED, TASK_FAILED}:
                     return False
+            return ARCWorkflowManager._declared_dependencies_satisfied(queue_state, node_id)
         elif phase == PHASE_IMPLEMENT:
             for other in queue_state["tasks"]:
                 if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
                     if other["status"] != TASK_COMPLETED:
                         return False
                     break
-            for dependency_id in (queue_state.get("dependencies") or {}).get(node_id, []):
-                dependency_status = ARCWorkflowManager._implement_status(queue_state, dependency_id)
-                # A dependency with no IMPLEMENT task means the queue is
-                # inconsistent with the tree it was built from: block, matching
-                # the unknown-baseline rule above.
-                if dependency_status is None or dependency_status not in {TASK_COMPLETED, TASK_FAILED}:
-                    return False
+            if not ARCWorkflowManager._declared_dependencies_satisfied(queue_state, node_id):
+                return False
             descendants = set(queue_state.get("descendants", {}).get(node_id, []))
             if not descendants:
                 return True
@@ -1476,6 +1597,27 @@ class ARCWorkflowManager:
                 other["status"] in {TASK_COMPLETED, TASK_FAILED}
                 for other in descendant_tasks
             )
+        return True
+
+    @staticmethod
+    def _declared_dependencies_satisfied(queue_state: dict[str, Any], node_id: str) -> bool:
+        """True when every declared dependency's IMPLEMENT task has ended.
+
+        An IMPLEMENT completes only after its work is merged, so satisfied
+        dependencies mean the dependency's surfaces are already on the
+        integration HEAD the task starts from. A failed dependency counts as
+        satisfied: the queue must keep draining instead of deadlocking,
+        matching the failed-descendant rule, and the dependent works against
+        whatever the dependency did land. A dependency with no IMPLEMENT task
+        means the queue is inconsistent with the tree it was built from
+        (restored maps are validated against this): block, matching the
+        unknown-parent rule.
+        """
+
+        for dependency_id in (queue_state.get("dependencies") or {}).get(node_id, []):
+            dependency_status = ARCWorkflowManager._implement_status(queue_state, dependency_id)
+            if dependency_status is None or dependency_status not in {TASK_COMPLETED, TASK_FAILED}:
+                return False
         return True
 
     @staticmethod

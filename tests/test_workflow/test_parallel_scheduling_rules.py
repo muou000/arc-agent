@@ -174,6 +174,83 @@ def test_break_dependency_cycles_drops_the_cycle_closing_edge() -> None:
     assert dropped == [("RB", "RA")], "the edge that closes the cycle is dropped"
 
 
+def test_structural_precedence_edges_encode_the_queue_rules() -> None:
+    """The queue always runs D-before-I, parents' DESIGN first and
+    descendants' IMPLEMENT first; those rules are the baseline a declared
+    edge is checked against for cycles."""
+    edges = ARCWorkflowManager._structural_precedence_edges(
+        {"RA": "R", "RA1": "RA"},
+        ["R", "RA", "RA1"],
+    )
+    assert edges == {
+        "D:R": {"I:R", "D:RA"},
+        "I:RA": {"I:R"},
+        "D:RA": {"I:RA", "D:RA1"},
+        "I:RA1": {"I:RA"},
+        "D:RA1": {"I:RA1"},
+    }
+
+
+def test_break_dependency_cycles_catches_a_cycle_through_structural_edges() -> None:
+    """An edge closing a cycle only through the parent-child rules is caught:
+    C depends on B while B's own child A depends on C. Node-level checking
+    (main's IMPLEMENT-only gate) misses this shape; with DESIGN gating it
+    would deadlock the drain, so the closing edge is dropped here."""
+    structural = ARCWorkflowManager._structural_precedence_edges(
+        {"B": "R", "C": "R", "A": "B"},
+        ["R", "B", "A", "C"],
+    )
+    # B -> C kept first (I:C precedes D:B is reachable nowhere yet), then
+    # C -> A closes the cycle: D:C reaches I:B via D:B -> I:B.
+    kept, dropped = ARCWorkflowManager._break_dependency_cycles(
+        {"B": ["C"], "C": ["A"]}, structural
+    )
+
+    assert kept == {"B": ["C"]}
+    assert dropped == [("C", "A")]
+
+
+def test_drop_ancestor_dependency_edges_drops_both_directions() -> None:
+    """An edge between an ancestor and its own descendant deadlocks the drain
+    in either direction (the parent-child rules already sequence the pair,
+    the dependency gate adds the reverse wait), so it is dropped with its own
+    reason rather than surfacing as an anonymous cycle."""
+    kept, dropped = ARCWorkflowManager._drop_ancestor_dependency_edges(
+        {"RA": ["RA1"], "RA1": ["RA"], "RB": ["RA"]},
+        {"RA": "R", "RA1": "RA", "RB": "R"},
+    )
+
+    assert kept == {"RB": ["RA"]}
+    assert dropped == [("RA", "RA1"), ("RA1", "RA")]
+
+
+def test_drop_ancestor_dependency_edges_covers_transitive_descendants() -> None:
+    """PR #38 review follow-up: the ancestry is derived from the parents map
+    (immediate parent per node), so a grandparent<->grandchild edge is
+    classified as ``ancestor-descendant`` here - not left to the cycle pass
+    as an anonymous drop - without any precomputed-closure convention a
+    future map-shape change could silently break."""
+    tree = {
+        "id": "R",
+        "children": [
+            {"id": "RA", "children": [{"id": "RA1", "children": []}]},
+            {"id": "RB", "children": []},
+        ],
+    }
+    parents = ARCWorkflowManager._build_parents_map(tree)
+    assert parents == {"RA": "R", "RA1": "RA", "RB": "R"}
+
+    kept, dropped = ARCWorkflowManager._drop_ancestor_dependency_edges(
+        {"R": ["RA1"], "RA1": ["R"], "RB": ["RA1"]},
+        parents,
+    )
+
+    assert kept == {"RB": ["RA1"]}
+    assert dropped == [("R", "RA1"), ("RA1", "R")], (
+        "transitive ancestor-descendant edges are dropped with their own reason"
+    )
+
+
 def test_break_dependency_cycles_keeps_a_dag_untouched() -> None:
     graph = {"RB": ["RA"], "RC": ["RB"]}
 
@@ -308,20 +385,56 @@ def test_implement_unblocked_when_dependency_finished_or_failed() -> None:
         assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
 
 
-def test_design_is_not_gated_on_dependencies() -> None:
-    """DESIGN runs before a dependency's contract exists (it reuses dependency
-    interfaces only when they are already present); gating it was measured at
-    ~30% more wall clock for no IMPLEMENT-ordering gain."""
+def test_design_waits_for_declared_dependency_implement() -> None:
+    """run7's parallel run: the login node's DESIGN ran while the registration
+    node was still implementing, so both designed their own auth routes. A
+    node's DESIGN now waits for the IMPLEMENT of every declared dependency -
+    which completes only after merging, so the design starts from the
+    dependency's real surfaces and reuses them (run8's serial semantics,
+    now guaranteed under parallel draining too)."""
     queue = _queue(
         [
-            _task("RA", PHASE_DESIGN, TASK_PENDING, 0),
-            _task("RB", PHASE_DESIGN, TASK_PENDING, 1),
+            _task("RA", PHASE_DESIGN, TASK_COMPLETED, 0),
+            _task("RA", PHASE_IMPLEMENT, TASK_RUNNING, 1),
+            _task("RB", PHASE_DESIGN, TASK_PENDING, 2),
         ],
         {"R": ["RA", "RB"]},
     )
     queue["dependencies"] = {"RB": ["RA"]}
 
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][1]) is True
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
+
+
+def test_design_unblocked_when_dependency_finished_or_failed() -> None:
+    """A failed dependency unblocks the dependent's DESIGN exactly like the
+    IMPLEMENT rule: the queue must keep draining instead of deadlocking."""
+    for dependency_status in (TASK_COMPLETED, TASK_FAILED):
+        queue = _queue(
+            [
+                _task("RA", PHASE_DESIGN, TASK_COMPLETED, 0),
+                _task("RA", PHASE_IMPLEMENT, dependency_status, 1),
+                _task("RB", PHASE_DESIGN, TASK_PENDING, 2),
+            ],
+            {"R": ["RA", "RB"]},
+        )
+        queue["dependencies"] = {"RB": ["RA"]}
+
+        assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
+
+
+def test_design_blocks_when_a_declared_dependency_has_no_task() -> None:
+    """Like the IMPLEMENT rule: a dependency without an IMPLEMENT task means
+    the queue is inconsistent with its tree, so block rather than design
+    against an unknown baseline."""
+    queue = _queue(
+        [
+            _task("RB", PHASE_DESIGN, TASK_PENDING, 0),
+        ],
+        {"R": ["RA", "RB"]},
+    )
+    queue["dependencies"] = {"RB": ["RA"]}
+
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][0]) is False
 
 
 def test_implement_blocks_when_a_declared_dependency_has_no_task() -> None:
