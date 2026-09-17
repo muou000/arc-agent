@@ -83,3 +83,32 @@ def test_missing_explicit_env_file_fails_with_a_clean_cli_error(tmp_path: Path) 
     assert f"ARC_ENV_FILE does not exist: {missing_env}" in result.stdout
     assert "Traceback" not in result.stdout
     assert "Traceback" not in result.stderr
+
+
+def test_check_config_flags_bad_model_retry_env_values(monkeypatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_TIMEOUT", "banana")
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "99")
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "5")
+
+    from core.config import check_config
+
+    result = check_config()
+
+    warnings = "\n".join(result["warnings"])
+    assert "ARC_MODEL_TIMEOUT must be a number, got: banana" in warnings
+    assert "ARC_MODEL_MAX_RETRIES=99 is outside the sane range 0-10" in warnings
+    assert "ARC_MODEL_RETRY_DELAY" not in warnings
+
+
+def test_check_config_accepts_valid_model_retry_env_values(monkeypatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_TIMEOUT", "120")
+    monkeypatch.setenv("ARC_MODEL_CONNECT_TIMEOUT", "5")
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "5")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "5")
+
+    from core.config import check_config
+
+    result = check_config()
+
+    assert not any("ARC_MODEL_" in item for item in result["warnings"])

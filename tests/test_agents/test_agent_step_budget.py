@@ -14,6 +14,7 @@ import asyncio
 import pytest
 from langgraph.errors import GraphRecursionError
 
+from agents.model.openai_api_adapter import ARCModelAPIError
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.runners import (
     DEFAULT_RECURSION_LIMIT,
@@ -112,5 +113,35 @@ def test_stream_budget_exhaustion_does_not_fall_back_to_ainvoke(tmp_path) -> Non
                 message="go",
                 context=_context(tmp_path),
                 thread_id="REQ-BUDGET-1:probe",
+            )
+        )
+
+
+class _StreamModelAPIErrorAgent:
+    name = "api-error-probe"
+
+    async def astream_events(self, *_args, **_kwargs):
+        raise ARCModelAPIError(
+            "Model API request failed using `chat_completions` mode; model=test-model",
+            api_mode="chat_completions",
+            model="test-model",
+        )
+
+    async def ainvoke(self, *_args, **_kwargs):
+        raise AssertionError("a model API failure must not be retried via ainvoke")
+
+
+def test_stream_model_api_error_does_not_fall_back_to_ainvoke(tmp_path) -> None:
+    """The adapter retry chain already ran (or tripped the consecutive-failure
+    budget); the ainvoke fallback would replay the whole session as a second
+    full retry chain against the same endpoint. The error must propagate."""
+
+    with pytest.raises(ARCModelAPIError):
+        asyncio.run(
+            ainvoke_stage_agent(
+                _StreamModelAPIErrorAgent(),
+                message="go",
+                context=_context(tmp_path),
+                thread_id="REQ-BUDGET-1:api-error-probe",
             )
         )

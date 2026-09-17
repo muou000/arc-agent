@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable
 
 from openai import OpenAI
 
+from agents.model.openai_api_adapter import resolve_model_request_timeout
 from core import files
 from core.service import get_runtime
 
@@ -55,7 +56,16 @@ def _get_visual_client() -> OpenAI:
     with _VISUAL_CLIENT_LOCK:
         client = _VISUAL_CLIENT_CACHE.get(cache_key)
         if client is None:
-            client = OpenAI(api_key=visual_api_key, base_url=visual_base_url)
+            # Same client contract as the model adapter: an explicit timeout
+            # and no hidden SDK retries, so a dropped connection fails once
+            # within the connect window instead of stretching to the SDK's
+            # 600s default x 3 attempts.
+            client = OpenAI(
+                api_key=visual_api_key,
+                base_url=visual_base_url,
+                timeout=resolve_model_request_timeout(),
+                max_retries=0,
+            )
             _VISUAL_CLIENT_CACHE[cache_key] = client
         return client
 

@@ -2,15 +2,19 @@
 
 The model layer used to only normalize provider exceptions: a single exhausted
 429 escaped as ``ARCModelAPIError`` and killed the running node. These tests pin
-the new contract:
+the current contract:
 
 * transient failures (429/408/409/5xx, connection and timeout errors) are
-  retried with exponential backoff, honoring ``Retry-After`` up to the cap;
+  retried with a short fixed delay, honoring ``Retry-After`` up to the cap;
+* after a connection-class failure the retry waits on a cheap GET /models
+  reachability probe instead of re-hanging until the full request timeout;
 * non-transient 4xx failures fail fast with the normalized error;
 * quota/billing exhaustion fails fast even when the provider returns it as a
   429: the error text is deterministic, so retries would only burn backoff time;
 * retries are configurable via ``ARC_MODEL_MAX_RETRIES`` and the delay env
   vars (``0`` restores the old no-retry behaviour);
+* a cross-call consecutive-failure budget (default 5) stops re-entering the
+  retry chain against a dead endpoint; any success resets it;
 * anything that is not a model API exception propagates unwrapped.
 """
 from __future__ import annotations
@@ -27,6 +31,8 @@ from agents.model.openai_api_adapter import (
     _acall_model_with_retries,
     _call_model_with_retries,
     _resolve_retry_policy,
+    probe_endpoint_reachable,
+    reset_consecutive_failure_budget_for_tests,
 )
 
 
@@ -73,9 +79,34 @@ class _AsyncFlakyCall(_FlakyCall):
 
 
 @pytest.fixture(autouse=True)
-def _deterministic_delays(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Remove jitter so asserted delays are exact."""
-    monkeypatch.setattr(adapter.random, "uniform", lambda low, high: high)
+def _reset_failure_budget() -> None:
+    reset_consecutive_failure_budget_for_tests()
+    yield
+    reset_consecutive_failure_budget_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _always_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Probe outcomes are asserted in dedicated tests; elsewhere answer yes."""
+
+    monkeypatch.setattr(adapter, "_endpoint_reachable", lambda base_url, api_key: True)
+
+    async def fake_areachable(base_url: str, api_key: str) -> bool:
+        return True
+
+    monkeypatch.setattr(adapter, "_aendpoint_reachable", fake_areachable)
+
+
+def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "ARC_MODEL_MAX_RETRIES",
+        "ARC_MODEL_RETRY_DELAY",
+        "ARC_MODEL_RETRY_MAX_DELAY",
+        "ARC_MODEL_MAX_CONSECUTIVE_FAILURES",
+        "ARC_MODEL_TIMEOUT",
+        "ARC_MODEL_CONNECT_TIMEOUT",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -84,32 +115,79 @@ def _deterministic_delays(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_resolve_retry_policy_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("ARC_MODEL_MAX_RETRIES", "ARC_MODEL_RETRY_INITIAL_DELAY", "ARC_MODEL_RETRY_MAX_DELAY"):
-        monkeypatch.delenv(name, raising=False)
+    _clear_env(monkeypatch)
     policy = _resolve_retry_policy()
     assert policy.max_retries == 3
-    assert policy.initial_delay == 2.0
-    assert policy.max_delay == 30.0
+    assert policy.retry_delay == 5.0
+    assert policy.max_delay == 60.0
+    assert policy.max_consecutive_failures == 5
 
 
 def test_resolve_retry_policy_honors_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "5")
-    monkeypatch.setenv("ARC_MODEL_RETRY_INITIAL_DELAY", "0.5")
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "3")
     monkeypatch.setenv("ARC_MODEL_RETRY_MAX_DELAY", "9")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "2")
     policy = _resolve_retry_policy()
     assert policy.max_retries == 5
-    assert policy.initial_delay == 0.5
+    assert policy.retry_delay == 3.0
     assert policy.max_delay == 9.0
+    assert policy.max_consecutive_failures == 2
 
 
 def test_resolve_retry_policy_falls_back_on_invalid_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "banana")
-    monkeypatch.setenv("ARC_MODEL_RETRY_INITIAL_DELAY", "soon")
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "soon")
     monkeypatch.setenv("ARC_MODEL_RETRY_MAX_DELAY", "-5")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "nope")
     policy = _resolve_retry_policy()
     assert policy.max_retries == 3
-    assert policy.initial_delay == 2.0
-    assert policy.max_delay == 30.0
+    assert policy.retry_delay == 5.0
+    assert policy.max_delay == 60.0
+    assert policy.max_consecutive_failures == 5
+
+
+# ---------------------------------------------------------------------------
+# Request timeout resolution
+# ---------------------------------------------------------------------------
+
+
+def test_request_timeout_defaults_to_sdk_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    timeout = adapter.resolve_model_request_timeout()
+    assert timeout.connect == 15.0
+    assert timeout.read == 600.0
+    assert timeout.write == 600.0
+
+
+def test_request_timeout_honors_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_TIMEOUT", "120")
+    monkeypatch.setenv("ARC_MODEL_CONNECT_TIMEOUT", "5")
+    timeout = adapter.resolve_model_request_timeout()
+    assert timeout.connect == 5.0
+    assert timeout.read == 120.0
+
+
+def test_build_openai_chat_model_sets_timeout_and_disables_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents.model.openai_api_adapter import build_openai_chat_model, reset_model_cache_for_tests
+
+    monkeypatch.setenv("ARC_MODEL_TIMEOUT", "120")
+    reset_model_cache_for_tests()
+    try:
+        model = build_openai_chat_model(
+            "test-model",
+            api_mode="chat_completions",
+            base_url="https://model.test/v1",
+            api_key="test-key",
+        )
+        client = model.root_client
+        assert client.timeout is not None
+        assert client.timeout.read == 120.0
+        assert client.max_retries == 0
+    finally:
+        reset_model_cache_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -222,13 +300,145 @@ def test_throttle_language_wins_over_quota_text() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reachability probe
+# ---------------------------------------------------------------------------
+
+
+def test_probe_reports_reachable_on_any_http_status() -> None:
+    # Even a 401 answers the question this probe exists for: the endpoint's
+    # TCP stack is alive. Only transport errors mean "unreachable".
+    transport = httpx.MockTransport(lambda request: httpx.Response(401, json={"error": "auth"}))
+    assert probe_endpoint_reachable(
+        base_url="https://model.test/v1", api_key="k", transport=transport
+    )
+
+
+def test_probe_reports_unreachable_on_transport_error() -> None:
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    transport = httpx.MockTransport(handler)
+    assert not probe_endpoint_reachable(
+        base_url="https://model.test/v1", api_key="k", transport=transport
+    )
+
+
+def test_probe_targets_the_models_listing() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"data": []})
+
+    transport = httpx.MockTransport(handler)
+    assert probe_endpoint_reachable(
+        base_url="https://model.test/v1", api_key="k", transport=transport
+    )
+    assert seen == ["/v1/models"]
+
+
+def test_probe_without_custom_base_url_assumes_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No OPENAI_API_BASE/OPENAI_BASE_URL configured: the probe would only
+    # duplicate the real attempt against the official default endpoint.
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    assert probe_endpoint_reachable(base_url="", api_key="") is True
+
+
+def test_connection_failure_triggers_probe_rounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connection failure must not be re-attempted blind: the loop probes.
+    A totally-down endpoint gives up after the probe-round cap, not after
+    burning the full real-attempt budget."""
+
+    probes: list[str] = []
+    monkeypatch.setattr(
+        adapter, "_endpoint_reachable", lambda base_url, api_key: probes.append(base_url) or False
+    )
+    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
+
+    call = _FlakyCall([_connection_error()] * 10)
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_model_with_retries(
+            call,
+            api_mode="chat_completions",
+            model="test-model",
+            base_url="https://model.test/v1",
+            api_key="test-key",
+        )
+
+    # One real attempt, then probe rounds: cap re-probes plus the final
+    # confirming probe whose failure crosses the cap and raises (no further
+    # real calls at any point).
+    assert call.calls == 1
+    assert probes == ["https://model.test/v1"] * (adapter._PROBE_ROUNDS_PER_ATTEMPT + 1)
+    assert "unreachable" in str(excinfo.value).lower()
+
+
+def test_probe_rounds_do_not_consume_the_model_attempt_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While the endpoint stays unreachable, only probes fly — no model calls,
+    and the default retry budget is untouched by probe failures (a connection
+    blip that recovers still gets its full budget of real retries)."""
+
+    monkeypatch.setattr(adapter, "_endpoint_reachable", lambda base_url, api_key: False)
+    sleeps: list[float] = []
+    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+
+    # Default policy (max_retries=3): one real failure, then probe rounds
+    # until the probe cap. The real-attempt count must stay at 1.
+    call = _FlakyCall([_connection_error()] * 10)
+    with pytest.raises(ARCModelAPIError):
+        _call_model_with_retries(
+            call,
+            api_mode="chat_completions",
+            model="test-model",
+            base_url="https://model.test/v1",
+            api_key="test-key",
+        )
+    assert call.calls == 1
+    # Post-failure delay plus one delay per probe round.
+    assert sleeps == [5.0] * (1 + adapter._PROBE_ROUNDS_PER_ATTEMPT)
+
+
+def test_probe_recovery_resumes_real_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After the endpoint answers the probe again, the real call is retried —
+    and a recovered probe round does not shorten the real-attempt budget."""
+
+    # Probe answers: first round unreachable, then recovered, then (after the
+    # second real failure) recovered again immediately.
+    probe_answers = iter([False, True, True])
+    monkeypatch.setattr(
+        adapter, "_endpoint_reachable", lambda base_url, api_key: next(probe_answers)
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
+
+    call = _FlakyCall([_connection_error(), _connection_error()])
+    result = _call_model_with_retries(
+        call,
+        api_mode="chat_completions",
+        model="test-model",
+        base_url="https://model.test/v1",
+        api_key="test-key",
+    )
+
+    assert result == "ok"
+    # All four budgeted real attempts were available; three were needed.
+    assert call.calls == 3
+    # One delay after each real failure, one between the two probe rounds.
+    assert sleeps == [5.0, 5.0, 5.0]
+
+
+# ---------------------------------------------------------------------------
 # Retry loop
 # ---------------------------------------------------------------------------
 
 
 def test_sync_call_retries_transient_429_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
-    monkeypatch.setenv("ARC_MODEL_RETRY_INITIAL_DELAY", "2")
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "2")
     sleeps: list[float] = []
     monkeypatch.setattr(adapter, "_sleep", sleeps.append)
 
@@ -237,12 +447,12 @@ def test_sync_call_retries_transient_429_and_succeeds(monkeypatch: pytest.Monkey
 
     assert result == "ok"
     assert call.calls == 3
-    assert sleeps == [2.0, 4.0]
+    assert sleeps == [2.0, 2.0]
 
 
 def test_async_call_retries_transient_429_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
-    monkeypatch.setenv("ARC_MODEL_RETRY_INITIAL_DELAY", "2")
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "2")
     sleeps: list[float] = []
 
     async def fake_asleep(seconds: float) -> None:
@@ -257,7 +467,7 @@ def test_async_call_retries_transient_429_and_succeeds(monkeypatch: pytest.Monke
 
     assert result == "ok"
     assert call.calls == 3
-    assert sleeps == [2.0, 4.0]
+    assert sleeps == [2.0, 2.0]
 
 
 def test_non_retryable_401_fails_fast_without_wrapping_delay(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -360,19 +570,182 @@ def test_retry_after_header_is_capped_at_max_delay(monkeypatch: pytest.MonkeyPat
     assert sleeps == [10.0]
 
 
-def test_backoff_delay_is_capped_at_max_delay(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "5")
-    monkeypatch.setenv("ARC_MODEL_RETRY_INITIAL_DELAY", "8")
+def test_retry_delay_is_the_fixed_short_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "5")
     monkeypatch.setenv("ARC_MODEL_RETRY_MAX_DELAY", "20")
     sleeps: list[float] = []
     monkeypatch.setattr(adapter, "_sleep", sleeps.append)
 
-    call = _FlakyCall([_status_error(500)] * 5)
+    call = _FlakyCall([_status_error(500)] * 3)
     result = _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
 
     assert result == "ok"
-    assert call.calls == 6
-    assert sleeps == [8.0, 16.0, 20.0, 20.0, 20.0]
+    assert call.calls == 4
+    # Fixed delay: no exponential growth between attempts.
+    assert sleeps == [5.0, 5.0, 5.0]
+
+
+def test_retry_delay_is_capped_at_max_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "30")
+    monkeypatch.setenv("ARC_MODEL_RETRY_MAX_DELAY", "20")
+    sleeps: list[float] = []
+    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+
+    call = _FlakyCall([_status_error(500)])
+    result = _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
+
+    assert result == "ok"
+    assert sleeps == [20.0]
+
+
+# ---------------------------------------------------------------------------
+# Cross-call consecutive-failure budget
+# ---------------------------------------------------------------------------
+
+
+def test_consecutive_failures_fail_fast_on_the_next_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default budget 5: after five consecutive failed calls, the sixth does
+    not enter the retry loop at all."""
+
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "5")
+    endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
+
+    for _ in range(5):
+        call = _FlakyCall([_connection_error()])
+        with pytest.raises(ARCModelAPIError):
+            _call_model_with_retries(
+                call, api_mode="chat_completions", model="test-model", **endpoint
+            )
+
+    # Budget exhausted: the next call fails fast with the budget message,
+    # without touching the model.
+    call = _FlakyCall([_connection_error()])
+    with pytest.raises(ARCModelAPIError, match="consecutive failed model calls"):
+        _call_model_with_retries(call, api_mode="chat_completions", model="test-model", **endpoint)
+    assert call.calls == 0
+
+
+def test_success_resets_the_consecutive_failure_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "2")
+    endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
+
+    failing = _FlakyCall([_connection_error()])
+    with pytest.raises(ARCModelAPIError):
+        _call_model_with_retries(failing, api_mode="chat_completions", model="test-model", **endpoint)
+
+    # A success in between resets the counter.
+    ok = _FlakyCall([], final="ok")
+    assert (
+        _call_model_with_retries(ok, api_mode="chat_completions", model="test-model", **endpoint)
+        == "ok"
+    )
+
+    failing2 = _FlakyCall([_connection_error()])
+    with pytest.raises(ARCModelAPIError):
+        _call_model_with_retries(failing2, api_mode="chat_completions", model="test-model", **endpoint)
+    # Only one consecutive failure so far: this call still entered the loop.
+    assert failing2.calls == 1
+
+
+def test_zero_budget_disables_the_circuit_breaker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "0")
+    endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
+
+    for _ in range(6):
+        call = _FlakyCall([_connection_error()])
+        with pytest.raises(ARCModelAPIError):
+            _call_model_with_retries(call, api_mode="chat_completions", model="test-model", **endpoint)
+        assert call.calls == 1
+
+
+def test_failure_budget_is_scoped_per_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "2")
+
+    for _ in range(2):
+        call = _FlakyCall([_connection_error()])
+        with pytest.raises(ARCModelAPIError):
+            _call_model_with_retries(
+                call,
+                api_mode="chat_completions",
+                model="test-model",
+                base_url="https://a.test/v1",
+                api_key="key-a",
+            )
+
+    # Same failure count on a different endpoint: unaffected.
+    call = _FlakyCall([_connection_error()])
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_model_with_retries(
+            call,
+            api_mode="chat_completions",
+            model="test-model",
+            base_url="https://b.test/v1",
+            api_key="key-b",
+        )
+    # Normalized per-attempt error, not the budget fail-fast message.
+    assert "consecutive" not in str(excinfo.value)
+    assert call.calls == 1
+
+
+def test_endpoint_key_never_contains_the_raw_api_key() -> None:
+    key = adapter._model_endpoint_key("m", "https://model.test/v1", "sk-secret")
+    assert "sk-secret" not in key
+
+
+def test_stale_failures_leave_the_recovery_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failures older than the recovery window stop counting, so a tripped
+    breaker unblocks itself once the outage is plausibly over instead of
+    failing calls forever, and stale entries do not leak into later runs
+    of the same process."""
+
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "2")
+    endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
+
+    for _ in range(2):
+        call = _FlakyCall([_connection_error()])
+        with pytest.raises(ARCModelAPIError):
+            _call_model_with_retries(call, api_mode="chat_completions", model="test-model", **endpoint)
+
+    # Budget tripped: the next call fails fast without touching the model.
+    tripped = _FlakyCall([_connection_error()])
+    with pytest.raises(ARCModelAPIError, match="consecutive failed model calls"):
+        _call_model_with_retries(tripped, api_mode="chat_completions", model="test-model", **endpoint)
+    assert tripped.calls == 0
+
+    # Age both failures past the recovery window: the breaker must release,
+    # letting the call enter the loop again (and fail per-attempt, not via
+    # the budget message).
+    with adapter._CONSECUTIVE_FAILURES_LOCK:
+        for ep_key, records in adapter._CONSECUTIVE_FAILURES.items():
+            stale = adapter.time.monotonic() - (adapter._FAILURE_RECOVERY_WINDOW_SECONDS + 60.0)
+            adapter._CONSECUTIVE_FAILURES[ep_key] = [(stale, exc) for _, exc in records]
+    aged = _FlakyCall([_connection_error()])
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_model_with_retries(aged, api_mode="chat_completions", model="test-model", **endpoint)
+    assert "consecutive" not in str(excinfo.value)
+    assert aged.calls == 1
+
+
+def test_endpoint_key_normalizes_explicit_and_env_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller passing the env credential explicitly and one relying on the
+    fallback must share one failure counter (same endpoint identity)."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://model.test/v1")
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+
+    explicit = adapter._model_endpoint_key("m", "https://model.test/v1", "sk-env")
+    via_env = adapter._model_endpoint_key("m", "", "")
+    assert explicit == via_env
 
 
 # ---------------------------------------------------------------------------

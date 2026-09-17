@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel
 
+from agents.model.openai_api_adapter import ARCModelAPIError
 from agents.model.usage_capture import llm_usage_context
 from agents.runtime.contracts import AgentRuntimeContext
 from core.logging import format_json_for_log, log_to_logger
@@ -411,6 +412,21 @@ async def _try_astream_stage_agent(
     except GraphRecursionError:
         # The step budget is exhausted; a full ainvoke retry would burn the
         # same budget again on a fresh session. Let the failure propagate.
+        raise
+    except ARCModelAPIError as exc:
+        # The model API call already exhausted its adapter-level retry chain
+        # (or tripped the consecutive-failure budget). The ainvoke fallback
+        # would replay the whole session — a second full retry chain against
+        # the same dead or throttling endpoint — so surface the error to the
+        # caller; the workflow marks the node failed and stays resumable.
+        await _emit_log(
+            log_cb,
+            run_label,
+            f"agent stream failed on a model API error; surfacing the error. error={exc}",
+            status="error",
+            node_id=context.node_id,
+        )
+        log_to_logger(logger, "AGENT_STREAM_MODEL_API_ERROR", label=run_label, thread_id=thread_id, body=str(exc))
         raise
     except StructuredOutputError as exc:
         # The structured-output contract failed validation and the strategy is
