@@ -436,6 +436,75 @@ def test_prior_implementation_anchor_couples_to_commit_builder() -> None:
     assert message == "REQ-ANCHOR-1 (implement): Calculator"
 
 
+def test_design_baseline_repair_rename_cannot_smuggle_green(tmp_project_dir, arc_runtime) -> None:
+    """A repair that renames a green file to a new path must re-baseline it.
+
+    The recheck loop used to only re-run files whose paths survived in the
+    manifest; a repair that deleted the green path and re-added the same
+    tautology under a new path let the new file through unvalidated (PR #35
+    review round 4). New paths introduced by a repair round are now always
+    re-baselined.
+    """
+    node_id = "REQ-BASE-RENAME"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    renamed_file = "tests/unit/test_calc_renamed.py"
+
+    class _RenameSmuggler(_StubGenerator):
+        """First repair renames the green file; later rounds keep the rename."""
+
+        async def repair_green_baseline(self, *args: Any, **kwargs: Any) -> tuple:
+            await super().repair_green_baseline(*args, **kwargs)
+            self._manifests.append([_manifest_item("T1-RENAMED", renamed_file)])
+            return ([_manifest_item("T1-RENAMED", renamed_file)], "{}")
+
+    generator = _RenameSmuggler([[_manifest_item("T1", UNIT_TEST_FILE)]])
+    # Initial baseline: green. Each round's re-baseline of the renamed file:
+    # still green (tautology smuggled under the new name) until the budget
+    # is exhausted and DESIGN fails.
+    fake = FakeAppHandler([passing_test_output()] * (1 + DESIGN_BASELINE_MAX_REJECTIONS))
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is False
+    # The renamed file WAS re-baselined every round (3 baseline runs total:
+    # the original green, and one re-baseline per rejection round).
+    assert fake.calls.count(("Unit", [renamed_file])) == DESIGN_BASELINE_MAX_REJECTIONS
+    assert fake.calls[0] == ("Unit", [UNIT_TEST_FILE])
+    errors = [entry for entry in logs if entry[2] == "error"]
+    assert any("DESIGN failed" in entry[1] for entry in errors)
+    assert any(renamed_file in entry[1] for entry in errors)
+    # The smuggled path never reached the stored manifest.
+    assert sessions.load_node_session(node_id).get("phase_status", {}).get("design") != "completed"
+
+
+def test_design_baseline_repair_new_file_validated_red_passes(tmp_project_dir, arc_runtime) -> None:
+    """A legitimate repair that introduces a new RED file passes the gate."""
+    node_id = "REQ-BASE-RENAME-OK"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    reworked_file = "tests/unit/test_calc_reworked.py"
+    generator = _StubGenerator(
+        [
+            [_manifest_item("T1", UNIT_TEST_FILE)],
+            # Repair round: old green path dropped, genuine rework at a new
+            # path that fails the baseline (RED) as it should.
+            [_manifest_item("T1-REWORKED", reworked_file)],
+        ]
+    )
+    fake = FakeAppHandler([passing_test_output(), failing_test_output()])
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is True
+    assert len(generator.rejection_calls) == 1
+    # The new path was re-baselined and recorded red.
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE]), ("Unit", [reworked_file])]
+    baseline = sessions.load_node_session(node_id).get("design_baseline")
+    assert baseline == {reworked_file: "red"}
+    assert any("Re-baselining" in entry[1] for entry in logs)
+
+
 def test_prior_implementation_anchor_survives_worktree_merges(tmp_project_dir, arc_runtime) -> None:
     """Merge commits must not break the prior-implementation anchor.
 

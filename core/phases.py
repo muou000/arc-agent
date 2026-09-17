@@ -521,11 +521,32 @@ class WorkflowPhaseRunner:
                 )
                 return None
 
+            # Re-baseline everything that must prove itself RED this round:
+            # the files that carried the green evidence into this repair
+            # round AND any file the repair newly introduced. The second set
+            # closes the rename escape: a repair that deletes the green path
+            # and re-adds the same tautology under a new path must not slip
+            # through just because the old evidence path left the manifest.
             survived: set[str] = set()
             for evidence in green_evidence:
                 if any(item.get("file_path") == evidence["file_path"] for item in current_tests):
                     survived.add(evidence["file_path"])
+            original_paths = {str(item.get("file_path", "") or "").strip() for item in prepared_tests}
+            for item in current_tests:
+                path = str(item.get("file_path", "") or "").strip()
+                if path and path not in original_paths:
+                    survived.add(path)
+                    file_state.pop(path, None)
             recheck_paths = sorted(survived)
+            if recheck_paths:
+                await self._log(
+                    "TestGenerator",
+                    (
+                        f"Re-baselining {len(recheck_paths)} file(s) after the rework round: "
+                        f"{', '.join(recheck_paths)}."
+                    ),
+                    node_id=node_id,
+                )
             green_evidence = []
             for path in recheck_paths:
                 test_type = next(
