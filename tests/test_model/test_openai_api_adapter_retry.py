@@ -346,16 +346,17 @@ def test_probe_without_custom_base_url_assumes_reachable(monkeypatch: pytest.Mon
 
 
 def test_connection_failure_triggers_probe_rounds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A connection failure must not be re-attempted blind: the loop probes."""
+    """A connection failure must not be re-attempted blind: the loop probes.
+    A totally-down endpoint gives up after the probe-round cap, not after
+    burning the full real-attempt budget."""
 
     probes: list[str] = []
     monkeypatch.setattr(
         adapter, "_endpoint_reachable", lambda base_url, api_key: probes.append(base_url) or False
     )
     monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "1")
 
-    call = _FlakyCall([_connection_error()])
+    call = _FlakyCall([_connection_error()] * 10)
     with pytest.raises(ARCModelAPIError) as excinfo:
         _call_model_with_retries(
             call,
@@ -365,24 +366,28 @@ def test_connection_failure_triggers_probe_rounds(monkeypatch: pytest.MonkeyPatc
             api_key="test-key",
         )
 
-    # One real attempt, then one probe round: the probe failure already
-    # exceeded the attempt budget (max_retries=1 -> 2 attempts), so the loop
-    # raised instead of waiting to re-probe again.
+    # One real attempt, then probe rounds: cap re-probes plus the final
+    # confirming probe whose failure crosses the cap and raises (no further
+    # real calls at any point).
     assert call.calls == 1
-    assert probes == ["https://model.test/v1"]
+    assert probes == ["https://model.test/v1"] * (adapter._PROBE_ROUNDS_PER_ATTEMPT + 1)
     assert "unreachable" in str(excinfo.value).lower()
 
 
 def test_probe_rounds_do_not_consume_the_model_attempt_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """While the endpoint stays unreachable, only probes fly — no model calls."""
+    """While the endpoint stays unreachable, only probes fly — no model calls,
+    and the default retry budget is untouched by probe failures (a connection
+    blip that recovers still gets its full budget of real retries)."""
 
     monkeypatch.setattr(adapter, "_endpoint_reachable", lambda base_url, api_key: False)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    sleeps: list[float] = []
+    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
 
-    call = _FlakyCall([_connection_error()])
+    # Default policy (max_retries=3): one real failure, then probe rounds
+    # until the probe cap. The real-attempt count must stay at 1.
+    call = _FlakyCall([_connection_error()] * 10)
     with pytest.raises(ARCModelAPIError):
         _call_model_with_retries(
             call,
@@ -391,12 +396,14 @@ def test_probe_rounds_do_not_consume_the_model_attempt_budget(
             base_url="https://model.test/v1",
             api_key="test-key",
         )
-    # The single real attempt failed; every later round was probe-only.
     assert call.calls == 1
+    # Post-failure delay plus one delay per probe round.
+    assert sleeps == [5.0] * (1 + adapter._PROBE_ROUNDS_PER_ATTEMPT)
 
 
 def test_probe_recovery_resumes_real_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
-    """After the endpoint answers the probe again, the real call is retried."""
+    """After the endpoint answers the probe again, the real call is retried —
+    and a recovered probe round does not shorten the real-attempt budget."""
 
     # Probe answers: first round unreachable, then recovered, then (after the
     # second real failure) recovered again immediately.
@@ -418,6 +425,7 @@ def test_probe_recovery_resumes_real_attempts(monkeypatch: pytest.MonkeyPatch) -
     )
 
     assert result == "ok"
+    # All four budgeted real attempts were available; three were needed.
     assert call.calls == 3
     # One delay after each real failure, one between the two probe rounds.
     assert sleeps == [5.0, 5.0, 5.0]

@@ -35,6 +35,12 @@ _DEFAULT_REQUEST_TIMEOUT = 600.0
 _DEFAULT_CONNECT_TIMEOUT = 15.0
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
 _REACHABILITY_PROBE_TIMEOUT = 5.0
+# A dead endpoint is re-probed up to this many times per real attempt before
+# the loop gives up on the call. Probe rounds never consume the real-attempt
+# budget (a connection blip that recovers still gets its full retry budget),
+# so the cap is what bounds a totally-down endpoint: 1 real failure + 3
+# probe rounds ~= 4 x (5s probe + 5s wait) before the call raises.
+_PROBE_ROUNDS_PER_ATTEMPT = 3
 
 # Quota/billing exhaustion is deterministic: retrying only burns backoff time.
 # A status carrying these texts is an account or subscription limit, not a
@@ -772,36 +778,46 @@ def _call_model_with_retries(
 ) -> Any:
     """Invoke a model call, retrying transient failures with a short fixed delay.
 
-    Failure detection has two layers. The per-call loop bounds one invocation
-    (default 1 original + 4 retries); before re-attempting after a
-    connection-class failure it runs a cheap GET /models reachability probe,
-    so a dead endpoint is detected in seconds instead of hanging until the
-    full request timeout on every attempt. The cross-call counter bounds a
-    whole run: when the same endpoint accumulates ``max_consecutive_failures``
-    consecutive failed attempts, later calls fail fast instead of re-burning
-    the retry chain. Any success resets the counter.
+    Failure detection has three layers. The per-call loop bounds one
+    invocation (default 1 original + 3 real retries). After a connection-class
+    failure the next attempt waits on a cheap GET /models reachability probe:
+    probe rounds are bounded separately by ``_PROBE_ROUNDS_PER_ATTEMPT`` and
+    never consume the real-attempt budget, so a dead endpoint is detected in
+    seconds without shortening the retry budget for a connection blip that
+    recovers. The cross-call counter bounds a whole run: when the same
+    endpoint accumulates ``max_consecutive_failures`` consecutive failed
+    attempts, later calls fail fast instead of re-burning the retry chain.
+    Any success resets the counter.
     """
 
     policy = _resolve_retry_policy()
     endpoint_key = _model_endpoint_key(model, base_url, api_key)
     _check_consecutive_failure_budget(endpoint_key, api_mode=api_mode, model=model, base_url=base_url, api_key=api_key)
     failed_attempts = 0
+    probe_rounds = 0
     probe_next = False
     while True:
         if probe_next:
-            probe_next = False
             if not _endpoint_reachable(base_url, api_key):
-                failed_attempts += 1
+                # The endpoint is down: probing is cheap, a real attempt is
+                # not, and the unreachable window already counts towards the
+                # consecutive-failure budget, so re-probe (up to the cap)
+                # instead of burning a real attempt against it.
                 _record_model_failure(endpoint_key)
-                _log_unreachable_probe(failed_attempts=failed_attempts, policy=policy)
-                if failed_attempts > policy.max_retries:
+                probe_rounds += 1
+                if probe_rounds > _PROBE_ROUNDS_PER_ATTEMPT:
                     _raise_endpoint_unreachable(
-                        api_mode=api_mode, model=model, base_url=base_url, attempts=failed_attempts
+                        api_mode=api_mode,
+                        model=model,
+                        base_url=base_url,
+                        attempts=failed_attempts,
                     )
+                _log_unreachable_probe(probe_rounds=probe_rounds, policy=policy)
                 _sleep(policy.retry_delay)
-                probe_next = True
                 continue
             # The endpoint answers again; fall through to the real attempt.
+            probe_next = False
+            probe_rounds = 0
         try:
             result = call()
         except Exception as exc:
@@ -834,22 +850,30 @@ async def _acall_model_with_retries(
         endpoint_key, api_mode=api_mode, model=model, base_url=base_url, api_key=api_key
     )
     failed_attempts = 0
+    probe_rounds = 0
     probe_next = False
     while True:
         if probe_next:
-            probe_next = False
             if not await _aendpoint_reachable(base_url, api_key):
-                failed_attempts += 1
+                # The endpoint is down: probing is cheap, a real attempt is
+                # not, and the unreachable window already counts towards the
+                # consecutive-failure budget, so re-probe (up to the cap)
+                # instead of burning a real attempt against it.
                 _record_model_failure(endpoint_key)
-                _log_unreachable_probe(failed_attempts=failed_attempts, policy=policy)
-                if failed_attempts > policy.max_retries:
+                probe_rounds += 1
+                if probe_rounds > _PROBE_ROUNDS_PER_ATTEMPT:
                     _raise_endpoint_unreachable(
-                        api_mode=api_mode, model=model, base_url=base_url, attempts=failed_attempts
+                        api_mode=api_mode,
+                        model=model,
+                        base_url=base_url,
+                        attempts=failed_attempts,
                     )
+                _log_unreachable_probe(probe_rounds=probe_rounds, policy=policy)
                 await _asleep(policy.retry_delay)
-                probe_next = True
                 continue
             # The endpoint answers again; fall through to the real attempt.
+            probe_next = False
+            probe_rounds = 0
         try:
             result = await call()
         except Exception as exc:
@@ -1069,11 +1093,12 @@ def _endpoint_reachable(base_url: str, api_key: str) -> bool:
     return probe_endpoint_reachable(base_url=base_url, api_key=api_key)
 
 
-def _log_unreachable_probe(*, failed_attempts: int, policy: _ModelRetryPolicy) -> None:
+def _log_unreachable_probe(*, probe_rounds: int, policy: _ModelRetryPolicy) -> None:
     logger.warning(
-        "Endpoint reachability probe failed (attempt %d of %d); waiting %.1fs before re-probing.",
-        failed_attempts,
-        1 + policy.max_retries,
+        "Endpoint reachability probe failed (probe round %d of %d); "
+        "waiting %.1fs before re-probing without consuming the retry budget.",
+        probe_rounds,
+        _PROBE_ROUNDS_PER_ATTEMPT,
         policy.retry_delay,
     )
 
