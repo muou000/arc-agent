@@ -436,6 +436,49 @@ def test_prior_implementation_anchor_couples_to_commit_builder() -> None:
     assert message == "REQ-ANCHOR-1 (implement): Calculator"
 
 
+def test_prior_implementation_anchor_survives_worktree_merges(tmp_project_dir, arc_runtime) -> None:
+    """Merge commits must not break the prior-implementation anchor.
+
+    Parallel-node integration creates ``merge arc-node/<id> into <branch>``
+    commits whose subjects never match the ``(implement`` grep, and the
+    node's own checkpoint keeps its full ``<node_id> (implement): ...``
+    subject on its branch (no squash/rebase in NodeWorktreeManager.integrate).
+    The anchor must still find that checkpoint after merges exist.
+    """
+    import subprocess
+
+    def _git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(tmp_project_dir), check=True, capture_output=True)
+
+    node_id = "REQ-BASE-MERGE"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    _git("init", "-q", "-b", "main")
+    _git("config", "user.name", "arc-test")
+    _git("config", "user.email", "arc-test@example.com")
+    (tmp_project_dir / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_project_dir / "src" / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-q", "-m", "init")
+    # The node's implement checkpoint on its worktree branch, merged back
+    # with the real NodeWorktreeManager message shape.
+    _git("checkout", "-q", "-b", "arc-node/REQ-BASE-MERGE")
+    (tmp_project_dir / "src" / "calc.py").write_text("def add(a, b):\n    return a + b + 0\n", encoding="utf-8")
+    _git("commit", "-q", "-am", build_commit_message(node_id, "IMPLEMENT", {"name": "Calculator"}))
+    _git("checkout", "-q", "main")
+    _git("merge", "--no-ff", "arc-node/REQ-BASE-MERGE", "-q", "-m", "merge arc-node/REQ-BASE-MERGE into main")
+
+    generator = _StubGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
+    fake = FakeAppHandler([passing_test_output()])
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    # The checkpoint behind merge commits still anchors: green is legitimate.
+    assert ok is True
+    assert generator.rejection_calls == []
+    assert any("implement checkpoint" in entry[1] for entry in logs)
+
+
 # ---------------------------------------------------------------------------
 # IMPLEMENT seeding: the DESIGN baseline states must be reused, not re-run.
 # ---------------------------------------------------------------------------
