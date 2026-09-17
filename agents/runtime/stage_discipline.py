@@ -19,6 +19,26 @@ _MAX_DESIGN_WRITES = 8
 _MAX_SKELETON_LINES = 160
 _MAX_READ_LIMIT = 200
 
+# Stage-specific exits appended to the repeated-write block: a generic
+# "wait for an error" gave stages without reachable errors (test_generation
+# has validation tools disabled) no visible way out. Kept to one sentence —
+# the message re-enters the context on every blocked attempt.
+_WRITE_BLOCK_EXITS = {
+    "test_generation": (
+        "To change it: write the revision to a new path, or delete this test asset first "
+        "and then write it back; if the test assets are ready, stop editing and return the "
+        "updated manifest."
+    ),
+    "implementation": (
+        "To change it: run the tests (a failing run unlocks written files for fixes) "
+        "or write the revision to a new path."
+    ),
+    "interface_design": (
+        "To change it: record the remaining interfaces in your response instead of "
+        "rewriting this skeleton."
+    ),
+}
+
 
 class StageDisciplineState(TypedDict, total=False):
     """Run-local state used to prevent redundant file-tool loops."""
@@ -90,8 +110,8 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return None
         if path in self._written_paths and not self._path_unlocked(path):
             return (
-                f"Read blocked: {path} was already written in this stage. Continue to the next action; "
-                "re-read only after a file-operation or system-validation error."
+                f"Read blocked: {path} was already written in this stage; you know its content. "
+                "Continue with the next action instead of re-reading it."
             )
         offset = _as_nonnegative_int(args.get("offset"), default=0)
         limit = min(_as_nonnegative_int(args.get("limit"), default=100), _MAX_READ_LIMIT)
@@ -101,7 +121,8 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous):
             return (
                 f"Repeated read blocked: {path} is already in this stage's read cache. "
-                "Use the earlier result; only a non-overlapping paginated range or a failure may justify another read."
+                "Use the earlier result and continue; if the file needs changes, follow the write "
+                "options instead of probing offsets to bypass the cache."
             )
         return None
 
@@ -112,7 +133,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if path in self._written_paths and not self._path_unlocked(path):
             return (
                 f"Repeated write blocked: {path} was already changed in this stage. "
-                "Wait for a file-operation or system-validation error before changing it again."
+                f"{_WRITE_BLOCK_EXITS[self._stage]}"
             )
         if self._stage == "test_generation" and not _is_test_asset(path):
             return (
@@ -162,6 +183,16 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             if path:
                 self._failed_paths.add(path)
             return
+        if name == "delete" and path:
+            # The file is gone, so its write lock, read ranges and failure
+            # record describe content that no longer exists; dropping them is
+            # what makes delete-then-rewrite a real exit instead of one that
+            # depends on an accidental later failure to unlock.
+            self._written_paths.discard(path)
+            self._failed_paths.discard(path)
+            self._read_ranges.pop(path, None)
+            self._discard_written_path(request, path)
+            return
         if name == "read_file" and path:
             offset = _as_nonnegative_int(args.get("offset"), default=0)
             limit = _as_nonnegative_int(args.get("limit"), default=100)
@@ -178,7 +209,9 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
 
         This is the discipline's ground truth for "the agent actually
         materialized files" — unlike the model's own ``files_written`` answer,
-        it cannot be empty when writes succeeded.
+        it cannot be empty when writes succeeded. Paths deleted afterwards are
+        excluded: only the interface_design stage consumes this (``delete`` is
+        disabled there), so in practice it never sees deleted paths.
         """
 
         return sorted(self._written_paths)
@@ -202,6 +235,13 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             written = request.state.setdefault("arc_written_paths", [])
             if path not in written:
                 written.append(path)
+
+    @staticmethod
+    def _discard_written_path(request: ToolCallRequest, path: str) -> None:
+        if isinstance(request.state, dict):
+            written = request.state.get("arc_written_paths")
+            if isinstance(written, list) and path in written:
+                written.remove(path)
 
     @staticmethod
     def _blocked(request: ToolCallRequest, message: str) -> ToolMessage:

@@ -5,7 +5,9 @@ The middleware guards every tool call of the three stage agents:
 - ``test_generation`` may only write test assets and must not run validation.
 - ``interface_design`` may materialize at most 8 small skeleton files.
 - every stage blocks repeated writes/re-reads until a file-operation or
-  validation failure unlocks the path again.
+  validation failure unlocks the path again; in ``test_generation`` a
+  successful delete also releases the path, so delete-then-rewrite works
+  without waiting for an accidental failure to unlock it.
 
 These tests call the middleware directly with synthetic ``ToolCallRequest``
 objects, so no agent runtime is needed.
@@ -125,6 +127,153 @@ def test_test_generation_repeated_test_write_is_blocked() -> None:
     second = run(middleware, make_request("write_file", {"file_path": path, "content": "b\n"}, call_id="c2"))
     assert isinstance(second, ToolMessage) and second.status == "error"
     assert "Repeated write blocked" in second.content
+
+
+def test_test_generation_repeated_write_block_lists_actionable_exits() -> None:
+    # The generic "wait for an error" exit was unreachable in test_generation
+    # (validation tools are disabled), so the run7 loop burned 52 blocked
+    # writes; the message must name the real ways out.
+    for stage, expected in (
+        ("test_generation", ("new path", "delete", "manifest")),
+        ("implementation", ("run the tests", "new path")),
+        ("interface_design", ("response", "skeleton")),
+    ):
+        middleware = make(stage)
+        path = "/workspace/tests/unit/test_calc.py" if stage == "test_generation" else "/workspace/src/calc.py"
+        first = run(middleware, make_request("write_file", {"file_path": path, "content": "a\n"}, call_id="c1"))
+        assert first.content == "ok"
+        blocked = run(middleware, make_request("write_file", {"file_path": path, "content": "b\n"}, call_id="c2"))
+        assert blocked.status == "error"
+        assert blocked.content.startswith("Error: ARC stage discipline:")
+        assert "Repeated write blocked" in blocked.content
+        for keyword in expected:
+            assert keyword in blocked.content, f"{stage} write block should mention {keyword!r}"
+
+
+def test_repeated_read_block_does_not_offer_offset_probing() -> None:
+    # run7 evidence: 50 consecutive offset=0..49 probe reads, each accepted as
+    # a "non-overlapping range" by the old message that suggested paginated
+    # re-reads as a justification. The message must not invite that again.
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    run(middleware, make_request("read_file", {"file_path": path, "offset": 0, "limit": 100}, call_id="r1"))
+    blocked = run(middleware, make_request("read_file", {"file_path": path, "offset": 10, "limit": 50}, call_id="r2"))
+    assert blocked.status == "error"
+    assert "Repeated read blocked" in blocked.content
+    assert "non-overlapping" not in blocked.content
+    assert "offset" in blocked.content
+
+
+def test_read_of_written_file_block_points_to_next_action() -> None:
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
+    blocked = run(middleware, make_request("read_file", {"file_path": path, "offset": 0, "limit": 100}, call_id="r1"))
+    assert blocked.status == "error"
+    assert "Read blocked" in blocked.content
+    assert "Continue with the next action" in blocked.content
+
+
+# ---------------------------------------------------------------------------
+# test_generation stage: delete releases the write lock (run8 regression)
+# ---------------------------------------------------------------------------
+
+
+def test_test_generator_delete_then_rewrite_releases_write_lock() -> None:
+    """Exact run8 sequence: the rewrite after a successful delete must pass.
+
+    Empirical trace (REQ-1 TestGenerator, passengerRepository.test.js):
+    write ok -> write blocked -> delete ok -> write blocked x6 -> delete
+    error (not found) -> write ok. The rewrite was only unlocked by the
+    *failed* second delete; with the lock released on successful delete the
+    rewrite passes immediately after the first one.
+    """
+
+    middleware = make("test_generation")
+    path = "/workspace/backend/tests/passengerRepository.test.js"
+    state: dict[str, Any] = {}
+    write_args = {"file_path": path, "content": "test v1\n"}
+
+    first = run(middleware, make_request("write_file", write_args, call_id="c1", state=state))
+    assert isinstance(first, ToolMessage) and first.content == "ok"
+    assert state["arc_written_paths"] == [path]
+
+    blocked = run(middleware, make_request("write_file", write_args, call_id="c2", state=state))
+    assert blocked.status == "error" and "Repeated write blocked" in blocked.content
+
+    deleted = run(middleware, make_request("delete", {"file_path": path}, call_id="c3", state=state))
+    assert not isinstance(deleted, ToolMessage) or deleted.status != "error"
+    # The state mirror must drop the path together with the internal lock.
+    assert state["arc_written_paths"] == []
+
+    rewritten = run(middleware, make_request("write_file", write_args, call_id="c4", state=state))
+    assert isinstance(rewritten, ToolMessage) and rewritten.content == "ok"
+    assert state["arc_written_paths"] == [path]
+
+
+def test_test_generator_delete_releases_read_cache_for_rewritten_file() -> None:
+    """A delete must clear the read cache of the deleted path.
+
+    The cached ranges describe content that no longer exists; keeping them
+    would turn the next read of the same range into a zombie
+    "Repeated read blocked" lock. Reading the rewritten file afterwards is
+    governed by the written-path rule, so the release is observed directly on
+    the deleted path.
+    """
+
+    middleware = make("test_generation")
+    path = "/workspace/backend/tests/passengerRepository.test.js"
+    read_args = {"file_path": path, "offset": 0, "limit": 100}
+
+    assert run(middleware, make_request("read_file", read_args, call_id="r1")).content == "ok"
+    blocked = run(middleware, make_request("read_file", read_args, call_id="r2"))
+    assert blocked.status == "error" and "Repeated read blocked" in blocked.content
+
+    assert run(middleware, make_request("delete", {"file_path": path}, call_id="d1")).content == "ok"
+    # Same range as before the delete: the cache entry died with the file.
+    assert run(middleware, make_request("read_file", read_args, call_id="r3")).content == "ok"
+
+    # After the delete-then-rewrite cycle, reads of the new content are
+    # governed by the written-path rule — never by the stale pre-delete range.
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "test v2\n"}, call_id="c1")).content == "ok"
+    rewrite_read = run(middleware, make_request("read_file", read_args, call_id="r4"))
+    assert rewrite_read.status == "error" and "Read blocked" in rewrite_read.content
+
+
+def test_test_generator_failed_delete_still_unlocks_via_failure_recording() -> None:
+    """run8's accidental escape stays valid: a *failed* delete records the
+    path in ``_failed_paths`` (the generic file-operation failure unlock),
+    so the rewrite passes without the delete-release semantics."""
+    middleware = make("test_generation")
+    path = "/workspace/backend/tests/passengerRepository.test.js"
+    write_args = {"file_path": path, "content": "test v1\n"}
+
+    assert run(middleware, make_request("write_file", write_args, call_id="c1")).content == "ok"
+    failed_delete = run(
+        middleware,
+        make_request("delete", {"file_path": path}, call_id="c2"),
+        handler=lambda req: ToolMessage(
+            content="Error: path not found", name="delete", tool_call_id="c2", status="error"
+        ),
+    )
+    assert failed_delete.status == "error"
+    # The failed file operation unlocks the path for the rewrite.
+    assert run(middleware, make_request("write_file", write_args, call_id="c3")).content == "ok"
+
+
+def test_materialized_paths_excludes_deleted_paths() -> None:
+    # materialized_paths() is only consumed in interface_design (where delete
+    # is disabled), so this documents the intended semantics rather than a
+    # live path: a deleted file is no longer materialized.
+    middleware = make("test_generation")
+    kept = "/workspace/backend/tests/kept.test.js"
+    removed = "/workspace/backend/tests/removed.test.js"
+
+    run(middleware, make_request("write_file", {"file_path": kept, "content": "test\n"}, call_id="c1"))
+    run(middleware, make_request("write_file", {"file_path": removed, "content": "test\n"}, call_id="c2"))
+    run(middleware, make_request("delete", {"file_path": removed}, call_id="c3"))
+
+    assert middleware.materialized_paths() == [kept]
 
 
 # ---------------------------------------------------------------------------
