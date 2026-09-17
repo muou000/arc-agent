@@ -696,6 +696,21 @@ def test_endpoint_key_never_contains_the_raw_api_key() -> None:
     assert "sk-secret" not in key
 
 
+def test_endpoint_key_normalizes_explicit_and_env_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller passing the env credential explicitly and one relying on the
+    fallback must share one failure counter (same endpoint identity)."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://model.test/v1")
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+
+    explicit = adapter._model_endpoint_key("m", "https://model.test/v1", "sk-env")
+    via_env = adapter._model_endpoint_key("m", "", "")
+    assert explicit == via_env
+
+
 # ---------------------------------------------------------------------------
 # Wiring inside the ARC model classes
 # ---------------------------------------------------------------------------

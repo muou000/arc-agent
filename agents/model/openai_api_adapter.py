@@ -967,9 +967,17 @@ _CONSECUTIVE_FAILURES_LOCK = threading.Lock()
 
 
 def _model_endpoint_key(model: str, base_url: str, api_key: str) -> str:
-    """Identity of the endpoint a failure is attributed to (secret-free)."""
+    """Identity of the endpoint a failure is attributed to (secret-free).
 
-    return f"{model}|{(base_url or _get_openai_base_url()).rstrip('/')}|{_structured_output_key_fingerprint(api_key or os.getenv('OPENAI_API_KEY', ''))}"
+    ``base_url`` and ``api_key`` are normalized the same way for every caller
+    in the process (explicit argument, else the environment fallback), so a
+    caller that passes an empty string and one that passes the env value
+    explicitly land on the same counter instead of splitting it.
+    """
+
+    resolved_base_url = (base_url or _get_openai_base_url()).strip()
+    resolved_api_key = (api_key or os.getenv("OPENAI_API_KEY", "")).strip()
+    return f"{model}|{resolved_base_url.rstrip('/')}|{_structured_output_key_fingerprint(resolved_api_key)}"
 
 
 def _record_model_failure(endpoint_key: str, *, exc: Exception | None = None) -> None:
