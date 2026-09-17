@@ -696,6 +696,43 @@ def test_endpoint_key_never_contains_the_raw_api_key() -> None:
     assert "sk-secret" not in key
 
 
+def test_stale_failures_leave_the_recovery_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failures older than the recovery window stop counting, so a tripped
+    breaker unblocks itself once the outage is plausibly over instead of
+    failing calls forever, and stale entries do not leak into later runs
+    of the same process."""
+
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "2")
+    endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
+
+    for _ in range(2):
+        call = _FlakyCall([_connection_error()])
+        with pytest.raises(ARCModelAPIError):
+            _call_model_with_retries(call, api_mode="chat_completions", model="test-model", **endpoint)
+
+    # Budget tripped: the next call fails fast without touching the model.
+    tripped = _FlakyCall([_connection_error()])
+    with pytest.raises(ARCModelAPIError, match="consecutive failed model calls"):
+        _call_model_with_retries(tripped, api_mode="chat_completions", model="test-model", **endpoint)
+    assert tripped.calls == 0
+
+    # Age both failures past the recovery window: the breaker must release,
+    # letting the call enter the loop again (and fail per-attempt, not via
+    # the budget message).
+    with adapter._CONSECUTIVE_FAILURES_LOCK:
+        for ep_key, records in adapter._CONSECUTIVE_FAILURES.items():
+            stale = adapter.time.monotonic() - (adapter._FAILURE_RECOVERY_WINDOW_SECONDS + 60.0)
+            adapter._CONSECUTIVE_FAILURES[ep_key] = [(stale, exc) for _, exc in records]
+    aged = _FlakyCall([_connection_error()])
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_model_with_retries(aged, api_mode="chat_completions", model="test-model", **endpoint)
+    assert "consecutive" not in str(excinfo.value)
+    assert aged.calls == 1
+
+
 def test_endpoint_key_normalizes_explicit_and_env_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

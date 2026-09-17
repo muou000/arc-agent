@@ -962,8 +962,16 @@ def _compute_retry_delay(policy: _ModelRetryPolicy, exc: Exception) -> float:
 # resets it, mirroring pi's retry-counter reset on a successful response.
 # Failure records are (timestamp, exception) pairs; only the count matters for
 # the budget, but the last exception is kept for the fail-fast message.
+#
+# Failures older than the recovery window stop counting: a breaker that
+# already tripped must not keep failing calls forever once the outage is
+# plausibly over (the run may outlive the outage), and stale entries must not
+# leak into later runs of a long-lived process. The window is deliberately
+# generous — it is a leak guard, not a retry policy; the per-call probe layer
+# is what decides whether the endpoint is actually back.
 _CONSECUTIVE_FAILURES: dict[str, list[tuple[float, Exception | None]]] = {}
 _CONSECUTIVE_FAILURES_LOCK = threading.Lock()
+_FAILURE_RECOVERY_WINDOW_SECONDS = 300.0
 
 
 def _model_endpoint_key(model: str, base_url: str, api_key: str) -> str:
@@ -982,7 +990,25 @@ def _model_endpoint_key(model: str, base_url: str, api_key: str) -> str:
 
 def _record_model_failure(endpoint_key: str, *, exc: Exception | None = None) -> None:
     with _CONSECUTIVE_FAILURES_LOCK:
-        _CONSECUTIVE_FAILURES.setdefault(endpoint_key, []).append((time.monotonic(), exc))
+        records = _CONSECUTIVE_FAILURES.setdefault(endpoint_key, [])
+        records.append((time.monotonic(), exc))
+        _prune_stale_failures_locked(endpoint_key, records)
+
+
+def _prune_stale_failures_locked(endpoint_key: str, records: list[tuple[float, Exception | None]]) -> None:
+    """Drop failures older than the recovery window (caller holds the lock)."""
+
+    cutoff = time.monotonic() - _FAILURE_RECOVERY_WINDOW_SECONDS
+    stale = 0
+    for stale, (timestamp, _exc) in enumerate(records):
+        if timestamp >= cutoff:
+            break
+    else:
+        stale = len(records)
+    if stale:
+        del records[:stale]
+        if not records:
+            _CONSECUTIVE_FAILURES.pop(endpoint_key, None)
 
 
 def _reset_model_failures(endpoint_key: str) -> None:
@@ -992,7 +1018,11 @@ def _reset_model_failures(endpoint_key: str) -> None:
 
 def _consecutive_failure_count(endpoint_key: str) -> int:
     with _CONSECUTIVE_FAILURES_LOCK:
-        return len(_CONSECUTIVE_FAILURES.get(endpoint_key, ()))
+        records = _CONSECUTIVE_FAILURES.get(endpoint_key)
+        if not records:
+            return 0
+        _prune_stale_failures_locked(endpoint_key, records)
+        return len(records)
 
 
 def reset_consecutive_failure_budget_for_tests() -> None:
@@ -1094,6 +1124,12 @@ def probe_endpoint_reachable(
 async def _aendpoint_reachable(base_url: str, api_key: str) -> bool:
     # httpx sync client in a short-lived probe; the async loop must not block
     # for the probe duration, so run it in the default executor.
+    # asyncio.to_thread never touches the loop while the probe runs: it
+    # schedules the sync call on a worker thread and awaits a future, so even
+    # a probe that runs its full timeout leaves the loop serving other tasks.
+    # ``transport`` is therefore a sync-only injection point (offline tests
+    # cover the sync wrapper); the async path probes the real network, which
+    # is the production behaviour.
     return await asyncio.to_thread(probe_endpoint_reachable, base_url=base_url, api_key=api_key)
 
 

@@ -142,6 +142,6 @@ def test_stream_model_api_error_does_not_fall_back_to_ainvoke(tmp_path) -> None:
                 _StreamModelAPIErrorAgent(),
                 message="go",
                 context=_context(tmp_path),
-                thread_id="REQ-BUDGET-1:probe",
+                thread_id="REQ-BUDGET-1:api-error-probe",
             )
         )
