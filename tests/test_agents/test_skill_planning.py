@@ -49,6 +49,7 @@ ALL_SKILL_NAMES = (
     "vercel-composition-patterns",
     "vercel-react-best-practices",
     "web-design-guidelines",
+    "web-test-harness-skill",
 )
 
 
