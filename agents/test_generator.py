@@ -18,6 +18,13 @@ from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
 from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, test_generation_skills
+from agents.tools.test_manifest import (
+    DeclaredTestFile,
+    TestManifestLock,
+    build_declare_test_manifest_tool,
+    canonical_test_type,
+    reconcile_declared_manifest,
+)
 from agents.tools.traceability import build_traceability_tools
 
 
@@ -29,7 +36,7 @@ class TestManifestItem(BaseModel):
     req_id: str = Field(description="Requirement node id covered by this test.")
     interface_ids: list[str] = Field(default_factory=list, description="Covered interface ids.")
     type: str = Field(description="Unit, Integration, or E2E.")
-    file_path: str = Field(description="Workspace-relative test file path.")
+    file_path: str = Field(description="Workspace-relative test file path; must be a path that was declared via declare_test_manifest and actually written in this pass.")
     first_line: str = Field(default="", description="Exact first line in the written test file.")
 
 
@@ -93,6 +100,7 @@ class TestGenerator:
         )
         interface_contract = context_pipeline.get_interface_contract_context(node_id)
         context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
+        manifest_lock = TestManifestLock()
         agent = build_stage_agent(
             name="test_generator",
             stage="test_generation",
@@ -106,9 +114,18 @@ class TestGenerator:
             skills=[SKILLS_SOURCE] if selected_skill_names else [],
             permitted_skill_names=selected_skill_names,
             memory=[],
-            tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+            tools=[
+                *build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+                build_declare_test_manifest_tool(
+                    node_id=node_id,
+                    manifest_lock=manifest_lock,
+                    validate_test_path=self._make_path_validator(app_type, workspace_root),
+                    log_cb=self.log_cb,
+                ),
+            ],
             node_id=node_id,
             claims_workspace_root=self.context_workspace_root or workspace_root,
+            test_manifest_lock=manifest_lock,
         )
 
         message = get_user_prompt(
@@ -134,9 +151,103 @@ class TestGenerator:
             log_cb=self.log_cb,
         )
         tests = normalize_test_manifest_payload(raw_payload)
-        output_text = json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
+        tests, output_text = await self._reconcile_first_pass(
+            node_id=node_id,
+            tests=tests,
+            raw_payload=raw_payload,
+            manifest_lock=manifest_lock,
+            agent=agent,
+        )
+        if tests is None:
+            return None, output_text
         await self._log(f"Test generation returned {len(tests)} test artifact(s).", node_id=node_id)
         return tests, output_text
+
+    async def _reconcile_first_pass(
+        self,
+        *,
+        node_id: str,
+        tests: list[dict[str, Any]],
+        raw_payload: dict[str, Any] | None,
+        manifest_lock: TestManifestLock,
+        agent: Any,
+    ) -> tuple[list[dict[str, Any]] | None, str]:
+        """Reconcile the returned manifest with the declaration and the disk.
+
+        The reconciliation contract (see
+        ``agents.tools.test_manifest.reconcile_declared_manifest``): entries
+        for undeclared paths fail the pass (the model returned tests it was
+        forbidden to write — or never wrote); declared-but-dropped rows are
+        re-attached mechanically; declared-but-unwritten entries are removed
+        with a diagnostic.
+        """
+
+        if not manifest_lock.locked:
+            return tests, json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
+
+        discipline = getattr(agent, "arc_stage_discipline", None)
+        written_paths = discipline.materialized_paths() if discipline is not None else []
+        result = reconcile_declared_manifest(
+            manifest_items=tests,
+            manifest_lock=manifest_lock,
+            written_paths=written_paths,
+        )
+        tests = result["tests"]
+        output_text = json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
+        if result["undeclared_paths"]:
+            # Hard contract violation: returning manifest entries that were
+            # never declared (hence never writable) means either the model
+            # fabricated rows or wrote files through an unlocked path. Either
+            # way the pass is invalid; None fails the DESIGN phase loudly.
+            await self._log(
+                "Test generation returned manifest entries for paths that were never "
+                f"declared: {', '.join(result['undeclared_paths'])}.",
+                status="error",
+                node_id=node_id,
+            )
+            return None, output_text
+        for path in result["reattached_paths"]:
+            await self._log(
+                f"Test file `{path}` was written but dropped from the returned manifest; "
+                "its entry was re-attached from the declaration.",
+                status="warning",
+                node_id=node_id,
+            )
+        for path in result["unwritten_paths"]:
+            await self._log(
+                f"Manifest entry `{path}` was declared but never written; dropping it "
+                "from the stored manifest.",
+                status="warning",
+                node_id=node_id,
+            )
+        return tests, output_text
+
+    def _make_path_validator(self, app_type: str, workspace_root: str) -> Callable[[str, str], str | None] | None:
+        """App-type placement validator for the declare tool (early check).
+
+        The handler instance is heavyweight (it may run template setup); only
+        its pure ``validate_test_path`` is needed here, so a tiny adapter is
+        returned instead of holding a handler for the whole stage. Any
+        construction failure disables the early check — the workflow's own
+        manifest validation stays authoritative.
+        """
+
+        try:
+            from app_type_handler import create_app_type_handler
+
+            handler = create_app_type_handler(
+                app_type=app_type,
+                workspace_path=workspace_root,
+                requirement_path=self.requirement_path or "",
+                interface_designer=None,
+                log_cb=None,
+            )
+        except Exception:
+            return None
+        validate = getattr(handler, "validate_test_path", None)
+        if not callable(validate):
+            return None
+        return lambda test_type, file_path: validate(test_type, file_path)
 
     async def repair_green_baseline(
         self,
@@ -162,6 +273,22 @@ class TestGenerator:
             or os.getcwd()
         ).expanduser().resolve())
         app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
+        # Pre-seed the manifest lock with the previous manifest's paths: a
+        # repair pass may only delete or rewrite existing test files, never
+        # introduce a new path. This closes the rename escape (delete the
+        # green file, re-add the same tautology under a fresh name) at the
+        # write gate, before the re-baseline could ever see it.
+        manifest_lock = TestManifestLock(
+            declared_files={
+                path: DeclaredTestFile(
+                    file_path=path,
+                    test_type=canonical_test_type(item.get("type")) or "Unit",
+                    interface_ids=[str(i) for i in item.get("interface_ids") or [] if str(i or "").strip()],
+                )
+                for item in previous_manifest
+                if (path := str(item.get("file_path", "") or "").strip())
+            }
+        )
         agent = build_stage_agent(
             name="test_generator",
             stage="test_generation",
@@ -172,9 +299,18 @@ class TestGenerator:
             writable_roots=[workspace_root],
             skills=[],
             memory=[],
-            tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+            tools=[
+                *build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+                build_declare_test_manifest_tool(
+                    node_id=node_id,
+                    manifest_lock=manifest_lock,
+                    validate_test_path=self._make_path_validator(app_type, workspace_root),
+                    log_cb=self.log_cb,
+                ),
+            ],
             node_id=node_id,
             claims_workspace_root=self.context_workspace_root or workspace_root,
+            test_manifest_lock=manifest_lock,
         )
         message = self._green_rejection_message(
             node_id=node_id,
@@ -243,6 +379,8 @@ class TestGenerator:
             "Rules:\n"
             "- Do not weaken or delete tests for files that are NOT listed above; their baseline "
             "runs verifiably failed (RED), which is the correct state.\n"
+            "- Do not create new test files in this repair: the test-file manifest is locked to "
+            "the existing files. Rework the content of a rejected file in place, or delete it.\n"
             "- Do not add setup/teardown guards, conditionals, or `skip` marks that make a test "
             "pass on the skeleton; the target behavior must be asserted unconditionally.\n"
             "- Do not run the tests yourself; the system re-runs the baseline after this pass.\n"

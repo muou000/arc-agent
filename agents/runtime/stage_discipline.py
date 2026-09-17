@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
+from agents.tools.test_manifest import TestManifestLock, is_test_file_path, normalize_manifest_path
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 
@@ -25,9 +26,8 @@ _MAX_READ_LIMIT = 200
 # the message re-enters the context on every blocked attempt.
 _WRITE_BLOCK_EXITS = {
     "test_generation": (
-        "To change it: write the revision to a new path, or delete this test asset first "
-        "and then write it back; if the test assets are ready, stop editing and return the "
-        "updated manifest."
+        "To change it: delete this test asset first and then write it back; if the test "
+        "assets are ready, stop editing and return the updated manifest."
     ),
     "implementation": (
         "To change it: run the tests (a failing run unlocks written files for fixes) "
@@ -57,9 +57,15 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         *,
         stage: Literal["interface_design", "test_generation", "implementation"],
         file_claim_gate: "FileClaimGate | None" = None,
+        test_manifest_lock: TestManifestLock | None = None,
     ) -> None:
         self._stage = stage
         self._file_claim_gate = file_claim_gate
+        # Manifest-first gate for the test_generation stage: once set, test
+        # files may only be written/edited/deleted on declared paths. ``None``
+        # keeps non-TestGenerator uses of this middleware (tests, other
+        # stages) on the classic behavior.
+        self._test_manifest_lock = test_manifest_lock
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._written_paths: set[str] = set()
         self._failed_paths: set[str] = set()
@@ -94,7 +100,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 # A green-baseline rejection may legitimately remove a test
                 # asset (duplicate or tautological coverage); deleting
                 # anything else stays blocked for every stage.
-                return None
+                return self._validate_test_manifest_path(args, operation="delete")
             return f"`{name}` is disabled in ARC's staged file workflow."
         if self._stage == "test_generation" and name in _VALIDATION_TOOLS:
             return "TestGenerator only creates tests and its manifest; it must not run validation."
@@ -103,6 +109,47 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if name in _FILE_WRITE_TOOLS:
             return self._validate_write(args)
         return None
+
+    def _validate_test_manifest_path(self, args: dict[str, Any], *, operation: str) -> str | None:
+        """Manifest-first gate for test files (test_generation stage only).
+
+        Test files (``.test.``/``.spec.`` names) must be declared through
+        ``declare_test_manifest`` before they can be written or deleted, and
+        every subsequent touch must stay on a declared path. This removes the
+        rename/duplicate-file churn class at write time: an undeclared path
+        cannot be created at all, so "try another name" and "write the same
+        coverage twice" become hard errors. Helpers and runner configs are
+        exempt — they carry no manifest entry and stay freely writable.
+
+        A failed declaration deliberately does NOT unlock the gate: the model
+        may retry the declaration until it validates; the stage can always end
+        by returning an empty manifest instead.
+        """
+
+        if self._test_manifest_lock is None:
+            return None
+        path = _discipline_path(args)
+        if not is_test_file_path(path):
+            return None
+        relative = normalize_manifest_path(path)
+        if self._test_manifest_lock.contains(relative):
+            return None
+        if not self._test_manifest_lock.locked:
+            return (
+                f"Manifest-first blocked: {path} is a test file, but the test-file "
+                "manifest has not been declared yet. Call `declare_test_manifest` "
+                "first with every planned test file (path + type + interface ids), "
+                "then write the files. Test helpers and runner configs do not need "
+                "a declaration."
+            )
+        declared = ", ".join(sorted(self._test_manifest_lock.declared_files))
+        return (
+            f"Manifest lock blocked: {path} is not in the declared test-file manifest "
+            f"({operation} on undeclared test paths is not allowed). Declared files: "
+            f"{declared}. Rewriting a test under a different name or duplicating its "
+            "coverage on a second path is not permitted; rework the content of a "
+            "declared file instead."
+        )
 
     def _validate_read(self, args: dict[str, Any]) -> str | None:
         path = _discipline_path(args)
@@ -140,6 +187,10 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 "TestGenerator may write only test files, test helpers/configuration, and the returned manifest; "
                 f"{path} is not a test asset."
             )
+        if self._stage == "test_generation":
+            blocked = self._validate_test_manifest_path(args, operation="write")
+            if blocked:
+                return blocked
         if self._stage == "interface_design":
             if path not in self._written_paths and self._design_write_count >= _MAX_DESIGN_WRITES:
                 return (
