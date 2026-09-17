@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from core import sessions
+from core.commits import build_commit_message
 from core.phases import DESIGN_BASELINE_MAX_REJECTIONS, WorkflowPhaseRunner
 from tests.helpers.faux import (
     FakeAppHandler,
@@ -378,6 +379,61 @@ def test_design_baseline_prior_implementation_requires_id_anchor(tmp_project_dir
     assert ok is False
     assert len(generator.rejection_calls) == DESIGN_BASELINE_MAX_REJECTIONS
     assert not any("implement checkpoint" in entry[1] for entry in logs)
+    # The gate releases the session-scoped E2E runtime even when it fails
+    # (the rejection loop may have started a backend for E2E baselines).
+    assert fake.shutdown_calls == 1
+
+
+def test_design_baseline_git_failure_degrades_visibly(tmp_project_dir, arc_runtime) -> None:
+    """A git failure must not silently flip a full-retry node into rejection.
+
+    The prior-implementation check is the only thing standing between a
+    legitimate-green full retry and a rejection spiral; when git itself
+    fails, the gate falls back to rejection rules but must log a warning
+    so the degraded mode is visible in the run log.
+    """
+
+    class _BrokenGit:
+        def run(self, *args: Any, **kwargs: Any):
+            raise RuntimeError("git is not available")
+
+    node_id = "REQ-BASE-GITFAIL"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    real_runtime = arc_runtime
+    original_git = real_runtime.git
+    real_runtime.git = _BrokenGit()
+    try:
+        generator = _StubGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
+        fake = FakeAppHandler([failing_test_output()])
+        runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+        ok = _run_design(runner, node_id)
+    finally:
+        real_runtime.git = original_git
+
+    # Red files pass the gate; only the degraded mode is logged.
+    assert ok is True
+    assert fake.shutdown_calls == 1
+    warnings = [entry for entry in logs if entry[2] == "warning"]
+    assert any("Prior-implementation git check failed" in entry[1] for entry in warnings)
+
+
+def test_prior_implementation_anchor_couples_to_commit_builder() -> None:
+    """Lock the commit-message format the gate's git anchor depends on.
+
+    ``_enforce_design_baseline_red`` anchors its prior-implementation match
+    on ``<node_id> (implement`` at the start of the commit message; that
+    prefix is produced by ``build_commit_message``. If the builder's format
+    ever changes, this test fails so the anchor gets updated with it.
+    """
+    message = build_commit_message(
+        "REQ-ANCHOR-1",
+        "IMPLEMENT",
+        {"name": "Calculator"},
+    )
+    assert message.startswith("REQ-ANCHOR-1 (implement")
+    # Phase is normalized to lower case; the anchor matches the prefix only.
+    assert message == "REQ-ANCHOR-1 (implement): Calculator"
 
 
 # ---------------------------------------------------------------------------

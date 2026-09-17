@@ -393,6 +393,9 @@ class WorkflowPhaseRunner:
         if not layer_files:
             return {"file_state": {}, "revised_tests": None, "skipped": "no tests"}
 
+        # The anchor relies on core.commits.build_commit_message, which
+        # prefixes every checkpoint with "<node_id> (<phase>):" — a coupling
+        # tests/test_workflow/test_design_baseline_red_gate.py locks in.
         prior_implementation = False
         try:
             git_log = get_runtime().git.run(["log", "--oneline", "--all", "-i", "--grep", "(implement", "--"], check=False)
@@ -404,8 +407,21 @@ class WorkflowPhaseRunner:
                 line.split(" ", 1)[-1].startswith(message_prefix) if " " in line else False
                 for line in (git_log.stdout or "").splitlines()
             )
-        except Exception:
+        except Exception as exc:
+            # A git failure must not silently degrade a full-retry node's
+            # legitimate-green path into a rejection spiral; make the
+            # degraded mode visible in the run log.
             prior_implementation = False
+            await self._log(
+                "TestGenerator",
+                (
+                    f"Prior-implementation git check failed ({exc}); assuming no prior "
+                    "implement checkpoint for this node and applying the green-baseline "
+                    "rejection rules."
+                ),
+                status="warning",
+                node_id=node_id,
+            )
 
         current_tests = prepared_tests
         manifest_revised = False
