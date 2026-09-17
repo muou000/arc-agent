@@ -441,7 +441,42 @@ class WorkflowPhaseRunner:
                     }
                 )
                 continue
-            file_state[path] = "red" if not classify_test_failure(baseline_output) else None
+            baseline_env = classify_test_failure(baseline_output)
+            file_state[path] = "red" if not baseline_env else None
+            if baseline_env:
+                # The file could not be verified either way (broken workspace,
+                # missing runner). The DESIGN gate only rejects verified-green
+                # files; environmental failures are handed to IMPLEMENT, whose
+                # per-layer baseline re-runs every None-state file and applies
+                # the repair-and-revalidate contract there.
+                await self._log(
+                    "TestGenerator",
+                    (
+                        f"Baseline RED check `{test_type}` {path} could not run for an "
+                        f"environmental reason ({baseline_env}); leaving it unverified - "
+                        "the IMPLEMENT baseline will re-run it under the environment "
+                        "repair contract."
+                    ),
+                    status="warning",
+                    node_id=node_id,
+                )
+
+        if not green_evidence and any(state is None for state in file_state.values()):
+            # Nothing was verified green, but not everything is provably red
+            # either: the manifest leaves DESIGN with unverified files rather
+            # than the contract's all-RED state. Make that visible; the gate
+            # itself must not fail the node over an environment problem.
+            await self._log(
+                "TestGenerator",
+                (
+                    "Baseline RED check ended with no verified-green files, but "
+                    f"{sum(1 for state in file_state.values() if state is None)} file(s) "
+                    "could not be verified for environmental reasons; they stay unverified "
+                    "and the IMPLEMENT baseline owns them."
+                ),
+                status="warning",
+                node_id=node_id,
+            )
 
         if prior_implementation:
             await self._log(
@@ -556,8 +591,8 @@ class WorkflowPhaseRunner:
                 )
                 baseline_output = await self._run_design_baseline_file(test_type, path)
                 exit_code = int(parse_test_results(baseline_output).get("exit_code", -1))
-                file_state[path] = "red" if exit_code != 0 else "green"
                 if exit_code == 0:
+                    file_state[path] = "green"
                     green_evidence.append(
                         {
                             "file_path": path,
@@ -565,6 +600,11 @@ class WorkflowPhaseRunner:
                             "output_summary": summarize_batch_output(baseline_output, max_lines=4),
                         }
                     )
+                else:
+                    # Same semantics as the first pass: an environmental
+                    # failure leaves the file unverified for IMPLEMENT's
+                    # baseline instead of asserting a RED it cannot prove.
+                    file_state[path] = "red" if not classify_test_failure(baseline_output) else None
 
         # Drop states for files a repair round removed from the manifest;
         # they are no longer this node's tests, and a stale "green" would

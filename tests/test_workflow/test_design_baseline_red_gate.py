@@ -290,6 +290,37 @@ def test_design_baseline_empty_manifest_skips_gate(tmp_project_dir, arc_runtime)
     assert fake.calls == []
 
 
+def test_design_baseline_environment_failure_leaves_file_unverified(tmp_project_dir, arc_runtime) -> None:
+    """An environmental baseline failure must not be recorded as RED.
+
+    The gate only rejects verified-green files; a file whose baseline could
+    not run (missing runner/dependency) stays ``None`` (unverified) and is
+    handed to the IMPLEMENT baseline, which re-runs every None-state file
+    under the environment repair contract. The DESIGN gate must pass the
+    node (an environment problem is not a test-design defect) and log both
+    the per-file reason and the closing unverified summary.
+    """
+    from tests.helpers.faux import test_result
+
+    node_id = "REQ-BASE-ENV"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    env_output = test_result(1, "Error: Cannot find module 'vitest'")
+    generator = _StubGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
+    fake = FakeAppHandler([env_output])
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is True
+    assert generator.rejection_calls == []
+    baseline = sessions.load_node_session(node_id).get("design_baseline")
+    # Unverified (None), not a fabricated "red" and never "green".
+    assert baseline == {UNIT_TEST_FILE: None}
+    warnings = [entry for entry in logs if entry[2] == "warning"]
+    assert any("could not run for an environmental reason" in entry[1] for entry in warnings)
+    assert any("stay unverified" in entry[1] for entry in warnings)
+
+
 def test_design_baseline_repair_returning_invalid_items_fails_design(tmp_project_dir, arc_runtime) -> None:
     """A repair whose items all fail manifest validation must not masquerade
     as a legitimate empty manifest (which would silently strip coverage)."""
