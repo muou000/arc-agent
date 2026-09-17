@@ -17,6 +17,9 @@ Contract notes:
   byte-stable system prefix shared by every node's planning call, so the
   provider prefix cache hits from the second node onward; the per-node
   requirement snapshot opens the user message.
+- The planning call is attributed to its node in ``llm_usage`` runner events
+  (phase ``SKILL_PLANNING``, via ``llm_usage_context``); without it the call
+  lands in the run-level empty-node bucket.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from agents.model.factory import create_arc_chat_model
+from agents.model.usage_capture import llm_usage_context
 from agents.skills.selection import available_skill_names
 from core.sessions import load_node_session, merge_node_session
 
@@ -42,6 +46,7 @@ SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
 STAGE_KEYS = ("design", "test_generation", "implementation")
 MAX_SKILLS_PER_STAGE = 3
 PLANNER_AGENT_NAME = "SkillPlanner"
+PLANNER_PHASE = "SKILL_PLANNING"
 
 
 class SkillPlanResponse(BaseModel):
@@ -135,12 +140,13 @@ async def plan_stage_skills(
             return None
         model = create_arc_chat_model(model_name)
     try:
-        response = await model.ainvoke(
-            [
-                SystemMessage(content=_system_prompt()),
-                HumanMessage(content=_user_prompt(node_id, requirement_data)),
-            ]
-        )
+        with llm_usage_context(node_id=node_id, phase=PLANNER_PHASE):
+            response = await model.ainvoke(
+                [
+                    SystemMessage(content=_system_prompt()),
+                    HumanMessage(content=_user_prompt(node_id, requirement_data)),
+                ]
+            )
         payload = _parse_plan_json(_extract_text(response))
         plan = SkillPlanResponse.model_validate(payload)
     except Exception as exc:

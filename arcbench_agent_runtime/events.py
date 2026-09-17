@@ -115,7 +115,7 @@ class EventClient:
         subset of the provider prompt total), ``reasoning`` is a subset of
         ``output``. ``source`` distinguishes provider-reported usage from a
         local token estimate. An empty ``node_id`` attributes the call to the
-        run as a whole (e.g. planning-time model calls outside any node).
+        run as a whole (model calls made outside any node's context).
         """
         append_jsonl(
             self.paths.runner_events_path,

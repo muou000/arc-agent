@@ -18,7 +18,10 @@ import asyncio
 import json
 
 import pytest
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
+from agents.model.usage_capture import current_usage_context, record_chat_result_usage
 from agents.skills.planning import (
     MAX_SKILLS_PER_STAGE,
     build_skill_catalog,
@@ -158,6 +161,69 @@ def test_plan_stage_skills_returns_none_on_failure(arc_runtime, payload):
 
     assert plan is None
     assert load_node_session("n1") == {}
+
+
+class _UsageProbeModel:
+    """Model stub that observes the active ``llm_usage_context`` at call time
+    and dispatches usage capture exactly like the ``ARCChatOpenAI`` wrapper."""
+
+    def __init__(self, response_text: str) -> None:
+        self._response_text = response_text
+        self.observed_contexts: list[tuple[str, str]] = []
+
+    async def ainvoke(self, messages):
+        self.observed_contexts.append(current_usage_context())
+        message = AIMessage(
+            content=self._response_text,
+            usage_metadata={"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+        )
+        record_chat_result_usage(
+            ChatResult(generations=[ChatGeneration(message=message)]),
+            model="deepseek-v4-flash",
+            api_mode="chat_completions",
+            messages=messages,
+        )
+        return message
+
+
+def _usage_events(runtime) -> list[dict]:
+    lines = runtime.paths.runner_events_path.read_text(encoding="utf-8").splitlines()
+    events = [json.loads(line) for line in lines if line.strip()]
+    return [event for event in events if event.get("type") == "llm_usage"]
+
+
+def test_plan_stage_skills_attributes_llm_usage_to_node(arc_runtime):
+    """The planner call must land in the node's bucket, not run-level empty node_id."""
+    model = _UsageProbeModel(json.dumps({"design": [], "test_generation": [], "implementation": []}))
+
+    plan = asyncio.run(
+        plan_stage_skills(node_id="n1", requirement_data={"name": "Counter"}, model=model)
+    )
+
+    assert plan is not None
+    # The model call ran inside the node's planning context...
+    assert model.observed_contexts == [("n1", "SKILL_PLANNING")]
+    # ...and the context was restored afterwards.
+    assert current_usage_context() == ("", "")
+    # End to end: wrapper-style capture persists one llm_usage event with the
+    # node and phase attribution.
+    events = _usage_events(arc_runtime)
+    assert len(events) == 1
+    assert events[0]["node_id"] == "n1"
+    assert events[0]["phase"] == "SKILL_PLANNING"
+
+
+def test_plan_stage_skills_failure_still_attributes_llm_usage(arc_runtime):
+    """A call whose answer fails parsing is still a real model call: usage is kept."""
+    model = _UsageProbeModel("not json at all")
+
+    plan = asyncio.run(plan_stage_skills(node_id="n2", requirement_data={}, model=model))
+
+    assert plan is None
+    events = _usage_events(arc_runtime)
+    assert len(events) == 1
+    assert events[0]["node_id"] == "n2"
+    assert events[0]["phase"] == "SKILL_PLANNING"
 
 
 def test_parse_plan_json_tolerates_prose_and_broken_candidates():

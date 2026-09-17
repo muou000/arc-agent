@@ -253,7 +253,7 @@ class TestLLMUsageEvents:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         # Unlike requirement_state events, usage without a node is valid: it
-        # attributes planning-time model calls to the run as a whole.
+        # attributes model calls made outside any node's context to the run.
         events.record_llm_usage(model="gpt-4o", input_tokens=1, output_tokens=1, total_tokens=2)
         lines = _read_jsonl(event_paths.runner_events_path)
         assert lines[0]["node_id"] == ""
