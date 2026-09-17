@@ -33,6 +33,7 @@ SKILLS_PREFIX = "/skills"
 DISABLED_BUILTIN_TOOLS = frozenset({"execute", "write_todos"})
 _WINDOWS_PATH_COMPAT_APPLIED = False
 _READ_FILE_FORMAT_PATCHED = False
+_DELETE_NOT_FOUND_PATCHED = False
 
 # Sentinel so callers can explicitly pass ``checkpointer=None`` (cold start)
 # while omitting the argument still resolves the process-wide shared saver.
@@ -340,6 +341,7 @@ def build_stage_agent(
 
     _apply_windows_filesystem_path_compat()
     _apply_unambiguous_read_file_format()
+    _apply_delete_not_found_precedence()
     resolved_checkpointer = get_checkpointer() if checkpointer is _UNSET else checkpointer
     root = Path(workspace_root).expanduser().resolve()
     routes = {
@@ -441,6 +443,111 @@ def _apply_unambiguous_read_file_format() -> None:
 
     filesystem_middleware.format_content_with_line_numbers = format_without_line_numbers
     _READ_FILE_FORMAT_PATCHED = True
+
+
+def _apply_delete_not_found_precedence() -> None:
+    """Report `not found` for deletes of missing paths instead of deny-rule spam.
+
+    Upstream's delete tool decides *before* the permission check whether the
+    target "may have descendants" (a recursive delete must scan every deny rule
+    for subtree overlap). ``ls`` answering ``path_not_found`` is not on its
+    leaf whitelist, so a missing path is treated as a possibly-populated
+    directory: every ``**`` deny pattern (``/**``, ``/workspace/**/node_modules``,
+    ...) overlaps, and the model is told "permission denied" with the full deny
+    rule list — for a file that does not exist. Observed on the 12306 benchmark
+    as 3-4 retries against the same missing path.
+
+    The patch recognizes the backend's explicit ``path_not_found`` answer as
+    "nothing to protect": permission resolution then follows the ordinary
+    first-matching-rule path (same as ``write_file``). A missing path inside a
+    writable root reaches the backend, whose own ``delete`` reports the honest
+    ``not found``; a denied path is still refused before the backend runs
+    (first matching deny rule), so delete cannot be used to probe which
+    protected files exist. Any other ``ls`` outcome keeps upstream's
+    conservative descendant check.
+    """
+
+    global _DELETE_NOT_FOUND_PATCHED
+    if _DELETE_NOT_FOUND_PATCHED:
+        return
+
+    import logging
+
+    import deepagents
+    import deepagents.middleware.filesystem as filesystem_middleware
+
+    # These helpers are upstream implementation details, not public contract.
+    # A deepagents upgrade that renames or removes them must degrade to the
+    # old (spammier but harmless) error message, not crash build_stage_agent.
+    original_has_descendants = getattr(
+        filesystem_middleware, "_delete_target_may_have_descendants", None
+    )
+    original_ahas_descendants = getattr(
+        filesystem_middleware, "_adelete_target_may_have_descendants", None
+    )
+    if not callable(original_has_descendants) or not callable(original_ahas_descendants):
+        logging.getLogger(__name__).warning(
+            "deepagents %s no longer exposes the delete descendant helpers; "
+            "keeping upstream delete permission behavior",
+            getattr(deepagents, "__version__", "unknown"),
+        )
+        return
+
+    _NOT_FOUND_SUFFIX = ": path_not_found"
+
+    def _missing_by_ls_error(ls_result: Any) -> bool:
+        """Whether an ls result is the backends' explicit ``path_not_found``.
+
+        Both shipped producers format the sentinel as exactly
+        ``"Path '<path>': path_not_found"`` (FilesystemBackend directly,
+        SandboxBackend via its JSON error passthrough), so anchor the match
+        to that suffix. A bare substring check would also fire when the
+        *path itself* contains the token (e.g. deleting a
+        ``/workspace/path_not_found`` directory whose ls fails some other
+        way) and wrongly relax the descendant check.
+        """
+
+        error = getattr(ls_result, "error", None)
+        return error is not None and str(error).endswith(_NOT_FOUND_SUFFIX)
+
+    def _confirmed_missing(backend: Any, target: str) -> bool:
+        """Whether ``backend.ls(target)`` explicitly reports ``path_not_found``.
+
+        Any probe failure (unsupported ``ls``, transient I/O error) counts as
+        "not confirmed": the caller keeps upstream's conservative answer
+        instead of letting the exception escape into the delete tool.
+        """
+
+        try:
+            ls_result = backend.ls(target)
+        except Exception:
+            return False
+        return _missing_by_ls_error(ls_result)
+
+    async def _aconfirmed_missing(backend: Any, target: str) -> bool:
+        try:
+            ls_result = await backend.als(target)
+        except Exception:
+            return False
+        return _missing_by_ls_error(ls_result)
+
+    def _delete_target_may_have_descendants(
+        backend: Any, target: str, *, permissions_configured: bool
+    ) -> bool:
+        if original_has_descendants(backend, target, permissions_configured=permissions_configured):
+            return not _confirmed_missing(backend, target)
+        return False
+
+    async def _adelete_target_may_have_descendants(
+        backend: Any, target: str, *, permissions_configured: bool
+    ) -> bool:
+        if await original_ahas_descendants(backend, target, permissions_configured=permissions_configured):
+            return not await _aconfirmed_missing(backend, target)
+        return False
+
+    filesystem_middleware._delete_target_may_have_descendants = _delete_target_may_have_descendants
+    filesystem_middleware._adelete_target_may_have_descendants = _adelete_target_may_have_descendants
+    _DELETE_NOT_FOUND_PATCHED = True
 
 
 def _build_filesystem_permissions(
