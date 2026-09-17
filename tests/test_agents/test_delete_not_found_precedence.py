@@ -171,3 +171,68 @@ def test_patch_is_idempotent() -> None:
     first = filesystem_middleware._delete_target_may_have_descendants
     _apply_delete_not_found_precedence()
     assert filesystem_middleware._delete_target_may_have_descendants is first
+
+
+def test_patch_survives_upstream_helper_removal(caplog: pytest.LogCaptureFixture) -> None:
+    """A deepagents upgrade that renames the helpers must not crash agents.
+
+    The patch targets underscore-private helpers; if they disappear, the
+    patch degrades to upstream behavior with a warning instead of raising
+    AttributeError inside build_stage_agent.
+    """
+
+    import agents.runtime.factory as factory
+    import deepagents.middleware.filesystem as filesystem_middleware
+    import logging
+
+    with pytest.MonkeyPatch.context() as ctx:
+        ctx.setattr(factory, "_DELETE_NOT_FOUND_PATCHED", False)
+        ctx.delattr(filesystem_middleware, "_delete_target_may_have_descendants", raising=False)
+        # Must not raise; the patch is skipped with a warning.
+        with caplog.at_level(logging.WARNING, logger="agents.runtime.factory"):
+            factory._apply_delete_not_found_precedence()
+        assert any("delete descendant helpers" in rec.message for rec in caplog.records)
+
+
+def test_probe_failure_keeps_conservative_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A crashing probe `ls` must not escape into the delete tool.
+
+    When upstream answers "may have descendants" and the patch's confirmation
+    probe then raises a transient error, upstream's conservative True must
+    stand (fail closed) instead of the exception escaping into the delete
+    tool call.
+    """
+
+    import deepagents.middleware.filesystem as filesystem_middleware
+
+    class _FlakyLsBackend:
+        def ls(self, path: str) -> Any:
+            raise OSError("transient backend failure")
+
+    wrapped = filesystem_middleware._delete_target_may_have_descendants
+    backend = _FlakyLsBackend()
+    # permissions_configured=False makes upstream return False without its own
+    # ls call; the only ls that runs is the patch's probe, which raises.
+    # Upstream's answer (False, "no descendants" because no permissions are
+    # configured) must stand.
+    assert wrapped(backend, "/workspace/src/some-file.ts", permissions_configured=False) is False
+
+    class _PopulatedDirBackend:
+        """ls succeeds for upstream's check, then crashes for the probe."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def ls(self, path: str) -> Any:
+            from deepagents.backends.protocol import LsResult
+
+            self.calls += 1
+            if self.calls > 1:
+                raise OSError("transient backend failure")
+            return LsResult(entries=[{"path": f"{path}/child.ts", "is_dir": False}])
+
+    backend = _PopulatedDirBackend()
+    # Upstream sees entries -> "may have descendants" (True); the probe then
+    # crashes, and the wrapper must keep True rather than propagate.
+    assert wrapped(backend, "/workspace/src", permissions_configured=True) is True
+    assert backend.calls == 2

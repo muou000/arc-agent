@@ -471,25 +471,49 @@ def _apply_delete_not_found_precedence() -> None:
     if _DELETE_NOT_FOUND_PATCHED:
         return
 
+    import logging
+
+    import deepagents
     import deepagents.middleware.filesystem as filesystem_middleware
 
-    original_has_descendants = filesystem_middleware._delete_target_may_have_descendants
-    original_ahas_descendants = filesystem_middleware._adelete_target_may_have_descendants
+    # These helpers are upstream implementation details, not public contract.
+    # A deepagents upgrade that renames or removes them must degrade to the
+    # old (spammier but harmless) error message, not crash build_stage_agent.
+    original_has_descendants = getattr(
+        filesystem_middleware, "_delete_target_may_have_descendants", None
+    )
+    original_ahas_descendants = getattr(
+        filesystem_middleware, "_adelete_target_may_have_descendants", None
+    )
+    if not callable(original_has_descendants) or not callable(original_ahas_descendants):
+        logging.getLogger(__name__).warning(
+            "deepagents %s no longer exposes the delete descendant helpers; "
+            "keeping upstream delete permission behavior",
+            getattr(deepagents, "__version__", "unknown"),
+        )
+        return
 
     def _confirmed_missing(backend: Any, target: str) -> bool:
-        """Whether ``backend.ls(target)`` explicitly reports ``path_not_found``."""
+        """Whether ``backend.ls(target)`` explicitly reports ``path_not_found``.
+
+        Any probe failure (unsupported ``ls``, transient I/O error) counts as
+        "not confirmed": the caller keeps upstream's conservative answer
+        instead of letting the exception escape into the delete tool.
+        """
 
         try:
             ls_result = backend.ls(target)
-        except NotImplementedError:
+        except Exception:
             return False
         error = getattr(ls_result, "error", None)
+        # Same sentinel upstream itself matches on (``not_a_directory not in
+        # ls_result.error``); LsResult.error is a plain string.
         return error is not None and "path_not_found" in str(error)
 
     async def _aconfirmed_missing(backend: Any, target: str) -> bool:
         try:
             ls_result = await backend.als(target)
-        except NotImplementedError:
+        except Exception:
             return False
         error = getattr(ls_result, "error", None)
         return error is not None and "path_not_found" in str(error)
