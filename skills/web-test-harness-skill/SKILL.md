@@ -115,11 +115,11 @@ function renderPage() {
 const { test, expect } = require('@playwright/test');
 
 function uniqueSuffix() {
-  return `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  return crypto.randomUUID().slice(0, 8);
 }
 ```
 
-17. Every test that creates records derives its identifiers from `uniqueSuffix()` (usernames, emails, document numbers); fixed values collide across runs and with seeded data.
+17. Every test that creates records derives its identifiers from `uniqueSuffix()` (usernames, emails, document numbers); fixed values collide across runs, across parallel workers, and with seeded data. `crypto.randomUUID()` is globally available in the Playwright Node runtime and safe under multi-worker execution, unlike millisecond timestamps.
 18. Select from requirement-declared labels, roles, and routes first — `page.getByLabel('用户名')`, `page.getByRole('button', { name: '下一步' })` — and scope or use `exact: true` when one label is a substring of another. Assert visible outcomes in the requirement's language and URL changes with `expect(page).toHaveURL(/\/route$/)`.
 19. The system starts the backend-hosted app and prepares the E2E database; tests must not spawn servers, call database preparation scripts, write to the database directly, or define custom fixtures for those concerns.
 20. Verify session or global state through the real API surface that shares the browser context: `const res = await page.request.get('/api/<state-endpoint>');` then assert on the JSON body.
