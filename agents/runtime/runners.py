@@ -423,7 +423,7 @@ async def _try_astream_stage_agent(
             log_cb,
             run_label,
             f"agent stream failed on a model API error; surfacing the error. error={exc}",
-            status="warning",
+            status="error",
             node_id=context.node_id,
         )
         log_to_logger(logger, "AGENT_STREAM_MODEL_API_ERROR", label=run_label, thread_id=thread_id, body=str(exc))
