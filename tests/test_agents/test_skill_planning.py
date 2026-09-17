@@ -18,7 +18,10 @@ import asyncio
 import json
 
 import pytest
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
+from agents.model.usage_capture import current_usage_context
 from agents.skills.planning import (
     MAX_SKILLS_PER_STAGE,
     build_skill_catalog,
@@ -158,6 +161,163 @@ def test_plan_stage_skills_returns_none_on_failure(arc_runtime, payload):
 
     assert plan is None
     assert load_node_session("n1") == {}
+
+
+class _UsageProbeModel:
+    """Model stub that observes the active ``llm_usage_context`` at call time.
+
+    Contract note: this stub deliberately does NOT call
+    ``record_chat_result_usage`` itself — that capture belongs to the
+    ``ARCChatOpenAI``/``ARCCompatibleChatOpenAI`` wrapper layer
+    (``_agenerate``/``_generate``). The wrapper-level dispatch is pinned by
+    ``test_plan_stage_skills_via_real_wrapper_persists_attributed_usage``
+    below using the real adapter class; these stub tests pin only what
+    planning.py owns (entering/restoring the context around ``ainvoke``).
+    """
+
+    def __init__(self, response_text: str) -> None:
+        self._response_text = response_text
+        self.observed_contexts: list[tuple[str, str]] = []
+
+    async def ainvoke(self, messages):
+        self.observed_contexts.append(current_usage_context())
+        return AIMessage(content=self._response_text)
+
+
+class _ExplodingModel:
+    """Model whose call raises inside the usage-attribution context."""
+
+    def __init__(self) -> None:
+        self.observed_contexts: list[tuple[str, str]] = []
+
+    async def ainvoke(self, messages):
+        self.observed_contexts.append(current_usage_context())
+        raise RuntimeError("endpoint exploded")
+
+
+def _usage_events(runtime) -> list[dict]:
+    lines = runtime.paths.runner_events_path.read_text(encoding="utf-8").splitlines()
+    events = [json.loads(line) for line in lines if line.strip()]
+    return [event for event in events if event.get("type") == "llm_usage"]
+
+
+def test_plan_stage_skills_attributes_llm_usage_to_node(arc_runtime):
+    """The planner call must run inside the node's usage-attribution context."""
+    model = _UsageProbeModel(json.dumps({"design": [], "test_generation": [], "implementation": []}))
+
+    plan = asyncio.run(
+        plan_stage_skills(node_id="n1", requirement_data={"name": "Counter"}, model=model)
+    )
+
+    assert plan is not None
+    # The model call ran inside the node's planning context...
+    assert model.observed_contexts == [("n1", "SKILL_PLANNING")]
+    # ...and the context was restored afterwards.
+    assert current_usage_context() == ("", "")
+
+
+def test_plan_stage_skills_restores_context_when_model_call_raises(arc_runtime):
+    """An exploding model call must not leak the planning context into the caller.
+
+    ``llm_usage_context`` resets in a ``finally`` block, so the exception path
+    (model API error, adapter failure) still restores the previous context;
+    subsequent calls in the same task attribute to their own node again.
+    """
+
+    model = _ExplodingModel()
+
+    plan = asyncio.run(plan_stage_skills(node_id="n3", requirement_data={}, model=model))
+
+    assert plan is None  # planning failure degrades to "no optional skills"
+    assert model.observed_contexts == [("n3", "SKILL_PLANNING")]  # call saw the context
+    assert current_usage_context() == ("", "")  # ...and it was cleaned up on the way out
+
+
+def test_plan_stage_skills_via_real_wrapper_persists_attributed_usage(
+    arc_runtime, monkeypatch: pytest.MonkeyPatch
+):
+    """End to end through the real ``ARCChatOpenAI`` wrapper: the provider call
+    happens inside planning's context, so wrapper-level capture persists one
+    ``llm_usage`` event attributed to the node and the SKILL_PLANNING phase."""
+
+    from agents.model import openai_api_adapter as adapter
+
+    metadata_message = AIMessage(
+        content=json.dumps({"design": [], "test_generation": [], "implementation": []}),
+        usage_metadata={"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+    )
+    metadata_result = ChatResult(generations=[ChatGeneration(message=metadata_message)])
+
+    async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        # The provider call runs while planning holds the context var...
+        observed.append(current_usage_context())
+        return metadata_result
+
+    observed: list[tuple[str, str]] = []
+    monkeypatch.setattr(adapter.ChatOpenAI, "_agenerate", fake_agenerate)
+    model = adapter.ARCChatOpenAI(
+        model="deepseek-v4-flash",
+        api_key="test-key",
+        arc_api_mode="chat_completions",
+        arc_model_name="deepseek-v4-flash",
+    )
+
+    plan = asyncio.run(
+        plan_stage_skills(node_id="n4", requirement_data={"name": "Counter"}, model=model)
+    )
+
+    assert plan == {"summary": "", "design": [], "test_generation": [], "implementation": []}
+    # The provider call saw the planning context, and the wrapper dispatched
+    # capture from inside it, so the persisted event carries the attribution.
+    assert observed == [("n4", "SKILL_PLANNING")]
+    events = _usage_events(arc_runtime)
+    assert len(events) == 1
+    assert events[0]["node_id"] == "n4"
+    assert events[0]["phase"] == "SKILL_PLANNING"
+    assert events[0]["model"] == "deepseek-v4-flash"
+    assert events[0]["usage"]["input"] == 10
+    assert current_usage_context() == ("", "")
+
+
+def test_plan_stage_skills_failure_still_attributes_llm_usage(arc_runtime):
+    """A call whose answer fails parsing is still a real model call: usage is kept.
+
+    The parse failure path is exercised through the real wrapper (which is the
+    only place usage capture happens); the stub `_UsageProbeModel` never
+    records usage itself.
+    """
+    from agents.model import openai_api_adapter as adapter
+
+    raw_result = ChatResult(
+        generations=[
+            ChatGeneration(message=AIMessage(content="not json at all", usage_metadata={
+                "input_tokens": 10, "output_tokens": 4, "total_tokens": 14,
+            }))
+        ]
+    )
+
+    async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        return raw_result
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(adapter.ChatOpenAI, "_agenerate", fake_agenerate)
+    try:
+        model = adapter.ARCChatOpenAI(
+            model="deepseek-v4-flash",
+            api_key="test-key",
+            arc_api_mode="chat_completions",
+            arc_model_name="deepseek-v4-flash",
+        )
+
+        plan = asyncio.run(plan_stage_skills(node_id="n2", requirement_data={}, model=model))
+
+        assert plan is None
+        events = _usage_events(arc_runtime)
+        assert len(events) == 1
+        assert events[0]["node_id"] == "n2"
+        assert events[0]["phase"] == "SKILL_PLANNING"
+    finally:
+        monkeypatch.undo()
 
 
 def test_parse_plan_json_tolerates_prose_and_broken_candidates():
