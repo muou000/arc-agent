@@ -236,3 +236,45 @@ def test_probe_failure_keeps_conservative_answer(monkeypatch: pytest.MonkeyPatch
     # crashes, and the wrapper must keep True rather than propagate.
     assert wrapped(backend, "/workspace/src", permissions_configured=True) is True
     assert backend.calls == 2
+
+
+def test_missing_sentinel_match_is_anchored() -> None:
+    """Only the backends' exact `Path '...': path_not_found` suffix counts.
+
+    A directory literally named ``path_not_found`` whose ls fails some other
+    way must not be mistaken for a confirmed-missing target: the error string
+    contains the token only as part of the *path*, and relaxing the
+    descendant check there would skip the recursive deny scan.
+    """
+
+    from deepagents.backends.protocol import LsResult
+
+    import deepagents.middleware.filesystem as filesystem_middleware
+
+    wrapped = filesystem_middleware._delete_target_may_have_descendants
+
+    class _TwoPhaseBackend:
+        """Upstream ls sees entries; the probe's answer is scripted."""
+
+        def __init__(self, probe_result: LsResult) -> None:
+            self._probe_result = probe_result
+            self.probe_calls = 0
+
+        def ls(self, path: str) -> LsResult:
+            self.probe_calls += 1
+            if self.probe_calls == 1:
+                return LsResult(entries=[{"path": f"{path}/child.ts", "is_dir": False}])
+            return self._probe_result
+
+    # The real backend sentinel (exact suffix) relaxes the check: the target
+    # is confirmed missing, so there is no subtree to protect.
+    backend = _TwoPhaseBackend(LsResult(error="Path '/workspace/path_not_found': path_not_found"))
+    assert wrapped(backend, "/workspace/path_not_found", permissions_configured=True) is False
+
+    # A *different* error whose text merely contains the token as part of the
+    # path (transient failure listing that directory) keeps the conservative
+    # "may have descendants" answer.
+    backend = _TwoPhaseBackend(
+        LsResult(error="Cannot list '/workspace/path_not_found': transient backend failure")
+    )
+    assert wrapped(backend, "/workspace/path_not_found", permissions_configured=True) is True

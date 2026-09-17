@@ -493,6 +493,23 @@ def _apply_delete_not_found_precedence() -> None:
         )
         return
 
+    _NOT_FOUND_SUFFIX = ": path_not_found"
+
+    def _missing_by_ls_error(ls_result: Any) -> bool:
+        """Whether an ls result is the backends' explicit ``path_not_found``.
+
+        Both shipped producers format the sentinel as exactly
+        ``"Path '<path>': path_not_found"`` (FilesystemBackend directly,
+        SandboxBackend via its JSON error passthrough), so anchor the match
+        to that suffix. A bare substring check would also fire when the
+        *path itself* contains the token (e.g. deleting a
+        ``/workspace/path_not_found`` directory whose ls fails some other
+        way) and wrongly relax the descendant check.
+        """
+
+        error = getattr(ls_result, "error", None)
+        return error is not None and str(error).endswith(_NOT_FOUND_SUFFIX)
+
     def _confirmed_missing(backend: Any, target: str) -> bool:
         """Whether ``backend.ls(target)`` explicitly reports ``path_not_found``.
 
@@ -505,18 +522,14 @@ def _apply_delete_not_found_precedence() -> None:
             ls_result = backend.ls(target)
         except Exception:
             return False
-        error = getattr(ls_result, "error", None)
-        # Same sentinel upstream itself matches on (``not_a_directory not in
-        # ls_result.error``); LsResult.error is a plain string.
-        return error is not None and "path_not_found" in str(error)
+        return _missing_by_ls_error(ls_result)
 
     async def _aconfirmed_missing(backend: Any, target: str) -> bool:
         try:
             ls_result = await backend.als(target)
         except Exception:
             return False
-        error = getattr(ls_result, "error", None)
-        return error is not None and "path_not_found" in str(error)
+        return _missing_by_ls_error(ls_result)
 
     def _delete_target_may_have_descendants(
         backend: Any, target: str, *, permissions_configured: bool
