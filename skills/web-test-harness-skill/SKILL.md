@@ -67,8 +67,9 @@ let app;
 beforeAll(async () => {
   harness = createTestDatabaseHarness({ label: 'domain-api' });
   await harness.setup();
-  // backend/src/app.js initializes the database at module load, so the app
-  // must be imported only AFTER the harness redirected the database path.
+  // Order contract: harness.setup() must redirect the database path BEFORE
+  // anything imports code that initializes the database. Dynamic import is
+  // the mechanism that guarantees this ordering.
   app = (await import('../src/app')).default;
 });
 
@@ -77,7 +78,7 @@ afterAll(async () => {
 });
 ```
 
-11. The dynamic `await import('../src/app')` after `harness.setup()` is mandatory. A static top-level import binds the app to the wrong database file.
+11. The ordering contract is `harness.setup()` before any import or call that can trigger database initialization. In the current template that means a dynamic `await import('../src/app')`, because `backend/src/app.js` initializes the database at module load; if initialization ever becomes explicit or lazy, the contract still applies and only the mechanism changes. A static top-level import is the canonical failure — the app binds to the wrong database file and tests silently write outside the isolated database.
 12. Assert `response.status`, the response envelope, and user-visible messages in the requirement's language (for Chinese requirements match `/中文关键词/`), never raw error stack text.
 13. For cookie flows, extract once and replay it: `const cookie = res.headers['set-cookie'].find((c) => c.includes('<cookie-name>=')).split(';')[0];` then `.set('Cookie', cookie)`.
 
