@@ -940,6 +940,66 @@ def test_design_gate_fails_open_for_queues_saved_before_parents() -> None:
     assert ARCWorkflowManager._task_dependencies_met(state, child) is True
 
 
+def test_design_gate_combines_parent_and_dependency_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #38 review follow-up: the parent rule and the dependency rule are
+    independent checks and both must hold - a child whose parent DESIGN
+    failed is unblocked by the parent rule, but a still-running declared
+    dependency keeps its DESIGN blocked; and a completed parent alone does
+    not unblock a child whose dependency is still running."""
+    # Parent failed, dependency done: the child designs against the
+    # integration state without the parent shell, reusing the dependency.
+    state = _gate_queue_state(TASK_FAILED)
+    state["tasks"] += [
+        {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+        {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_COMPLETED},
+    ]
+    state["dependencies"] = {"RA": ["RB"]}
+    child = next(t for t in state["tasks"] if t["task_id"] == "RA:DESIGN")
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is True, (
+        "failed parent unblocks; completed dependency unblocks"
+    )
+
+    # Parent failed but the dependency is still implementing: still blocked.
+    for rb_implement_status in (TASK_PENDING, TASK_RUNNING):
+        state["tasks"][3]["status"] = rb_implement_status
+        assert ARCWorkflowManager._task_dependencies_met(state, child) is False, (
+            "a failed parent must not let the dependency check pass the child through"
+        )
+
+    # Parent completed, dependency still implementing: still blocked.
+    state["tasks"][0]["status"] = TASK_COMPLETED
+    state["tasks"][3]["status"] = TASK_RUNNING
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is False
+
+
+def test_design_gate_applies_declared_dependencies_to_the_root() -> None:
+    """PR #38 review follow-up: the root has no parent, so its DESIGN goes
+    straight to the dependency check - blocked while a declared dependency's
+    IMPLEMENT runs, unblocked when it fails (the failed-dependency release
+    the IMPLEMENT rule already follows)."""
+    state = {
+        "tasks": [
+            {"task_id": "R:DESIGN", "node_id": "R", "phase": PHASE_DESIGN, "status": TASK_PENDING},
+            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_RUNNING},
+        ],
+        "dependencies": {"R": ["RB"]},
+    }
+
+    root = state["tasks"][0]
+    assert ARCWorkflowManager._task_dependencies_met(state, root) is False
+
+    state["tasks"][2]["status"] = TASK_COMPLETED
+    assert ARCWorkflowManager._task_dependencies_met(state, root) is True
+
+    state["tasks"][2]["status"] = TASK_FAILED
+    assert ARCWorkflowManager._task_dependencies_met(state, root) is True, (
+        "a failed dependency releases the dependent root, matching the IMPLEMENT rule"
+    )
+
+
 def test_design_gate_blocks_when_the_parent_design_task_is_missing() -> None:
     # A parents entry without a matching DESIGN task is an inconsistent
     # queue: block the child instead of designing against an unknown

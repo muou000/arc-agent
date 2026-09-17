@@ -1231,7 +1231,10 @@ class ARCWorkflowManager:
         reverse wait, so either direction of the edge makes the pair wait on
         itself and deadlocks the drain. The edge schedules nothing beyond
         those rules, so it is dropped here with its own reason instead of
-        surfacing as an anonymous cycle later.
+        surfacing as an anonymous cycle later. ``descendants`` must be the
+        transitive closure (as built by _build_descendants_map): with only
+        direct children, grandparent<->grandchild edges would fall through
+        to the cycle pass and lose their classification.
         """
 
         descendant_sets = {

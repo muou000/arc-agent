@@ -224,6 +224,32 @@ def test_drop_ancestor_dependency_edges_drops_both_directions() -> None:
     assert dropped == [("RA", "RA1"), ("RA1", "RA")]
 
 
+def test_drop_ancestor_dependency_edges_covers_transitive_descendants() -> None:
+    """PR #38 review follow-up: the descendants map is a transitive closure
+    (built by _build_descendants_map), so a grandparent<->grandchild edge is
+    classified as ``ancestor-descendant`` here - not left to the cycle pass
+    as an anonymous drop."""
+    tree = {
+        "id": "R",
+        "children": [
+            {"id": "RA", "children": [{"id": "RA1", "children": []}]},
+            {"id": "RB", "children": []},
+        ],
+    }
+    descendants = ARCWorkflowManager._build_descendants_map(tree)
+    assert "RA1" in descendants["R"], "the map is a transitive closure"
+
+    kept, dropped = ARCWorkflowManager._drop_ancestor_dependency_edges(
+        {"R": ["RA1"], "RA1": ["R"], "RB": ["RA1"]},
+        descendants,
+    )
+
+    assert kept == {"RB": ["RA1"]}
+    assert dropped == [("R", "RA1"), ("RA1", "R")], (
+        "transitive ancestor-descendant edges are dropped with their own reason"
+    )
+
+
 def test_break_dependency_cycles_keeps_a_dag_untouched() -> None:
     graph = {"RB": ["RA"], "RC": ["RB"]}
 
