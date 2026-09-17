@@ -396,11 +396,19 @@ class WorkflowPhaseRunner:
         prior_implementation = False
         try:
             git_log = get_runtime().git.run(["log", "--oneline", "--all", "-i", "--grep", "(implement", "--"], check=False)
-            prior_implementation = node_id in git_log.stdout
+            # --oneline lines are "<short-sha> <commit message>"; the commit
+            # builder starts every message with the node id, so anchor the
+            # match to the message start to keep REQ-1 from matching REQ-10.
+            message_prefix = f"{node_id} (implement"
+            prior_implementation = any(
+                line.split(" ", 1)[-1].startswith(message_prefix) if " " in line else False
+                for line in (git_log.stdout or "").splitlines()
+            )
         except Exception:
             prior_implementation = False
 
         current_tests = prepared_tests
+        manifest_revised = False
         file_state: dict[str, str | None] = {}
         green_evidence: list[dict[str, Any]] = []
 
@@ -476,14 +484,26 @@ class WorkflowPhaseRunner:
                 return None
             try:
                 current_tests = self._prepare_tests(node_id=node_id, tests=revised_tests)
+                manifest_revised = True
             except ValueError as exc:
                 await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
                 return None
-            if not current_tests:
-                # The repair deleted every test (legitimate outcome when the
-                # whole manifest was tautological); an empty manifest is a
-                # valid DESIGN result.
+            if not revised_tests and not current_tests:
+                # The repair explicitly returned an empty manifest: every
+                # test was tautological and got deleted. An empty manifest
+                # is a valid DESIGN result (the node owns no local tests).
                 break
+            if not current_tests:
+                # The repair claimed tests but every item was dropped by
+                # manifest validation; treating that as a legitimate empty
+                # manifest would silently strip the node's coverage.
+                await self._log(
+                    "TestGenerator",
+                    "Green baseline rework returned only invalid manifest item(s).",
+                    status="error",
+                    node_id=node_id,
+                )
+                return None
 
             survived: set[str] = set()
             for evidence in green_evidence:
@@ -526,7 +546,7 @@ class WorkflowPhaseRunner:
         )
         return {
             "file_state": file_state,
-            "revised_tests": current_tests if current_tests is not prepared_tests else None,
+            "revised_tests": current_tests if manifest_revised else None,
         }
 
     async def _run_design_baseline_file(self, test_type: str, file_path: str) -> str:

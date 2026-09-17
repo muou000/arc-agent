@@ -289,6 +289,97 @@ def test_design_baseline_empty_manifest_skips_gate(tmp_project_dir, arc_runtime)
     assert fake.calls == []
 
 
+def test_design_baseline_repair_returning_invalid_items_fails_design(tmp_project_dir, arc_runtime) -> None:
+    """A repair whose items all fail manifest validation must not masquerade
+    as a legitimate empty manifest (which would silently strip coverage)."""
+    node_id = "REQ-BASE-REPAIR-JUNK"
+    _seed_leaf_requirement(arc_runtime, node_id)
+
+    class _JunkGenerator(_StubGenerator):
+        async def repair_green_baseline(self, *args: Any, **kwargs: Any) -> tuple:
+            # Record the call, then return items that _prepare_tests drops
+            # (no test_id/file_path -> filtered to an empty manifest).
+            await super().repair_green_baseline(*args, **kwargs)
+            return ([{"type": "Unit"}], "{}")
+
+    generator = _JunkGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
+    fake = FakeAppHandler([passing_test_output()])
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is False
+    errors = [entry for entry in logs if entry[2] == "error"]
+    assert any("only invalid manifest item(s)" in entry[1] for entry in errors)
+
+
+def test_design_baseline_repair_explicitly_empty_manifest_passes(tmp_project_dir, arc_runtime) -> None:
+    """An explicitly empty repair manifest is a valid full delete."""
+    node_id = "REQ-BASE-REPAIR-EMPTY"
+    _seed_leaf_requirement(arc_runtime, node_id)
+
+    class _EmptyDeleteGenerator(_StubGenerator):
+        async def repair_green_baseline(self, *args: Any, **kwargs: Any) -> tuple:
+            await super().repair_green_baseline(*args, **kwargs)
+            return ([], "{}")
+
+    generator = _EmptyDeleteGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
+    fake = FakeAppHandler([passing_test_output()])
+    runner, _logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is True
+    stored = arc_runtime.traceability.list_tests(req_id=node_id)
+    assert stored == []
+    assert sessions.load_node_session(node_id).get("design_baseline") == {}
+
+
+def test_design_baseline_prior_implementation_requires_id_anchor(tmp_project_dir, arc_runtime) -> None:
+    """A sibling node whose id is a superstring must not flip the anchor.
+
+    REQ-1's gate must stay rejecting when only REQ-10's implement checkpoint
+    exists (the pre-fix substring check ``node_id in stdout`` matched both).
+    """
+    import subprocess
+
+    def _git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(tmp_project_dir), check=True, capture_output=True)
+
+    node_id = "REQ-BASE-SUB"
+    sibling_id = "REQ-BASE-SUB-2"
+    for target in (node_id, sibling_id):
+        _seed_leaf_requirement(arc_runtime, target)
+    _git("init", "-q")
+    _git("config", "user.name", "arc-test")
+    _git("config", "user.email", "arc-test@example.com")
+    (tmp_project_dir / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_project_dir / "src" / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    _git("add", ".")
+    # Only the SIBLING's implement checkpoint exists.
+    _git("commit", "-q", "-m", f"{sibling_id} (implement): Sibling feature")
+
+    class _SteadyGenerator(_StubGenerator):
+        """Every repair round keeps returning the same (still-green) manifest."""
+
+        async def repair_green_baseline(self, *args: Any, **kwargs: Any) -> tuple:
+            await super().repair_green_baseline(*args, **kwargs)
+            self._manifests.append([_manifest_item("T1", UNIT_TEST_FILE)])
+            return ([_manifest_item("T1", UNIT_TEST_FILE)], "{}")
+
+    generator = _SteadyGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
+    fake = FakeAppHandler([passing_test_output()] * 3)
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    # The sibling's checkpoint must NOT legitimize this node's green file:
+    # the gate still rejects (2 bounded rounds, then DESIGN fails).
+    assert ok is False
+    assert len(generator.rejection_calls) == DESIGN_BASELINE_MAX_REJECTIONS
+    assert not any("implement checkpoint" in entry[1] for entry in logs)
+
+
 # ---------------------------------------------------------------------------
 # IMPLEMENT seeding: the DESIGN baseline states must be reused, not re-run.
 # ---------------------------------------------------------------------------
