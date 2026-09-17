@@ -17,6 +17,8 @@ The template ships the complete test infrastructure. Treat these as fixed contra
 - Isolated test database: `backend/src/database/test_harness.js` exports `createTestDatabaseHarness`.
 - All runner libraries (`vitest`, `supertest`, `@testing-library/*`, `@playwright/test`) are already declared in both `package.json` files.
 
+These files are injected into your context as `<scaffold_files>`. The bullets above are starting anchors, not the contract itself: the durable contract is the usage pattern (setup -> operate -> cleanup lifecycle, import ordering, placement rules below). When a recipe references a path, export, or option that does not match the actual scaffold file contents, trust the file and adapt the recipe to it — never invent the missing piece, and never rebuild infrastructure to match the recipe.
+
 Rules:
 
 1. Never create or edit a test config, setup file, harness module, or package manifest to "set up" testing, and never install dependencies for it. If a recipe below works against the files listed above, the infrastructure is sufficient.
