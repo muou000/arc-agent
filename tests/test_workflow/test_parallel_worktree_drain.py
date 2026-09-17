@@ -268,6 +268,99 @@ def test_declared_dependency_cycle_is_broken_and_the_drain_finishes(
     assert all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
 
 
+def test_design_waits_for_declared_dependency_in_the_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run7's parallel failure mode: the login node's DESIGN ran beside the
+    registration node's IMPLEMENT and both wrote their own auth routes. A
+    dependent node's DESIGN now starts only after the dependency's IMPLEMENT
+    has finished - i.e. after its merge - so it designs against the merged
+    integration HEAD and reuses the dependency's surfaces (run8's serial
+    semantics, guaranteed under parallel draining)."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][1]["dependencies"] = ["RA"]
+    queue_state = _queue_state(manager, tree)
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        events.append(("start", task["task_id"]))
+        await asyncio.sleep(0.01)
+        events.append(("end", task["task_id"]))
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert events.index(("start", "RB:DESIGN")) > events.index(("end", "RA:IMPLEMENT"))
+    assert all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
+
+
+def test_ancestor_dependency_edge_is_dropped_and_the_drain_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child declaring a dependency on its own parent (or the reverse)
+    would deadlock the drain: the parent-child rules already sequence the
+    pair and the dependency gate adds the reverse wait. The edge is dropped
+    with a report instead of leaving the tasks PENDING forever."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][0]["children"] = [
+        {"id": "RA1", "name": "grandchild", "description": "a1", "children": []}
+    ]
+    tree["children"][0]["dependencies"] = ["RA1"]  # parent depends on its own child
+    queue_state = _queue_state(manager, tree)
+
+    assert queue_state["dependencies"] == {}
+    assert queue_state["dropped_dependency_edges"] == [("RA", "RA1", "ancestor-descendant")]
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
+
+
+def test_uncle_nephew_dependency_cycle_is_broken_and_the_drain_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared cycle that closes only through the parent-child rules: C
+    depends on B while B's own child A depends on C. Node-level cycle
+    checking does not see it, but with DESIGN gating it deadlocks the drain
+    (D:C waits for I:B which waits for I:A which waits for I:C); the closing
+    edge is dropped with a report."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = _make_parallel_manager(tmp_path)
+    tree = _requirement_tree()
+    tree["children"][0]["children"] = [
+        {"id": "RA1", "name": "grandchild", "description": "a1", "children": []}
+    ]
+    tree["children"][0]["dependencies"] = ["RB"]  # B (RA) depends on C (RB)
+    tree["children"][1]["dependencies"] = ["RA1"]  # C (RB) depends on A (RA1, B's child)
+    queue_state = _queue_state(manager, tree)
+
+    assert queue_state["dependencies"] == {"RA": ["RB"]}
+    assert queue_state["dropped_dependency_edges"] == [("RB", "RA1", "cycle")]
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
+
+
 def test_resumed_queue_with_dangling_dependency_edge_is_filtered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
