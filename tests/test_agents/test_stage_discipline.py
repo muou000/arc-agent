@@ -53,14 +53,33 @@ def make(stage: str) -> StageDisciplineMiddleware:
 # ---------------------------------------------------------------------------
 
 
-def test_execute_and_delete_are_always_blocked() -> None:
+def test_execute_is_always_blocked() -> None:
     for stage in ("interface_design", "test_generation", "implementation"):
         middleware = make(stage)
-        for name in ("execute", "delete"):
-            result = run(middleware, make_request(name))
-            assert isinstance(result, ToolMessage)
-            assert result.status == "error"
-            assert "disabled in ARC's staged file workflow" in result.content
+        result = run(middleware, make_request("execute"))
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        assert "disabled in ARC's staged file workflow" in result.content
+
+
+def test_delete_is_blocked_outside_test_generation_and_for_non_test_assets() -> None:
+    # interface_design / implementation: fully blocked.
+    for stage in ("interface_design", "implementation"):
+        middleware = make(stage)
+        result = run(middleware, make_request("delete", {"file_path": "/workspace/tests/unit/test_calc.py"}))
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        assert "disabled in ARC's staged file workflow" in result.content
+    # test_generation: blocked for non-test assets...
+    middleware = make("test_generation")
+    result = run(middleware, make_request("delete", {"file_path": "/workspace/src/calc.py"}))
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "disabled in ARC's staged file workflow" in result.content
+    # ...and allowed for test assets (green-baseline rejection may remove a
+    # tautological test file).
+    result = run(middleware, make_request("delete", {"file_path": "/workspace/tests/unit/test_calc.py"}))
+    assert not isinstance(result, ToolMessage) or result.status != "error"
 
 
 # ---------------------------------------------------------------------------

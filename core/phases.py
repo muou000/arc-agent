@@ -20,6 +20,9 @@ TDD_RUN_TESTS_BUDGET = 10
 TDD_STALL_THRESHOLD = 3
 ALLOWED_INTERFACE_TYPES = {"UI", "API", "FUNC", "DB"}
 TDD_BATCH_ORDER = ("Unit", "Integration", "E2E")
+#: Rejection rounds a TestGenerator pass gets to clear its green baseline
+#: files (delete or rework) before the DESIGN phase hard-fails.
+DESIGN_BASELINE_MAX_REJECTIONS = 2
 
 class WorkflowPhaseRunner:
     """Run ARC DESIGN and IMPLEMENT phases using the agent adapters."""
@@ -247,6 +250,23 @@ class WorkflowPhaseRunner:
             await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
             return False
 
+        baseline = await self._enforce_design_baseline_red(
+            node_id=node_id,
+            requirement_data=requirement_data,
+            prepared_tests=stored_tests,
+        )
+        # The E2E baseline runs may have started the session-scoped backend
+        # runtime; DESIGN must not leave it holding the task's port (the
+        # same lifecycle rule run_implement_phase applies at its end).
+        await self.app_handler.shutdown_e2e_runtime()
+        if baseline is None:
+            # The gate hard-failed (green files survived every rejection
+            # round, or the repair pass broke the manifest); run_design_phase
+            # must not store the rejected artifacts.
+            return False
+        if baseline.get("revised_tests") is not None:
+            stored_tests = baseline["revised_tests"]
+
         self.traceability.clear_node_design_artifacts(node_id)
         self._store_prepared_interfaces(node_id, prepared_interfaces)
         self._store_prepared_tests(stored_tests)
@@ -258,6 +278,7 @@ class WorkflowPhaseRunner:
                 "interfaces": prepared_interfaces,
                 "test_artifacts": stored_tests,
                 "phase_status": {"design": "completed", "test": "completed"},
+                "design_baseline": baseline["file_state"],
             },
         )
         await self._log(
@@ -329,6 +350,289 @@ class WorkflowPhaseRunner:
         )
         return final_ok
 
+    async def _enforce_design_baseline_red(
+        self,
+        *,
+        node_id: str,
+        requirement_data: dict[str, Any],
+        prepared_tests: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """System-run baseline RED gate over the freshly generated manifest.
+
+        Runs every manifest file once through the real test executor right
+        after test generation, while the workspace still only contains the
+        DESIGN skeletons. The intended state is all-RED: the TestGenerator
+        contract requires tests that drive the requirement's final behavior
+        and never pass against placeholder scaffolds. Green files are
+        rejected back to the TestGenerator (same thread) with the exact file
+        list; it must delete or rework each one. After
+        ``DESIGN_BASELINE_MAX_REJECTIONS`` rounds, surviving green files fail
+        the DESIGN phase instead of being waved through by the tautology
+        fast path at IMPLEMENT time.
+
+        Returns ``None`` when the gate hard-fails, otherwise a dict with:
+        - ``file_state``: ``{file_path: "red" | "green" | None}`` seeds for
+          the IMPLEMENT baseline (``None`` = environmental failure);
+        - ``revised_tests``: the final manifest when a rejection round
+          changed it, else ``None``.
+
+        Two legitimate-green situations do not reject: an empty manifest
+        (nothing to gate) and a node whose git history already contains an
+        ``implement`` checkpoint (a retry designing over its own landed
+        implementation; recording the state without rejection is the only
+        truthful signal, and the IMPLEMENT tautology fast path is the
+        intended outcome there).
+        """
+        del requirement_data
+        layer_files: list[tuple[str, str]] = []
+        for test_type in TDD_BATCH_ORDER:
+            for path in collect_test_files(
+                [item for item in prepared_tests if str(item.get("type", "")).strip().lower() == test_type.lower()]
+            ):
+                layer_files.append((test_type, path))
+        if not layer_files:
+            return {"file_state": {}, "revised_tests": None, "skipped": "no tests"}
+
+        # The anchor relies on core.commits.build_commit_message, which
+        # prefixes every checkpoint with "<node_id> (<phase>):" — a coupling
+        # tests/test_workflow/test_design_baseline_red_gate.py locks in.
+        prior_implementation = False
+        try:
+            git_log = get_runtime().git.run(["log", "--oneline", "--all", "-i", "--grep", "(implement", "--"], check=False)
+            # --oneline lines are "<short-sha> <commit message>"; the commit
+            # builder starts every message with the node id, so anchor the
+            # match to the message start to keep REQ-1 from matching REQ-10.
+            message_prefix = f"{node_id} (implement"
+            prior_implementation = any(
+                line.split(" ", 1)[-1].startswith(message_prefix) if " " in line else False
+                for line in (git_log.stdout or "").splitlines()
+            )
+        except Exception as exc:
+            # A git failure must not silently degrade a full-retry node's
+            # legitimate-green path into a rejection spiral; make the
+            # degraded mode visible in the run log.
+            prior_implementation = False
+            await self._log(
+                "TestGenerator",
+                (
+                    f"Prior-implementation git check failed ({exc}); assuming no prior "
+                    "implement checkpoint for this node and applying the green-baseline "
+                    "rejection rules."
+                ),
+                status="warning",
+                node_id=node_id,
+            )
+
+        current_tests = prepared_tests
+        manifest_revised = False
+        file_state: dict[str, str | None] = {}
+        green_evidence: list[dict[str, Any]] = []
+
+        for test_type, path in layer_files:
+            baseline_output = await self._run_design_baseline_file(test_type, path)
+            exit_code = int(parse_test_results(baseline_output).get("exit_code", -1))
+            if exit_code == 0:
+                file_state[path] = "green"
+                green_evidence.append(
+                    {
+                        "file_path": path,
+                        "type": test_type,
+                        "output_summary": summarize_batch_output(baseline_output, max_lines=4),
+                    }
+                )
+                continue
+            baseline_env = classify_test_failure(baseline_output)
+            file_state[path] = "red" if not baseline_env else None
+            if baseline_env:
+                # The file could not be verified either way (broken workspace,
+                # missing runner). The DESIGN gate only rejects verified-green
+                # files; environmental failures are handed to IMPLEMENT, whose
+                # per-layer baseline re-runs every None-state file and applies
+                # the repair-and-revalidate contract there.
+                await self._log(
+                    "TestGenerator",
+                    (
+                        f"Baseline RED check `{test_type}` {path} could not run for an "
+                        f"environmental reason ({baseline_env}); leaving it unverified - "
+                        "the IMPLEMENT baseline will re-run it under the environment "
+                        "repair contract."
+                    ),
+                    status="warning",
+                    node_id=node_id,
+                )
+
+        if not green_evidence and any(state is None for state in file_state.values()):
+            # Nothing was verified green, but not everything is provably red
+            # either: the manifest leaves DESIGN with unverified files rather
+            # than the contract's all-RED state. Make that visible; the gate
+            # itself must not fail the node over an environment problem.
+            await self._log(
+                "TestGenerator",
+                (
+                    "Baseline RED check ended with no verified-green files, but "
+                    f"{sum(1 for state in file_state.values() if state is None)} file(s) "
+                    "could not be verified for environmental reasons; they stay unverified "
+                    "and the IMPLEMENT baseline owns them."
+                ),
+                status="warning",
+                node_id=node_id,
+            )
+
+        if prior_implementation:
+            await self._log(
+                "TestGenerator",
+                (
+                    f"Baseline RED check skipped rejection: git history contains an implement "
+                    f"checkpoint for {node_id}; {len(green_evidence)} green file(s) recorded as "
+                    "legitimate (behavior already landed by a previous run)."
+                    if green_evidence
+                    else f"Baseline RED check complete; no green files (implement checkpoint present for {node_id})."
+                ),
+                status="warning",
+                node_id=node_id,
+            )
+            return {"file_state": file_state, "revised_tests": None, "prior_implementation": True}
+
+        rejection_round = 0
+        while green_evidence:
+            rejection_round += 1
+            if rejection_round > DESIGN_BASELINE_MAX_REJECTIONS:
+                green_paths = ", ".join(item["file_path"] for item in green_evidence)
+                await self._log(
+                    "TestGenerator",
+                    (
+                        f"DESIGN failed: {len(green_evidence)} test file(s) still pass the baseline "
+                        f"after {DESIGN_BASELINE_MAX_REJECTIONS} rejection round(s): {green_paths}. "
+                        "Green tests against an unimplemented node cannot verify the requirement."
+                    ),
+                    status="error",
+                    node_id=node_id,
+                )
+                return None
+            await self._log(
+                "TestGenerator",
+                (
+                    f"Green baseline rejection round {rejection_round}/{DESIGN_BASELINE_MAX_REJECTIONS}: "
+                    f"{len(green_evidence)} test file(s) pass before implementation "
+                    f"({', '.join(item['file_path'] for item in green_evidence)})."
+                ),
+                status="warning",
+                node_id=node_id,
+            )
+            revised_tests, _ = await self.test_generator.repair_green_baseline(
+                node_id,
+                {"name": "", "description": ""},
+                green_evidence=green_evidence,
+                previous_manifest=current_tests,
+            )
+            if revised_tests is None:
+                await self._log(
+                    "TestGenerator",
+                    "Green baseline rework did not return a valid test manifest.",
+                    status="error",
+                    node_id=node_id,
+                )
+                return None
+            try:
+                current_tests = self._prepare_tests(node_id=node_id, tests=revised_tests)
+                manifest_revised = True
+            except ValueError as exc:
+                await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
+                return None
+            if not revised_tests and not current_tests:
+                # The repair explicitly returned an empty manifest: every
+                # test was tautological and got deleted. An empty manifest
+                # is a valid DESIGN result (the node owns no local tests).
+                break
+            if not current_tests:
+                # The repair claimed tests but every item was dropped by
+                # manifest validation; treating that as a legitimate empty
+                # manifest would silently strip the node's coverage.
+                await self._log(
+                    "TestGenerator",
+                    "Green baseline rework returned only invalid manifest item(s).",
+                    status="error",
+                    node_id=node_id,
+                )
+                return None
+
+            # Re-baseline everything that must prove itself RED this round:
+            # the files that carried the green evidence into this repair
+            # round AND any file the repair newly introduced. The second set
+            # closes the rename escape: a repair that deletes the green path
+            # and re-adds the same tautology under a new path must not slip
+            # through just because the old evidence path left the manifest.
+            survived: set[str] = set()
+            for evidence in green_evidence:
+                if any(item.get("file_path") == evidence["file_path"] for item in current_tests):
+                    survived.add(evidence["file_path"])
+            original_paths = {str(item.get("file_path", "") or "").strip() for item in prepared_tests}
+            for item in current_tests:
+                path = str(item.get("file_path", "") or "").strip()
+                if path and path not in original_paths:
+                    survived.add(path)
+                    file_state.pop(path, None)
+            recheck_paths = sorted(survived)
+            if recheck_paths:
+                await self._log(
+                    "TestGenerator",
+                    (
+                        f"Re-baselining {len(recheck_paths)} file(s) after the rework round: "
+                        f"{', '.join(recheck_paths)}."
+                    ),
+                    node_id=node_id,
+                )
+            green_evidence = []
+            for path in recheck_paths:
+                test_type = next(
+                    str(item.get("type", "")).strip()
+                    for item in current_tests
+                    if item.get("file_path") == path
+                )
+                baseline_output = await self._run_design_baseline_file(test_type, path)
+                exit_code = int(parse_test_results(baseline_output).get("exit_code", -1))
+                if exit_code == 0:
+                    file_state[path] = "green"
+                    green_evidence.append(
+                        {
+                            "file_path": path,
+                            "type": test_type,
+                            "output_summary": summarize_batch_output(baseline_output, max_lines=4),
+                        }
+                    )
+                else:
+                    # Same semantics as the first pass: an environmental
+                    # failure leaves the file unverified for IMPLEMENT's
+                    # baseline instead of asserting a RED it cannot prove.
+                    file_state[path] = "red" if not classify_test_failure(baseline_output) else None
+
+        # Drop states for files a repair round removed from the manifest;
+        # they are no longer this node's tests, and a stale "green" would
+        # poison nothing but the log (the IMPLEMENT seeding only reads
+        # registered files), while a stale entry lying around the session
+        # invites confusion on later reads.
+        final_paths = {str(item.get("file_path", "") or "").strip() for item in current_tests}
+        file_state = {path: state for path, state in file_state.items() if path in final_paths}
+        await self._log(
+            "TestGenerator",
+            (
+                f"Baseline RED verification complete: {len(current_tests)} test item(s), "
+                + ", ".join(f"{path}: {state or 'not verified (environment)'}" for path, state in sorted(file_state.items()))
+            ),
+            node_id=node_id,
+        )
+        return {
+            "file_state": file_state,
+            "revised_tests": current_tests if manifest_revised else None,
+        }
+
+    async def _run_design_baseline_file(self, test_type: str, file_path: str) -> str:
+        return await self.app_handler.run_test_group(
+            test_type,
+            [file_path],
+            web_port=self.web_port,
+        )
+
     async def _run_tdd_for_node(
         self,
         *,
@@ -357,8 +661,18 @@ class WorkflowPhaseRunner:
         # files already passed (tautology fast path), and ``None`` means no
         # verified state yet (never run, or the baseline stopped at an
         # environment failure).
+        # The DESIGN phase already ran each file once right after generation
+        # (the green-baseline rejection gate); its per-file state is reused
+        # here so IMPLEMENT does not pay the same runs again. Files the DESIGN
+        # baseline never saw (manifests from before that gate, or new files
+        # from a repair pass) keep ``None`` and are baseline-run below.
+        design_baseline = sessions.load_node_session(node_id).get("design_baseline") or {}
+        design_baseline = design_baseline if isinstance(design_baseline, dict) else {}
         file_state_by_type: dict[str, dict[str, str | None]] = {
-            test_type: {path: None for path in collect_test_files(groups[test_type.lower()])}
+            test_type: {
+                path: design_baseline.get(path)
+                for path in collect_test_files(groups[test_type.lower()])
+            }
             for test_type in ordered_types
         }
         # A layer passes only through a passing run that covered EVERY

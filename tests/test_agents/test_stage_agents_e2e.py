@@ -11,6 +11,8 @@ the ``interface_design`` and ``test_generation`` stages.
 from __future__ import annotations
 
 import asyncio
+
+import pytest
 from pathlib import Path
 
 from agents.interface_designer import InterfaceDesigner
@@ -639,6 +641,140 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
     assert "T-ADD" in output_text
     # The scripted test asset really landed in the workspace.
     assert (tmp_project_dir / "tests" / "unit" / "test_calc.py").read_text(encoding="utf-8") == test_code
+
+
+def test_test_generator_delete_cannot_escape_the_workspace_root(tmp_project_dir: Path, arc_runtime) -> None:
+    """Green-baseline rejection deletions stay inside the agent's root.
+
+    The discipline now permits `delete` for test assets in the
+    test_generation stage; the filesystem backend's virtual-mode resolution
+    (root containment, traversal rejection) is what keeps that permission
+    from touching files outside the workspace. This locks the guarantee in
+    through the real deep-agents backend.
+    """
+    node_id = "REQ-GEN-DELETE"
+    seed_requirement(arc_runtime, node_id)
+
+    test_code = "def test_add():\n    assert add(1, 1) == 2\n"
+    protected = tmp_project_dir / "protected.txt"
+    protected.write_text("must survive\n", encoding="utf-8")
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/tests/unit/test_calc.py", "content": test_code},
+                call_id="c1",
+            ),
+            # Traversal attempt: must be rejected by the backend, not delete
+            # anything outside the root.
+            faux_tool_call(
+                "delete",
+                {"file_path": "/workspace/tests/../../protected.txt"},
+                call_id="c2",
+            ),
+            faux_tool_call(
+                "delete",
+                {"file_path": "/workspace/tests/unit/test_calc.py"},
+                call_id="c3",
+            ),
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "Deleted the tautological test.",
+                    "tests": [],
+                    "files_written": [],
+                },
+                call_id="c4",
+            ),
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    # The in-root test asset was really deleted; the traversal attempt was
+    # rejected and the protected file survived.
+    assert tests == []
+    assert not (tmp_project_dir / "tests" / "unit" / "test_calc.py").exists()
+    assert protected.read_text(encoding="utf-8") == "must survive\n"
+
+
+def test_test_generator_delete_cannot_escape_via_symlink(tmp_project_dir: Path, arc_runtime) -> None:
+    """A symlink inside the test tree cannot point the delete outside the root.
+
+    The backend resolves virtual paths through ``Path.resolve()`` and then
+    enforces ``relative_to(root_dir)``; a symlink under ``tests/`` pointing
+    at a file outside the workspace fails that containment (verified
+    empirically: ValueError "outside root directory", target untouched).
+    This locks the behavior through the deep-agents filesystem backend.
+    """
+    import shutil as _shutil
+
+    node_id = "REQ-GEN-SYMLINK"
+    seed_requirement(arc_runtime, node_id)
+
+    test_code = "def test_add():\n    assert add(1, 1) == 2\n"
+    outside_dir = tmp_project_dir.parent / "pr35-symlink-outside"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    protected = outside_dir / "protected.txt"
+    protected.write_text("must survive\n", encoding="utf-8")
+    link = tmp_project_dir / "tests" / "unit" / "escape.spec.ts"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(protected)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation requires elevated privileges on this platform")
+
+    try:
+        model = FauxChatModel(
+            responses=[
+                faux_tool_call(
+                    "write_file",
+                    {"file_path": "/workspace/tests/unit/test_calc.py", "content": test_code},
+                    call_id="c1",
+                ),
+                # Symlink escape attempt: deleting the link must be refused
+                # (resolved target lies outside the workspace root).
+                faux_tool_call(
+                    "delete",
+                    {"file_path": "/workspace/tests/unit/escape.spec.ts"},
+                    call_id="c2",
+                ),
+                faux_tool_call(
+                    "delete",
+                    {"file_path": "/workspace/tests/unit/test_calc.py"},
+                    call_id="c3",
+                ),
+                faux_tool_call(
+                    "TestGenerationResponse",
+                    {
+                        "summary": "Deleted the tautological test.",
+                        "tests": [],
+                        "files_written": [],
+                    },
+                    call_id="c4",
+                ),
+            ]
+        )
+
+        tests, _output = asyncio.run(
+            make_generator(tmp_project_dir, model).run(
+                node_id,
+                {"name": "Calculator", "description": "Add two numbers"},
+            )
+        )
+
+        assert tests == []
+        assert not (tmp_project_dir / "tests" / "unit" / "test_calc.py").exists()
+        # The out-of-root target survived; the refused delete never ran.
+        assert protected.read_text(encoding="utf-8") == "must survive\n"
+    finally:
+        _shutil.rmtree(outside_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
