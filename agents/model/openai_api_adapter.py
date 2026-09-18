@@ -216,14 +216,22 @@ def _arc_empty_stream_error() -> APIConnectionError:
 
     The retry loop treats connection-class failures as "transport suspect" —
     the stream transport gets marked not-first-choice — which is exactly the
-    handling an empty SSE body deserves.
+    handling an empty SSE body deserves. The ``_arc_empty_stream`` marker
+    additionally skips the reachability probe round: the endpoint just
+    answered the request with HTTP 200, so it is provably alive and waiting on
+    ``GET /models`` only burns wall-clock time before the transport switch.
     """
 
     request = httpx.Request("POST", "stream://chat/completions")
     error = APIConnectionError(
         message="streamed response closed without any generation chunks", request=request
     )
+    setattr(error, "_arc_empty_stream", True)
     return error
+
+
+def _is_empty_stream_error(exc: BaseException) -> bool:
+    return bool(getattr(exc, "_arc_empty_stream", False))
 
 
 class ARCChatOpenAI(ChatOpenAI):
@@ -1046,7 +1054,10 @@ def _call_model_with_retries(
             )
             _sleep(delay)
             if _is_connection_failure(exc):
-                probe_next = True
+                # An empty stream proves the endpoint just answered with HTTP
+                # 200, so the reachability probe would only burn its wait;
+                # switch transport and re-attempt directly.
+                probe_next = not _is_empty_stream_error(exc)
                 # Only a connection-class failure is transport-suspicious:
                 # alternate. Any other retryable error keeps the current
                 # transport (a 5xx says nothing about stream vs plain).
@@ -1138,7 +1149,10 @@ async def _acall_model_with_retries(
             )
             await _asleep(delay)
             if _is_connection_failure(exc):
-                probe_next = True
+                # An empty stream proves the endpoint just answered with HTTP
+                # 200, so the reachability probe would only burn its wait;
+                # switch transport and re-attempt directly.
+                probe_next = not _is_empty_stream_error(exc)
                 # Only a connection-class failure is transport-suspicious:
                 # alternate. Any other retryable error keeps the current
                 # transport (a 5xx says nothing about stream vs plain).

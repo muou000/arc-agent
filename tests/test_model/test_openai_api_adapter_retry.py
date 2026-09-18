@@ -1351,3 +1351,45 @@ def test_arc_streamed_hook_converts_no_generations_valueerror(
 
     message = asyncio.run(run())
     assert "without any generation chunks" in message
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: streaming-unsupported TTL and empty-stream probe skip
+# ---------------------------------------------------------------------------
+
+
+def test_empty_stream_skips_the_reachability_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty stream proves the endpoint just answered with HTTP 200, so the
+    retry must switch transport directly instead of waiting on probe rounds."""
+
+    _clear_stream_env(monkeypatch)
+    sleeps: list[float] = []
+    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+    probe_calls = {"count": 0}
+    real_probe = adapter._endpoint_reachable
+
+    def counting_probe(base_url: str, api_key: str) -> bool:
+        probe_calls["count"] += 1
+        return real_probe(base_url, api_key)
+
+    monkeypatch.setattr(adapter, "_endpoint_reachable", counting_probe)
+
+    empty_results = [adapter._arc_empty_stream_error()]
+
+    def streamed() -> str:
+        raise empty_results.pop(0)
+
+    def plain() -> str:
+        return "plain-ok"
+
+    result = _call_model_with_retries(
+        plain,
+        api_mode="chat_completions",
+        model="test-model",
+        streamed_retry=streamed,
+        stream_first=True,
+    )
+
+    assert result == "plain-ok"
+    assert probe_calls["count"] == 0  # no probe round before the plain retry
+    assert sleeps == [5.0]  # only the retry delay, no probe-wait sleeps
