@@ -107,6 +107,9 @@ ARC_MODEL_RETRY_DELAY=5                # 重试间隔秒数（固定短延迟，
                                        # ARC_MODEL_RETRY_MAX_DELAY=60）
 ARC_MODEL_MAX_CONSECUTIVE_FAILURES=5   # 跨调用连续失败熔断阈值（默认 5）：同一端点连续 5 次模型调用失败后，
                                        # 后续调用立即失败并提示 --resume；任一成功即重置计数（设 0 关闭）
+ARC_MODEL_STREAM_TRANSPORT=1           # 连接类失败后的下一次重试改走流式 HTTP 传输（默认开）。非流式请求在
+                                       # 模型思考期间零字节流动，网关空闲超时（实测 ~120s）会掐断连接；流式
+                                       # SSE chunk 持续流动可让同一生成存活。设 0 恢复纯非流式重试
 ARC_VISUAL_PRECOMPUTE=1                # 编译前并发预分析需求参考图（设 0/false/no/off 关闭）
 ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
 ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_format）开关：auto（默认，对自定义
