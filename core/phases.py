@@ -12,6 +12,11 @@ from agents.tools.test_contract_check import (
     classify_test_hooks,
     collect_manifest_hooks,
 )
+from agents.tools.test_failure_digest import (
+    build_failure_digest,
+    format_failure_digest,
+    persist_run_output,
+)
 from core import sessions
 from core.service import get_runtime
 from core.path_compat import normalize_windows_extended_prefix_text
@@ -28,6 +33,8 @@ TDD_BATCH_ORDER = ("Unit", "Integration", "E2E")
 #: Rejection rounds a TestGenerator pass gets to clear its green baseline
 #: files (delete or rework) before the DESIGN phase hard-fails.
 DESIGN_BASELINE_MAX_REJECTIONS = 2
+#: Cap on run-output log files retained per node under ``.arc/tdd_runs``.
+TDD_RUN_LOG_RETENTION = 20
 
 class WorkflowPhaseRunner:
     """Run ARC DESIGN and IMPLEMENT phases using the agent adapters."""
@@ -874,6 +881,52 @@ class WorkflowPhaseRunner:
                 selected_files,
                 web_port=self.web_port,
             )
+            parsed_result = parse_test_results(output)
+            exit_code = int(parsed_result.get("exit_code", -1))
+            passed = exit_code == 0
+            # Persist every run's raw output under .arc/tdd_runs (ignored by
+            # Git checkpoints/merges) and expose it to the agent: in-session
+            # via a pointer line, cross-session via the structured digest in
+            # the failure handoff. This is what lets a follow-up session
+            # re-localize a failure by reading one file instead of spending
+            # budget re-running tests to see output it has already seen.
+            run_log_path = ""
+            try:
+                run_log_path = persist_run_output(
+                    self.workspace_path,
+                    node_id,
+                    selected_type,
+                    used + 1,
+                    output,
+                )
+            except OSError as exc:
+                await self._log(
+                    "TestDrivenDeveloper",
+                    f"Failed to persist run output log: {exc}",
+                    status="warning",
+                    node_id=node_id,
+                )
+            if run_log_path:
+                output += (
+                    f"\n\nARC_RUN_OUTPUT_LOG: the complete raw output of this run is saved at "
+                    f"`{run_log_path}`. Read that file for the full output of this attempt "
+                    "instead of re-running the tests.\n"
+                )
+            if not passed:
+                # Structured per-test digest appended to the tool result: the
+                # model sees each failed test's location and expected/received
+                # up front instead of mining the long raw output for them.
+                output += (
+                    "\n\n"
+                    + format_failure_digest(
+                        build_failure_digest(output),
+                        test_type=selected_type,
+                        raw_output_path=run_log_path or None,
+                        fingerprint=failure_fingerprint(output),
+                        environment_failure=classify_test_failure(output),
+                    )
+                    + "\n"
+                )
             await self._log(
                 "TestDrivenDeveloper",
                 (
@@ -888,9 +941,6 @@ class WorkflowPhaseRunner:
                 status="debug",
                 node_id=node_id,
             )
-            parsed_result = parse_test_results(output)
-            exit_code = int(parsed_result.get("exit_code", -1))
-            passed = exit_code == 0
             await self._log(
                 "TestDrivenDeveloper",
                 (
@@ -1083,6 +1133,9 @@ class WorkflowPhaseRunner:
         output = ""
         session_count = 0
         max_sessions = max(1, TDD_RUN_TESTS_BUDGET * len(ordered_types))
+        # Files edited across every agent session of this TDD pass (the
+        # adapter exposes only the latest session's writes).
+        modified_files_round: list[str] = []
         for ordered_type in ordered_types:
             if environment_failure:
                 # The workspace is broken; every remaining layer would fail the
@@ -1315,11 +1368,28 @@ class WorkflowPhaseRunner:
                     run_tests_usage=None,
                     run_tests_executor=run_requested_tests,
                 )
+                # Union across sessions: the adapter's per-session list resets
+                # on every run(), so accumulate here for the round-level
+                # tdd_handoff written at the end of this TDD pass.
+                for path in self.test_driven_developer.get_last_modified_files():
+                    if path and path not in modified_files_round:
+                        modified_files_round.append(path)
 
                 latest_result = result_by_type.get(ordered_type, "")
+                # Three-part cross-session handoff: the structured per-test
+                # digest (locations + expected/received), a diff hint of what
+                # the previous session edited, and the pointer to the persisted
+                # raw output. The digest is preferred over the raw verifier
+                # report tail; the report stays as the fallback when the run
+                # output carried no recognizable per-test structure.
                 previous_failure_summary = (
-                    self.test_driven_developer.get_last_verifier_report()
-                    or summarize_batch_output(latest_result or output)
+                    self._build_session_handoff(
+                        self.test_driven_developer.get_last_failure_digest()
+                        or self.test_driven_developer.get_last_verifier_report()
+                        or summarize_batch_output(latest_result or output),
+                        modified_files=self.test_driven_developer.get_last_modified_files(),
+                        fingerprint_history=fingerprint_history[ordered_type],
+                    )
                 )
                 used_after = usage_by_type.get(ordered_type, 0)
                 if full_layer_passed[ordered_type]:
@@ -1414,7 +1484,11 @@ class WorkflowPhaseRunner:
                 "tdd_handoff": {
                     "last_test_type": failed_types[-1] if failed_types else ordered_types[-1],
                     "last_failed_output_summary": failure_summary,
-                    "modified_files": [],
+                    # Diff hint for the next TDD round (post-run retry or
+                    # --retry-failed): what the sessions of this pass actually
+                    # edited, from the stage discipline rather than the
+                    # model's own self-report.
+                    "modified_files": sorted(modified_files_round),
                 },
             },
         )
@@ -1571,9 +1645,51 @@ class WorkflowPhaseRunner:
 
     def _mark_interfaces_implemented(self, interfaces: list[dict[str, Any]]) -> None:
         for interface in interfaces:
-            interface_id = str(interface.get("interface_id", "") or "").strip()
+            interface_id = str(interface.get("interface_id", "")).strip()
             if interface_id:
                 self.traceability.set_interface_implemented(interface_id, True)
+
+    @staticmethod
+    def _build_session_handoff(
+        failure_evidence: str,
+        *,
+        modified_files: list[str],
+        fingerprint_history: list[str],
+    ) -> str:
+        """Compose the cross-session TDD handoff text.
+
+        Parts: the failure evidence (structured digest preferred, verifier
+        report tail as fallback), then a diff hint naming the files the
+        previous session edited and how the failure fingerprint moved — the
+        next session uses this to know what was already tried without
+        re-reading files or re-running tests.
+        """
+
+        evidence = str(failure_evidence or "").strip()
+        hint_parts: list[str] = []
+        if modified_files:
+            hint_parts.append(
+                "Files edited by the previous session (stage-discipline ground truth): "
+                + ", ".join(f"`{path}`" for path in modified_files)
+            )
+        if len(fingerprint_history) >= 2:
+            moved = (
+                "changed"
+                if fingerprint_history[-1] != fingerprint_history[-2]
+                else "DID NOT change — the previous session's edits did not move this failure; "
+                "rotate your hypothesis before editing the same files again"
+            )
+            hint_parts.append(
+                f"Failure fingerprint across this layer's runs: {fingerprint_history[-1]} "
+                f"(vs. previous run: {moved})"
+            )
+        if not hint_parts:
+            return evidence
+        return (
+            evidence
+            + "\n\n### Previous Session Diff Hint\n"
+            + "\n".join(f"- {part}" for part in hint_parts)
+        )
 
     def _update_node_session(self, node_id: str, patch: dict[str, Any]) -> None:
         sessions.merge_node_session(node_id, patch)
