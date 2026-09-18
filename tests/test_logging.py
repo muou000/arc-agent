@@ -17,6 +17,7 @@ def test_configured_stdio_delivers_print_before_process_exit() -> None:
     code = (
         "from core.logging import configure_process_stdio; "
         "configure_process_stdio(); "
+        "assert __import__('os').environ['PYTHONUNBUFFERED'] == '0'; "
         "print('ARC_LIVE_OUTPUT_1'); "
         "print('ARC_LIVE_OUTPUT_2'); "
         "import time; time.sleep(1.2)"
@@ -64,3 +65,25 @@ def test_stdio_configuration_failure_is_reported(monkeypatch) -> None:
     diagnostic = warning.getvalue()
     assert "stdout" in diagnostic
     assert "stderr" in diagnostic
+
+
+def test_stdio_wrapper_traversal_handles_falsy_wrappers_and_unexpected_errors() -> None:
+    class FalsyStream:
+        configured = False
+
+        def __bool__(self) -> bool:
+            return False
+
+        def reconfigure(self, **_kwargs) -> None:
+            self.configured = True
+
+    class RaisingWrapper:
+        def __init__(self, wrapped) -> None:
+            self.stream = wrapped
+
+        def reconfigure(self, **_kwargs) -> None:
+            raise RuntimeError("wrapper failure")
+
+    falsy_stream = FalsyStream()
+    assert arc_logging._configure_text_stream(RaisingWrapper(falsy_stream)) is True
+    assert falsy_stream.configured is True

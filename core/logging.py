@@ -15,12 +15,13 @@ def configure_process_stdio() -> None:
     ARC-Bench runs the agent without a TTY and consumes its stdout one line at
     a time. Python otherwise uses block buffering for ordinary ``print``
     calls in that mode. The explicit stream configuration covers the current
-    process, while ``PYTHONUNBUFFERED`` is inherited by Python subprocesses.
+    process, while a missing ``PYTHONUNBUFFERED`` value is supplied to Python
+    subprocesses. An explicit user value is preserved.
     ``write_terminal_log`` already flushes its own writes; this also covers
     banners, startup text, third-party prints, and stderr diagnostics.
     """
 
-    os.environ["PYTHONUNBUFFERED"] = "1"
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
     for stream_name, stream in (("stdout", sys.stdout), ("stderr", sys.stderr)):
         if not _configure_text_stream(stream):
             _report_stdio_configuration_failure(stream_name)
@@ -34,15 +35,27 @@ def _configure_text_stream(stream: Any) -> bool:
     configured = False
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        reconfigure = getattr(current, "reconfigure", None)
+        try:
+            reconfigure = getattr(current, "reconfigure", None)
+        except Exception:
+            reconfigure = None
         if callable(reconfigure):
             try:
                 reconfigure(line_buffering=True, write_through=True)
                 configured = True
                 break
-            except (AttributeError, OSError, TypeError, ValueError):
+            except Exception:
                 pass
-        current = getattr(current, "stream", None) or getattr(current, "wrapped", None)
+        next_stream = None
+        for attribute in ("stream", "wrapped"):
+            try:
+                candidate = getattr(current, attribute, None)
+            except Exception:
+                continue
+            if candidate is not None and id(candidate) not in seen:
+                next_stream = candidate
+                break
+        current = next_stream
 
     flush = getattr(stream, "flush", None)
     if callable(flush):
