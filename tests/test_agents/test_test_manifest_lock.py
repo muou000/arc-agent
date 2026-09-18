@@ -170,6 +170,64 @@ def test_declaration_fails_open_without_runtime_for_interface_ids() -> None:
     assert payload["status"] == "locked"
 
 
+def test_declaration_accepts_staged_current_interface_ids() -> None:
+    lock = TestManifestLock()
+    tool = build_declare_test_manifest_tool(
+        node_id="REQ-X",
+        manifest_lock=lock,
+        current_interface_ids=["REQ-X-FUNC-CALC"],
+        require_interface_coverage=True,
+    )
+
+    payload = _parse(
+        str(
+            asyncio.run(
+                tool(
+                    files=[
+                        {
+                            "file_path": "tests/unit/calc.test.ts",
+                            "type": "Unit",
+                            "interface_ids": ["REQ-X-FUNC-CALC"],
+                        }
+                    ]
+                )
+            )
+        )
+    )
+
+    assert payload["status"] == "locked"
+
+
+def test_declaration_rejects_empty_coverage_when_current_interfaces_exist() -> None:
+    lock = TestManifestLock()
+    tool = build_declare_test_manifest_tool(
+        node_id="REQ-X",
+        manifest_lock=lock,
+        current_interface_ids=["REQ-X-FUNC-CALC"],
+        require_interface_coverage=True,
+    )
+
+    payload = _parse(
+        str(
+            asyncio.run(
+                tool(
+                    files=[
+                        {
+                            "file_path": "tests/unit/calc.test.ts",
+                            "type": "Unit",
+                            "interface_ids": [],
+                        }
+                    ]
+                )
+            )
+        )
+    )
+
+    assert payload["status"] == "error"
+    assert "empty `interface_ids`" in payload["error"]
+    assert "bypass coverage validation" in payload["error"]
+
+
 def test_second_declaration_extends_the_lock_without_reset() -> None:
     lock = TestManifestLock()
     tool = build_declare_test_manifest_tool(node_id="REQ-X", manifest_lock=lock)

@@ -28,6 +28,14 @@ from typing import Any
 
 _FALSE_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
 
+# LangGraph's msgpack serializer warns for custom objects unless they are
+# explicitly allowlisted. Keep this list narrow: these are the only Pydantic
+# response objects ARC puts into stage-agent checkpoints.
+_STAGE_RESPONSE_MSGPACK_ALLOWLIST = (
+    ("agents.interface_designer", "InterfaceDesignResponse"),
+    ("agents.test_generator", "TestGenerationResponse"),
+)
+
 _checkpointer: Any | None = None
 
 
@@ -67,8 +75,13 @@ def get_checkpointer() -> Any | None:
         return None
     if _checkpointer is None:
         from langgraph.checkpoint.memory import InMemorySaver
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-        _checkpointer = InMemorySaver()
+        _checkpointer = InMemorySaver(
+            serde=JsonPlusSerializer(
+                allowed_msgpack_modules=_STAGE_RESPONSE_MSGPACK_ALLOWLIST,
+            )
+        )
     return _checkpointer
 
 

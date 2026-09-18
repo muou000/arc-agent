@@ -15,6 +15,7 @@ import asyncio
 import pytest
 from pathlib import Path
 
+from core import sessions
 from agents.interface_designer import InterfaceDesigner
 from agents.test_generator import TestGenerator
 from tests.helpers.faux import FauxChatModel, faux_tool_call
@@ -658,6 +659,89 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
     assert (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").read_text(encoding="utf-8") == test_code
 
 
+def test_test_generator_uses_staged_current_interfaces_before_db_commit(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    node_id = "REQ-GEN-STAGED"
+    seed_requirement(arc_runtime, node_id)
+    sessions.merge_node_session(
+        node_id,
+        {
+            "interfaces": [
+                {
+                    "interface_id": "REQ-GEN-STAGED-FUNC-CALC",
+                    "req_id": node_id,
+                    "type": "FUNC",
+                    "name": "add",
+                    "file_path": "backend/src/services/calc.js",
+                    "first_line": "function add(a, b)",
+                    "responsibility": "Add two integers.",
+                    "specification": "Returns a + b.",
+                }
+            ],
+            "phase_status": {"design": "prepared"},
+        },
+    )
+
+    test_code = "test('add', () => { expect(add(1, 1)).toBe(2); });\n"
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "get_interfaces_for_requirement",
+                {"req_id": node_id},
+                call_id="c0",
+            ),
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "type": "Unit",
+                            "interface_ids": ["REQ-GEN-STAGED-FUNC-CALC"],
+                        }
+                    ]
+                },
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": test_code},
+                call_id="c2",
+            ),
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "One unit test for the staged calculator contract.",
+                    "tests": [
+                        {
+                            "test_id": "T-STAGED-ADD",
+                            "req_id": node_id,
+                            "interface_ids": ["REQ-GEN-STAGED-FUNC-CALC"],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "first_line": "test('add', () => {",
+                        }
+                    ],
+                    "files_written": ["backend/tests/unit/calc.test.js"],
+                },
+                call_id="c3",
+            ),
+        ]
+    )
+
+    tests, _ = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    assert model.call_count == 4
+    assert tests is not None
+    assert tests[0]["interface_ids"] == ["REQ-GEN-STAGED-FUNC-CALC"]
+
+
 def test_test_generator_delete_cannot_escape_the_workspace_root(tmp_project_dir: Path, arc_runtime) -> None:
     """Green-baseline rejection deletions stay inside the agent's root.
 
@@ -1129,7 +1213,9 @@ def test_test_generator_helpers_stay_writable_without_declaration(tmp_project_di
     assert (tmp_project_dir / "tests" / "setup-tests.ts").exists()
 
 
-def test_test_generator_repair_pass_cannot_introduce_new_test_paths(tmp_project_dir: Path, arc_runtime) -> None:
+def test_test_generator_repair_pass_cannot_introduce_new_test_paths(
+    tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The green-baseline repair lock is pre-seeded with the previous
     manifest: deleting a green file and re-adding the coverage under a fresh
     name (the rename escape) is blocked at write time."""
@@ -1149,6 +1235,23 @@ def test_test_generator_repair_pass_cannot_introduce_new_test_paths(tmp_project_
     green_file = tmp_project_dir / "backend" / "tests" / "unit" / "green.test.js"
     green_file.parent.mkdir(parents=True, exist_ok=True)
     green_file.write_text("test('tautology', () => { expect(true).toBe(true); });\n", encoding="utf-8")
+
+    original_current_interface_ids = TestGenerator._current_interface_ids
+    current_interface_id_calls = 0
+
+    def count_current_interface_id_reads(
+        requested_node_id: str,
+        interfaces: list[dict[str, object]] | None = None,
+    ) -> list[str]:
+        nonlocal current_interface_id_calls
+        current_interface_id_calls += 1
+        return original_current_interface_ids(requested_node_id, interfaces)
+
+    monkeypatch.setattr(
+        TestGenerator,
+        "_current_interface_ids",
+        staticmethod(count_current_interface_id_reads),
+    )
 
     model = FauxChatModel(
         responses=[
@@ -1204,6 +1307,7 @@ def test_test_generator_repair_pass_cannot_introduce_new_test_paths(tmp_project_
     assert tests is not None and len(tests) == 1
     assert tests[0]["file_path"] == "backend/tests/unit/green.test.js"
     assert not (tmp_project_dir / "backend" / "tests" / "unit" / "greenV2.test.js").exists()
+    assert current_interface_id_calls == 1
 
 
 # ---------------------------------------------------------------------------

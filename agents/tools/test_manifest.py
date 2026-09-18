@@ -122,6 +122,8 @@ def build_declare_test_manifest_tool(
     manifest_lock: TestManifestLock,
     validate_test_path: Callable[[str, str], str | None] | None = None,
     log_cb: LogCallback | None = None,
+    current_interface_ids: list[str] | set[str] | None = None,
+    require_interface_coverage: bool = False,
 ):
     """Build the ``declare_test_manifest`` tool for the current stage run.
 
@@ -131,7 +133,17 @@ def build_declare_test_manifest_tool(
     with the exact rule text, instead of failing the whole DESIGN phase after
     the files were already written. ``None`` disables that early check (unit
     tests, handlers without placement rules).
+
+    ``current_interface_ids`` contains DESIGN-stage contracts that are already
+    present in the node session but not yet committed to the traceability DB.
+    ``require_interface_coverage`` rejects empty coverage rows when the current
+    node owns interfaces, preventing a model from using ``[]`` to bypass a
+    failed or temporarily unavailable interface lookup.
     """
+
+    staged_interface_ids = {
+        str(value).strip() for value in current_interface_ids or [] if str(value or "").strip()
+    }
 
     async def declare_test_manifest(files: list[dict[str, Any]]) -> str:
         """Declare and lock the test-file manifest for this stage run.
@@ -206,7 +218,16 @@ def build_declare_test_manifest_tool(
                 )
             )
 
-        unknown_interfaces = _unknown_interface_ids(rows)
+        if require_interface_coverage and staged_interface_ids:
+            for row in rows:
+                if not row.interface_ids:
+                    errors.append(
+                        f"Entry `{row.file_path}` has empty `interface_ids`, but the current node "
+                        "owns interface contracts. Map this test file to the exact current interface id(s); "
+                        "do not use an empty list to bypass coverage validation."
+                    )
+
+        unknown_interfaces = _unknown_interface_ids(rows, known_interface_ids=staged_interface_ids)
         if unknown_interfaces:
             errors.append(
                 "Unknown interface id(s) not present in the traceability DB: "
@@ -271,7 +292,11 @@ def canonical_test_type(value: Any) -> str | None:
     return None
 
 
-def _unknown_interface_ids(rows: list[DeclaredTestFile]) -> set[str]:
+def _unknown_interface_ids(
+    rows: list[DeclaredTestFile],
+    *,
+    known_interface_ids: set[str] | None = None,
+) -> set[str]:
     """Interface ids that do not exist in the traceability DB.
 
     Empty-string and placeholder ids are ignored (they never reach here — the
@@ -290,9 +315,12 @@ def _unknown_interface_ids(rows: list[DeclaredTestFile]) -> set[str]:
         store = get_runtime().traceability
     except Exception:
         return set()
+    known = known_interface_ids or set()
     unknown: set[str] = set()
     for row in rows:
         for interface_id in row.interface_ids:
+            if interface_id in known:
+                continue
             if interface_id not in unknown and store.get_interface(interface_id) is None:
                 unknown.add(interface_id)
     return unknown
