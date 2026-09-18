@@ -239,7 +239,7 @@ def _arc_empty_stream_error() -> APIConnectionError:
     error = APIConnectionError(
         message="streamed response closed without any generation chunks", request=request
     )
-    setattr(error, "_arc_empty_stream", True)
+    error._arc_empty_stream = True
     return error
 
 
@@ -1291,14 +1291,12 @@ def _prune_stale_failures_locked(endpoint_key: str, records: list[tuple[float, E
     """Drop failures older than the recovery window (caller holds the lock)."""
 
     cutoff = time.monotonic() - _FAILURE_RECOVERY_WINDOW_SECONDS
-    stale = 0
-    for stale, (timestamp, _exc) in enumerate(records):
-        if timestamp >= cutoff:
-            break
-    else:
-        stale = len(records)
-    if stale:
-        del records[:stale]
+    stale_count = next(
+        (index for index, (timestamp, _exc) in enumerate(records) if timestamp >= cutoff),
+        len(records),
+    )
+    if stale_count:
+        del records[:stale_count]
         if not records:
             _CONSECUTIVE_FAILURES.pop(endpoint_key, None)
 

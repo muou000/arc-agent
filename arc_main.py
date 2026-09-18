@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -319,10 +320,8 @@ def build_usage_parser(subparsers) -> None:
 
 def cmd_usage(args: argparse.Namespace) -> int:
     """Execute usage subcommand."""
-    try:
+    with suppress(FileNotFoundError):
         _ensure_dotenv_loaded()
-    except FileNotFoundError:
-        pass  # usage reporting works without provider configuration
 
     from arcbench_agent_runtime.context import RuntimePaths
     from arcbench_agent_runtime.usage import aggregate_llm_usage, aggregate_tool_usage

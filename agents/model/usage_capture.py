@@ -42,7 +42,7 @@ _sink_lock = threading.Lock()
 _encoder_cache: dict[str, Any] = {}
 _encoder_cache_lock = threading.Lock()
 
-_usage_context: ContextVar[dict[str, str]] = ContextVar("arc_llm_usage_context", default={})
+_usage_context: ContextVar[dict[str, str] | None] = ContextVar("arc_llm_usage_context", default=None)
 
 
 @dataclass(frozen=True)

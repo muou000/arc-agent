@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import threading
 import urllib.request
+from contextlib import suppress
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -528,10 +529,8 @@ async def _wait_for_http_server(host: str, port: int, timeout: float = 20.0) -> 
             continue
         finally:
             writer.close()
-            try:
+            with suppress(OSError):
                 await writer.wait_closed()
-            except OSError:
-                pass
         if status_line.startswith(b"HTTP/"):
             return True
         await asyncio.sleep(0.5)
@@ -1022,7 +1021,39 @@ def _frontend_build_fingerprint_path(frontend_path: str) -> str:
     return os.path.join(frontend_path, "dist", FRONTEND_BUILD_FINGERPRINT_FILENAME)
 
 
-def _read_recorded_frontend_fingerprint(frontend_path: str) -> str | None:
+def _frontend_dist_fingerprint(frontend_path: str) -> str | None:
+    """Return a content hash for the built frontend output.
+
+    The source fingerprint alone cannot detect a build that was interrupted
+    after it started rewriting ``dist``.  Hashing the output lets cache reuse
+    fail closed when a previous build left a partial or externally modified
+    artifact behind.
+    """
+
+    dist_root = Path(frontend_path) / "dist"
+    dist_index_path = dist_root / "index.html"
+    if not dist_index_path.is_file():
+        return None
+
+    digest = hashlib.sha256()
+    for dirpath, dirnames, filenames in os.walk(dist_root):
+        dirnames.sort()
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            if path.name == FRONTEND_BUILD_FINGERPRINT_FILENAME:
+                continue
+            try:
+                content = path.read_bytes()
+            except OSError:
+                return None
+            digest.update(path.relative_to(dist_root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(content)
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _read_recorded_frontend_build(frontend_path: str) -> tuple[str, str] | None:
     try:
         with open(_frontend_build_fingerprint_path(frontend_path), "r", encoding="utf-8") as file:
             payload = json.load(file)
@@ -1030,13 +1061,27 @@ def _read_recorded_frontend_fingerprint(frontend_path: str) -> str | None:
         return None
     if not isinstance(payload, dict):
         return None
-    return str(payload.get("fingerprint", "") or "").strip() or None
+    source_fingerprint = str(payload.get("fingerprint", "") or "").strip()
+    dist_fingerprint = str(payload.get("dist_fingerprint", "") or "").strip()
+    if not source_fingerprint or not dist_fingerprint:
+        return None
+    return source_fingerprint, dist_fingerprint
 
 
-def _record_frontend_fingerprint(frontend_path: str, fingerprint: str) -> None:
+def _read_recorded_frontend_fingerprint(frontend_path: str) -> str | None:
+    recorded_build = _read_recorded_frontend_build(frontend_path)
+    return recorded_build[0] if recorded_build is not None else None
+
+
+def _clear_recorded_frontend_fingerprint(frontend_path: str) -> None:
+    with suppress(OSError):
+        os.remove(_frontend_build_fingerprint_path(frontend_path))
+
+
+def _record_frontend_fingerprint(frontend_path: str, fingerprint: str, dist_fingerprint: str) -> None:
     try:
         with open(_frontend_build_fingerprint_path(frontend_path), "w", encoding="utf-8") as file:
-            json.dump({"fingerprint": fingerprint}, file)
+            json.dump({"fingerprint": fingerprint, "dist_fingerprint": dist_fingerprint}, file)
             file.write("\n")
     except OSError:
         # Best effort: losing the fingerprint only costs one extra build.
@@ -1045,31 +1090,40 @@ def _record_frontend_fingerprint(frontend_path: str, fingerprint: str) -> None:
 
 async def _build_frontend_dist(workspace_path: str) -> tuple[bool, str]:
     frontend_path = os.path.join(workspace_path, "frontend")
-    dist_index_path = os.path.join(frontend_path, "dist", "index.html")
+    dist_index_path = Path(frontend_path) / "dist" / "index.html"
     fingerprint = _frontend_source_fingerprint(frontend_path)
+    dist_fingerprint = _frontend_dist_fingerprint(frontend_path)
+    recorded_build = _read_recorded_frontend_build(frontend_path)
 
     # Every E2E attempt rebuilt the frontend from scratch (~tens of seconds),
-    # even when the previous attempt already produced a `dist` for the same
-    # sources. Reuse it when the tree is byte-for-byte unchanged.
-    if fingerprint is not None and os.path.exists(dist_index_path):
-        if _read_recorded_frontend_fingerprint(frontend_path) == fingerprint:
-            return True, (
-                "Reused the existing `frontend/dist` because the frontend sources are unchanged "
-                f"since the last successful build (fingerprint {fingerprint[:12]}).\n"
-            )
+    # even when the previous attempt already produced a valid `dist` for the
+    # same sources. Reuse it only when both sides of the cache are unchanged.
+    if (
+        fingerprint is not None
+        and dist_fingerprint is not None
+        and recorded_build == (fingerprint, dist_fingerprint)
+    ):
+        return True, (
+            "Reused the existing `frontend/dist` because the frontend sources are unchanged "
+            f"since the last successful build (fingerprint {fingerprint[:12]}).\n"
+        )
 
+    # A failed/interrupted build may leave a partial output tree behind. The
+    # old record must not make that tree eligible for reuse on the next run.
+    _clear_recorded_frontend_fingerprint(frontend_path)
     frontend_build_output = await _execute_web_test_command(
         "npm run build",
         cwd=frontend_path,
         timeout=120.0,
     )
-    build_ok = _extract_exit_code(frontend_build_output) == 0 and os.path.exists(dist_index_path)
+    build_ok = _extract_exit_code(frontend_build_output) == 0 and dist_index_path.is_file()
     if build_ok:
-        if fingerprint is not None:
-            _record_frontend_fingerprint(frontend_path, fingerprint)
+        rebuilt_dist_fingerprint = _frontend_dist_fingerprint(frontend_path)
+        if fingerprint is not None and rebuilt_dist_fingerprint is not None:
+            _record_frontend_fingerprint(frontend_path, fingerprint, rebuilt_dist_fingerprint)
         return True, frontend_build_output
 
-    if os.path.exists(dist_index_path):
+    if dist_index_path.exists():
         return False, frontend_build_output
 
     return (
@@ -1892,9 +1946,7 @@ class WebAppType(AppTypeHandler):
                 if label == "frontend":
                     await self._ensure_testing_library_dom(target_path)
 
-            if browser_task is not None and not await browser_task:
-                return False
-            return True
+            return browser_task is None or await browser_task
         finally:
             # A failed npm install must not leave a browser download waiting on
             # a CLI that will never appear in the incomplete node_modules tree.
@@ -2262,11 +2314,11 @@ class WebAppType(AppTypeHandler):
         for file_path in file_paths:
             await self._log("System", f"System test execution ({test_type}): {file_path}")
 
-        invalid_paths = [file_path for file_path in file_paths if self.validate_test_path(test_type, file_path)]
-        if invalid_paths:
+        validation_errors = [self.validate_test_path(test_type, file_path) for file_path in file_paths]
+        invalid_errors = [error for error in validation_errors if error]
+        if invalid_errors:
             error_lines = ["Exit Code: 1", "STDERR:"]
-            for file_path in invalid_paths:
-                error_lines.append(self.validate_test_path(test_type, file_path) or "")
+            error_lines.extend(invalid_errors)
             return "\n".join(error_lines) + "\n"
 
         try:

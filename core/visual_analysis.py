@@ -208,7 +208,7 @@ async def precompute_visual_references(
         return_exceptions=True,
     )
     analyzed = 0
-    for (req_id, _data), result in zip(pending, results):
+    for (req_id, _data), result in zip(pending, results, strict=True):
         if isinstance(result, BaseException):
             await _log(
                 log_cb,

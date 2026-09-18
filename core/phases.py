@@ -20,6 +20,7 @@ from agents.tools.test_failure_digest import (
 from core import sessions
 from core.service import get_runtime
 from core.path_compat import normalize_windows_extended_prefix_text
+from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 from core.visual_analysis import analyze_and_attach_visual_references
 from app_type_handler.test_results import classify_test_failure, failure_fingerprint, parse_test_results
 
@@ -29,7 +30,7 @@ TDD_RUN_TESTS_BUDGET = 10
 #: Consecutive identical failure fingerprints before stall governance fires.
 TDD_STALL_THRESHOLD = 3
 ALLOWED_INTERFACE_TYPES = {"UI", "API", "FUNC", "DB"}
-TDD_BATCH_ORDER = ("Unit", "Integration", "E2E")
+TDD_BATCH_ORDER = CANONICAL_TEST_TYPES
 #: Rejection rounds a TestGenerator pass gets to clear its green baseline
 #: files (delete or rework) before the DESIGN phase hard-fails.
 DESIGN_BASELINE_MAX_REJECTIONS = 2
@@ -1716,14 +1717,6 @@ def collect_test_files(tests: list[dict[str, Any]]) -> list[str]:
         if file_path and file_path not in seen:
             seen.append(file_path)
     return seen
-
-
-def canonical_test_type(value: str) -> str | None:
-    normalized = str(value or "").strip().lower()
-    for test_type in TDD_BATCH_ORDER:
-        if normalized == test_type.lower():
-            return test_type
-    return None
 
 
 def summarize_interface_artifacts(interfaces: list[dict[str, Any]]) -> dict[str, Any]:

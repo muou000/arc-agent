@@ -671,7 +671,7 @@ def _collect_insertions(
 
     matcher = difflib.SequenceMatcher(a=base_lines, b=side_lines, autojunk=False)
     insertions: dict[int, list[str]] = {}
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+    for tag, i1, _, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             continue
         if tag != "insert":

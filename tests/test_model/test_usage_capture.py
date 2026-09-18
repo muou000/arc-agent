@@ -269,6 +269,9 @@ class TestAdapterIntegration:
     def test_async_generate_reports_usage(self, monkeypatch: pytest.MonkeyPatch) -> None:
         records: list[LLMUsageRecord] = []
         set_llm_usage_sink(records.append)
+        # This test exercises usage extraction through the non-streaming
+        # adapter path; transport selection is covered by the retry suite.
+        monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
         metadata_result = self._metadata_result()
 
         async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):

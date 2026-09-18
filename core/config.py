@@ -270,13 +270,12 @@ def print_health_check() -> int:
     if result["ok"]:
         print(f"{Fore.GREEN}✓ Configuration is valid{Style.RESET_ALL}\n")
         return 0
-    else:
-        print(f"{Fore.RED}✗ Configuration has errors. Fix them before running ARC.{Style.RESET_ALL}\n")
-        print(f"{Fore.WHITE}Quick fix:{Style.RESET_ALL}")
-        print(f"  1. Copy .env_example to .env")
-        print(f"  2. Edit .env and fill in your API credentials")
-        print(f"  3. Run: arc doctor\n")
-        return 1
+    print(f"{Fore.RED}✗ Configuration has errors. Fix them before running ARC.{Style.RESET_ALL}\n")
+    print(f"{Fore.WHITE}Quick fix:{Style.RESET_ALL}")
+    print(f"  1. Copy .env_example to .env")
+    print(f"  2. Edit .env and fill in your API credentials")
+    print(f"  3. Run: arc doctor\n")
+    return 1
 
 
 def interactive_config_setup() -> int:

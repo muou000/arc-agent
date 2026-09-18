@@ -236,10 +236,7 @@ def _append_tool_call(
     name = str(item.get("name", "") or "")
     call_id = str(item.get("call_id") or item.get("id") or "")
     arguments = item.get("arguments", "{}")
-    if isinstance(arguments, dict):
-        args = arguments
-    else:
-        args = None
+    args = arguments if isinstance(arguments, dict) else None
     if args is not None:
         tool_calls.append(
             {

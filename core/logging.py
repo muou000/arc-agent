@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from contextlib import suppress
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
@@ -59,10 +60,8 @@ def _configure_text_stream(stream: Any) -> bool:
 
     flush = getattr(stream, "flush", None)
     if callable(flush):
-        try:
+        with suppress(OSError, ValueError):
             flush()
-        except (OSError, ValueError):
-            pass
     return configured
 
 
