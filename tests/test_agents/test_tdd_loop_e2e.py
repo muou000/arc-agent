@@ -29,6 +29,7 @@ from tests.helpers.faux import (
 
 UNIT_TEST_FILE = "tests/unit/test_calc.py"
 INTEGRATION_TEST_FILE = "tests/integration/test_flow.py"
+E2E_TEST_FILE = "test-e2e/register.e2e.spec.js"
 
 
 def seed_node(runtime, node_id: str, tests: list[dict]) -> None:
@@ -92,6 +93,20 @@ def track_tdd_sessions(tdd: TestDrivenDeveloper) -> list[str]:
 
     tdd.run = recording_run
     return session_types
+
+
+def track_tdd_handoffs(tdd: TestDrivenDeveloper) -> list[str]:
+    """Record the ``previous_failure_summary`` of every agent session."""
+
+    handoffs: list[str] = []
+    original_run = tdd.run
+
+    async def recording_run(**kwargs: Any) -> str:
+        handoffs.append(str(kwargs.get("previous_failure_summary") or ""))
+        return await original_run(**kwargs)
+
+    tdd.run = recording_run
+    return handoffs
 
 
 def tool_results_text(model: FauxChatModel) -> str:
@@ -1007,3 +1022,169 @@ def test_all_green_without_full_run_closes_layer_via_system_regression(tmp_proje
     assert arc_runtime.traceability.get_test("T2")["passed"] is True
     node_session = sessions.load_node_session(node_id)
     assert node_session["recent_failure_summary"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Failure digest: raw-output persistence, digest in tool results, diff hint
+# ---------------------------------------------------------------------------
+
+
+E2E_FAILURE_OUTPUT = """Exit Code: 1
+
+Running 2 tests using 1 worker
+
+  ✘  1 test-e2e\register.e2e.spec.js:20:3 › register › rejects invalid input (5.1s)
+
+  1) test-e2e\register.e2e.spec.js:20:3 › register › rejects invalid input ─────
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByLabel('用户名')
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+Exit Code: 1
+"""
+
+
+def test_run_tests_result_carries_digest_and_log_pointer(tmp_project_dir: Path, arc_runtime) -> None:
+    """A failed run must give the agent the structured digest and a log path.
+
+    This is the in-session half of the failure-visibility contract: the model
+    sees each failed test's location and expected/received up front, plus a
+    pointer to the persisted raw output so re-reading the full output is one
+    read_file call instead of a re-run.
+    """
+
+    node_id = "REQ-TDD-DIGEST"
+    tests = [{"test_id": "T1", "type": "E2E", "file_path": E2E_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    (tmp_project_dir / E2E_TEST_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_project_dir / E2E_TEST_FILE).write_text("// e2e spec\n", encoding="utf-8")
+
+    # Session 1 runs once (fail) then a continuation note; session 2 makes no
+    # run_tests call, which ends the layer ("ended without calling run_tests").
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {}, call_id="c1"),
+            faux_text("continuation needed"),
+            faux_text("no more attempts"),
+            faux_text("script pad for an extra scheduler turn"),
+        ]
+    )
+    # Baseline fails, agent run fails.
+    fake = FakeAppHandler([E2E_FAILURE_OUTPUT, E2E_FAILURE_OUTPUT])
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is False
+    results = tool_results_text(model)
+    # The agent-facing run_tests result carries the digest block.
+    assert "Structured Failure Digest" in results
+    assert "register › rejects invalid input" in results
+    assert "getByLabel('用户名')" in results
+    # ...and the persisted raw-output pointer.
+    assert "ARC_RUN_OUTPUT_LOG" in results
+    assert ".arc/tdd_runs/REQ-TDD-DIGEST/E2E-" in results
+    # The log file itself exists under the runtime-ignored .arc tree and holds
+    # the raw output of the agent's run (the per-file baseline runs go through
+    # the system path, not run_requested_tests, so they are not persisted).
+    log_files = sorted((tmp_project_dir / ".arc" / "tdd_runs" / node_id).glob("*.log"))
+    assert len(log_files) == 1
+    assert "getByLabel('用户名')" in log_files[0].read_text(encoding="utf-8")
+
+
+def test_tdd_handoff_records_modified_files(tmp_project_dir: Path, arc_runtime) -> None:
+    """The node session handoff must tell the next TDD round what was edited.
+
+    ``tdd_handoff.modified_files`` used to be a permanently empty list; it now
+    carries the stage-discipline write paths of the last session so a later
+    round (post-run TDD retry, --retry-failed) does not re-derive them.
+    """
+
+    node_id = "REQ-TDD-HANDOFF"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    write_test_file(tmp_project_dir)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/src/calc.py", "content": "def add(a, b):\n    return a - b\n"},
+                call_id="c1",
+            ),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="c2"),
+            faux_text("continuation needed"),
+            faux_text("no more attempts"),
+            faux_text("script pad for an extra scheduler turn"),
+        ]
+    )
+    # Baseline fails, agent run fails with a DIFFERENT detail so the
+    # fingerprints differ (exercises the "fingerprint moved" branch).
+    fake = FakeAppHandler(
+        [
+            failing_test_output(detail="AssertionError: expected 2 got 1"),
+            failing_test_output(detail="AssertionError: expected 2 got 3"),
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is False
+    node_session = sessions.load_node_session(node_id)
+    # modified_files is the round-level union of the sessions' writes, from
+    # the stage discipline rather than the model's self-report — the last
+    # session here wrote nothing, so only the union survives it.
+    assert node_session["tdd_handoff"]["modified_files"] == ["src/calc.py"]
+
+
+def test_followup_session_receives_digest_and_diff_hint(tmp_project_dir: Path, arc_runtime) -> None:
+    """A second session on the same layer starts from the three-part handoff.
+
+    Session 1 fails; session 2's prompt must carry the structured digest (not
+    just a raw tail), the files session 1 edited, and the fingerprint movement.
+    """
+
+    node_id = "REQ-TDD-HANDOFF-2"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    write_test_file(tmp_project_dir)
+
+    model = FauxChatModel(
+        responses=[
+            # Session 1: write, run (fail), run (same failure), end turn.
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/src/calc.py", "content": "def add(a, b):\n    return a - b\n"},
+                call_id="s1c1",
+            ),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="s1c2"),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="s1c3"),
+            faux_text("continuation needed"),
+            # Session 2: no run_tests call, ends the layer.
+            faux_text("no more attempts"),
+        ]
+    )
+    # Baseline plus the two session-1 runs all fail with the SAME detail: the
+    # diff hint must then report that the fingerprint DID NOT change.
+    fake = FakeAppHandler([failing_test_output()] * 3)
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    handoffs = track_tdd_handoffs(tdd)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert len(handoffs) == 2
+    session2_handoff = handoffs[1]
+    assert "Files edited by the previous session" in session2_handoff
+    assert "`src/calc.py`" in session2_handoff
+    assert "DID NOT change" in session2_handoff
+    # The digest from the adapter's last failed run is the evidence part.
+    assert "Structured Failure Digest" in session2_handoff
+    # And the persisted raw output pointer reached the next session.
+    assert ".arc/tdd_runs/" in session2_handoff

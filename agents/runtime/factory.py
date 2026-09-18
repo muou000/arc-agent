@@ -579,6 +579,15 @@ def _build_filesystem_permissions(
     skill_instruction_paths: list[str],
 ) -> list[Any]:
     permissions: list[Any] = [
+        # Read-only escape hatch carved out of the .arc deny below: TDD run
+        # outputs are persisted under .arc/tdd_runs so a follow-up session
+        # can read the exact failed output instead of re-running tests.
+        # First-match-wins, so this must precede the deny rules.
+        FilesystemPermission(
+            operations=["read"],
+            paths=[f"{WORKSPACE_PREFIX}/.arc/tdd_runs", f"{WORKSPACE_PREFIX}/.arc/tdd_runs/**"],
+            mode="allow",
+        ),
         FilesystemPermission(
             operations=["read", "write"],
             paths=[
