@@ -60,6 +60,12 @@ def _node_supports_require_esm(version_text: str) -> bool:
 # Generous because a cold machine downloads ~150 MB of browser binaries. Once
 # the machine-wide Playwright cache is warm the command exits in seconds.
 PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
+# The browser task starts with npm, but waits until npm has materialized the
+# local Playwright CLI before touching the workspace. This preserves the
+# package-version coupling while overlapping the browser download with the
+# remainder of dependency installation.
+PLAYWRIGHT_CLI_WAIT_TIMEOUT_SECONDS = 60.0
+PLAYWRIGHT_CLI_POLL_INTERVAL_SECONDS = 0.1
 # Escape hatch for machines that intentionally run without browser binaries or
 # without the network access the download requires.
 _BROWSER_INSTALL_SKIP_VALUES = {"1", "true", "yes", "on"}
@@ -107,6 +113,29 @@ def _browser_install_command(backend_dir: str) -> str:
     if scripts.get("e2e:install-browsers"):
         return "npm run e2e:install-browsers"
     return "npx playwright install chromium chromium-headless-shell"
+
+
+def _playwright_dependency_declared(backend_dir: str) -> bool:
+    manifest = os.path.join(backend_dir, "package.json")
+    try:
+        with open(manifest, "r", encoding="utf-8") as file:
+            package = json.loads(file.read())
+    except (OSError, ValueError):
+        return False
+    for section_name in ("dependencies", "devDependencies", "optionalDependencies"):
+        section = package.get(section_name) or {}
+        if "playwright" in section or "@playwright/test" in section:
+            return True
+    return False
+
+
+def _playwright_cli_ready(backend_dir: str) -> bool:
+    candidates = (
+        os.path.join(backend_dir, "node_modules", ".bin", "playwright"),
+        os.path.join(backend_dir, "node_modules", ".bin", "playwright.cmd"),
+        os.path.join(backend_dir, "node_modules", "playwright", "cli.js"),
+    )
+    return any(os.path.isfile(candidate) for candidate in candidates)
 
 
 def node_modules_ready(target_dir: str) -> bool:
@@ -1836,14 +1865,42 @@ class WebAppType(AppTypeHandler):
                 "System",
                 f"Installing {label} dependencies. This might take a moment...",
             )
-        results = await asyncio.gather(
-            *(run_npm_install(target_path, self.log_cb) for _label, target_path in installable)
-        )
-        if all(results):
+
+        browser_task: asyncio.Task[bool] | None = None
+        backend_dir = os.path.join(self.workspace_path, "backend")
+        if (
+            os.path.isdir(backend_dir)
+            and not _browser_install_skipped()
+            and _playwright_dependency_declared(backend_dir)
+        ):
+            await self._log(
+                "System",
+                "Installing Playwright browsers alongside npm dependencies...",
+            )
+            browser_task = asyncio.create_task(
+                self._verify_e2e_runner(wait_for_cli=True)
+            )
+
+        try:
+            results = await asyncio.gather(
+                *(run_npm_install(target_path, self.log_cb) for _label, target_path in installable)
+            )
+            if not all(results):
+                return False
+
             for label, target_path in installable:
                 if label == "frontend":
                     await self._ensure_testing_library_dom(target_path)
-        return all(results)
+
+            if browser_task is not None and not await browser_task:
+                return False
+            return True
+        finally:
+            # A failed npm install must not leave a browser download waiting on
+            # a CLI that will never appear in the incomplete node_modules tree.
+            if browser_task is not None and not browser_task.done():
+                browser_task.cancel()
+                await asyncio.gather(browser_task, return_exceptions=True)
 
     async def _ensure_testing_library_dom(self, frontend_dir: str) -> None:
         """Install the missing ``@testing-library/dom`` peer without editing files.
@@ -1915,7 +1972,24 @@ class WebAppType(AppTypeHandler):
 
         return await self._verify_e2e_runner()
 
-    async def _verify_e2e_runner(self) -> bool:
+    async def _wait_for_playwright_cli(self, backend_dir: str) -> None:
+        if not _playwright_dependency_declared(backend_dir):
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PLAYWRIGHT_CLI_WAIT_TIMEOUT_SECONDS
+        while not _playwright_cli_ready(backend_dir):
+            if loop.time() >= deadline:
+                await self._log(
+                    "System",
+                    "Playwright CLI did not appear during npm install; continuing with "
+                    "the configured browser install command.",
+                    "warning",
+                )
+                return
+            await asyncio.sleep(PLAYWRIGHT_CLI_POLL_INTERVAL_SECONDS)
+
+    async def _verify_e2e_runner(self, *, wait_for_cli: bool = False) -> bool:
         """Provision the Playwright browsers before the node loop starts.
 
         The template declares `@playwright/test`, but npm only installs the
@@ -1938,13 +2012,19 @@ class WebAppType(AppTypeHandler):
         backend_dir = os.path.join(self.workspace_path, "backend")
         if not os.path.isdir(backend_dir):
             return True
+        if getattr(self, "_playwright_browsers_ready", False):
+            return True
         if _browser_install_skipped():
             await self._log(
                 "System",
                 "Skipping Playwright browser install (ARC_SKIP_BROWSER_INSTALL is set). "
                 "E2E tests will fail on a missing browser until the binaries are installed.",
             )
+            self._playwright_browsers_ready = True
             return True
+
+        if wait_for_cli:
+            await self._wait_for_playwright_cli(backend_dir)
 
         await self._log("System", "Verifying workspace: installing Playwright browsers...")
         result = await _execute_web_test_command(
@@ -1954,6 +2034,7 @@ class WebAppType(AppTypeHandler):
         )
         if _extract_exit_code(result) == 0:
             await self._log("System", "Workspace verification passed: Playwright browsers ready.")
+            self._playwright_browsers_ready = True
             return True
 
         await self._log(
