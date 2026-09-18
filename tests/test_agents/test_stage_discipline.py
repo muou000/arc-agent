@@ -156,6 +156,35 @@ def test_test_generation_repeated_write_block_lists_actionable_exits() -> None:
             assert "new path" not in blocked.content
 
 
+def test_interface_design_first_repeated_write_explains_unlock_condition() -> None:
+    middleware = make("interface_design")
+    path = "/workspace/src/calc.py"
+    run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
+
+    first_block = run(
+        middleware,
+        make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c2"),
+    )
+    assert first_block.status == "error"
+    assert "Unlock condition" in first_block.content
+    assert "failed file operation" in first_block.content
+    assert "run_build" in first_block.content and "run_tests" in first_block.content
+    assert "delete" in first_block.content
+    assert "do not invoke validation merely to unlock it" in first_block.content
+    assert "Do not retry this path" in first_block.content
+    assert "final response's `interfaces` array" in first_block.content
+
+    # The detailed hint is only needed on the first blocked rewrite for a path;
+    # later blocks use the existing compact exit to avoid context churn.
+    second_block = run(
+        middleware,
+        make_request("write_file", {"file_path": path, "content": "v3\n"}, call_id="c3"),
+    )
+    assert second_block.status == "error"
+    assert "Unlock condition" not in second_block.content
+    assert "response" in second_block.content and "skeleton" in second_block.content
+
+
 def test_repeated_read_block_does_not_offer_offset_probing() -> None:
     # run7 evidence: 50 consecutive offset=0..49 probe reads, each accepted as
     # a "non-overlapping range" by the old message that suggested paginated

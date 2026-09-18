@@ -39,6 +39,14 @@ _WRITE_BLOCK_EXITS = {
     ),
 }
 
+_INTERFACE_DESIGN_FIRST_WRITE_BLOCK_EXIT = (
+    "Unlock condition: only a failed file operation on this path or a failing "
+    "`run_build`/`run_tests` validation unlocks it. `delete` is disabled in "
+    "DESIGN; do not invoke validation merely to unlock it. Do not retry this "
+    "path; keep the skeleton and put its contract in the final response's "
+    "`interfaces` array."
+)
+
 
 class StageDisciplineState(TypedDict, total=False):
     """Run-local state used to prevent redundant file-tool loops."""
@@ -71,6 +79,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         self._failed_paths: set[str] = set()
         self._validation_failed = False
         self._design_write_count = 0
+        self._write_block_counts: dict[str, int] = {}
 
     def wrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
         blocked = self._validate_tool_call(request)
@@ -178,9 +187,14 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if not path:
             return None
         if path in self._written_paths and not self._path_unlocked(path):
+            block_count = self._write_block_counts.get(path, 0) + 1
+            self._write_block_counts[path] = block_count
+            exit_text = _WRITE_BLOCK_EXITS[self._stage]
+            if self._stage == "interface_design" and block_count == 1:
+                exit_text = _INTERFACE_DESIGN_FIRST_WRITE_BLOCK_EXIT
             return (
                 f"Repeated write blocked: {path} was already changed in this stage. "
-                f"{_WRITE_BLOCK_EXITS[self._stage]}"
+                f"{exit_text}"
             )
         if self._stage == "test_generation" and not _is_test_asset(path):
             return (
@@ -242,6 +256,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             self._written_paths.discard(path)
             self._failed_paths.discard(path)
             self._read_ranges.pop(path, None)
+            self._write_block_counts.pop(path, None)
             self._discard_written_path(request, path)
             return
         if name == "read_file" and path:
@@ -253,6 +268,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             if path not in self._written_paths and self._stage == "interface_design":
                 self._design_write_count += 1
             self._written_paths.add(path)
+            self._write_block_counts.pop(path, None)
             self._cache_written_path(request, path)
 
     def materialized_paths(self) -> list[str]:
