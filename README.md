@@ -257,7 +257,8 @@ Eval Comparisons
 - 运行按 repetition 配对：pass rate 是配对运行中编译成功（runner 退出码为 0 且无 FAILED
   节点、queue task 全部完成且没有非终态节点）的占比，tokens / latency / est. cost 是配对运行的均值差；
   `comparison.latency_distribution` 还提供每个 arm 的 mean/median/p95/min/max 和 paired delta，避免
-  长尾运行被均值掩盖；cache hit rate 的口径
+  长尾运行被均值掩盖；`report.txt` 的 p95 行同时标出样本数，避免把单次调试运行误读为稳定的
+  百分位估计；cache hit rate 的口径
   与「Token 用量统计」一致（`runs.jsonl` 中存 0–1 比率，报告中以百分点呈现），运行中没有任何
   provider 已报告缓存分解的调用时记为 None。一侧缺失遥测时该指标标记 unavailable 而不是
   猜测。成本为 CNY，来自 `agents/model/costing.py` 单价目录。
@@ -265,7 +266,8 @@ Eval Comparisons
  记录）和 `sessions/<run_id>/`（该次运行的 runner 事件、队列、追溯表、节点会话与控制台
  输出快照）。每条 run 还含 `diagnostics`：task 完成计数、失败事件/fingerprint、traceability
   测试状态、LLM 按节点/阶段/模型聚合、tool blocked/error/empty/unpaged 信号和明确的 outcome
-  分类。工件中的 arm 环境变量会对疑似 key/token/secret/password 字段脱敏。运行工作区默认放在系统临时目录并在快照后删除，
+  分类。`events_present` 标记 runner event 是否存在；缺失 event 不会伪造 token/cost 数据。
+  工件中的 arm 环境变量会对敏感 key/token/secret/password 字段及常见 token 值脱敏。运行工作区默认放在系统临时目录并在快照后删除，
   `--work-root` /
   `--keep-workspaces` 可控制。
 

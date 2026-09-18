@@ -114,7 +114,7 @@ make clean       # 清理 pytest 缓存与 __pycache__
   unavailable 语义。
 - 报告渲染与 pi `Eval Comparisons` 版式一致（`report.txt` / `report.json` / `runs.jsonl`）。
 - 运行诊断：queue task 完成门禁、非终态节点拒绝、失败事件/fingerprint、traceability 测试汇总、
-  LLM/tool 分维度聚合、arm 交替顺序和敏感环境变量脱敏。
+  LLM/tool 分维度聚合、`events_present`、arm 交替顺序和敏感环境变量名/值脱敏。
 - `eval_table` 端到端（`fake_eval_runner.py`）：工件落盘、`.arc` 证据快照、工作区清理、
   超时与启动失败仍产出报告。
 - `arc eval` 子命令的参数解析、校验与 `--runner-script` 注入路径。

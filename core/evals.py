@@ -82,7 +82,21 @@ _TASK_COMPLETED_STATES = frozenset({"COMPLETED"})
 _TASK_FAILED_STATES = frozenset({"FAILED"})
 _ARM_ORDER_VALUES = frozenset({"baseline-first", "candidate-first", "alternate"})
 _SECRET_ENV_MARKERS = frozenset(
-    {"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"}
+    {
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PWD",
+        "CREDENTIAL",
+        "APIKEY",
+    }
+)
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"(?i)\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"),
+    re.compile(r"(?i)\bBearer\s+\S+"),
 )
 _MAX_FAILURE_EVENTS = 20
 
@@ -181,15 +195,18 @@ def task_outcome_counts(tasks: Sequence[dict[str, Any]] | None) -> dict[str, int
 
 
 def _redact_env(env: dict[str, str]) -> dict[str, str]:
-    """Keep eval provenance useful without copying credentials into artifacts."""
+    """Keep eval provenance useful without copying likely credentials into artifacts."""
 
     redacted: dict[str, str] = {}
     for key, value in env.items():
         normalized = str(key).upper().replace("-", "_")
-        if any(marker in normalized.split("_") for marker in _SECRET_ENV_MARKERS):
+        value_text = str(value)
+        key_is_sensitive = any(token in _SECRET_ENV_MARKERS for token in normalized.split("_"))
+        value_is_sensitive = any(pattern.search(value_text) for pattern in _SECRET_VALUE_PATTERNS)
+        if key_is_sensitive or value_is_sensitive:
             redacted[str(key)] = "<redacted>"
         else:
-            redacted[str(key)] = str(value)
+            redacted[str(key)] = value_text
     return redacted
 
 
@@ -369,6 +386,7 @@ def summarize_run_diagnostics(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
             {
                 "runs": 0,
                 "outcomes": Counter(),
+                # Event-level count; distinct from one outcome per run.
                 "failure_events": 0,
                 "llm": {"calls": 0, "total_tokens": 0, "cost_total": 0.0},
                 "tools": {
@@ -426,17 +444,16 @@ def collect_run_record(
     workspace = Path(workspace)
     usage: dict[str, Any] | None = None
     events_path = workspace / ".arc" / "runner-events.jsonl"
-    llm_summary: dict[str, Any] = {"totals": {}, "by_node": {}, "by_phase": {}, "by_model": {}}
-    tool_summary: dict[str, Any] = {"totals": {}, "by_node": {}, "by_tool": {}, "by_phase": {}}
+    llm_summary = aggregate_llm_usage(events_path)
+    tool_summary = aggregate_tool_usage(events_path)
     event_summary = {
         "counts": {},
         "requirement_states": {},
         "failure_count": 0,
         "failures": [],
     }
+    events_present = events_path.exists()
     if events_path.exists():
-        llm_summary = aggregate_llm_usage(events_path)
-        tool_summary = aggregate_tool_usage(events_path)
         event_summary = _summarize_runner_events(events_path)
         totals = llm_summary["totals"]
         usage = {
@@ -482,6 +499,7 @@ def collect_run_record(
         "outcome": "passed" if passed else outcome,
         "diagnostics": {
             "wall_clock_ms": float(latency_ms),
+            "events_present": events_present,
             "tasks": {**task_counts, "present": isinstance(tasks_raw, list) and bool(tasks)},
             "events": event_summary,
             "llm_usage": llm_summary,
@@ -599,9 +617,11 @@ def render_report_text(report: dict[str, Any]) -> str:
         baseline_p95 = latency_distribution["baseline"].get("p95")
         candidate_p95 = latency_distribution["candidate"].get("p95")
         if baseline_p95 is not None and candidate_p95 is not None:
+            baseline_n = latency_distribution["baseline"].get("n")
+            candidate_n = latency_distribution["candidate"].get("n")
             lines.append(
-                f"{'Latency p95':>13}  candidate {candidate_p95:.1f}ms, "
-                f"baseline {baseline_p95:.1f}ms"
+                f"{'Latency p95':>13}  candidate {candidate_p95:.1f}ms (n={candidate_n}), "
+                f"baseline {baseline_p95:.1f}ms (n={baseline_n})"
             )
     lines.append(f"{'Est. cost':>13}  {_format_cost_delta(comparison['est_cost'])}")
     return "\n".join(lines)

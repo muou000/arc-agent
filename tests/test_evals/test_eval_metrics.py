@@ -254,6 +254,21 @@ def test_collect_run_record_without_artifacts(tmp_path):
     assert record["usage"] is None
 
 
+def test_collect_run_record_without_events_keeps_pass_and_marks_unmeasured(tmp_path):
+    workspace = _write_workspace(
+        tmp_path,
+        node_states={"n1": "PASSED"},
+        usage_events=None,
+    )
+    record = collect_run_record(workspace, exit_code=0, latency_ms=100.0)
+    assert record["passed"] is True
+    assert record["outcome"] == "passed"
+    assert record["usage"] is None
+    assert record["diagnostics"]["events_present"] is False
+    assert record["diagnostics"]["llm_usage"]["totals"]["calls"] == 0
+    assert record["diagnostics"]["tool_usage"]["totals"]["calls"] == 0
+
+
 # ---------------------------------------------------------------------------
 # summarize_runs
 # ---------------------------------------------------------------------------
@@ -400,6 +415,28 @@ def test_render_report_text_unavailable_branches():
     assert "    Candidate  c (0/5 pairs)" in text
     assert "unavailable (0/5 pairs)" in text
     assert text.count("unavailable (missing telemetry)") == 4
+
+
+def test_render_report_text_annotates_latency_p95_sample_counts():
+    report = {
+        "set_name": "small sample",
+        "baseline": {"label": "b"},
+        "candidate": {"label": "c"},
+        "comparison": {
+            "pairs": 1,
+            "repetitions": 1,
+            "pass_rate": {"baseline": 100.0, "candidate": 100.0, "delta_pp": 0.0},
+            "tokens": {"baseline": 1.0, "candidate": 1.0, "delta": 0.0},
+            "cache_hit_rate": {"baseline": None, "candidate": None, "delta": None},
+            "latency_ms": {"baseline": 100.0, "candidate": 90.0, "delta": -10.0},
+            "latency_distribution": {
+                "baseline": {"n": 1, "p95": 100.0},
+                "candidate": {"n": 1, "p95": 90.0},
+            },
+            "est_cost": {"baseline": 0.0, "candidate": 0.0, "delta": 0.0},
+        },
+    }
+    assert "Latency p95  candidate 90.0ms (n=1), baseline 100.0ms (n=1)" in render_report_text(report)
 
 
 # ---------------------------------------------------------------------------

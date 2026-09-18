@@ -139,7 +139,14 @@ def test_eval_table_keep_workspaces(tmp_path):
 def test_eval_table_alternate_arm_order_and_redacts_secrets(tmp_path):
     baseline = ArmConfig(
         label="b",
-        env={"OPENAI_API_KEY": "secret", "EVAL_FAKE_TOKENS": "10"},
+        env={
+            "OPENAI_API_KEY": "secret",
+            "EVAL_FAKE_TOKENS": "10",
+            "API_KEYWORD": "visible config",
+            "ARC_FOO_APIKEY": "secret-value",
+            "NOTE": "token=sk-proj-test-secret-value-12345",
+            "CUSTOM_HEADER": "Bearer test-header-token-12345",
+        },
     )
     candidate = ArmConfig(label="c", env={"EVAL_FAKE_TOKENS": "10"})
     result = eval_table(
@@ -162,6 +169,10 @@ def test_eval_table_alternate_arm_order_and_redacts_secrets(tmp_path):
     ]
     assert result.report["arm_order"] == "alternate"
     assert result.report["baseline"]["env"]["OPENAI_API_KEY"] == "<redacted>"
+    assert result.report["baseline"]["env"]["API_KEYWORD"] == "visible config"
+    assert result.report["baseline"]["env"]["ARC_FOO_APIKEY"] == "<redacted>"
+    assert result.report["baseline"]["env"]["NOTE"] == "<redacted>"
+    assert result.report["baseline"]["env"]["CUSTOM_HEADER"] == "<redacted>"
     assert result.runs[0]["env"]["OPENAI_API_KEY"] == "<redacted>"
 
 
