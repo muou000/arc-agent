@@ -1213,7 +1213,9 @@ def test_test_generator_helpers_stay_writable_without_declaration(tmp_project_di
     assert (tmp_project_dir / "tests" / "setup-tests.ts").exists()
 
 
-def test_test_generator_repair_pass_cannot_introduce_new_test_paths(tmp_project_dir: Path, arc_runtime) -> None:
+def test_test_generator_repair_pass_cannot_introduce_new_test_paths(
+    tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The green-baseline repair lock is pre-seeded with the previous
     manifest: deleting a green file and re-adding the coverage under a fresh
     name (the rename escape) is blocked at write time."""
@@ -1233,6 +1235,23 @@ def test_test_generator_repair_pass_cannot_introduce_new_test_paths(tmp_project_
     green_file = tmp_project_dir / "backend" / "tests" / "unit" / "green.test.js"
     green_file.parent.mkdir(parents=True, exist_ok=True)
     green_file.write_text("test('tautology', () => { expect(true).toBe(true); });\n", encoding="utf-8")
+
+    original_current_interface_ids = TestGenerator._current_interface_ids
+    current_interface_id_calls = 0
+
+    def count_current_interface_id_reads(
+        requested_node_id: str,
+        interfaces: list[dict[str, object]] | None = None,
+    ) -> list[str]:
+        nonlocal current_interface_id_calls
+        current_interface_id_calls += 1
+        return original_current_interface_ids(requested_node_id, interfaces)
+
+    monkeypatch.setattr(
+        TestGenerator,
+        "_current_interface_ids",
+        staticmethod(count_current_interface_id_reads),
+    )
 
     model = FauxChatModel(
         responses=[
@@ -1288,6 +1307,7 @@ def test_test_generator_repair_pass_cannot_introduce_new_test_paths(tmp_project_
     assert tests is not None and len(tests) == 1
     assert tests[0]["file_path"] == "backend/tests/unit/green.test.js"
     assert not (tmp_project_dir / "backend" / "tests" / "unit" / "greenV2.test.js").exists()
+    assert current_interface_id_calls == 1
 
 
 # ---------------------------------------------------------------------------

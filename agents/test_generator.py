@@ -283,6 +283,8 @@ class TestGenerator:
             or os.getcwd()
         ).expanduser().resolve())
         app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
+        current_interfaces = self._current_node_interfaces(node_id)
+        current_interface_ids = self._current_interface_ids(node_id, current_interfaces)
         # Pre-seed the manifest lock with the previous manifest's paths: a
         # repair pass may only delete or rewrite existing test files, never
         # introduce a new path. This closes the rename escape (delete the
@@ -313,15 +315,15 @@ class TestGenerator:
                 *build_traceability_tools(
                     node_id=node_id,
                     log_cb=self.log_cb,
-                    current_interfaces=self._current_node_interfaces(node_id),
+                    current_interfaces=current_interfaces,
                 ),
                 build_declare_test_manifest_tool(
                     node_id=node_id,
                     manifest_lock=manifest_lock,
                     validate_test_path=self._make_path_validator(app_type, workspace_root),
                     log_cb=self.log_cb,
-                    current_interface_ids=self._current_interface_ids(node_id),
-                    require_interface_coverage=bool(self._current_interface_ids(node_id)),
+                    current_interface_ids=current_interface_ids,
+                    require_interface_coverage=bool(current_interface_ids),
                 ),
             ],
             node_id=node_id,
