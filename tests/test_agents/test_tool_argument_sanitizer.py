@@ -59,6 +59,17 @@ def test_write_file_envelope_is_unwrapped_before_execution() -> None:
     assert recorder[0]["args"]["content"] == "body"
 
 
+def test_append_file_envelope_is_unwrapped_before_execution() -> None:
+    recorder: list = []
+    middleware = ToolArgumentSanitizerMiddleware()
+    request = _request("append_file", {"file_path": "a.ts", "content": {"$text": "body"}})
+
+    result = asyncio.run(middleware.awrap_tool_call(request, _handler(recorder)))
+
+    assert result == "tool-executed"
+    assert recorder[0]["args"]["content"] == "body"
+
+
 def test_write_file_non_string_payload_is_rejected_without_executing() -> None:
     recorder: list = []
     middleware = ToolArgumentSanitizerMiddleware()
