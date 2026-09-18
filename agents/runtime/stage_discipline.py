@@ -151,7 +151,13 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 "Split the next cohesive skeleton section into another append."
             )
         if self._file_claim_gate is not None:
-            return self._file_claim_gate.check_and_claim(path)
+            blocked = self._file_claim_gate.check_and_claim(path)
+            if blocked:
+                return blocked
+        # Reserve the append budget before invoking the filesystem tool. A
+        # failed append still represents a model attempt and must not become
+        # an unbounded retry loop around a missing or denied file.
+        self._append_counts[path] = count + 1
         return None
 
     def _validate_test_manifest_path(self, args: dict[str, Any], *, operation: str) -> str | None:
@@ -294,8 +300,6 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             self._read_ranges.setdefault(path, []).append((offset, offset + limit))
             self._cache_read_summary(request, path, offset, limit, result)
         if (name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS) and path:
-            if name == "append_file":
-                self._append_counts[path] = self._append_counts.get(path, 0) + 1
             if path not in self._written_paths and self._stage == "interface_design":
                 self._design_write_count += 1
             self._written_paths.add(path)

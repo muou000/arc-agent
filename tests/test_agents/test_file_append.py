@@ -49,10 +49,15 @@ def test_append_rejects_oversized_chunks_and_path_escape(tmp_path: Path) -> None
     tool = build_append_file_tool(workspace_root=str(tmp_path))
 
     oversized = _invoke(tool, file_path="/workspace/src/page.tsx", content="x\n" * 81)
+    safe_name = tmp_path / "src" / "..bar" / "safe.ts"
+    safe_name.parent.mkdir(parents=True)
+    safe_name.write_text("x\n", encoding="utf-8")
+    safe_name_result = _invoke(tool, file_path="/workspace/src/..bar/safe.ts", content="y")
     escaped = _invoke(tool, file_path="/workspace/../outside.ts", content="x")
 
     assert "Appended" not in oversized
     assert "at most 80" in oversized or "skeleton ceiling" in oversized
+    assert "Appended 1 line(s)" in safe_name_result
     assert "traversal" in escaped or "outside the project root" in escaped
 
 

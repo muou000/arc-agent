@@ -411,6 +411,37 @@ def test_interface_design_allows_bounded_append_continuations() -> None:
     assert blocked.status == "error" and "only available during the interface_design stage" in blocked.content
 
 
+def test_failed_append_attempts_consume_the_per_file_budget() -> None:
+    middleware = make("interface_design")
+    path = "/workspace/src/page.tsx"
+    assert run(
+        middleware,
+        make_request("write_file", {"file_path": path, "content": "export function Page() {\n"}, call_id="w1"),
+    ).content == "ok"
+
+    def failed_append(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="Error: transient append failure",
+            name=request.tool_call["name"],
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+    for index in range(3):
+        result = run(
+            middleware,
+            make_request("append_file", {"file_path": path, "content": "  // retry\n"}, call_id=f"f{index}"),
+            failed_append,
+        )
+        assert result.status == "error" and "transient append failure" in result.content
+
+    blocked = run(
+        middleware,
+        make_request("append_file", {"file_path": path, "content": "  // retry again\n"}, call_id="f3"),
+    )
+    assert blocked.status == "error" and "at most 3 times" in blocked.content
+
+
 # ---------------------------------------------------------------------------
 # read_file discipline
 # ---------------------------------------------------------------------------
