@@ -787,19 +787,42 @@ def test_templates_without_registered_fixes_are_untouched(tmp_path) -> None:
     assert apply_template_patches(str(tmp_path), "cli-python") == []
 
 
-def test_repo_template_readme_documents_the_runtime_contract(monkeypatch) -> None:
-    """The contract line must survive in the repo README even though the fix
-    itself is delivered by patches: a maintainer reading the shipped template
-    has to see what behavior ARC guarantees and where the fix lives.
+def test_repo_template_readme_documents_the_runtime_contract(tmp_path) -> None:
+    """The contract line must reach the generated workspace's README.
+
+    The repo mirror now tracks the official template, so the pre-fix README
+    carries no contract line of its own; the patches deliver it, and a
+    maintainer reading a scaffolded workspace has to see what behavior ARC
+    guarantees and where the fix lives.
     """
 
-    monkeypatch.delenv("ARC_AGENT_TEMPLATES_ROOT", raising=False)
-    readme = (
-        Path(web_handler.WebAppType.template_dir()) / "README.md"
-    ).read_text(encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+    assert all(outcome.status == APPLIED for outcome in outcomes), outcomes
+    readme = (workspace / "README.md").read_text(encoding="utf-8")
 
     assert "never returns a closed handle" in readme
     assert "template_patches.py" in readme
+
+
+def test_repo_template_tracks_the_official_prefix_shapes() -> None:
+    """The mirror must ship the shapes the patch chain searches for.
+
+    The patch search shapes assume the official provisioned template's pre-fix
+    content. On 2026-09-18 the mirror had drifted ahead of it (it carried a
+    repo-only fix the platform never received), the first edit matched nothing,
+    and every online run aborted at scaffold time. Pinning the pre-fix shape
+    here turns that drift into a local test failure instead.
+    """
+
+    mirror = (SHIPPED_TEMPLATE_ROOT / "backend" / "src" / "database" / "init_db.js").read_text(
+        encoding="utf-8"
+    ).replace("\r\n", "\n")
+
+    assert "  if (initPromise) {\n    return initPromise;\n  }\n" in mirror
+    assert "function startInit() {" not in mirror
+    assert "const MAX_INIT_ATTEMPTS" not in mirror
 
 
 def test_patch_dependencies_must_be_registered_in_order() -> None:
