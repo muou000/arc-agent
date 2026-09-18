@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import core.logging as arc_logging
 
 
 def test_configured_stdio_delivers_print_before_process_exit() -> None:
@@ -14,11 +17,12 @@ def test_configured_stdio_delivers_print_before_process_exit() -> None:
     code = (
         "from core.logging import configure_process_stdio; "
         "configure_process_stdio(); "
-        "print('ARC_LIVE_OUTPUT'); "
+        "print('ARC_LIVE_OUTPUT_1'); "
+        "print('ARC_LIVE_OUTPUT_2'); "
         "import time; time.sleep(1.2)"
     )
     env = os.environ.copy()
-    env.pop("PYTHONUNBUFFERED", None)
+    env["PYTHONUNBUFFERED"] = "0"
 
     process = subprocess.Popen(
         [sys.executable, "-c", code],
@@ -31,10 +35,32 @@ def test_configured_stdio_delivers_print_before_process_exit() -> None:
     started = time.monotonic()
     try:
         assert process.stdout is not None
-        line = process.stdout.readline()
+        lines = [process.stdout.readline(), process.stdout.readline()]
         elapsed = time.monotonic() - started
-        assert line == "ARC_LIVE_OUTPUT\n"
+        assert lines == ["ARC_LIVE_OUTPUT_1\n", "ARC_LIVE_OUTPUT_2\n"]
         assert elapsed < 1.0
+        assert process.poll() is None
     finally:
         process.terminate()
         process.communicate(timeout=5)
+
+
+def test_stdio_configuration_failure_is_reported(monkeypatch) -> None:
+    class UnsupportedStream:
+        def reconfigure(self, **_kwargs) -> None:
+            raise TypeError("unsupported")
+
+        def flush(self) -> None:
+            return None
+
+    warning = io.StringIO()
+    stream = UnsupportedStream()
+    monkeypatch.setattr(arc_logging.sys, "stdout", stream)
+    monkeypatch.setattr(arc_logging.sys, "stderr", stream)
+    monkeypatch.setattr(arc_logging.sys, "__stderr__", warning)
+
+    arc_logging.configure_process_stdio()
+
+    diagnostic = warning.getvalue()
+    assert "stdout" in diagnostic
+    assert "stderr" in diagnostic

@@ -21,21 +21,24 @@ def configure_process_stdio() -> None:
     """
 
     os.environ["PYTHONUNBUFFERED"] = "1"
-    for stream in (sys.stdout, sys.stderr):
-        _configure_text_stream(stream)
+    for stream_name, stream in (("stdout", sys.stdout), ("stderr", sys.stderr)):
+        if not _configure_text_stream(stream):
+            _report_stdio_configuration_failure(stream_name)
 
 
-def _configure_text_stream(stream: Any) -> None:
+def _configure_text_stream(stream: Any) -> bool:
     """Configure a text stream, including wrappers such as colorama's."""
 
     current = stream
     seen: set[int] = set()
+    configured = False
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         reconfigure = getattr(current, "reconfigure", None)
         if callable(reconfigure):
             try:
                 reconfigure(line_buffering=True, write_through=True)
+                configured = True
                 break
             except (AttributeError, OSError, TypeError, ValueError):
                 pass
@@ -47,6 +50,21 @@ def _configure_text_stream(stream: Any) -> None:
             flush()
         except (OSError, ValueError):
             pass
+    return configured
+
+
+def _report_stdio_configuration_failure(stream_name: str) -> None:
+    """Surface a best-effort stdio configuration failure without recursion."""
+
+    diagnostic = getattr(sys, "__stderr__", None) or sys.stderr
+    try:
+        diagnostic.write(
+            f"[arc-agent] failed to enable write-through buffering on {stream_name}; "
+            "output may be delayed.\n"
+        )
+        diagnostic.flush()
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def format_json_for_log(value: Any) -> str:
