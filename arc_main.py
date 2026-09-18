@@ -21,6 +21,7 @@ from core.cli import (
     stop_cli_spinner,
 )
 from core.config import set_web_port
+from core.logging import configure_process_stdio
 from core.path_safety import validate_clean_target
 
 
@@ -545,6 +546,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    configure_process_stdio()
     parser = build_parser()
     args = parser.parse_args()
     

@@ -9,6 +9,77 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+def configure_process_stdio() -> None:
+    """Make CLI output observable immediately when stdout is a pipe.
+
+    ARC-Bench runs the agent without a TTY and consumes its stdout one line at
+    a time. Python otherwise uses block buffering for ordinary ``print``
+    calls in that mode. The explicit stream configuration covers the current
+    process, while a missing ``PYTHONUNBUFFERED`` value is supplied to Python
+    subprocesses. An explicit user value is preserved.
+    ``write_terminal_log`` already flushes its own writes; this also covers
+    banners, startup text, third-party prints, and stderr diagnostics.
+    """
+
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    for stream_name, stream in (("stdout", sys.stdout), ("stderr", sys.stderr)):
+        if not _configure_text_stream(stream):
+            _report_stdio_configuration_failure(stream_name)
+
+
+def _configure_text_stream(stream: Any) -> bool:
+    """Configure a text stream, including wrappers such as colorama's."""
+
+    current = stream
+    seen: set[int] = set()
+    configured = False
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        try:
+            reconfigure = getattr(current, "reconfigure", None)
+        except Exception:
+            reconfigure = None
+        if callable(reconfigure):
+            try:
+                reconfigure(line_buffering=True, write_through=True)
+                configured = True
+                break
+            except Exception:
+                pass
+        next_stream = None
+        for attribute in ("stream", "wrapped"):
+            try:
+                candidate = getattr(current, attribute, None)
+            except Exception:
+                continue
+            if candidate is not None and id(candidate) not in seen:
+                next_stream = candidate
+                break
+        current = next_stream
+
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
+        try:
+            flush()
+        except (OSError, ValueError):
+            pass
+    return configured
+
+
+def _report_stdio_configuration_failure(stream_name: str) -> None:
+    """Surface a best-effort stdio configuration failure without recursion."""
+
+    diagnostic = getattr(sys, "__stderr__", None) or sys.stderr
+    try:
+        diagnostic.write(
+            f"[arc-agent] failed to enable write-through buffering on {stream_name}; "
+            "output may be delayed.\n"
+        )
+        diagnostic.flush()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def format_json_for_log(value: Any) -> str:
     try:
         return json.dumps(value, ensure_ascii=False, indent=2, default=str)
