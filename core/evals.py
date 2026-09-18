@@ -16,6 +16,10 @@ One invocation writes a self-contained artifacts directory (by default under
 - ``sessions/<run_id>/``: the run's ``.arc`` evidence (runner events, queue,
   traceability tables, node sessions, debug log) plus captured console output.
 
+Each run record also contains compact diagnostics: completion/outcome gates,
+failure events and fingerprints, traceability test status, and the existing
+LLM/tool aggregations split by node, phase, model, and tool.
+
 Run workspaces are throwaway: they live under a work root (system temp by
 default) and are deleted after their evidence is snapshotted unless
 ``keep_workspaces`` is set, and an auto-created temp work root is removed
@@ -42,6 +46,7 @@ expect the ``compile`` subcommand.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -49,14 +54,16 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app_type_handler.test_results import failure_fingerprint
 from arcbench_agent_runtime.events import utc_timestamp
 from arcbench_agent_runtime.jsonio import append_jsonl, read_json, write_json_atomic
-from arcbench_agent_runtime.usage import aggregate_llm_usage
+from arcbench_agent_runtime.usage import aggregate_llm_usage, aggregate_tool_usage
 
 REPORT_SCHEMA = "arc.eval.report/1"
 RUN_SCHEMA = "arc.eval.run/1"
@@ -71,6 +78,13 @@ _QUEUE_FILENAME = "processing_queue.json"  # core.workflow QUEUE_FILENAME
 # FAILED entries, so CONVERGED_WITH_FAILED_CHILDREN is counted as neither.
 _NODE_PASSED_STATES = frozenset({"PASSED", "CONVERGED"})
 _NODE_FAILED_STATES = frozenset({"FAILED"})
+_TASK_COMPLETED_STATES = frozenset({"COMPLETED"})
+_TASK_FAILED_STATES = frozenset({"FAILED"})
+_ARM_ORDER_VALUES = frozenset({"baseline-first", "candidate-first", "alternate"})
+_SECRET_ENV_MARKERS = frozenset(
+    {"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"}
+)
+_MAX_FAILURE_EVENTS = 20
 
 _CNY = "¥"
 _ARM_KEYS = ("baseline", "candidate")
@@ -137,6 +151,261 @@ def node_outcome_counts(node_states: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
+def task_outcome_counts(tasks: Sequence[dict[str, Any]] | None) -> dict[str, int]:
+    """Bucket processing-queue task statuses for completion diagnostics."""
+
+    counts = {
+        "total": 0,
+        "completed": 0,
+        "failed": 0,
+        "pending": 0,
+        "running": 0,
+        "other": 0,
+    }
+    for task in tasks or []:
+        if not isinstance(task, dict):
+            continue
+        counts["total"] += 1
+        status = str(task.get("status") or "").strip().upper()
+        if status in _TASK_COMPLETED_STATES:
+            counts["completed"] += 1
+        elif status in _TASK_FAILED_STATES:
+            counts["failed"] += 1
+        elif status == "PENDING":
+            counts["pending"] += 1
+        elif status == "RUNNING":
+            counts["running"] += 1
+        else:
+            counts["other"] += 1
+    return counts
+
+
+def _redact_env(env: dict[str, str]) -> dict[str, str]:
+    """Keep eval provenance useful without copying credentials into artifacts."""
+
+    redacted: dict[str, str] = {}
+    for key, value in env.items():
+        normalized = str(key).upper().replace("-", "_")
+        if any(marker in normalized.split("_") for marker in _SECRET_ENV_MARKERS):
+            redacted[str(key)] = "<redacted>"
+        else:
+            redacted[str(key)] = str(value)
+    return redacted
+
+
+def _summarize_traceability_tests(arc_dir: Path) -> dict[str, Any]:
+    """Summarize declared/final test statuses without reading test output text."""
+
+    table = read_json(arc_dir / "traceability" / "tests.json", default={})
+    summary: dict[str, Any] = {
+        "total": 0,
+        "passed": 0,
+        "failed": 0,
+        "unmeasured": 0,
+        "by_type": {},
+    }
+    for row in table.values():
+        if not isinstance(row, dict):
+            continue
+        summary["total"] += 1
+        passed = row.get("passed")
+        if passed is True:
+            summary["passed"] += 1
+        elif passed is False:
+            summary["failed"] += 1
+        else:
+            summary["unmeasured"] += 1
+        test_type = str(row.get("type") or "unknown").strip() or "unknown"
+        bucket = summary["by_type"].setdefault(
+            test_type,
+            {"total": 0, "passed": 0, "failed": 0, "unmeasured": 0},
+        )
+        bucket["total"] += 1
+        bucket["passed" if passed is True else "failed" if passed is False else "unmeasured"] += 1
+    return summary
+
+
+def _summarize_runner_events(events_path: Path) -> dict[str, Any]:
+    """Collect stable failure/event summaries while preserving raw session evidence."""
+
+    counts: Counter[str] = Counter()
+    requirement_states: Counter[str] = Counter()
+    failures: list[dict[str, Any]] = []
+    if not events_path.exists():
+        return {
+            "counts": {},
+            "requirement_states": {},
+            "failure_count": 0,
+            "failures": [],
+        }
+    for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        event_type = str(record.get("type") or "unknown")
+        counts[event_type] += 1
+        if event_type != "requirement_state":
+            continue
+        phase = str(record.get("phase") or "unknown").strip() or "unknown"
+        status = str(record.get("status") or "unknown").strip() or "unknown"
+        requirement_states[f"{phase}/{status}"] += 1
+        if status != "failed":
+            continue
+        if len(failures) >= _MAX_FAILURE_EVENTS:
+            continue
+        message = str(record.get("message") or "").strip()
+        failures.append(
+            {
+                "node_id": str(record.get("node_id") or "").strip(),
+                "phase": phase,
+                "message": " ".join(message.split())[:240] or None,
+                "fingerprint": failure_fingerprint(message) if message else None,
+            }
+        )
+    return {
+        "counts": dict(sorted(counts.items())),
+        "requirement_states": dict(sorted(requirement_states.items())),
+        "failure_count": sum(
+            count for key, count in requirement_states.items() if key.endswith("/failed")
+        ),
+        "failures": failures,
+    }
+
+
+def _run_outcome(
+    *,
+    exit_code: int | None,
+    error: str | None,
+    node_counts: dict[str, int],
+    task_counts: dict[str, int],
+    node_states_present: bool,
+    tasks_present: bool,
+) -> tuple[bool, str]:
+    """Return a fail-closed outcome based on the same completion contract as workflow."""
+
+    if error:
+        return False, "timeout" if error.startswith("timed out after") else "launch_error"
+    if exit_code is None:
+        return False, "runner_exit_missing"
+    if not node_states_present:
+        return False, "missing_node_states"
+    if node_counts["failed"]:
+        return False, "node_failed"
+    if task_counts["failed"]:
+        return False, "task_failed"
+    if tasks_present and (
+        task_counts["completed"] != task_counts["total"]
+        or task_counts["other"]
+        or task_counts["pending"]
+        or task_counts["running"]
+    ):
+        return False, "incomplete_tasks"
+    if node_counts["other"]:
+        return False, "incomplete_node_state"
+    if exit_code != 0:
+        return False, "runner_exit_nonzero"
+    return True, "passed"
+
+
+def _metric_distribution(values: Sequence[float]) -> dict[str, float | int | None]:
+    """Return robust distribution stats for a small repeated-run sample."""
+
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return {
+            "n": 0,
+            "mean": None,
+            "median": None,
+            "p95": None,
+            "min": None,
+            "max": None,
+        }
+    index = (len(ordered) - 1) * 0.95
+    lower = int(index)
+    upper = min(lower + 1, len(ordered) - 1)
+    p95 = ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
+    middle = len(ordered) // 2
+    median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+    return {
+        "n": len(ordered),
+        "mean": sum(ordered) / len(ordered),
+        "median": median,
+        "p95": p95,
+        "min": ordered[0],
+        "max": ordered[-1],
+    }
+
+
+def _ordered_arms(
+    baseline: ArmConfig,
+    candidate: ArmConfig,
+    *,
+    repetition: int,
+    arm_order: str,
+) -> list[tuple[str, ArmConfig]]:
+    """Return the per-repetition arm order used by the harness."""
+
+    if arm_order == "candidate-first":
+        return [("candidate", candidate), ("baseline", baseline)]
+    if arm_order == "alternate" and repetition % 2 == 0:
+        return [("candidate", candidate), ("baseline", baseline)]
+    return [("baseline", baseline), ("candidate", candidate)]
+
+
+def summarize_run_diagnostics(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate compact outcome, LLM, and tool diagnostics by evaluation arm."""
+
+    by_arm: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        arm = str(run.get("arm") or "unknown")
+        summary = by_arm.setdefault(
+            arm,
+            {
+                "runs": 0,
+                "outcomes": Counter(),
+                "failure_events": 0,
+                "llm": {"calls": 0, "total_tokens": 0, "cost_total": 0.0},
+                "tools": {
+                    "calls": 0,
+                    "blocked": 0,
+                    "errors": 0,
+                    "empty_results": 0,
+                    "unpaged_reads": 0,
+                },
+            },
+        )
+        summary["runs"] += 1
+        summary["outcomes"][str(run.get("outcome") or "unknown")] += 1
+        diagnostics = run.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            continue
+        events = diagnostics.get("events")
+        if isinstance(events, dict):
+            failure_count = events.get("failure_count")
+            if failure_count is not None:
+                summary["failure_events"] += int(failure_count)
+        usage = run.get("usage")
+        if isinstance(usage, dict):
+            summary["llm"]["calls"] += int(usage.get("calls") or 0)
+            summary["llm"]["total_tokens"] += int(usage.get("total_tokens") or 0)
+            summary["llm"]["cost_total"] += float(usage.get("cost_total") or 0.0)
+        tool_usage = diagnostics.get("tool_usage")
+        totals = tool_usage.get("totals") if isinstance(tool_usage, dict) else None
+        if isinstance(totals, dict):
+            for key in summary["tools"]:
+                summary["tools"][key] += int(totals.get(key) or 0)
+
+    for summary in by_arm.values():
+        summary["outcomes"] = dict(sorted(summary["outcomes"].items()))
+    return {"by_arm": by_arm}
+
+
 def collect_run_record(
     workspace: str | Path,
     *,
@@ -146,20 +415,30 @@ def collect_run_record(
 ) -> dict[str, Any]:
     """Extract the eval metrics of one finished run from its output workspace.
 
-    Reads ``.arc/processing_queue.json`` for node outcomes and aggregates
-    ``.arc/runner-events.jsonl`` for token/cost totals; both are optional so a
-    run that crashed before producing artifacts still yields a usable record.
-    ``cache_hit_rate`` is ``None`` when no call reported a provider cache
-    breakdown (denominator ``prompt_tokens`` stayed 0). A run counts as passed
-    only when the runner exited 0, no node stayed in a failed state, and at
-    least one node was recorded.
+    Reads ``.arc/processing_queue.json`` for node/task outcomes and aggregates
+    ``.arc/runner-events.jsonl`` for token/cost/tool/failure diagnostics; all
+    evidence is optional so a run that crashed before producing artifacts still
+    yields a usable record. A run counts as passed only when the queue is
+    complete (when present), every recorded node is terminal-successful, and
+    the runner exited 0.
     """
 
     workspace = Path(workspace)
     usage: dict[str, Any] | None = None
     events_path = workspace / ".arc" / "runner-events.jsonl"
+    llm_summary: dict[str, Any] = {"totals": {}, "by_node": {}, "by_phase": {}, "by_model": {}}
+    tool_summary: dict[str, Any] = {"totals": {}, "by_node": {}, "by_tool": {}, "by_phase": {}}
+    event_summary = {
+        "counts": {},
+        "requirement_states": {},
+        "failure_count": 0,
+        "failures": [],
+    }
     if events_path.exists():
-        totals = aggregate_llm_usage(events_path)["totals"]
+        llm_summary = aggregate_llm_usage(events_path)
+        tool_summary = aggregate_tool_usage(events_path)
+        event_summary = _summarize_runner_events(events_path)
+        totals = llm_summary["totals"]
         usage = {
             "calls": totals["calls"],
             "estimated_calls": totals["estimated_calls"],
@@ -173,15 +452,42 @@ def collect_run_record(
     queue = read_json(workspace / ".arc" / _QUEUE_FILENAME, default={})
     node_states_raw = queue.get("node_states")
     node_states = node_states_raw if isinstance(node_states_raw, dict) else {}
+    tasks_raw = queue.get("tasks")
+    tasks = tasks_raw if isinstance(tasks_raw, list) else []
     counts = node_outcome_counts(node_states)
+    task_counts = task_outcome_counts(tasks)
+    passed, outcome = _run_outcome(
+        exit_code=exit_code,
+        error=error,
+        node_counts=counts,
+        task_counts=task_counts,
+        node_states_present=bool(node_states),
+        tasks_present=isinstance(tasks_raw, list) and bool(tasks),
+    )
     ok = exit_code == 0 and error is None
+    passed = bool(ok and counts["total"] > 0 and passed)
     return {
         "nodes_total": counts["total"],
         "nodes_passed": counts["passed"],
         "nodes_failed": counts["failed"],
         "nodes_other": counts["other"],
         "node_states": node_states,
-        "passed": bool(ok and counts["total"] > 0 and counts["failed"] == 0),
+        "tasks_total": task_counts["total"],
+        "tasks_completed": task_counts["completed"],
+        "tasks_failed": task_counts["failed"],
+        "tasks_pending": task_counts["pending"],
+        "tasks_running": task_counts["running"],
+        "tasks_other": task_counts["other"],
+        "passed": passed,
+        "outcome": "passed" if passed else outcome,
+        "diagnostics": {
+            "wall_clock_ms": float(latency_ms),
+            "tasks": {**task_counts, "present": isinstance(tasks_raw, list) and bool(tasks)},
+            "events": event_summary,
+            "llm_usage": llm_summary,
+            "tool_usage": tool_summary,
+            "traceability_tests": _summarize_traceability_tests(workspace / ".arc"),
+        },
         "usage": usage,
     }
 
@@ -225,6 +531,22 @@ def summarize_runs(runs: Sequence[dict[str, Any]], *, repetitions: int) -> dict[
     pass_rate = _metric(lambda run: 100.0 if run.get("passed") else 0.0)
     pass_rate["delta_pp"] = pass_rate.pop("delta")
 
+    baseline_latency = [
+        float(base["latency_ms"])
+        for base, _candidate in pairs
+        if base.get("latency_ms") is not None
+    ]
+    candidate_latency = [
+        float(candidate["latency_ms"])
+        for _base, candidate in pairs
+        if candidate.get("latency_ms") is not None
+    ]
+    paired_latency_delta = [
+        float(candidate["latency_ms"]) - float(base["latency_ms"])
+        for base, candidate in pairs
+        if base.get("latency_ms") is not None and candidate.get("latency_ms") is not None
+    ]
+
     return {
         "pairs": len(pairs),
         "repetitions": repetitions,
@@ -234,6 +556,11 @@ def summarize_runs(runs: Sequence[dict[str, Any]], *, repetitions: int) -> dict[
         # metric is in percent so its delta reads in percentage points.
         "cache_hit_rate": _metric(lambda run: _usage_percent_field(run, "cache_hit_rate")),
         "latency_ms": _metric(lambda run: run.get("latency_ms")),
+        "latency_distribution": {
+            "baseline": _metric_distribution(baseline_latency),
+            "candidate": _metric_distribution(candidate_latency),
+            "paired_delta": _metric_distribution(paired_latency_delta),
+        },
         "est_cost": _metric(lambda run: _usage_field(run, "cost_total")),
     }
 
@@ -267,6 +594,15 @@ def render_report_text(report: dict[str, Any]) -> str:
     lines.append(f"{'Tokens':>13}  {_format_float_delta(comparison['tokens'], 'f')}")
     lines.append(f"{'Cache hit':>13}  {_format_pp_delta(comparison['cache_hit_rate'])}")
     lines.append(f"{'Latency':>13}  {_format_float_delta(comparison['latency_ms'], 'ms')}")
+    latency_distribution = comparison.get("latency_distribution") or {}
+    if latency_distribution.get("baseline") and latency_distribution.get("candidate"):
+        baseline_p95 = latency_distribution["baseline"].get("p95")
+        candidate_p95 = latency_distribution["candidate"].get("p95")
+        if baseline_p95 is not None and candidate_p95 is not None:
+            lines.append(
+                f"{'Latency p95':>13}  candidate {candidate_p95:.1f}ms, "
+                f"baseline {baseline_p95:.1f}ms"
+            )
     lines.append(f"{'Est. cost':>13}  {_format_cost_delta(comparison['est_cost'])}")
     return "\n".join(lines)
 
@@ -329,12 +665,15 @@ def eval_table(
     artifacts_dir: str | Path | None = None,
     work_root: str | Path | None = None,
     keep_workspaces: bool = False,
+    arm_order: str = "baseline-first",
     log: Callable[[str], None] = print,
 ) -> EvalResult:
     """Run the A/B comparison and write its artifacts; see module docstring."""
 
     if repetitions < 1:
         raise ValueError(f"repetitions must be at least 1, got {repetitions}")
+    if arm_order not in _ARM_ORDER_VALUES:
+        raise ValueError(f"arm_order must be one of {sorted(_ARM_ORDER_VALUES)}, got {arm_order!r}")
     for arm_key, arm in (("baseline", baseline), ("candidate", candidate)):
         if not arm.label.strip():
             raise ValueError(f"{arm_key} arm label must not be empty")
@@ -359,7 +698,10 @@ def eval_table(
 
     runs: list[dict[str, Any]] = []
     for rep in range(1, repetitions + 1):
-        for arm_key, arm in (("baseline", baseline), ("candidate", candidate)):
+        for order_index, (arm_key, arm) in enumerate(
+            _ordered_arms(baseline, candidate, repetition=rep, arm_order=arm_order),
+            start=1,
+        ):
             run_id = f"{arm_key}-rep{rep:03d}"
             workspace = workspace_root / run_id
             run = _run_once(
@@ -374,6 +716,8 @@ def eval_table(
                 timeout_seconds=timeout_seconds,
                 workspace=workspace,
                 sessions_dir=sessions_dir,
+                order_index=order_index,
+                arm_order=arm_order,
             )
             append_jsonl(runs_jsonl, run)
             runs.append(run)
@@ -392,13 +736,23 @@ def eval_table(
         "set_name": name,
         "generated_at": utc_timestamp(),
         "repetitions": repetitions,
+        "arm_order": arm_order,
         "requirement_path": str(requirement),
         "app_type": app_type,
         "web_port": web_port,
         "runner_command": runner_prefix,
-        "baseline": {"label": baseline.label, "env": dict(baseline.env), "argv": list(baseline.argv)},
-        "candidate": {"label": candidate.label, "env": dict(candidate.env), "argv": list(candidate.argv)},
+        "baseline": {
+            "label": baseline.label,
+            "env": _redact_env(baseline.env),
+            "argv": list(baseline.argv),
+        },
+        "candidate": {
+            "label": candidate.label,
+            "env": _redact_env(candidate.env),
+            "argv": list(candidate.argv),
+        },
         "comparison": comparison,
+        "diagnostics": summarize_run_diagnostics(runs),
         "artifacts": {"runs_jsonl": str(runs_jsonl), "sessions_dir": str(sessions_dir)},
         "run_ids": [run["run_id"] for run in runs],
     }
@@ -452,6 +806,8 @@ def _run_once(
     timeout_seconds: float | None,
     workspace: Path,
     sessions_dir: Path,
+    order_index: int,
+    arm_order: str,
 ) -> dict[str, Any]:
     """Launch one compile run, snapshot its evidence, and collect its record."""
 
@@ -501,9 +857,11 @@ def _run_once(
         "arm": arm_key,
         "label": arm.label,
         "repetition": repetition,
+        "order_index": order_index,
+        "arm_order": arm_order,
         "requirement_path": str(requirement),
         "workspace": str(workspace),
-        "env": dict(arm.env),
+        "env": _redact_env(arm.env),
         "argv": list(arm.argv),
         "exit_code": exit_code,
         "latency_ms": latency_ms,

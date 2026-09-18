@@ -238,7 +238,9 @@ python arc_main.py eval path/to/requirements \
   `arc_main.py` 的 `compile` 子命令；`--runner-script` 可换成任意脚本（接收上述纯运行
   参数，不带 `compile` 子命令）。
 - 调试用 `--repetitions 1`，报告提升时建议 5 次；`--timeout` 给单次运行设置秒级上限，
-  超时按失败运行计入报告。报告默认写入 `records/evals/<时间戳>-<名称>/`，`--out-dir` 可覆盖。
+  超时按失败运行计入报告。`--arm-order alternate` 会在 repetition 之间交替先运行
+  baseline/candidate，降低 provider 负载和缓存预热造成的时序偏差；默认仍保持
+  baseline-first 以兼容已有脚本。报告默认写入 `records/evals/<时间戳>-<名称>/`，`--out-dir` 可覆盖。
 
 ```text
 Eval Comparisons
@@ -253,13 +255,18 @@ Eval Comparisons
 ```
 
 - 运行按 repetition 配对：pass rate 是配对运行中编译成功（runner 退出码为 0 且无 FAILED
-  节点）的占比，tokens / latency / est. cost 是配对运行的均值差；cache hit rate 的口径
+  节点、queue task 全部完成且没有非终态节点）的占比，tokens / latency / est. cost 是配对运行的均值差；
+  `comparison.latency_distribution` 还提供每个 arm 的 mean/median/p95/min/max 和 paired delta，避免
+  长尾运行被均值掩盖；cache hit rate 的口径
   与「Token 用量统计」一致（`runs.jsonl` 中存 0–1 比率，报告中以百分点呈现），运行中没有任何
   provider 已报告缓存分解的调用时记为 None。一侧缺失遥测时该指标标记 unavailable 而不是
   猜测。成本为 CNY，来自 `agents/model/costing.py` 单价目录。
 - 产物目录包含 `report.txt` / `report.json`（结构化对比）、`runs.jsonl`（每次运行一条
-  记录）和 `sessions/<run_id>/`（该次运行的 runner 事件、队列、追溯表、节点会话与控制台
-  输出快照）。运行工作区默认放在系统临时目录并在快照后删除，`--work-root` /
+ 记录）和 `sessions/<run_id>/`（该次运行的 runner 事件、队列、追溯表、节点会话与控制台
+ 输出快照）。每条 run 还含 `diagnostics`：task 完成计数、失败事件/fingerprint、traceability
+  测试状态、LLM 按节点/阶段/模型聚合、tool blocked/error/empty/unpaged 信号和明确的 outcome
+  分类。工件中的 arm 环境变量会对疑似 key/token/secret/password 字段脱敏。运行工作区默认放在系统临时目录并在快照后删除，
+  `--work-root` /
   `--keep-workspaces` 可控制。
 
 ### 测试
