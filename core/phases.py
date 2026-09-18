@@ -7,6 +7,11 @@ from typing import Any, Awaitable, Callable
 from app_type_handler import create_app_type_handler
 from agents.context.pipeline import context_pipeline
 from agents.skills.planning import plan_and_store_stage_skills
+from agents.tools.test_contract_check import (
+    build_satisfiability_universe,
+    classify_test_hooks,
+    collect_manifest_hooks,
+)
 from agents.tools.test_failure_digest import (
     build_failure_digest,
     format_failure_digest,
@@ -257,6 +262,32 @@ class WorkflowPhaseRunner:
             await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
             return False
 
+        # Static satisfiability check, before any baseline run spends real
+        # test executions: extract the observable hooks the E2E/Integration
+        # tests drive and classify them against the requirement + interface
+        # specs. Hooks the sources never name become declared test-contract
+        # hooks (node session -> TDD context); this is what turns the REQ-1
+        # dual-blind selector mismatch into an explicit handoff. Fail-open:
+        # a checker error logs and continues rather than failing DESIGN.
+        try:
+            test_contract_hooks = await self._check_test_contract_satisfiability(
+                node_id=node_id,
+                requirement_data=requirement_data,
+                tests=stored_tests,
+            )
+        except Exception as exc:
+            test_contract_hooks = []
+            await self._log(
+                "TestGenerator",
+                f"Static satisfiability check failed ({exc}); continuing without test-contract hooks.",
+                status="warning",
+                node_id=node_id,
+            )
+        # Always (re)write the hook list: a retry design pass with zero
+        # test-contract hooks must not leave the previous run's stale hooks
+        # in the session.
+        self._update_node_session(node_id, {"test_contract_hooks": test_contract_hooks})
+
         baseline = await self._enforce_design_baseline_red(
             node_id=node_id,
             requirement_data=requirement_data,
@@ -356,6 +387,53 @@ class WorkflowPhaseRunner:
             {"phase_status": {"implement": "completed" if final_ok else "failed"}},
         )
         return final_ok
+
+    async def _check_test_contract_satisfiability(
+        self,
+        *,
+        node_id: str,
+        requirement_data: dict[str, Any],
+        tests: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Classify the E2E/Integration tests' observable hooks (mechanical).
+
+        Returns the ``test_contract`` hooks — values the tests drive that
+        neither the requirement text nor the interface specs name. They are
+        stored in the node session and surface to TestDrivenDeveloper as a
+        context block; the implementer aligns to them instead of discovering
+        them one Playwright timeout at a time. Grounded hooks need no
+        handoff: the implementer already receives those source texts.
+        """
+
+        interfaces = sessions.load_node_session(node_id).get("interfaces") or []
+        hooks = collect_manifest_hooks(self.workspace_path, tests)
+        if not hooks:
+            return []
+        universe = build_satisfiability_universe(requirement_data, interfaces)
+        result = classify_test_hooks(hooks, universe)
+        test_contract = result["test_contract"]
+        if test_contract:
+            summary = ", ".join(
+                f"{hook['kind']}=`{hook['value']}`" for hook in test_contract[:8]
+            )
+            suffix = f" (+{len(test_contract) - 8} more)" if len(test_contract) > 8 else ""
+            await self._log(
+                "TestGenerator",
+                (
+                    f"Static satisfiability check: {len(result['grounded'])}/{len(hooks)} hook(s) grounded "
+                    f"in the requirement/interface specs; {len(test_contract)} are test-defined contract "
+                    f"hooks handed to the implementation: {summary}{suffix}."
+                ),
+                status="warning",
+                node_id=node_id,
+            )
+        else:
+            await self._log(
+                "TestGenerator",
+                f"Static satisfiability check: all {len(result['grounded'])}/{len(hooks)} hook(s) grounded in the requirement/interface specs.",
+                node_id=node_id,
+            )
+        return test_contract
 
     async def _enforce_design_baseline_red(
         self,
