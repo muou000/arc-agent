@@ -55,15 +55,22 @@ _BY_ACCESSIBLE_NAME = re.compile(
     re.DOTALL,
 )
 #: ``getByRole('button', { name: '下一步' })`` — the role itself plus the
-#: name option; the name is the hook the app must provide.
+#: name option; the name is the hook the app must provide. ``name`` may not
+#: be the first option (``{ exact: true, name: ... }``), so the options
+#: prefix is any run of non-name properties. ``\s`` + DOTALL also covers the
+#: multi-line call form.
 _BY_ROLE_NAME = re.compile(
-    r"\bgetByRole\(\s*(['\"])(\w+)\1\s*,\s*\{\s*name\s*:\s*(?:(['\"])(.+?)\3|/(.+?)/)",
+    r"\bgetByRole\(\s*(['\"])(\w+)\1\s*,\s*\{(?:[^{}]|\{[^{}]*\})*?\bname\s*:\s*(?:(['\"])(.+?)\3|/(.+?)/)",
     re.DOTALL,
 )
-#: ``page.goto('/register')``, ``toHaveURL(/\/register$/)``, relative links.
-#: The regex alternative must tolerate escaped slashes (``\/``) inside the
-#: pattern body, so each unit is an escaped char or a non-slash char.
-_URL_HOOK = re.compile(r"(?:goto|toHaveURL)\(\s*(?:(['\"])([^'\"]+)\1|/((?:\\.|[^/\\])+?)/)", re.DOTALL)
+#: ``page.goto('/register')``, ``toHaveURL(/\/register$/)`` and the
+#: ``goto(new URL('/login', base))`` form, relative links. The regex
+#: alternative must tolerate escaped slashes (``\/``) inside the pattern
+#: body, so each unit is an escaped char or a non-slash char.
+_URL_HOOK = re.compile(
+    r"(?:goto|toHaveURL)\(\s*(?:new\s+URL\(\s*)?(?:(['\"])([^'\"]+)\1|/((?:\\.|[^/\\])+?)/)",
+    re.DOTALL,
+)
 #: test-id selectors (``getByTestId('submit-btn')``, ``locator('[data-testid="x"]')``).
 _TEST_ID = re.compile(r"(?:getByTestId\(\s*|\[data-testid\s*=\s*)(['\"])([\w.-]+)\1")
 #: Integration/API calls: ``fetch('/api/auth/register'...)``,
@@ -207,8 +214,10 @@ def _normalize_for_match(value: str) -> str:
         return ""
     for prefix in _URL_NOISE_PREFIXES:
         if text.startswith(prefix):
-            text = text[len(prefix):]
-            text = text.split("/", 1)[-1] if "/" not in text[len(prefix):] else text
+            stripped = text[len(prefix):]
+            # Drop the origin, keep the path (``http://host/register`` ->
+            # ``/register``); a bare origin is noise and normalizes to "".
+            text = stripped.split("/", 1)[-1] if "/" in stripped else ""
             break
     text = text.replace("\\/", "/").rstrip("$^")
     return " ".join(text.split())

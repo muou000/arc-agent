@@ -54,6 +54,10 @@ class NodeContextCache:
         self.invalidate(node_id, "resume_context")
         self.invalidate(node_id, "existing_interfaces")
         self.invalidate(node_id, "recent_failure_summary")
+        # The DESIGN phase rewrites test_contract_hooks in the node session on
+        # every (re)design pass; a same-process TDD build afterwards must not
+        # serve the previous pass's cached hook block.
+        self.invalidate(node_id, "test_contract_hooks")
 
     def clear(self) -> None:
         self._cache.clear()

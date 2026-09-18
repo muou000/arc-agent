@@ -190,3 +190,45 @@ def test_format_test_contract_context_renders_hook_block() -> None:
 
 def test_format_test_contract_context_empty_returns_empty() -> None:
     assert format_test_contract_context([]) == ""
+
+
+def test_extract_hooks_name_not_first_role_option() -> None:
+    """``{ exact: true, name: ... }`` — name after other options still matches."""
+
+    hooks = extract_test_hooks(
+        "x.spec.js",
+        "page.getByRole('link', { exact: true, name: 'Register' }).click();",
+    )
+    assert ("role", "Register") in {(h["kind"], h["value"]) for h in hooks}
+
+
+def test_extract_hooks_nested_option_object() -> None:
+    """A nested option object before ``name`` must not derail the match."""
+
+    hooks = extract_test_hooks(
+        "x.spec.js",
+        "page.getByRole('row', { name: 'row1' }).filter({ hasText: 'detail' });",
+    )
+    assert ("role", "row1") in {(h["kind"], h["value"]) for h in hooks}
+
+
+def test_extract_hooks_goto_new_url_form() -> None:
+    """``goto(new URL('/login', base))`` — the path is still a URL hook."""
+
+    hooks = extract_test_hooks("x.spec.js", "await page.goto(new URL('/login', base));")
+    assert ("url", "/login") in {(h["kind"], h["value"]) for h in hooks}
+
+
+def test_normalize_strips_origin_to_path() -> None:
+    """Full origins reduce to their path; a bare origin reduces to nothing.
+
+    ``http://localhost:3301/register`` -> ``register`` is the surface a
+    requirement could name; ``http://localhost:3301`` alone carries none.
+    """
+
+    from agents.tools.test_contract_check import _normalize_for_match
+
+    assert _normalize_for_match("http://localhost:3301/register") == "register"
+    assert _normalize_for_match("http://localhost:3301") == ""
+    assert _normalize_for_match("https://example.com/api/auth") == "api/auth"
+    assert _normalize_for_match("\/register$") == "/register"

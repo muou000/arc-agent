@@ -217,3 +217,36 @@ def test_tdd_context_without_hooks_has_no_block(tmp_project_dir: Path, arc_runti
         agent_type="TestDrivenDeveloper",
     )
     assert "<test_contract_hooks>" not in context
+
+
+def test_tdd_context_hooks_refresh_after_session_rewrite(tmp_project_dir: Path, arc_runtime) -> None:
+    """A same-process hook rewrite must not serve the cached old block.
+
+    The DESIGN phase rewrites ``test_contract_hooks`` in the node session on
+    every (re)design pass; ``_update_node_session`` invalidates the db layers,
+    so the next context build for the same node must read the new list. This
+    pins the invalidation wiring (``test_contract_hooks`` belongs to the
+    db-layer invalidation set).
+    """
+
+    node_id = "REQ-HOOK-5"
+    arc_runtime.traceability.store_requirement_tree({"id": node_id, **REQ_DATA})
+    context_pipeline.configure(workspace_dir=str(tmp_project_dir), app_type="web")
+
+    sessions.merge_node_session(
+        node_id,
+        {"test_contract_hooks": [{"kind": "testid", "value": "old-hook", "file_path": E2E_TEST_FILE}]},
+    )
+    first = context_pipeline.build_agent_context(node_id=node_id, agent_type="TestDrivenDeveloper")
+    assert "`old-hook`" in first
+
+    # The workflow's session write path: merge + invalidate_db_layers.
+    sessions.merge_node_session(
+        node_id,
+        {"test_contract_hooks": [{"kind": "testid", "value": "new-hook", "file_path": E2E_TEST_FILE}]},
+    )
+    context_pipeline.cache.invalidate_db_layers(node_id)
+
+    second = context_pipeline.build_agent_context(node_id=node_id, agent_type="TestDrivenDeveloper")
+    assert "`new-hook`" in second
+    assert "`old-hook`" not in second
