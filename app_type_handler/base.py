@@ -99,10 +99,7 @@ class AppTypeHandler(ABC):
         if not deps_ok:
             return False
 
-        verified = await self.verify_workspace()
-        if not verified:
-            return False
-        return True
+        return await self.verify_workspace()
 
     async def shutdown_e2e_runtime(self) -> None:
         """Release any E2E runtime kept alive across a TDD session.
@@ -112,7 +109,7 @@ class AppTypeHandler(ABC):
         per attempt. App types without a long-lived E2E runtime do nothing.
         Called when a node's IMPLEMENT phase finishes.
         """
-        return None
+        return
 
     async def verify_workspace(self) -> bool:
         """Post-install gate. Returning False aborts the compilation.
@@ -228,7 +225,7 @@ class AppTypeHandler(ABC):
         """
         if not file_paths:
             return (
-                "Exit Code: 0\n"
+                "Exit Code: 1\n"
                 "STDERR:\n"
                 f"No test files were configured for the current {test_type} batch.\n"
             )

@@ -182,11 +182,11 @@ class CliAppType(AppTypeHandler):
                 "STDERR:\n"
                 f"No test files were configured for the current {test_type} batch.\n"
             )
-        invalid_paths = [path for path in file_paths if self.validate_test_path(test_type, path)]
-        if invalid_paths:
+        validation_errors = [self.validate_test_path(test_type, path) for path in file_paths]
+        invalid_errors = [error for error in validation_errors if error]
+        if invalid_errors:
             error_lines = ["Exit Code: 1", "STDERR:"]
-            for path in invalid_paths:
-                error_lines.append(self.validate_test_path(test_type, path) or "")
+            error_lines.extend(invalid_errors)
             return "\n".join(error_lines) + "\n"
         await self._log("System", f"System test execution ({test_type}) batch: {', '.join(file_paths)}")
         modules = [_cli_test_module(path) for path in file_paths]

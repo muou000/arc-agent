@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -271,7 +272,5 @@ def _prune_run_logs(directory: Path, keep: int) -> None:
     except OSError:
         return
     for stale in logs[:-keep] if len(logs) > keep else []:
-        try:
+        with suppress(OSError):
             stale.unlink()
-        except OSError:
-            pass

@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import threading
 import urllib.request
+from contextlib import suppress
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -528,10 +529,8 @@ async def _wait_for_http_server(host: str, port: int, timeout: float = 20.0) -> 
             continue
         finally:
             writer.close()
-            try:
+            with suppress(OSError):
                 await writer.wait_closed()
-            except OSError:
-                pass
         if status_line.startswith(b"HTTP/"):
             return True
         await asyncio.sleep(0.5)
@@ -1051,12 +1050,15 @@ async def _build_frontend_dist(workspace_path: str) -> tuple[bool, str]:
     # Every E2E attempt rebuilt the frontend from scratch (~tens of seconds),
     # even when the previous attempt already produced a `dist` for the same
     # sources. Reuse it when the tree is byte-for-byte unchanged.
-    if fingerprint is not None and os.path.exists(dist_index_path):
-        if _read_recorded_frontend_fingerprint(frontend_path) == fingerprint:
-            return True, (
-                "Reused the existing `frontend/dist` because the frontend sources are unchanged "
-                f"since the last successful build (fingerprint {fingerprint[:12]}).\n"
-            )
+    if (
+        fingerprint is not None
+        and os.path.exists(dist_index_path)
+        and _read_recorded_frontend_fingerprint(frontend_path) == fingerprint
+    ):
+        return True, (
+            "Reused the existing `frontend/dist` because the frontend sources are unchanged "
+            f"since the last successful build (fingerprint {fingerprint[:12]}).\n"
+        )
 
     frontend_build_output = await _execute_web_test_command(
         "npm run build",
@@ -1892,9 +1894,7 @@ class WebAppType(AppTypeHandler):
                 if label == "frontend":
                     await self._ensure_testing_library_dom(target_path)
 
-            if browser_task is not None and not await browser_task:
-                return False
-            return True
+            return browser_task is None or await browser_task
         finally:
             # A failed npm install must not leave a browser download waiting on
             # a CLI that will never appear in the incomplete node_modules tree.
@@ -2262,11 +2262,11 @@ class WebAppType(AppTypeHandler):
         for file_path in file_paths:
             await self._log("System", f"System test execution ({test_type}): {file_path}")
 
-        invalid_paths = [file_path for file_path in file_paths if self.validate_test_path(test_type, file_path)]
-        if invalid_paths:
+        validation_errors = [self.validate_test_path(test_type, file_path) for file_path in file_paths]
+        invalid_errors = [error for error in validation_errors if error]
+        if invalid_errors:
             error_lines = ["Exit Code: 1", "STDERR:"]
-            for file_path in invalid_paths:
-                error_lines.append(self.validate_test_path(test_type, file_path) or "")
+            error_lines.extend(invalid_errors)
             return "\n".join(error_lines) + "\n"
 
         try:

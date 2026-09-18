@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
@@ -12,7 +13,7 @@ from agents.test_driven_developer import TestDrivenDeveloper
 from agents.test_generator import TestGenerator
 from app_type_handler import create_app_type_handler, normalize_app_type
 from agents.context.pipeline import context_pipeline
-from core import commits, config, files, sessions
+from core import sessions
 from core.file_claims import get_file_claim_registry
 from core.phases import WorkflowPhaseRunner
 from core.service import configure_runtime
@@ -765,7 +766,7 @@ class ARCWorkflowManager:
             app_type=self.app_type,
             context_workspace_root=self.workspace_path,
         )
-        runner = WorkflowPhaseRunner(
+        return WorkflowPhaseRunner(
             workspace_path=workspace_path,
             requirement_path=self.requirement_path,
             app_type=self.app_type,
@@ -776,7 +777,6 @@ class ARCWorkflowManager:
             web_port=web_port,
             context_workspace_path=self.workspace_path,
         )
-        return runner
 
     async def _integrate_task_workspace(
         self,
@@ -966,12 +966,8 @@ class ARCWorkflowManager:
     def _prune_worktrees(self) -> None:
         if self._worktree_manager is None:
             return
-        try:
+        with suppress(Exception):
             self._worktree_manager.prune()
-        except Exception:
-            # Pruning is advisory; a stale registration only makes prepare()
-            # fall back to removing the leftover directory itself.
-            pass
 
     def _remove_worktree_root(self) -> None:
         if self._worktree_manager is None:
@@ -1453,9 +1449,9 @@ class ARCWorkflowManager:
     def _apply_saved_states_to_tasks(queue_state: dict[str, Any]) -> None:
         for task in queue_state["tasks"]:
             node_state = queue_state["node_states"].get(task["node_id"], NODE_UNSEEN)
-            if node_state in {NODE_PASSED, NODE_CONVERGED, NODE_CONVERGED_WITH_FAILED_CHILDREN}:
-                task["status"] = TASK_COMPLETED
-            elif node_state == NODE_DESIGNED and task["phase"] == PHASE_DESIGN:
+            if node_state in {NODE_PASSED, NODE_CONVERGED, NODE_CONVERGED_WITH_FAILED_CHILDREN} or (
+                node_state == NODE_DESIGNED and task["phase"] == PHASE_DESIGN
+            ):
                 task["status"] = TASK_COMPLETED
             elif node_state == NODE_FAILED:
                 task["status"] = TASK_FAILED
@@ -1577,7 +1573,7 @@ class ARCWorkflowManager:
                 if parent_design_status not in {TASK_COMPLETED, TASK_FAILED}:
                     return False
             return ARCWorkflowManager._declared_dependencies_satisfied(queue_state, node_id)
-        elif phase == PHASE_IMPLEMENT:
+        if phase == PHASE_IMPLEMENT:
             for other in queue_state["tasks"]:
                 if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
                     if other["status"] != TASK_COMPLETED:
@@ -1863,9 +1859,7 @@ class ARCWorkflowManager:
 
 class _CompletedLogAwaitable:
     def __await__(self):
-        if False:
-            yield None
-        return None
+        return iter(())
 
 
 def _default_log_cb(

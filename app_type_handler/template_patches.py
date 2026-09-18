@@ -33,6 +33,7 @@ together, so a workspace can never end up half-patched.
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 from dataclasses import dataclass
 
 
@@ -432,10 +433,8 @@ def _patched_text(text: str, edit: TemplateEdit) -> str:
 
 def _remove(paths) -> None:
     for path in paths:
-        try:
+        with suppress(OSError):
             os.remove(path)
-        except OSError:
-            pass
 
 
 def _restore(paths: list[str], originals: dict[str, str]) -> str:

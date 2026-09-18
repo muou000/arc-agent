@@ -13,7 +13,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel, Field, create_model
 
-from agents.model.factory import create_arc_chat_model
+from agents.model.factory import create_arc_chat_model, split_model_name
 from agents.model.openai_api_adapter import structured_output_supported
 from agents.runtime.checkpointer import get_checkpointer
 from agents.runtime.contracts import AgentRuntimeContext
@@ -681,12 +681,11 @@ def _resolve_skill_instruction_paths(
     """
 
     if permitted_skill_names is not None:
-        paths = [
+        return [
             f"{SKILLS_PREFIX}/{name}/SKILL.md"
             for name in dict.fromkeys(permitted_skill_names)
             if (skills_root / name / "SKILL.md").is_file()
         ]
-        return paths
 
     paths: list[str] = []
     for source in sources:
@@ -722,7 +721,7 @@ def _register_arc_tool_exclusions(*, model: Any, resolved_model: Any) -> None:
     )
     registered: set[str] = set()
     if isinstance(model, str):
-        provider, model_name = _split_model_name(model)
+        provider, model_name = split_model_name(model)
         if provider:
             for key in (provider, f"{provider}:{model_name}"):
                 registered.add(key)
@@ -864,13 +863,6 @@ def _normalize_virtual_path(path: str) -> str:
     if normalized != WORKSPACE_PREFIX and normalized.endswith("/"):
         return normalized.rstrip("/")
     return normalized
-
-
-def _split_model_name(model: str) -> tuple[str, str]:
-    if ":" not in model:
-        return "", model.strip()
-    provider, model_name = model.split(":", 1)
-    return provider.strip().lower(), model_name.strip()
 
 
 def _tool_name(tool: "BaseTool | dict[str, Any] | Any") -> str | None:

@@ -161,14 +161,11 @@ def normalize_claim_path(virtual_path: str) -> str:
     normalized = str(virtual_path or "").replace("\\", "/").strip()
     if not normalized:
         return ""
+    if normalized == "/workspace" or normalized.startswith("/skills/") or normalized == "/skills":
+        return ""
     if normalized.startswith("/workspace/"):
         normalized = normalized[len("/workspace/"):]
-    elif normalized == "/workspace":
-        return ""
-    elif normalized.startswith("/skills/") or normalized == "/skills":
-        return ""
-    normalized = normalized.strip("/")
-    return normalized
+    return normalized.strip("/")
 
 
 def _load_tracked_paths(agent_root: str) -> set[str] | None:

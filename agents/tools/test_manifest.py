@@ -25,11 +25,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
+from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 
-#: Canonical test layers (matches ``core.phases.TDD_BATCH_ORDER``; duplicated
-#: here to keep the tools package free of a core.workflow import).
-CANONICAL_TEST_TYPES = ("Unit", "Integration", "E2E")
+LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
 _TOOL_NAME = "declare_test_manifest"
 
@@ -242,7 +240,6 @@ def build_declare_test_manifest_tool(
             )
 
         first_declaration = not manifest_lock.locked
-        newly_declared = [row for row in rows if row.file_path not in manifest_lock.declared_files]
         manifest_lock.declare(rows)
         await _emit_log(
             log_cb,
@@ -282,14 +279,6 @@ def build_declare_test_manifest_tool(
 
     declare_test_manifest.__name__ = _TOOL_NAME
     return declare_test_manifest
-
-
-def canonical_test_type(value: Any) -> str | None:
-    normalized = str(value or "").strip().lower()
-    for test_type in CANONICAL_TEST_TYPES:
-        if normalized == test_type.lower():
-            return test_type
-    return None
 
 
 def _unknown_interface_ids(
