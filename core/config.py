@@ -182,6 +182,25 @@ def check_config() -> dict[str, Any]:
         if value < low or value > high:
             warnings.append(f"{name}={raw} is outside the sane range {low}-{high}")
 
+    # Enum-style knobs: a typo silently falls back to a default instead of
+    # erroring, so surface it here rather than mid-run.
+    stream_transport = os.environ.get("ARC_MODEL_STREAM_TRANSPORT", "").strip().lower()
+    if stream_transport and stream_transport not in {
+        "stream",
+        "retry",
+        "retry-only",
+        "on-failure",
+        "on_failure",
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        warnings.append(
+            f"ARC_MODEL_STREAM_TRANSPORT has unexpected value: {stream_transport} "
+            "(expected stream, retry, or 0/false/no/off)"
+        )
+
     # Check .env file presence
     env_file = get_project_env_path()
     if not env_file.exists():
