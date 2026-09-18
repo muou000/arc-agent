@@ -9,6 +9,7 @@ is byte-for-byte unchanged, and rebuilt as soon as it is not.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from app_type_handler import web as web_handler
@@ -98,6 +99,23 @@ def test_rebuilds_when_a_source_file_changes(tmp_path, monkeypatch) -> None:
     assert len(recorder.calls) == 2
 
 
+def test_rebuilds_when_a_dist_artifact_changes(tmp_path, monkeypatch) -> None:
+    workspace = _make_workspace(tmp_path)
+    recorder = _BuildRecorder()
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+
+    _build(workspace)
+    (workspace / "frontend" / "dist" / "index.html").write_text(
+        "<html>partial rebuild</html>\n",
+        encoding="utf-8",
+    )
+    ok, output = _build(workspace)
+
+    assert ok is True
+    assert recorder.calls == ["npm run build", "npm run build"]
+    assert "Reused the existing" not in output
+
+
 def test_rebuilds_when_the_built_dist_disappears(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     recorder = _BuildRecorder()
@@ -127,6 +145,22 @@ def test_a_failed_build_records_no_fingerprint(tmp_path, monkeypatch) -> None:
     assert len(recorder.calls) == 2
 
 
+def test_a_failed_rebuild_clears_the_previous_fingerprint(tmp_path, monkeypatch) -> None:
+    workspace = _make_workspace(tmp_path)
+    recorder = _BuildRecorder()
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+
+    _build(workspace)
+    (workspace / "frontend" / "dist" / "index.html").write_text("partial\n", encoding="utf-8")
+    recorder.exit_code = 1
+    recorder.produce_dist = False
+
+    ok, _ = _build(workspace)
+
+    assert ok is False
+    assert web_handler._read_recorded_frontend_fingerprint(str(workspace / "frontend")) is None
+
+
 def test_a_stale_dist_without_a_recorded_fingerprint_is_not_reused(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     dist_dir = workspace / "frontend" / "dist"
@@ -140,6 +174,28 @@ def test_a_stale_dist_without_a_recorded_fingerprint_is_not_reused(tmp_path, mon
 
     assert ok is True
     assert recorder.calls == ["npm run build"]
+
+
+def test_a_legacy_source_only_fingerprint_is_not_reused(tmp_path, monkeypatch) -> None:
+    workspace = _make_workspace(tmp_path)
+    frontend = workspace / "frontend"
+    dist_dir = frontend / "dist"
+    dist_dir.mkdir()
+    (dist_dir / "index.html").write_text("<html>legacy</html>\n", encoding="utf-8")
+    source_fingerprint = web_handler._frontend_source_fingerprint(str(frontend))
+    (dist_dir / web_handler.FRONTEND_BUILD_FINGERPRINT_FILENAME).write_text(
+        json.dumps({"fingerprint": source_fingerprint}) + "\n",
+        encoding="utf-8",
+    )
+
+    recorder = _BuildRecorder()
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+
+    ok, output = _build(workspace)
+
+    assert ok is True
+    assert recorder.calls == ["npm run build"]
+    assert "Reused the existing" not in output
 
 
 def test_fingerprint_ignores_build_output_and_dependencies(tmp_path) -> None:
