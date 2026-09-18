@@ -185,6 +185,22 @@ def test_interface_design_first_repeated_write_explains_unlock_condition() -> No
     assert "response" in second_block.content and "skeleton" in second_block.content
 
 
+def test_non_interface_stages_do_not_allocate_design_write_block_counter() -> None:
+    for stage, path in (
+        ("test_generation", "/workspace/tests/unit/test_calc.py"),
+        ("implementation", "/workspace/src/calc.py"),
+    ):
+        middleware = make(stage)
+        assert middleware._write_block_counts is None
+        run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
+        blocked = run(
+            middleware,
+            make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c2"),
+        )
+        assert blocked.status == "error"
+        assert "Unlock condition" not in blocked.content
+
+
 def test_repeated_read_block_does_not_offer_offset_probing() -> None:
     # run7 evidence: 50 consecutive offset=0..49 probe reads, each accepted as
     # a "non-overlapping range" by the old message that suggested paginated
