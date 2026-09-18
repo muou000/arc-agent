@@ -19,6 +19,7 @@ from agents.runtime.checkpointer import get_checkpointer
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.stage_discipline import StageDisciplineMiddleware
 from agents.runtime.tool_usage import ToolUsageMiddleware
+from agents.tools.file_append import build_append_file_tool
 from core.path_compat import normalize_windows_extended_prefix_path, normalize_windows_extended_prefix_text
 
 if TYPE_CHECKING:
@@ -111,6 +112,7 @@ class ToolArgumentSanitizerMiddleware(AgentMiddleware[Any, Any, Any]):
     _TEXT_ARGS_BY_TOOL = {
         "write_file": ("content",),
         "edit_file": ("old_string", "new_string"),
+        "append_file": ("content",),
     }
 
     def wrap_tool_call(
@@ -407,6 +409,19 @@ def build_stage_agent(
         file_claim_gate=file_claim_gate,
         test_manifest_lock=test_manifest_lock if stage == "test_generation" else None,
     )
+    permissions = _build_filesystem_permissions(
+        root,
+        writable_roots,
+        skill_instruction_paths=_resolve_skill_instruction_paths(
+            resolved_skills,
+            skills_root,
+            permitted_skill_names=permitted_skill_names,
+        ),
+    )
+    stage_tools = list(tools or [])
+    if stage == "interface_design":
+        stage_tools.append(build_append_file_tool(workspace_root=str(root), permissions=permissions))
+
     agent = create_deep_agent(
         name=name,
         model=resolved_model,
@@ -419,18 +434,10 @@ def build_stage_agent(
             stage_discipline,
             DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
         ],
-        tools=tools or [],
+        tools=stage_tools,
         skills=resolved_skills,
         memory=_resolve_source_paths(memory, root, skills_root, default=[]),
-        permissions=_build_filesystem_permissions(
-            root,
-            writable_roots,
-            skill_instruction_paths=_resolve_skill_instruction_paths(
-                resolved_skills,
-                skills_root,
-                permitted_skill_names=permitted_skill_names,
-            ),
-        ),
+        permissions=permissions,
         context_schema=AgentRuntimeContext,
         response_format=_resolve_response_format(response_format, model=model),
         checkpointer=resolved_checkpointer,

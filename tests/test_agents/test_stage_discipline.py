@@ -396,6 +396,11 @@ def test_interface_design_blocks_more_than_eight_skeleton_writes() -> None:
         make_request("write_file", {"file_path": "/workspace/src/mod_new.py", "content": "class B:\n"}, call_id="c9"),
     )
     assert ninth.status == "error" and "at most 8 small skeleton files" in ninth.content
+    ninth_append = run(
+        middleware,
+        make_request("append_file", {"file_path": "/workspace/src/mod_new.py", "content": "class B:\n"}, call_id="a9"),
+    )
+    assert ninth_append.status == "error" and "at most 8 small skeleton files" in ninth_append.content
     # Rewriting an already-written path is governed by the repeated-write rule,
     # not the skeleton budget.
     rewrite = run(
@@ -415,6 +420,71 @@ def test_interface_design_blocks_large_files() -> None:
         ),
     )
     assert result.status == "error" and "small skeletons (at most 160 lines" in result.content
+
+
+def test_interface_design_allows_bounded_append_continuations() -> None:
+    middleware = make("interface_design")
+    path = "/workspace/src/page.tsx"
+    assert run(
+        middleware,
+        make_request("write_file", {"file_path": path, "content": "export function Page() {\n"}, call_id="w1"),
+    ).content == "ok"
+
+    for index in range(3):
+        result = run(
+            middleware,
+            make_request("append_file", {"file_path": path, "content": f"  // section {index}\n"}, call_id=f"a{index}"),
+        )
+        assert result.content == "ok"
+
+    fourth = run(
+        middleware,
+        make_request("append_file", {"file_path": path, "content": "  // too many\n"}, call_id="a3"),
+    )
+    assert fourth.status == "error" and "at most 3 times" in fourth.content
+
+    oversized = run(
+        make("interface_design"),
+        make_request("append_file", {"file_path": "/workspace/src/other.ts", "content": "x\n" * 81}),
+    )
+    assert oversized.status == "error" and "at most 80 lines" in oversized.content
+
+    blocked = run(
+        make("implementation"),
+        make_request("append_file", {"file_path": path, "content": "x\n"}),
+    )
+    assert blocked.status == "error" and "only available during the interface_design stage" in blocked.content
+
+
+def test_failed_append_attempts_consume_the_per_file_budget() -> None:
+    middleware = make("interface_design")
+    path = "/workspace/src/page.tsx"
+    assert run(
+        middleware,
+        make_request("write_file", {"file_path": path, "content": "export function Page() {\n"}, call_id="w1"),
+    ).content == "ok"
+
+    def failed_append(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="Error: transient append failure",
+            name=request.tool_call["name"],
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+    for index in range(3):
+        result = run(
+            middleware,
+            make_request("append_file", {"file_path": path, "content": "  // retry\n"}, call_id=f"f{index}"),
+            failed_append,
+        )
+        assert result.status == "error" and "transient append failure" in result.content
+
+    blocked = run(
+        middleware,
+        make_request("append_file", {"file_path": path, "content": "  // retry again\n"}, call_id="f3"),
+    )
+    assert blocked.status == "error" and "at most 3 times" in blocked.content
 
 
 # ---------------------------------------------------------------------------

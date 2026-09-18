@@ -12,12 +12,16 @@ if TYPE_CHECKING:
     from core.file_claims import FileClaimGate
 
 _FILE_WRITE_TOOLS = frozenset({"edit_file", "write_file"})
+_ADDITIVE_FILE_WRITE_TOOLS = frozenset({"append_file"})
 _VALIDATION_TOOLS = frozenset({"run_build", "run_tests"})
 # Marker prefix of results produced by _blocked(); tool-usage observability
 # uses it to tell blocked round-trips apart from tool errors.
 BLOCKED_RESULT_PREFIX = "Error: ARC stage discipline:"
 _MAX_DESIGN_WRITES = 8
 _MAX_SKELETON_LINES = 160
+MAX_SKELETON_LINES = _MAX_SKELETON_LINES
+MAX_APPEND_LINES = 80
+MAX_APPENDS_PER_FILE = 3
 _MAX_READ_LIMIT = 200
 
 # Stage-specific exits appended to the repeated-write block: a generic
@@ -79,6 +83,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         self._failed_paths: set[str] = set()
         self._validation_failed = False
         self._design_write_count = 0
+        self._append_counts: dict[str, int] = {}
         self._write_block_counts: dict[str, int] | None = {} if stage == "interface_design" else None
 
     def wrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
@@ -115,8 +120,53 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return "TestGenerator only creates tests and its manifest; it must not run validation."
         if name == "read_file":
             return self._validate_read(args)
+        if name in _ADDITIVE_FILE_WRITE_TOOLS:
+            return self._validate_append(args)
         if name in _FILE_WRITE_TOOLS:
             return self._validate_write(args)
+        return None
+
+    def _validate_append(self, args: dict[str, Any]) -> str | None:
+        """Validate the DESIGN-only additive continuation tool.
+
+        The filesystem tool checks the real file length. This middleware keeps
+        ownership and stage policy here so appending cannot bypass claims,
+        write-count limits, or the observability used by InterfaceDesigner.
+        """
+
+        if self._stage != "interface_design":
+            return "append_file is only available during the interface_design stage."
+        path = _discipline_path(args)
+        if not path:
+            return "append_file requires a workspace file_path."
+        if path not in self._written_paths and self._design_write_count >= _MAX_DESIGN_WRITES:
+            return (
+                f"InterfaceDesigner may materialize at most {_MAX_DESIGN_WRITES} small skeleton files. "
+                "Record remaining interfaces in the response for TDD."
+            )
+        count = self._append_counts.get(path, 0)
+        if count >= MAX_APPENDS_PER_FILE:
+            return (
+                f"InterfaceDesigner may append to {path} at most {MAX_APPENDS_PER_FILE} times in one pass. "
+                "Keep the skeleton compact and record remaining contract detail in the response for TDD."
+            )
+        content = args.get("content", "")
+        if not isinstance(content, str) or not content.strip():
+            return "append_file requires non-empty string content."
+        line_count = len(content.splitlines())
+        if line_count > MAX_APPEND_LINES:
+            return (
+                f"append_file accepts at most {MAX_APPEND_LINES} lines per chunk; received {line_count}. "
+                "Split the next cohesive skeleton section into another append."
+            )
+        if self._file_claim_gate is not None:
+            blocked = self._file_claim_gate.check_and_claim(path)
+            if blocked:
+                return blocked
+        # Reserve the append budget before invoking the filesystem tool. A
+        # failed append still represents a model attempt and must not become
+        # an unbounded retry loop around a missing or denied file.
+        self._append_counts[path] = count + 1
         return None
 
     def _validate_test_manifest_path(self, args: dict[str, Any], *, operation: str) -> str | None:
@@ -266,7 +316,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             limit = _as_nonnegative_int(args.get("limit"), default=100)
             self._read_ranges.setdefault(path, []).append((offset, offset + limit))
             self._cache_read_summary(request, path, offset, limit, result)
-        if name in _FILE_WRITE_TOOLS and path:
+        if (name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS) and path:
             if path not in self._written_paths and self._stage == "interface_design":
                 self._design_write_count += 1
             self._written_paths.add(path)
