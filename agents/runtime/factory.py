@@ -46,7 +46,14 @@ class OpenAIGlobSchema(BaseModel):
     """OpenAI-compatible schema for the glob tool."""
 
     pattern: str = Field(description="Glob pattern to match files (e.g., '**/*.py', '*.txt', '/subdir/**/*.md').")
-    path: str = Field(default=None, description="Base directory to search from. Defaults to the backend's default root.")
+    path: str = Field(
+        default=None,
+        description=(
+            "Required base directory to search from, as an absolute virtual path "
+            "(e.g. '/workspace', '/workspace/backend/tests'). A glob without `path` "
+            "is denied by the read policy, so always pass it explicitly."
+        ),
+    )
 
 
 class OpenAIGrepSchema(BaseModel):
