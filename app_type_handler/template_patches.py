@@ -2,12 +2,12 @@
 
 A run compiles against the templates the platform provisions through
 ``ARC_AGENT_TEMPLATES_ROOT`` (see ``app_type_handler/base.py``); the in-repo
-``arc-template/templates`` tree only mirrors them. A fix that must reach every
-generated workspace therefore cannot live as an edit to the template source -
-the provisioned template would never carry it, every workspace would be
-generated from the unfixed files, and every node would pay for the defect in
-its own TDD loop. Fixes are delivered here instead and applied to the workspace
-immediately after the template is copied.
+``arc-template/templates`` tree only mirrors them and carries no repo-only
+fixes. A fix that must reach every generated workspace therefore cannot live
+as an edit to the template source - the provisioned template would never carry
+it, every workspace would be generated from the unfixed files, and every node
+would pay for the defect in its own TDD loop. Fixes are delivered here instead
+and applied to the workspace immediately after the template is copied.
 
 Every edit is *directed* and *marker-guarded*:
 
@@ -78,10 +78,17 @@ SKIPPED = "skipped"
 _INIT_DB_PATH = "backend/src/database/init_db.js"
 _README_PATH = "README.md"
 
-# PR #28 fixed two defects in the template's database bootstrap. Both are
-# delivered here instead of as repo template edits, because the template that
-# actually compiles the workspace is provisioned by the platform:
+# PR #28 fixed two defects in the template's database bootstrap, and this
+# chain also carries the earlier handle-return fix (a15ad24) the provisioned
+# template never received. All three are delivered here instead of as repo
+# template edits, because the template that actually compiles the workspace is
+# provisioned by the platform, and the in-repo mirror tracks that official
+# template rather than carrying repo-only fixes:
 #
+#  0. initializeDatabase() returned the bare init promise from the memoized
+#     path, handing callers a Promise<void> instead of a handle, so every
+#     second DB operation failed with
+#     "Cannot read properties of undefined (reading 'exec')".
 #  1. initializeDatabase() could hand a caller a closed handle when a
 #     concurrent closeDb()/setDbPath() invalidated an in-flight first init, so
 #     the caller's next DB operation failed with
@@ -89,6 +96,12 @@ _README_PATH = "README.md"
 #     surface as an unhandled rejection.
 #  2. A genuine init failure was swallowed into the bounded retry loop instead
 #     of surfacing, so a real error burned every attempt before being reported.
+#
+# The search shapes below assume the official template's pre-fix content. When
+# the platform re-provisions a newer official template, re-align the mirror and
+# these shapes together - a search shape that only matches the repo mirror
+# breaks the scaffold on every online run (seen 2026-09-18: the shapes assumed
+# an a15ad24-era template the platform had never shipped).
 TEMPLATE_PATCHES: tuple[TemplatePatch, ...] = (
     TemplatePatch(
         name="init-db-never-return-closed-handle",
@@ -128,12 +141,7 @@ TEMPLATE_PATCHES: tuple[TemplatePatch, ...] = (
                     "    await resetDatabaseFile();\n"
                     "  }\n"
                     "  if (initPromise) {\n"
-                    "    // Memoized path: callers await this function and then use the result as a\n"
-                    "    // database handle. Returning the init promise would hand them a\n"
-                    "    // Promise<void>, so every second DB operation failed with\n"
-                    "    // \"Cannot read properties of undefined (reading 'exec')\".\n"
-                    "    await initPromise;\n"
-                    "    return getDb();\n"
+                    "    return initPromise;\n"
                     "  }\n"
                     "\n"
                     "  const database = getDb();\n"
@@ -255,7 +263,7 @@ TEMPLATE_PATCHES: tuple[TemplatePatch, ...] = (
                 ),
                 replace=(
                     "- The default database file is `database.db`, unless `ARC_DB_FILE` or `DATABASE_FILE` is set.\n"
-                    "- `initializeDatabase()` always resolves to an open handle for the current database path, even when `closeDb()`/`setDbPath()` race an in-flight initialization; it never returns a closed handle.\n"
+                    "- `initializeDatabase()` always resolves to an open handle for the current database path, even when `closeDb()`/`setDbPath()` race an in-flight initialization; it never returns a closed handle. The provisioned template may predate this fix; ARC applies it to the workspace at scaffold time via `app_type_handler/template_patches.py`.\n"
                 ),
                 applied_marker="always resolves to an open handle for the current database path",
             ),

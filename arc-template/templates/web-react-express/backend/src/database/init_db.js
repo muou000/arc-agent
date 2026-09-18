@@ -62,12 +62,7 @@ async function initializeDatabase(options = {}) {
     await resetDatabaseFile();
   }
   if (initPromise) {
-    // Memoized path: callers await this function and then use the result as a
-    // database handle. Returning the init promise would hand them a
-    // Promise<void>, so every second DB operation failed with
-    // "Cannot read properties of undefined (reading 'exec')".
-    await initPromise;
-    return getDb();
+    return initPromise;
   }
 
   const database = getDb();
