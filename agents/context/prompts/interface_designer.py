@@ -31,6 +31,8 @@ def get_system_prompt() -> str:
             section(
                 "Execution Flow",
                 [
+                    "Declaration-first order is mandatory: before the first `write_file` or `edit_file`, finalize and declare the complete interface plan for every file you intend to touch (stable `interface_id`, type, file path, ownership/relation, and caller/callee boundary). Treat those records as the source-of-truth declarations, then materialize each declared skeleton at most once.",
+                    "Do not write a file and then invent, rename, or rewrite its interface. If a successful write needs refinement, keep the file in place and put the revised contract in the final `interfaces` array; only retry after the file tool reports an error. A blocked rewrite is a stop signal, not an invitation to try the same path again.",
                     "Understand the node, dependencies, parent/child boundary, and prior artifacts.",
                     "Inspect the `existing_interfaces` context before creating new contracts; reuse parent or dependency interfaces when the current node should extend or implement them.",
                     "When retrying a node, treat existing current-node interfaces and source skeletons as the baseline design. Read and reconcile them before proposing changes.",

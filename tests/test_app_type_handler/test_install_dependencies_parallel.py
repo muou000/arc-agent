@@ -8,6 +8,7 @@ no isolation benefit.
 from __future__ import annotations
 
 import asyncio
+import json
 
 from app_type_handler import web as web_module
 from app_type_handler.web import WebAppType
@@ -68,3 +69,46 @@ def test_missing_frontend_directory_is_skipped(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(web_module, "run_npm_install", fake_install)
     assert asyncio.run(_handler(tmp_path, with_frontend=False).install_dependencies()) is True
     assert len(called) == 1 and called[0].endswith("backend")
+
+
+def test_playwright_install_overlaps_npm_install_after_cli_is_ready(tmp_path, monkeypatch) -> None:
+    handler = _handler(tmp_path)
+    backend = tmp_path / "backend"
+    (backend / "node_modules").mkdir()
+    (backend / "package.json").write_text(
+        json.dumps({"devDependencies": {"playwright": "^1.57.0"}}),
+        encoding="utf-8",
+    )
+
+    running: set[str] = set()
+    browser_overlapped = False
+
+    async def fake_install(target_dir: str, log_cb=None) -> bool:
+        label = "backend" if target_dir.endswith("backend") else "frontend"
+        running.add(label)
+        if label == "backend":
+            await asyncio.sleep(0.01)
+            playwright = backend / "node_modules" / "playwright"
+            playwright.mkdir()
+            (playwright / "cli.js").write_text("", encoding="utf-8")
+        await asyncio.sleep(0.03)
+        running.discard(label)
+        return True
+
+    async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
+        nonlocal browser_overlapped
+        if "playwright install" in command:
+            browser_overlapped = bool(running)
+        await asyncio.sleep(0.01)
+        return "Exit Code: 0\nSTDOUT:\nok\n"
+
+    async def fake_peer_patch(_handler: WebAppType, _frontend_dir: str) -> None:
+        return None
+
+    monkeypatch.setattr(web_module, "run_npm_install", fake_install)
+    monkeypatch.setattr(web_module, "_execute_web_test_command", fake_command)
+    monkeypatch.setattr(web_module, "PLAYWRIGHT_CLI_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(WebAppType, "_ensure_testing_library_dom", fake_peer_patch)
+
+    assert asyncio.run(handler.install_dependencies()) is True
+    assert browser_overlapped, "Playwright browser installation must overlap npm install"
