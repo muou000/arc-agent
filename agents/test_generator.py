@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
+from core import sessions
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_generator import get_system_prompt, get_user_prompt
@@ -100,6 +101,8 @@ class TestGenerator:
         )
         interface_contract = context_pipeline.get_interface_contract_context(node_id)
         context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
+        current_interfaces = self._current_node_interfaces(node_id)
+        current_interface_ids = self._current_interface_ids(node_id, current_interfaces)
         manifest_lock = TestManifestLock()
         agent = build_stage_agent(
             name="test_generator",
@@ -115,12 +118,18 @@ class TestGenerator:
             permitted_skill_names=selected_skill_names,
             memory=[],
             tools=[
-                *build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+                *build_traceability_tools(
+                    node_id=node_id,
+                    log_cb=self.log_cb,
+                    current_interfaces=current_interfaces,
+                ),
                 build_declare_test_manifest_tool(
                     node_id=node_id,
                     manifest_lock=manifest_lock,
                     validate_test_path=self._make_path_validator(app_type, workspace_root),
                     log_cb=self.log_cb,
+                    current_interface_ids=current_interface_ids,
+                    require_interface_coverage=bool(current_interface_ids),
                 ),
             ],
             node_id=node_id,
@@ -301,12 +310,18 @@ class TestGenerator:
             skills=[],
             memory=[],
             tools=[
-                *build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+                *build_traceability_tools(
+                    node_id=node_id,
+                    log_cb=self.log_cb,
+                    current_interfaces=self._current_node_interfaces(node_id),
+                ),
                 build_declare_test_manifest_tool(
                     node_id=node_id,
                     manifest_lock=manifest_lock,
                     validate_test_path=self._make_path_validator(app_type, workspace_root),
                     log_cb=self.log_cb,
+                    current_interface_ids=self._current_interface_ids(node_id),
+                    require_interface_coverage=bool(self._current_interface_ids(node_id)),
                 ),
             ],
             node_id=node_id,
@@ -397,3 +412,23 @@ class TestGenerator:
         result = self.log_cb(self.agent_name, message, status, node_id)
         if inspect.isawaitable(result):
             await result
+
+    @staticmethod
+    def _current_node_interfaces(node_id: str) -> list[dict[str, Any]]:
+        session = sessions.load_node_session(node_id)
+        interfaces = session.get("interfaces")
+        if not isinstance(interfaces, list):
+            return []
+        return [dict(item) for item in interfaces if isinstance(item, dict)]
+
+    @staticmethod
+    def _current_interface_ids(
+        node_id: str,
+        interfaces: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
+        source = interfaces if interfaces is not None else TestGenerator._current_node_interfaces(node_id)
+        return [
+            str(item.get("interface_id") or "").strip()
+            for item in source
+            if str(item.get("interface_id") or "").strip()
+        ]

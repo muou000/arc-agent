@@ -15,6 +15,7 @@ import asyncio
 import pytest
 from pathlib import Path
 
+from core import sessions
 from agents.interface_designer import InterfaceDesigner
 from agents.test_generator import TestGenerator
 from tests.helpers.faux import FauxChatModel, faux_tool_call
@@ -656,6 +657,89 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
     assert "T-ADD" in output_text
     # The scripted test asset really landed in the workspace.
     assert (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").read_text(encoding="utf-8") == test_code
+
+
+def test_test_generator_uses_staged_current_interfaces_before_db_commit(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    node_id = "REQ-GEN-STAGED"
+    seed_requirement(arc_runtime, node_id)
+    sessions.merge_node_session(
+        node_id,
+        {
+            "interfaces": [
+                {
+                    "interface_id": "REQ-GEN-STAGED-FUNC-CALC",
+                    "req_id": node_id,
+                    "type": "FUNC",
+                    "name": "add",
+                    "file_path": "backend/src/services/calc.js",
+                    "first_line": "function add(a, b)",
+                    "responsibility": "Add two integers.",
+                    "specification": "Returns a + b.",
+                }
+            ],
+            "phase_status": {"design": "prepared"},
+        },
+    )
+
+    test_code = "test('add', () => { expect(add(1, 1)).toBe(2); });\n"
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "get_interfaces_for_requirement",
+                {"req_id": node_id},
+                call_id="c0",
+            ),
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "type": "Unit",
+                            "interface_ids": ["REQ-GEN-STAGED-FUNC-CALC"],
+                        }
+                    ]
+                },
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": test_code},
+                call_id="c2",
+            ),
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "One unit test for the staged calculator contract.",
+                    "tests": [
+                        {
+                            "test_id": "T-STAGED-ADD",
+                            "req_id": node_id,
+                            "interface_ids": ["REQ-GEN-STAGED-FUNC-CALC"],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "first_line": "test('add', () => {",
+                        }
+                    ],
+                    "files_written": ["backend/tests/unit/calc.test.js"],
+                },
+                call_id="c3",
+            ),
+        ]
+    )
+
+    tests, _ = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    assert model.call_count == 4
+    assert tests is not None
+    assert tests[0]["interface_ids"] == ["REQ-GEN-STAGED-FUNC-CALC"]
 
 
 def test_test_generator_delete_cannot_escape_the_workspace_root(tmp_project_dir: Path, arc_runtime) -> None:
