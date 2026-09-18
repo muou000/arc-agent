@@ -43,11 +43,18 @@ _UNSET: Any = object()
 _REGISTERED_HARNESS_PROFILES: set[str] = set()
 
 class OpenAIGlobSchema(BaseModel):
-    """OpenAI-compatible schema for the glob tool."""
+    """OpenAI-compatible schema for the glob tool.
+
+    ``path`` is declared required even though deepagents' glob wrapper accepts
+    ``None``: a pathless call anchors the permission check at ``/``, which the
+    ARC permission set denies, so the tool can never succeed without it. Making
+    the field required turns a doomed call into an argument-validation error
+    ToolMessage (langgraph's ToolNode converts pydantic ValidationError before
+    the tool runs), telling the model exactly what is missing.
+    """
 
     pattern: str = Field(description="Glob pattern to match files (e.g., '**/*.py', '*.txt', '/subdir/**/*.md').")
     path: str = Field(
-        default=None,
         description=(
             "Required base directory to search from, as an absolute virtual path "
             "(e.g. '/workspace', '/workspace/backend/tests'). A glob without `path` "

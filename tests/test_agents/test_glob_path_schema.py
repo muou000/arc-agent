@@ -15,8 +15,9 @@ shared Tool Policy must repeat the rule where every stage agent reads it.
 
 from __future__ import annotations
 
+import pytest
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agents.context.prompts.common import workspace_tool_policy
 from agents.runtime.factory import OpenAIGlobSchema, _normalize_tool_schema
@@ -49,6 +50,17 @@ def test_glob_schema_path_description_says_path_is_required() -> None:
     assert "default root" not in description
 
 
+def test_glob_schema_path_is_actually_required() -> None:
+    # The description says "Required"; the schema must enforce it. Omitting the
+    # argument or passing null must fail validation (langgraph's ToolNode turns
+    # the ValidationError into an error ToolMessage before the tool runs).
+    with pytest.raises(ValidationError):
+        OpenAIGlobSchema(pattern="**/*.py")
+    with pytest.raises(ValidationError):
+        OpenAIGlobSchema(pattern="**/*.py", path=None)
+    assert "path" in OpenAIGlobSchema.model_json_schema().get("required", [])
+
+
 def test_normalized_glob_schema_reaches_the_model() -> None:
     normalized = _normalize_tool_schema(_glob_tool())
     schema = getattr(normalized, "args_schema", None)
@@ -59,3 +71,16 @@ def test_tool_policy_teaches_explicit_glob_path() -> None:
     policy = workspace_tool_policy()
     assert "explicit `path`" in policy
     assert "glob" in policy
+    # The rule must be stated as a tool-argument constraint, not glob syntax,
+    # and must sit with the tool-selection rules rather than the syntax rules.
+    lines = [line for line in policy.splitlines() if "explicit `path`" in line]
+    assert len(lines) == 1
+    assert "required argument" in lines[0]
+    tool_selection = next(
+        idx for idx, line in enumerate(policy.splitlines()) if "file discovery" in line
+    )
+    glob_syntax = next(
+        idx for idx, line in enumerate(policy.splitlines()) if "brace expansion" in line
+    )
+    path_rule = policy.splitlines().index(lines[0])
+    assert tool_selection < path_rule < glob_syntax
