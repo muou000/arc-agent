@@ -330,6 +330,11 @@ def _tool_result_failed(result: ToolMessage | Any) -> bool:
 def _is_test_asset(path: str) -> bool:
     normalized = path.replace("\\", "/").lower()
     name = normalized.rsplit("/", 1)[-1]
-    test_segments = ("/test/", "/tests/", "/__tests__/", "/e2e/", "/__mocks__/")
+    # ``/test-e2e/`` is the web app type's E2E directory: its files may carry
+    # any JS/TS source name (the placement rule accepts plain names), so the
+    # segment must count as a test asset even without a `.test.`/`.spec.`
+    # marker — otherwise a declared `backend/test-e2e/login.js` would be
+    # rejected as "not a test asset" after passing the manifest declaration.
+    test_segments = ("/test/", "/tests/", "/__tests__/", "/e2e/", "/test-e2e/", "/__mocks__/")
     test_names = (".test.", ".spec.", "playwright.config.", "vitest.config.", "jest.config.", "setup-tests.", "setuptests.")
     return any(segment in normalized for segment in test_segments) or any(marker in name for marker in test_names)

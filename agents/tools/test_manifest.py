@@ -109,8 +109,10 @@ def is_test_file_path(path: str) -> bool:
     if "/test-e2e/" in f"/{normalized}/":
         return True
     name = normalized.rsplit("/", 1)[-1]
+    if ".test." in name or ".spec." in name:
+        return True
     if not name.endswith(".py"):
-        return ".test." in name or ".spec." in name
+        return False
     return name.startswith("test_") or name.endswith("_test.py")
 
 
@@ -301,6 +303,7 @@ def reconcile_declared_manifest(
     manifest_items: list[dict[str, Any]],
     manifest_lock: TestManifestLock,
     written_paths: list[str],
+    node_id: str = "",
 ) -> dict[str, Any]:
     """Reconcile the returned manifest against the declaration and the disk.
 
@@ -312,9 +315,10 @@ def reconcile_declared_manifest(
       coverage;
     - a declared-and-written path with no manifest entry means the model wrote
       the file but dropped its row; the row is re-attached from the declaration
-      (path + type + interfaces survive) with ``req_id`` and ``test_id``
-      derived mechanically — losing a real test file's registration over a
-      serialization slip is strictly worse;
+      (path + type + interfaces survive), with ``req_id`` and ``test_id``
+      derived mechanically from ``node_id`` — the node prefix keeps the
+      generated ``test_id`` globally unique and traceable, and losing a real
+      test file's registration over a serialization slip is strictly worse;
     - entries for declared-but-unwritten paths are dropped with a diagnostic:
       the file does not exist, so registering it would poison the baseline RED
       gate with a phantom run.
@@ -364,8 +368,8 @@ def reconcile_declared_manifest(
         row = manifest_lock.declared_files[path]
         reconciled.append(
             {
-                "test_id": _mechanical_test_id(node_hint="", file_path=path),
-                "req_id": "",
+                "test_id": _mechanical_test_id(node_hint=node_id, file_path=path),
+                "req_id": str(node_id or "").strip(),
                 "interface_ids": list(row.interface_ids),
                 "type": row.test_type,
                 "file_path": path,
@@ -384,10 +388,18 @@ def reconcile_declared_manifest(
 
 
 def _mechanical_test_id(node_hint: str, *, file_path: str) -> str:
+    """Deterministic test id for a mechanically re-attached manifest row.
+
+    Shape: ``<NODE>-T-<FILE-STEM>`` (``T-<STEM>`` without a node hint). The
+    node prefix keeps ids from different nodes apart in the tests table even
+    when two nodes each re-attach a same-named file, and satisfies the
+    manifest contract that every ``test_id`` names its owning node.
+    """
+
     stem = Path(file_path).stem
     cleaned = re.sub(r"[^A-Za-z0-9]+", "-", stem).strip("-").upper() or "TEST"
     prefix = re.sub(r"[^A-Za-z0-9]+", "-", str(node_hint or "").strip()).strip("-").upper()
-    return f"{prefix}-{''.join(part for part in ('T', cleaned) if part)}" if prefix else f"T-{cleaned}"
+    return f"{prefix}-T-{cleaned}" if prefix else f"T-{cleaned}"
 
 
 def _tool_error(message: str) -> str:

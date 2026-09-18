@@ -1063,6 +1063,10 @@ def test_test_generator_written_file_dropped_from_manifest_is_reattached(tmp_pro
     assert tests[0]["file_path"] == "backend/tests/unit/auth.test.js"
     assert tests[0]["type"] == "Unit"
     assert tests[0].get("manifest_reattached") is True
+    # The re-attached row stays node-scoped: its mechanical test_id carries
+    # the node prefix and req_id names the owning node (manifest contract).
+    assert tests[0]["test_id"].startswith(node_id)
+    assert tests[0]["req_id"] == node_id
 
 
 def test_test_generator_helpers_stay_writable_without_declaration(tmp_project_dir: Path, arc_runtime) -> None:

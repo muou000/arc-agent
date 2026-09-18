@@ -512,13 +512,32 @@ def test_test_file_write_blocked_outside_declared_manifest() -> None:
 
 
 def test_declared_path_matches_despite_prefix_forms() -> None:
-    middleware = make_locked(declared=["tests/unit/test_a.py"])
-    for path in ("/workspace/tests/unit/test_a.py", "tests/unit/test_a.py", "./tests/unit/test_a.py"):
+    middleware = make_locked(declared=["tests/unit/a.test.py"])
+    for path in ("/workspace/tests/unit/a.test.py", "tests/unit/a.test.py", "./tests/unit/a.test.py"):
         result = run(
             middleware,
             make_request("edit_file", {"file_path": path, "old_string": "a", "new_string": "b"}),
         )
         assert result.content == "ok", f"declared path in form {path!r} must pass"
+
+
+def test_edit_file_is_gated_like_write_file() -> None:
+    """edit_file must not be a bypass: the gate lives in _validate_write,
+    which covers both file-write tools, and the undeclared case is blocked
+    with the same manifest message."""
+    middleware = make_locked(declared=["tests/unit/a.test.py"])
+    blocked = run(
+        middleware,
+        make_request("edit_file", {"file_path": "/workspace/tests/unit/b.test.py", "old_string": "a", "new_string": "b"}),
+    )
+    assert blocked.status == "error" and "Manifest lock blocked" in blocked.content
+
+    undeclared_stage = make_locked(declared=[])
+    blocked = run(
+        undeclared_stage,
+        make_request("edit_file", {"file_path": "/workspace/tests/unit/a.test.py", "old_string": "a", "new_string": "b"}),
+    )
+    assert blocked.status == "error" and "Manifest-first blocked" in blocked.content
 
 
 def test_manifest_lock_blocks_delete_of_undeclared_test_file() -> None:
@@ -531,10 +550,28 @@ def test_manifest_lock_blocks_delete_of_undeclared_test_file() -> None:
 
 
 def test_manifest_lock_ignores_helpers_and_configs() -> None:
-    middleware = make_locked(declared=["tests/unit/test_a.py"])
+    middleware = make_locked(declared=["tests/unit/a.test.py"])
     for path in ("/workspace/tests/setup-tests.ts", "/workspace/backend/vitest.config.js"):
         result = run(middleware, make_request("write_file", {"file_path": path, "content": "x\n"}))
         assert result.content == "ok", f"helper/config {path} must stay writable"
+
+
+def test_test_e2e_directory_files_are_test_assets_and_gated() -> None:
+    """A web E2E file may carry a plain JS name under `test-e2e/`; it must be
+    writable when declared (test-asset check) and blocked when not declared
+    (manifest gate) — a declared-but-unwritable path would be a dead end."""
+    middleware = make_locked(declared=["backend/test-e2e/login.js"])
+    declared = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/backend/test-e2e/login.js", "content": "// e2e\n"}),
+    )
+    assert declared.content == "ok"
+
+    undeclared = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/backend/test-e2e/logout.js", "content": "// e2e\n"}),
+    )
+    assert undeclared.status == "error" and "Manifest lock blocked" in undeclared.content
 
 
 def test_manifest_lock_inactive_for_other_stages() -> None:

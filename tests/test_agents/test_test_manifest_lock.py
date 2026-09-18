@@ -66,6 +66,10 @@ def test_is_test_file_path_matches_test_names_only() -> None:
     assert is_test_file_path("/workspace/src/app.spec.tsx")
     assert is_test_file_path("tests/unit/test_calc.py")
     assert is_test_file_path("tests/unit/calc_test.py")
+    # The `.test.`/`.spec.` marker rule and the Python conventions are a
+    # union: a Python file carrying a JS-style test marker is still a test
+    # file (the `.py` suffix must not short-circuit the marker check).
+    assert is_test_file_path("tests/unit/b.test.py")
     # Web E2E accepts any JS/TS source name under test-e2e directories.
     assert is_test_file_path("backend/test-e2e/login.js")
     assert is_test_file_path("/workspace/backend/test-e2e/flows/auth.ts")
@@ -73,6 +77,7 @@ def test_is_test_file_path_matches_test_names_only() -> None:
     assert not is_test_file_path("backend/vitest.config.js")
     assert not is_test_file_path("src/helper.ts")
     assert not is_test_file_path("src/e2e-helper.ts")
+    assert not is_test_file_path("")
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +185,41 @@ def test_declaration_rejects_empty_list() -> None:
     assert "non-empty list" in payload["error"]
 
 
+def test_failed_redeclaration_keeps_the_existing_lock_intact() -> None:
+    """A rejected re-declaration must not disturb already-locked paths.
+
+    The state machine: a successful declaration locks its rows; a later
+    declaration may only add new valid rows. A failing attempt leaves the
+    lock exactly as it was (no partial state, no lost rows) — otherwise a
+    model could erase its own locked set by submitting one bad row.
+    """
+    lock = TestManifestLock()
+    tool = build_declare_test_manifest_tool(node_id="REQ-X", manifest_lock=lock)
+    first = _parse(str(asyncio.run(tool(files=[{"file_path": "tests/unit/a.test.ts", "type": "Unit", "interface_ids": []}]))))
+    assert first["status"] == "locked"
+
+    rejected = _parse(
+        str(
+            asyncio.run(
+                tool(
+                    files=[
+                        {"file_path": "tests/unit/b.test.ts", "type": "Unit", "interface_ids": []},
+                        {"file_path": "src/not-a-test.ts", "type": "Unit", "interface_ids": []},
+                    ]
+                )
+            )
+        )
+    )
+    assert rejected["status"] == "error"
+    # Neither the invalid row nor the valid row of the failed attempt landed;
+    # the original lock is untouched.
+    assert sorted(lock.declared_files) == ["tests/unit/a.test.ts"]
+
+    retry = _parse(str(asyncio.run(tool(files=[{"file_path": "tests/unit/b.test.ts", "type": "Unit", "interface_ids": []}]))))
+    assert retry["status"] == "locked"
+    assert sorted(lock.declared_files) == ["tests/unit/a.test.ts", "tests/unit/b.test.ts"]
+
+
 # ---------------------------------------------------------------------------
 # reconciliation
 # ---------------------------------------------------------------------------
@@ -218,6 +258,7 @@ def test_reconcile_reattaches_written_files_dropped_from_the_answer() -> None:
         manifest_items=[],
         manifest_lock=lock,
         written_paths=["/workspace/tests/unit/a.test.ts"],
+        node_id="REQ-7",
     )
     assert result["reattached_paths"] == ["tests/unit/a.test.ts"]
     assert len(result["tests"]) == 1
@@ -226,6 +267,30 @@ def test_reconcile_reattaches_written_files_dropped_from_the_answer() -> None:
     assert reattached["type"] == "Unit"
     assert reattached["interface_ids"] == ["IF-A"]
     assert reattached["manifest_reattached"] is True
+    # The node prefix keeps ids globally unique and traceable per the
+    # manifest contract; req_id names the owning node.
+    assert reattached["test_id"] == "REQ-7-T-A-TEST"
+    assert reattached["req_id"] == "REQ-7"
+
+
+def test_reconcile_reattached_ids_do_not_collide_across_nodes() -> None:
+    def reattach(node_id: str) -> str:
+        lock = TestManifestLock(
+            declared_files={
+                "backend/tests/unit/auth.test.js": DeclaredTestFile(
+                    file_path="backend/tests/unit/auth.test.js", test_type="Unit"
+                ),
+            }
+        )
+        result = reconcile_declared_manifest(
+            manifest_items=[],
+            manifest_lock=lock,
+            written_paths=["/workspace/backend/tests/unit/auth.test.js"],
+            node_id=node_id,
+        )
+        return result["tests"][0]["test_id"]
+
+    assert reattach("REQ-1") != reattach("REQ-2")
 
 
 def test_reconcile_empty_lock_is_a_passthrough() -> None:

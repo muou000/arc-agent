@@ -191,6 +191,7 @@ class TestGenerator:
             manifest_items=tests,
             manifest_lock=manifest_lock,
             written_paths=written_paths,
+            node_id=node_id,
         )
         tests = result["tests"]
         output_text = json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
