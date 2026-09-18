@@ -40,6 +40,8 @@ def test_eval_parser_defaults_and_flags():
             "--out-dir",
             "somewhere",
             "--keep-workspaces",
+            "--arm-order",
+            "alternate",
         ]
     )
     assert args.requirement_path == "req"
@@ -54,6 +56,7 @@ def test_eval_parser_defaults_and_flags():
     assert args.timeout == 1800.0
     assert args.out_dir == "somewhere"
     assert args.keep_workspaces is True
+    assert args.arm_order == "alternate"
     assert args.runner_script is None
     assert args.func is cmd_eval
 
