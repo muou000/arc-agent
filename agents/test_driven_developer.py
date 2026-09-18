@@ -16,7 +16,10 @@ from agents.runtime.runners import ainvoke_stage_agent
 from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
+from agents.tools.test_manifest import normalize_manifest_path
+from agents.tools.test_failure_digest import build_failure_digest, format_failure_digest
 from agents.tools.traceability import build_traceability_tools
+from app_type_handler.test_results import classify_test_failure, failure_fingerprint
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -50,6 +53,8 @@ class TestDrivenDeveloper:
         self._last_run_tests_result: str | None = None
         self._last_run_tests_exit_code: int | None = None
         self._last_verifier_report_text = ""
+        self._last_failure_digest_text = ""
+        self._last_modified_files: list[str] = []
         self._test_budget_exhausted = False
         self._current_test_files: list[str] = []
         self._current_test_type = ""
@@ -71,6 +76,8 @@ class TestDrivenDeveloper:
         self._last_run_tests_result = None
         self._last_run_tests_exit_code = None
         self._last_verifier_report_text = ""
+        self._last_failure_digest_text = ""
+        self._last_modified_files = []
         self._test_budget_exhausted = False
         self._current_test_files = [str(path or "").strip() for path in test_files if str(path or "").strip()]
         self._current_test_type = test_type
@@ -234,6 +241,15 @@ class TestDrivenDeveloper:
             log_cb=self.log_cb,
         )
         final_text = self._payload_to_final_text(payload)
+        # Capture the session's writes (discipline ground truth, virtual
+        # /workspace/ paths) for the cross-session diff hint. Deleted-after-
+        # write paths are excluded by the discipline itself.
+        discipline = getattr(agent, "arc_stage_discipline", None)
+        if discipline is not None:
+            self._last_modified_files = [
+                normalize_manifest_path(path)
+                for path in discipline.materialized_paths()
+            ]
         if self._test_budget_exhausted and stop_on_test_budget_exhausted:
             return "BUDGET_EXHAUSTED"
         if "IMPLEMENTED" in final_text.upper() and self._last_run_tests_exit_code != 0:
@@ -250,6 +266,28 @@ class TestDrivenDeveloper:
     def get_last_verifier_report(self) -> str:
         return self._last_verifier_report_text
 
+    def get_last_failure_digest(self) -> str:
+        """Structured per-test digest of the last failed in-session run.
+
+        Empty when the last run passed or the session never ran tests. The
+        workflow prefers this over ``get_last_verifier_report`` for the
+        cross-session handoff: it carries per-test locations and
+        expected/received detail instead of a raw tail, so the next session
+        starts at the failure instead of re-localizing it.
+        """
+
+        return self._last_failure_digest_text
+
+    def get_last_modified_files(self) -> list[str]:
+        """Workspace-relative paths this session wrote (discipline ground truth).
+
+        Populated only when the backing agent exposes the stage discipline;
+        stays empty otherwise. Feeds the tdd_handoff diff hint so the next
+        session knows what its predecessor edited without re-reading files.
+        """
+
+        return list(self._last_modified_files)
+
     @staticmethod
     def _payload_to_final_text(payload: dict[str, Any]) -> str:
         summary = str(payload.get("summary", "") or "").strip()
@@ -265,7 +303,16 @@ class TestDrivenDeveloper:
         exit_code = self._extract_exit_code(result)
         if exit_code == 0:
             self._last_verifier_report_text = ""
+            self._last_failure_digest_text = ""
             return
+        digest = build_failure_digest(result)
+        self._last_failure_digest_text = format_failure_digest(
+            digest,
+            test_type=self._current_test_type,
+            raw_output_path=self._extract_run_log_path(result),
+            fingerprint=failure_fingerprint(result),
+            environment_failure=classify_test_failure(result),
+        )
         key_line = ""
         for line in (result or "").splitlines():
             stripped = line.strip()
@@ -295,6 +342,21 @@ class TestDrivenDeveloper:
                 return int(stripped.split("Exit Code:", 1)[1].strip())
             except ValueError:
                 return None
+        return None
+
+    @staticmethod
+    def _extract_run_log_path(tool_result: str) -> str | None:
+        """Pull the persisted raw-output path out of a run_tests result.
+
+        The workflow appends an ``ARC_RUN_OUTPUT_LOG: ... saved at `path`.``
+        line to every persisted run; re-reading it here keeps the digest
+        builder free of workflow knowledge.
+        """
+
+        for line in (tool_result or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("ARC_RUN_OUTPUT_LOG:") and "`" in stripped:
+                return stripped.split("`", 2)[1] if stripped.count("`") >= 2 else None
         return None
 
     async def _log(self, message: str, status: str | None = None, node_id: str | None = None) -> None:
