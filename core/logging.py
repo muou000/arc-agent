@@ -9,6 +9,46 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+def configure_process_stdio() -> None:
+    """Make CLI output observable immediately when stdout is a pipe.
+
+    ARC-Bench runs the agent without a TTY and consumes its stdout one line at
+    a time. Python otherwise uses block buffering for ordinary ``print``
+    calls in that mode. The explicit stream configuration covers the current
+    process, while ``PYTHONUNBUFFERED`` is inherited by Python subprocesses.
+    ``write_terminal_log`` already flushes its own writes; this also covers
+    banners, startup text, third-party prints, and stderr diagnostics.
+    """
+
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    for stream in (sys.stdout, sys.stderr):
+        _configure_text_stream(stream)
+
+
+def _configure_text_stream(stream: Any) -> None:
+    """Configure a text stream, including wrappers such as colorama's."""
+
+    current = stream
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        reconfigure = getattr(current, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(line_buffering=True, write_through=True)
+                break
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+        current = getattr(current, "stream", None) or getattr(current, "wrapped", None)
+
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
+        try:
+            flush()
+        except (OSError, ValueError):
+            pass
+
+
 def format_json_for_log(value: Any) -> str:
     try:
         return json.dumps(value, ensure_ascii=False, indent=2, default=str)
