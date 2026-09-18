@@ -84,18 +84,31 @@ def _stream_transport_enabled() -> bool:
 # unsupported there, so every later call goes plain without paying the failed
 # streamed attempt again. Keyed by (model, base_url); a process-wide cache
 # like the model-client cache because the capability is an endpoint property.
-_STREAMING_UNSUPPORTED: set[tuple[str, str]] = set()
+# The mark expires after ``_STREAMING_UNSUPPORTED_TTL_SECONDS``: a 4xx can also
+# come from a transient gateway misconfiguration, and a permanent mark would
+# re-expose large-output turns to the gateway idle-timeout drop for the rest
+# of a long run even after the endpoint recovers streaming.
+_STREAMING_UNSUPPORTED: dict[tuple[str, str], float] = {}
 _STREAMING_UNSUPPORTED_LOCK = threading.Lock()
+_STREAMING_UNSUPPORTED_TTL_SECONDS = 300.0
 
 
 def _mark_streaming_unsupported(model: str, base_url: str) -> None:
     with _STREAMING_UNSUPPORTED_LOCK:
-        _STREAMING_UNSUPPORTED.add((model, base_url))
+        _STREAMING_UNSUPPORTED[(model, base_url)] = time.monotonic()
 
 
 def _streaming_marked_unsupported(model: str, base_url: str) -> bool:
     with _STREAMING_UNSUPPORTED_LOCK:
-        return (model, base_url) in _STREAMING_UNSUPPORTED
+        marked_at = _STREAMING_UNSUPPORTED.get((model, base_url))
+    if marked_at is None:
+        return False
+    if time.monotonic() - marked_at > _STREAMING_UNSUPPORTED_TTL_SECONDS:
+        # Expired: forget the mark so the next call rediscovers streaming.
+        with _STREAMING_UNSUPPORTED_LOCK:
+            _STREAMING_UNSUPPORTED.pop((model, base_url), None)
+        return False
+    return True
 
 
 def reset_streaming_support_cache_for_tests() -> None:

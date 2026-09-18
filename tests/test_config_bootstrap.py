@@ -106,9 +106,30 @@ def test_check_config_accepts_valid_model_retry_env_values(monkeypatch) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
     monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "5")
     monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "5")
+    monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "stream")
 
     from core.config import check_config
 
     result = check_config()
 
     assert not any("ARC_MODEL_" in item for item in result["warnings"])
+
+
+def test_check_config_flags_bad_stream_transport_env_value(monkeypatch) -> None:
+    monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "streaming")
+
+    from core.config import check_config
+
+    result = check_config()
+
+    warnings = "\n".join(result["warnings"])
+    assert "ARC_MODEL_STREAM_TRANSPORT has unexpected value: streaming" in warnings
+
+
+def test_check_config_accepts_all_stream_transport_modes(monkeypatch) -> None:
+    from core.config import check_config
+
+    for mode in ("stream", "retry", "0", "off"):
+        monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", mode)
+        result = check_config()
+        assert not any("ARC_MODEL_STREAM_TRANSPORT" in item for item in result["warnings"])

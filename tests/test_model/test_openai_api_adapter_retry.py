@@ -1358,6 +1358,60 @@ def test_arc_streamed_hook_converts_no_generations_valueerror(
 # ---------------------------------------------------------------------------
 
 
+def test_streaming_unsupported_mark_expires_after_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 4xx mark must not route the endpoint to plain forever: after the TTL
+    the next call rediscovers streaming (a gateway misconfiguration can be
+    transient, and a permanent mark would re-expose large-output turns to the
+    idle-timeout drop for the rest of a long run)."""
+
+    _clear_stream_env(monkeypatch)
+    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
+    adapter.reset_streaming_support_cache_for_tests()
+
+    # First call: streamed attempt answers 4xx -> plain fallback + mark.
+    recorder = _TransportRecorder([_status_error(400)])
+    result = _call_model_with_retries(
+        recorder.plain,
+        api_mode="chat_completions",
+        model="ttl-model",
+        base_url="https://ttl.test/v1",
+        streamed_retry=recorder.streamed,
+        stream_first=True,
+    )
+    assert result == "plain-ok"
+
+    # Still within the TTL: the mark holds, second call starts plain.
+    recorder2 = _TransportRecorder()
+    result2 = _call_model_with_retries(
+        recorder2.plain,
+        api_mode="chat_completions",
+        model="ttl-model",
+        base_url="https://ttl.test/v1",
+        streamed_retry=recorder2.streamed,
+        stream_first=True,
+    )
+    assert result2 == "plain-ok"
+    assert recorder2.streamed_calls == 0
+
+    # Age the mark past the TTL: streaming is retried.
+    with adapter._STREAMING_UNSUPPORTED_LOCK:
+        adapter._STREAMING_UNSUPPORTED[("ttl-model", "https://ttl.test/v1")] = (
+            adapter.time.monotonic() - (adapter._STREAMING_UNSUPPORTED_TTL_SECONDS + 1.0)
+        )
+    recorder3 = _TransportRecorder()
+    result3 = _call_model_with_retries(
+        recorder3.plain,
+        api_mode="chat_completions",
+        model="ttl-model",
+        base_url="https://ttl.test/v1",
+        streamed_retry=recorder3.streamed,
+        stream_first=True,
+    )
+    assert result3 == "streamed-ok"
+    assert recorder3.streamed_calls == 1
+    adapter.reset_streaming_support_cache_for_tests()
+
+
 def test_empty_stream_skips_the_reachability_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty stream proves the endpoint just answered with HTTP 200, so the
     retry must switch transport directly instead of waiting on probe rounds."""
