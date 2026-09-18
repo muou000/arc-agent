@@ -656,6 +656,41 @@ class ContextPipeline:
             return ""
         return "<recent_failure_summary>\n" + summary + "\n</recent_failure_summary>"
 
+    def _get_test_contract_hooks(self, node_id: str) -> str:
+        """Declared test-contract hooks for the implementation stages.
+
+        The DESIGN-phase static satisfiability check splits the generated
+        tests' observable hooks into grounded ones (already covered by the
+        requirement/interface texts the implementer receives) and
+        test-contract ones — values the tests define themselves. Without this
+        block the implementer never sees the second kind, which is exactly
+        the REQ-1 dual-blind failure loop.
+        """
+
+        session = self._load_node_session(node_id)
+        hooks = session.get("test_contract_hooks")
+        if not isinstance(hooks, list) or not hooks:
+            return ""
+        lines = [
+            "<test_contract_hooks>",
+            "The generated tests drive the following observable hooks that are NOT spelled",
+            "out in the requirement or the interface contract. The tests define them as the",
+            "stable contract the implementation must align to: render these exact accessible",
+            "names / test-ids / routes, or the corresponding test will fail.",
+        ]
+        for hook in hooks:
+            if not isinstance(hook, dict):
+                continue
+            kind = str(hook.get("kind") or "").strip()
+            value = str(hook.get("value") or "").strip()
+            file_path = str(hook.get("file_path") or "").strip()
+            if not value:
+                continue
+            used = f" (used by {file_path})" if file_path else ""
+            lines.append(f"- {kind or 'hook'}: `{value}`{used}")
+        lines.append("</test_contract_hooks>")
+        return "\n".join(lines)
+
     def build_agent_context(
         self,
         node_id: str,
@@ -758,6 +793,15 @@ class ContextPipeline:
         )
         if recent_failure_summary:
             context_parts.append(recent_failure_summary)
+
+        if agent_type in {"TestDrivenDeveloper", "TestFailureVerifier"}:
+            test_contract_hooks = self.cache.get_or_compute(
+                node_id,
+                "test_contract_hooks",
+                lambda: self._get_test_contract_hooks(node_id),
+            )
+            if test_contract_hooks:
+                context_parts.append(test_contract_hooks)
 
         return "\n\n".join(part for part in context_parts if part)
 
