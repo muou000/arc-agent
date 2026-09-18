@@ -331,12 +331,16 @@ def build_stage_agent(
     checkpointer: Any = _UNSET,
     node_id: str | None = None,
     claims_workspace_root: str | None = None,
+    test_manifest_lock: Any | None = None,
 ):
     """Create an agent instance with ARC's first-batch filesystem policy.
 
     ``checkpointer`` defaults to the process-wide shared saver so that rebuilding
     an agent for the same ``thread_id`` resumes the previous conversation rather
     than starting cold. Pass ``checkpointer=None`` to opt a single agent out.
+
+    ``test_manifest_lock`` wires the test_generation stage's manifest-first
+    gate (see ``agents/tools/test_manifest.py``); other stages ignore it.
     """
 
     _apply_windows_filesystem_path_compat()
@@ -384,7 +388,11 @@ def build_stage_agent(
             agent_root=str(root),
         )
 
-    stage_discipline = StageDisciplineMiddleware(stage=stage, file_claim_gate=file_claim_gate)
+    stage_discipline = StageDisciplineMiddleware(
+        stage=stage,
+        file_claim_gate=file_claim_gate,
+        test_manifest_lock=test_manifest_lock if stage == "test_generation" else None,
+    )
     agent = create_deep_agent(
         name=name,
         model=resolved_model,

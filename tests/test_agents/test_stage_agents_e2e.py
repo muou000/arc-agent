@@ -597,12 +597,27 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
     node_id = "REQ-GEN-1"
     seed_requirement(arc_runtime, node_id)
 
-    test_code = "def test_add():\n    assert add(1, 1) == 2\n"
+    test_code = "test('add', () => { expect(add(1, 1)).toBe(2); });\n"
     model = FauxChatModel(
         responses=[
+            # Manifest-first: the declaration locks the test-file paths
+            # before the first write.
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "type": "Unit",
+                            "interface_ids": [],
+                        }
+                    ]
+                },
+                call_id="c0",
+            ),
             faux_tool_call(
                 "write_file",
-                {"file_path": "/workspace/tests/unit/test_calc.py", "content": test_code},
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": test_code},
                 call_id="c1",
             ),
             faux_tool_call(
@@ -615,11 +630,11 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
                             "req_id": node_id,
                             "interface_ids": ["IF-CALC"],
                             "type": "Unit",
-                            "file_path": "tests/unit/test_calc.py",
-                            "first_line": "def test_add():",
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "first_line": "test('add', () => {",
                         }
                     ],
-                    "files_written": ["tests/unit/test_calc.py"],
+                    "files_written": ["backend/tests/unit/calc.test.js"],
                 },
                 call_id="c2",
             ),
@@ -633,14 +648,14 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
         )
     )
 
-    assert model.call_count == 2
+    assert model.call_count == 3
     assert tests is not None and len(tests) == 1
     assert tests[0]["test_id"] == "T-ADD"
     assert tests[0]["type"] == "Unit"
-    assert tests[0]["file_path"] == "tests/unit/test_calc.py"
+    assert tests[0]["file_path"] == "backend/tests/unit/calc.test.js"
     assert "T-ADD" in output_text
     # The scripted test asset really landed in the workspace.
-    assert (tmp_project_dir / "tests" / "unit" / "test_calc.py").read_text(encoding="utf-8") == test_code
+    assert (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").read_text(encoding="utf-8") == test_code
 
 
 def test_test_generator_delete_cannot_escape_the_workspace_root(tmp_project_dir: Path, arc_runtime) -> None:
@@ -655,15 +670,28 @@ def test_test_generator_delete_cannot_escape_the_workspace_root(tmp_project_dir:
     node_id = "REQ-GEN-DELETE"
     seed_requirement(arc_runtime, node_id)
 
-    test_code = "def test_add():\n    assert add(1, 1) == 2\n"
+    test_code = "test('add', () => { expect(add(1, 1)).toBe(2); });\n"
     protected = tmp_project_dir / "protected.txt"
     protected.write_text("must survive\n", encoding="utf-8")
 
     model = FauxChatModel(
         responses=[
             faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "type": "Unit",
+                            "interface_ids": [],
+                        }
+                    ]
+                },
+                call_id="c0",
+            ),
+            faux_tool_call(
                 "write_file",
-                {"file_path": "/workspace/tests/unit/test_calc.py", "content": test_code},
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": test_code},
                 call_id="c1",
             ),
             # Traversal attempt: must be rejected by the backend, not delete
@@ -675,7 +703,7 @@ def test_test_generator_delete_cannot_escape_the_workspace_root(tmp_project_dir:
             ),
             faux_tool_call(
                 "delete",
-                {"file_path": "/workspace/tests/unit/test_calc.py"},
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js"},
                 call_id="c3",
             ),
             faux_tool_call(
@@ -700,7 +728,7 @@ def test_test_generator_delete_cannot_escape_the_workspace_root(tmp_project_dir:
     # The in-root test asset was really deleted; the traversal attempt was
     # rejected and the protected file survived.
     assert tests == []
-    assert not (tmp_project_dir / "tests" / "unit" / "test_calc.py").exists()
+    assert not (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").exists()
     assert protected.read_text(encoding="utf-8") == "must survive\n"
 
 
@@ -718,12 +746,12 @@ def test_test_generator_delete_cannot_escape_via_symlink(tmp_project_dir: Path, 
     node_id = "REQ-GEN-SYMLINK"
     seed_requirement(arc_runtime, node_id)
 
-    test_code = "def test_add():\n    assert add(1, 1) == 2\n"
+    test_code = "test('add', () => { expect(add(1, 1)).toBe(2); });\n"
     outside_dir = tmp_project_dir.parent / "pr35-symlink-outside"
     outside_dir.mkdir(parents=True, exist_ok=True)
     protected = outside_dir / "protected.txt"
     protected.write_text("must survive\n", encoding="utf-8")
-    link = tmp_project_dir / "tests" / "unit" / "escape.spec.ts"
+    link = tmp_project_dir / "backend" / "tests" / "unit" / "escape.spec.ts"
     link.parent.mkdir(parents=True, exist_ok=True)
     try:
         link.symlink_to(protected)
@@ -734,8 +762,21 @@ def test_test_generator_delete_cannot_escape_via_symlink(tmp_project_dir: Path, 
         model = FauxChatModel(
             responses=[
                 faux_tool_call(
+                    "declare_test_manifest",
+                    {
+                        "files": [
+                            {
+                                "file_path": "backend/tests/unit/calc.test.js",
+                                "type": "Unit",
+                                "interface_ids": [],
+                            }
+                        ]
+                    },
+                    call_id="c0",
+                ),
+                faux_tool_call(
                     "write_file",
-                    {"file_path": "/workspace/tests/unit/test_calc.py", "content": test_code},
+                    {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": test_code},
                     call_id="c1",
                 ),
                 # Symlink escape attempt: deleting the link must be refused
@@ -747,7 +788,7 @@ def test_test_generator_delete_cannot_escape_via_symlink(tmp_project_dir: Path, 
                 ),
                 faux_tool_call(
                     "delete",
-                    {"file_path": "/workspace/tests/unit/test_calc.py"},
+                    {"file_path": "/workspace/backend/tests/unit/calc.test.js"},
                     call_id="c3",
                 ),
                 faux_tool_call(
@@ -770,11 +811,399 @@ def test_test_generator_delete_cannot_escape_via_symlink(tmp_project_dir: Path, 
         )
 
         assert tests == []
-        assert not (tmp_project_dir / "tests" / "unit" / "test_calc.py").exists()
+        assert not (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").exists()
         # The out-of-root target survived; the refused delete never ran.
         assert protected.read_text(encoding="utf-8") == "must survive\n"
     finally:
         _shutil.rmtree(outside_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# manifest-first test generation (declare_test_manifest lock)
+# ---------------------------------------------------------------------------
+
+
+def test_test_generator_blocks_writes_before_declaration(tmp_project_dir: Path, arc_runtime) -> None:
+    """A test-file write before the manifest declaration is hard-blocked.
+
+    This is the core manifest-first invariant: the model cannot create a test
+    file whose path was never declared, so path churn (renames, duplicate
+    formats) fails at write time instead of surfacing as manifest drift.
+    """
+    node_id = "REQ-GEN-LOCK-1"
+    seed_requirement(arc_runtime, node_id)
+
+    model = FauxChatModel(
+        responses=[
+            # Undeclared write attempt: blocked by the discipline.
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": "export {};\n"},
+                call_id="c1",
+            ),
+            # The model then declares and writes the declared path.
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {"file_path": "backend/tests/unit/calc.test.js", "type": "Unit", "interface_ids": []}
+                    ]
+                },
+                call_id="c2",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": "test('add', () => { expect(add(1, 1)).toBe(2); });\n"},
+                call_id="c3",
+            ),
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "One unit test for add().",
+                    "tests": [
+                        {
+                            "test_id": "T-ADD",
+                            "req_id": node_id,
+                            "interface_ids": [],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "first_line": "test('add', () => {",
+                        }
+                    ],
+                    "files_written": ["backend/tests/unit/calc.test.js"],
+                },
+                call_id="c4",
+            ),
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    assert tests is not None and len(tests) == 1
+    assert (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").read_text(encoding="utf-8").startswith("test('add'")
+
+
+def test_test_generator_blocks_writes_outside_the_declared_manifest(tmp_project_dir: Path, arc_runtime) -> None:
+    """Renames and duplicate paths are dead ends once the manifest is locked.
+
+    REQ-1's sessionHeader rename chain and the passwordStrength double-format
+    attempt were both "path not settled" churn; with the lock, the second
+    path cannot be created at all, and the model must return to the declared
+    file.
+    """
+    node_id = "REQ-GEN-LOCK-2"
+    seed_requirement(arc_runtime, node_id)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {"file_path": "backend/tests/unit/auth.test.js", "type": "Unit", "interface_ids": []}
+                    ]
+                },
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/auth.test.js", "content": "test('login', () => { expect(login()).toBe(false); });\n"},
+                call_id="c2",
+            ),
+            # Rename attempt: blocked (not declared).
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/sessionHeader.test.js", "content": "test('login', () => { expect(login()).toBe(false); });\n"},
+                call_id="c3",
+            ),
+            # Back on the declared path: the final manifest is returned.
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "Auth test reworked in place.",
+                    "tests": [
+                        {
+                            "test_id": "T-AUTH",
+                            "req_id": node_id,
+                            "interface_ids": [],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/auth.test.js",
+                            "first_line": "test('login', () => {",
+                        }
+                    ],
+                    "files_written": ["backend/tests/unit/auth.test.js"],
+                },
+                call_id="c4",
+            ),
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Auth", "description": "Login flow"},
+        )
+    )
+
+    assert tests is not None and len(tests) == 1
+    assert tests[0]["file_path"] == "backend/tests/unit/auth.test.js"
+    # The rename target was never created.
+    assert not (tmp_project_dir / "backend" / "tests" / "unit" / "sessionHeader.test.js").exists()
+
+
+def test_test_generator_undeclared_manifest_entry_fails_the_pass(tmp_project_dir: Path, arc_runtime) -> None:
+    """Returning manifest rows for never-declared paths fails the pass.
+
+    The model cannot register coverage it never declared (phantom rows), even
+    if the file exists on disk from an earlier node.
+    """
+    node_id = "REQ-GEN-LOCK-3"
+    seed_requirement(arc_runtime, node_id)
+
+    stale = tmp_project_dir / "backend" / "tests" / "unit" / "stale.test.js"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("test('old', () => { expect(true).toBe(true); });\n", encoding="utf-8")
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {"file_path": "backend/tests/unit/auth.test.js", "type": "Unit", "interface_ids": []}
+                    ]
+                },
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/auth.test.js", "content": "test('login', () => { expect(login()).toBe(false); });\n"},
+                call_id="c2",
+            ),
+            # Phantom row: the stale file exists on disk but was never declared.
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "Auth tests.",
+                    "tests": [
+                        {
+                            "test_id": "T-STALE",
+                            "req_id": node_id,
+                            "interface_ids": [],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/stale.test.js",
+                            "first_line": "test('old', () => {",
+                        }
+                    ],
+                    "files_written": ["backend/tests/unit/auth.test.js"],
+                },
+                call_id="c3",
+            ),
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Auth", "description": "Login flow"},
+        )
+    )
+
+    assert tests is None
+
+
+def test_test_generator_written_file_dropped_from_manifest_is_reattached(tmp_project_dir: Path, arc_runtime) -> None:
+    """A declared, written file whose row was dropped from the answer keeps
+    its registration: the row is re-attached from the declaration."""
+    node_id = "REQ-GEN-LOCK-4"
+    seed_requirement(arc_runtime, node_id)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {"file_path": "backend/tests/unit/auth.test.js", "type": "Unit", "interface_ids": []}
+                    ]
+                },
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/auth.test.js", "content": "test('login', () => { expect(login()).toBe(false); });\n"},
+                call_id="c2",
+            ),
+            # The answer forgets the manifest row for the written file.
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "Auth tests.",
+                    "tests": [],
+                    "files_written": ["backend/tests/unit/auth.test.js"],
+                },
+                call_id="c3",
+            ),
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Auth", "description": "Login flow"},
+        )
+    )
+
+    assert tests is not None and len(tests) == 1
+    assert tests[0]["file_path"] == "backend/tests/unit/auth.test.js"
+    assert tests[0]["type"] == "Unit"
+    assert tests[0].get("manifest_reattached") is True
+    # The re-attached row stays node-scoped: its mechanical test_id carries
+    # the node prefix and req_id names the owning node (manifest contract).
+    assert tests[0]["test_id"].startswith(node_id)
+    assert tests[0]["req_id"] == node_id
+
+
+def test_test_generator_helpers_stay_writable_without_declaration(tmp_project_dir: Path, arc_runtime) -> None:
+    """Test helpers and runner configs are not manifest entries: they stay
+    writable before and after the declaration (no lock on non-test assets)."""
+    node_id = "REQ-GEN-LOCK-5"
+    seed_requirement(arc_runtime, node_id)
+
+    model = FauxChatModel(
+        responses=[
+            # Helper written BEFORE any declaration: allowed.
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/tests/setup-tests.ts", "content": "export {}\n"},
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {"file_path": "backend/tests/unit/auth.test.js", "type": "Unit", "interface_ids": []}
+                    ]
+                },
+                call_id="c2",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/auth.test.js", "content": "test('login', () => { expect(login()).toBe(false); });\n"},
+                call_id="c3",
+            ),
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "Auth tests with helper.",
+                    "tests": [
+                        {
+                            "test_id": "T-AUTH",
+                            "req_id": node_id,
+                            "interface_ids": [],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/auth.test.js",
+                            "first_line": "test('login', () => {",
+                        }
+                    ],
+                    "files_written": ["tests/setup-tests.ts", "backend/tests/unit/auth.test.js"],
+                },
+                call_id="c4",
+            ),
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Auth", "description": "Login flow"},
+        )
+    )
+
+    assert tests is not None and len(tests) == 1
+    assert (tmp_project_dir / "tests" / "setup-tests.ts").exists()
+
+
+def test_test_generator_repair_pass_cannot_introduce_new_test_paths(tmp_project_dir: Path, arc_runtime) -> None:
+    """The green-baseline repair lock is pre-seeded with the previous
+    manifest: deleting a green file and re-adding the coverage under a fresh
+    name (the rename escape) is blocked at write time."""
+    node_id = "REQ-GEN-LOCK-6"
+    seed_requirement(arc_runtime, node_id)
+
+    previous_manifest = [
+        {
+            "test_id": "T-GREEN",
+            "req_id": node_id,
+            "interface_ids": [],
+            "type": "Unit",
+            "file_path": "backend/tests/unit/green.test.js",
+            "first_line": "test('tautology', () => {",
+        }
+    ]
+    green_file = tmp_project_dir / "backend" / "tests" / "unit" / "green.test.js"
+    green_file.parent.mkdir(parents=True, exist_ok=True)
+    green_file.write_text("test('tautology', () => { expect(true).toBe(true); });\n", encoding="utf-8")
+
+    model = FauxChatModel(
+        responses=[
+            # Rename escape attempt: the fresh path is not in the pre-seeded
+            # lock, so the write is blocked.
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/greenV2.test.js", "content": "test('tautology', () => { expect(true).toBe(true); });\n"},
+                call_id="c1",
+            ),
+            # Compliant repair: rewrite the declared (pre-seeded) path.
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/green.test.js", "content": "test('login', () => { expect(login()).toBe(false); });\n"},
+                call_id="c2",
+            ),
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "Reworked the tautological test.",
+                    "tests": [
+                        {
+                            "test_id": "T-GREEN",
+                            "req_id": node_id,
+                            "interface_ids": [],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/green.test.js",
+                            "first_line": "test('login', () => {",
+                        }
+                    ],
+                    "files_written": ["backend/tests/unit/green.test.js"],
+                },
+                call_id="c3",
+            ),
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).repair_green_baseline(
+            node_id,
+            {"name": "", "description": ""},
+            green_evidence=[
+                {
+                    "file_path": "backend/tests/unit/green.test.js",
+                    "type": "Unit",
+                    "output_summary": "1 passed",
+                }
+            ],
+            previous_manifest=previous_manifest,
+        )
+    )
+
+    assert tests is not None and len(tests) == 1
+    assert tests[0]["file_path"] == "backend/tests/unit/green.test.js"
+    assert not (tmp_project_dir / "backend" / "tests" / "unit" / "greenV2.test.js").exists()
 
 
 # ---------------------------------------------------------------------------

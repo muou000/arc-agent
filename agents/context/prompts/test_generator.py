@@ -35,6 +35,7 @@ def get_system_prompt() -> str:
                 "Execution Flow",
                 [
                     "Read the interface specifications and decide the minimal coverage matrix from node ownership and scenarios.",
+                    "Declare the full test-file manifest (`declare_test_manifest`) before writing the first test file; the declared paths are the only test files you may write in this pass.",
                     "When retrying a node, treat existing current-node tests and test manifests as the baseline verification design. Read and reconcile them before writing replacement tests.",
                     "Inspect nearby existing test patterns only when needed to match project conventions; do not inspect product implementation unless a selector, import path, or test convention cannot be inferred from the contract.",
                     "Use the current interface contract and requirement scenarios as the primary design input; do not broaden exploration beyond direct dependencies unless a path issue or project convention requires it.",
@@ -47,6 +48,18 @@ def get_system_prompt() -> str:
                     "Before writing each test, compare its setup, action, and assertion against the requirement description and each GIVEN/WHEN/THEN scenario step. Once written, leave correction to a later system validation handoff and TestDrivenDeveloper.",
                     "Return a manifest that maps each test file to requirement id, interface ids, type, path, and first line.",
                     "If a later system validation reports an error, the next invocation may repair only the rejected manifest/files without broadening scope. Do not create a self-validation loop in this invocation.",
+                ],
+            ),
+            section(
+                "Test Manifest Declaration Protocol",
+                [
+                    "Before writing any test file, you MUST call `declare_test_manifest` exactly once with one entry per planned test file: its `file_path`, `type` (Unit/Integration/E2E), and the `interface_ids` it covers.",
+                    "The declaration is validated against the app-type test placement rules and the registered interface ids, then LOCKED for the rest of this stage: `write_file`, `edit_file`, and `delete` on a test-file path outside the declared manifest are rejected by the system.",
+                    "Plan the coverage matrix up front — every scenario, interface, and layer you intend to cover — so the declaration is complete in one call. A later declaration may only add paths that failed validation earlier, never a fresh idea.",
+                    "Test helpers and runner configuration files are not manifest entries; they stay writable without a declaration.",
+                    "If the node should own no local tests, skip the declaration and return an empty `tests` manifest with a clear `summary`.",
+                    "Never rewrite a test under a new file name or duplicate its coverage on a second path: if a test needs rework, rework the declared file's content in place.",
+                    "The returned `tests` manifest must describe exactly the declared files that were actually written — no entries for paths you did not declare or did not write.",
                 ],
             ),
             section(
@@ -110,6 +123,7 @@ def get_user_prompt(
                 "This is a generation-only pass: create tests and the returned manifest, then stop. Do not run, reread, or self-repair files written in this pass; TestDrivenDeveloper receives all test repair work.",
                 "Target the current interface contract and declared scenarios rather than speculative behavior.",
                 "Before writing files, make a private requirement-to-test map: each scenario GIVEN becomes setup, WHEN becomes action, THEN becomes assertion. Do not output the map, but use it to reject contradictory tests.",
+                "Then declare the test-file manifest: call `declare_test_manifest` with every planned test file (file_path + type + interface ids) BEFORE writing the first test file. The declaration locks the writable test-file paths for this pass; test helpers and runner configs are declared nowhere and stay writable.",
                 "Use interface ids from the current interface contract in the test manifest. Do not invent interface ids that were not returned by InterfaceDesigner.",
                 "For leaf nodes, tests must drive the final desired behavior. Do not write tests that pass against placeholder skeletons, `NOT_IMPLEMENTED` responses, 501 responses, fake success messages, or intentionally unimplemented branches.",
                 "If `Requirement Snapshot.scenarios` is non-empty, you must generate E2E coverage for those scenarios and include the E2E files in the returned manifest.",
@@ -121,9 +135,11 @@ def get_user_prompt(
                 "Do not assert absence of an element, route, or state when the requirement declares it should be visible, available, or usable as a precondition.",
                 "Return `summary`, `tests`, and `files_written`.",
                 "Each test manifest item must include `test_id`, `req_id`, `interface_ids`, `type`, `file_path`, and `first_line`.",
+                "Every `file_path` in the returned manifest must be a declared path that was actually written in this pass; do not return entries for undeclared or unwritten paths.",
                 "Return manifest paths as workspace-relative paths that follow the app-type test placement context; do not include the virtual `/workspace/` prefix in `file_path` or `files_written`.",
                 "Every `test_id` must be globally stable and include the current node id.",
                 "On retry, prefer returning updated versions of existing current-node tests with the same `test_id`; do not mint duplicate ids for the same scenario/interface/type coverage.",
+                "On retry, the manifest lock is pre-seeded with the existing test files: you may only rewrite or delete those paths, not create new test files.",
                 "In `summary`, include the coverage rationale by layer and name the user-visible or runtime path being protected.",
             ],
         )

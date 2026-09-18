@@ -132,9 +132,13 @@ def test_test_generation_repeated_test_write_is_blocked() -> None:
 def test_test_generation_repeated_write_block_lists_actionable_exits() -> None:
     # The generic "wait for an error" exit was unreachable in test_generation
     # (validation tools are disabled), so the run7 loop burned 52 blocked
-    # writes; the message must name the real ways out.
+    # writes; the message must name the real ways out. Since the manifest
+    # lock, "write the revision to a new path" is deliberately NOT an exit
+    # for test files (rename churn is the failure mode the lock exists for);
+    # the ways out are delete-then-rewrite the same declared path or return
+    # the manifest.
     for stage, expected in (
-        ("test_generation", ("new path", "delete", "manifest")),
+        ("test_generation", ("delete", "manifest")),
         ("implementation", ("run the tests", "new path")),
         ("interface_design", ("response", "skeleton")),
     ):
@@ -148,6 +152,8 @@ def test_test_generation_repeated_write_block_lists_actionable_exits() -> None:
         assert "Repeated write blocked" in blocked.content
         for keyword in expected:
             assert keyword in blocked.content, f"{stage} write block should mention {keyword!r}"
+        if stage == "test_generation":
+            assert "new path" not in blocked.content
 
 
 def test_repeated_read_block_does_not_offer_offset_probing() -> None:
@@ -457,3 +463,127 @@ def test_paths_without_file_path_are_not_validated() -> None:
     # A tool without file_path args (e.g. traceability queries) must pass.
     result = run(middleware, make_request("get_interface", {"interface_id": "IF-1"}))
     assert result.content == "ok"
+
+
+# ---------------------------------------------------------------------------
+# manifest-first gate (test_generation only)
+# ---------------------------------------------------------------------------
+
+
+def make_locked(stage: str = "test_generation", declared: list[str] | None = None) -> StageDisciplineMiddleware:
+    from agents.tools.test_manifest import DeclaredTestFile, TestManifestLock
+
+    lock = TestManifestLock(
+        declared_files={
+            path: DeclaredTestFile(file_path=path, test_type="Unit", interface_ids=[])
+            for path in declared or []
+        }
+    )
+    return StageDisciplineMiddleware(stage=stage, test_manifest_lock=lock)
+
+
+def test_test_file_write_blocked_before_declaration() -> None:
+    middleware = make_locked(declared=[])
+    blocked = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/tests/unit/test_a.py", "content": "x\n"}),
+    )
+    assert blocked.status == "error" and "Manifest-first blocked" in blocked.content
+    assert "declare_test_manifest" in blocked.content
+
+
+def test_test_file_write_allowed_on_declared_path_after_lock() -> None:
+    middleware = make_locked(declared=["tests/unit/test_a.py"])
+    result = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/tests/unit/test_a.py", "content": "x\n"}),
+    )
+    assert result.content == "ok"
+
+
+def test_test_file_write_blocked_outside_declared_manifest() -> None:
+    middleware = make_locked(declared=["tests/unit/test_a.py"])
+    blocked = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/tests/unit/test_b.py", "content": "x\n"}),
+    )
+    assert blocked.status == "error" and "Manifest lock blocked" in blocked.content
+    assert "tests/unit/test_a.py" in blocked.content
+
+
+def test_declared_path_matches_despite_prefix_forms() -> None:
+    middleware = make_locked(declared=["tests/unit/a.test.py"])
+    for path in ("/workspace/tests/unit/a.test.py", "tests/unit/a.test.py", "./tests/unit/a.test.py"):
+        result = run(
+            middleware,
+            make_request("edit_file", {"file_path": path, "old_string": "a", "new_string": "b"}),
+        )
+        assert result.content == "ok", f"declared path in form {path!r} must pass"
+
+
+def test_edit_file_is_gated_like_write_file() -> None:
+    """edit_file must not be a bypass: the gate lives in _validate_write,
+    which covers both file-write tools, and the undeclared case is blocked
+    with the same manifest message."""
+    middleware = make_locked(declared=["tests/unit/a.test.py"])
+    blocked = run(
+        middleware,
+        make_request("edit_file", {"file_path": "/workspace/tests/unit/b.test.py", "old_string": "a", "new_string": "b"}),
+    )
+    assert blocked.status == "error" and "Manifest lock blocked" in blocked.content
+
+    undeclared_stage = make_locked(declared=[])
+    blocked = run(
+        undeclared_stage,
+        make_request("edit_file", {"file_path": "/workspace/tests/unit/a.test.py", "old_string": "a", "new_string": "b"}),
+    )
+    assert blocked.status == "error" and "Manifest-first blocked" in blocked.content
+
+
+def test_manifest_lock_blocks_delete_of_undeclared_test_file() -> None:
+    middleware = make_locked(declared=["tests/unit/test_a.py"])
+    blocked = run(middleware, make_request("delete", {"file_path": "/workspace/tests/unit/test_b.py"}))
+    assert blocked.status == "error" and "Manifest lock blocked" in blocked.content
+    # A declared test asset stays deletable (green-baseline repair).
+    result = run(middleware, make_request("delete", {"file_path": "/workspace/tests/unit/test_a.py"}))
+    assert not isinstance(result, ToolMessage) or result.status != "error"
+
+
+def test_manifest_lock_ignores_helpers_and_configs() -> None:
+    middleware = make_locked(declared=["tests/unit/a.test.py"])
+    for path in ("/workspace/tests/setup-tests.ts", "/workspace/backend/vitest.config.js"):
+        result = run(middleware, make_request("write_file", {"file_path": path, "content": "x\n"}))
+        assert result.content == "ok", f"helper/config {path} must stay writable"
+
+
+def test_test_e2e_directory_files_are_test_assets_and_gated() -> None:
+    """A web E2E file may carry a plain JS name under `test-e2e/`; it must be
+    writable when declared (test-asset check) and blocked when not declared
+    (manifest gate) — a declared-but-unwritable path would be a dead end."""
+    middleware = make_locked(declared=["backend/test-e2e/login.js"])
+    declared = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/backend/test-e2e/login.js", "content": "// e2e\n"}),
+    )
+    assert declared.content == "ok"
+
+    undeclared = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/backend/test-e2e/logout.js", "content": "// e2e\n"}),
+    )
+    assert undeclared.status == "error" and "Manifest lock blocked" in undeclared.content
+
+
+def test_manifest_lock_inactive_for_other_stages() -> None:
+    from agents.tools.test_manifest import TestManifestLock
+
+    for stage in ("interface_design", "implementation"):
+        middleware = StageDisciplineMiddleware(
+            stage=stage,
+            test_manifest_lock=TestManifestLock(declared_files={}),
+        )
+        result = run(
+            middleware,
+            make_request("write_file", {"file_path": "/workspace/src/mod.py", "content": "x\n"}),
+        )
+        assert result.content == "ok", f"{stage} must ignore the manifest lock"
