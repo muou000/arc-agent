@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agents.tools.test_failure_digest import (
     build_failure_digest,
     format_failure_digest,
@@ -302,6 +304,108 @@ def test_digest_resets_vitest_context_at_summary_lines() -> None:
         " Test Files  1 failed (1)\n"
         "      Tests  1 failed | 1 passed (2)\n"
         " × unrelated summary row 12ms\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert names == ["real failure"]
+
+
+def test_persist_run_output_continues_sequence_across_passes(tmp_path: Path) -> None:
+    """A second TDD pass must not overwrite the first pass's run logs.
+
+    ``sequence`` is the per-layer counter of the current pass, which restarts
+    at 1 on every pass (post-run auto retry, ``--retry-failed``). Trusting it
+    verbatim made pass N+1 overwrite pass N's logs (observed on the 2026-09-19
+    test1 run: the first round's Integration-003.log was replaced by the
+    second round's, so a handoff written by round 1 pointed at round 2's
+    content). The on-disk counter must continue past the highest existing log
+    of the same layer.
+    """
+
+    # Pass 1: three Unit runs.
+    for i in (1, 2, 3):
+        persist_run_output(tmp_path, "REQ-1", "Unit", i, f"pass1 attempt {i}")
+    # Pass 2: the layer counter restarts at 1.
+    rel = persist_run_output(tmp_path, "REQ-1", "Unit", 1, "pass2 attempt 1")
+    assert rel == ".arc/tdd_runs/REQ-1/Unit-004.log"
+    assert (tmp_path / ".arc" / "tdd_runs" / "REQ-1" / "Unit-003.log").read_text(
+        encoding="utf-8"
+    ).startswith("pass1 attempt 3")
+    assert (tmp_path / rel).read_text(encoding="utf-8").startswith("pass2 attempt 1")
+    # Layers are independent counters: a first Integration run stays at 001.
+    rel_integration = persist_run_output(tmp_path, "REQ-1", "Integration", 1, "integration 1")
+    assert rel_integration == ".arc/tdd_runs/REQ-1/Integration-001.log"
+
+
+def test_persist_run_output_prunes_oldest_across_passes(tmp_path: Path) -> None:
+    """Cross-pass continuation still respects the retention cap."""
+
+    for i in range(1, 25):
+        persist_run_output(tmp_path, "REQ-1", "Unit", 1, f"attempt {i}")
+    kept = sorted(
+        item.name
+        for item in (tmp_path / ".arc" / "tdd_runs" / "REQ-1").iterdir()
+        if item.suffix == ".log"
+    )
+    assert len(kept) == 20
+    assert kept[0] == "Unit-005.log"
+    assert kept[-1] == "Unit-024.log"
+
+
+def test_persist_run_output_scan_failure_propagates(tmp_path: Path, monkeypatch) -> None:
+    """A directory-scan failure must not silently fall back to the old numbering.
+
+    Falling back to ``requested`` on OSError would reintroduce the exact
+    overwrite this continuation prevents (a second pass clobbering the
+    first pass's evidence) with no log line anywhere - the internal
+    swallow made the outer OSError handler in ``core.phases`` unreachable.
+    The scan failure now propagates so that handler logs and skips the
+    pointer instead.
+    """
+
+    calls = {"n": 0}
+
+    def broken_iterdir(self):
+        calls["n"] += 1
+        raise OSError("scan denied")
+
+    monkeypatch.setattr(Path, "iterdir", broken_iterdir)
+    with pytest.raises(OSError):
+        persist_run_output(tmp_path, "REQ-1", "Unit", 1, "boom")
+    assert calls["n"] >= 1
+
+
+def test_digest_bare_row_never_swallows_suite_named_entry() -> None:
+    """Only the fuller "suite > case" form may replace; never the bare row.
+
+    A later bare x-row carrying less identity (just the case name) must not
+    replace an existing "suite > case" entry: the old symmetric suffix
+    match let "× saves" swallow an earlier "B > saves" row, silently
+    dropping the suite identity. The merge direction is now explicit.
+    """
+
+    output = (
+        "Exit Code: 1\n"
+        " ❯ tests/a.test.js (4 tests | 2 failed) 100ms\n"
+        "     × B > saves 30ms\n"
+        "     × saves 30ms\n"
+        " FAIL  tests/a.test.js > A > saves\n"
+        " AssertionError: boom A\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert names == ["B > saves", "A > saves"]
+
+
+def test_digest_summary_reset_matches_decorated_lines() -> None:
+    """Box-drawing decorations around 'Test Files' still close the run block."""
+
+    output = (
+        "Exit Code: 1\n"
+        " ❯ tests/a.test.js (2 tests | 1 failed) 100ms\n"
+        "     × real failure 30ms\n"
+        "  ⎯⎯⎯ Test Files  1 failed (1) ⎯⎯⎯\n"
+        " × leaked row 12ms\n"
     )
     digest = build_failure_digest(output)
     names = [item["name"] for item in digest["failed_tests"]]

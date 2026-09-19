@@ -138,6 +138,12 @@ class FakeAppHandler:
         self._results: deque[str] = deque(results or [])
         self.calls: list[tuple[str, list[str]]] = []
         self.shutdown_calls = 0
+        self.install_calls: list[tuple[str, str]] = []
+        self._install_results: deque[str] = deque()
+
+    def queue_install(self, *results: str) -> "FakeAppHandler":
+        self._install_results.extend(results)
+        return self
 
     def queue(self, *results: str) -> "FakeAppHandler":
         self._results.extend(results)
@@ -162,6 +168,18 @@ class FakeAppHandler:
 
     async def run_build(self) -> str:
         return "Exit Code: 0\nSTDERR:\n(fake build ok)\n"
+
+    async def install_package(self, package: str, target: str = "backend") -> str:
+        """Scriptable stand-in for the TDD-stage package install."""
+
+        self.install_calls.append((package, target))
+        if self._install_results:
+            return self._install_results.popleft()
+        return (
+            "Exit Code: 0\n"
+            f"Installed '{package}' into {target}/node_modules (no-save; package.json and "
+            "lockfile untouched). Re-run run_tests to validate the repair.\n"
+        )
 
     def validate_test_path(self, test_type: str, file_path: str) -> str:
         del test_type, file_path

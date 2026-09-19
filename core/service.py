@@ -60,6 +60,9 @@ def _make_llm_usage_sink(runtime: AgentRuntime) -> Any:
             reasoning_tokens=record.reasoning_tokens,
             total_tokens=record.total_tokens,
             cost=record.cost,
+            duration_s=record.duration_s,
+            transport=record.transport,
+            attempts=record.attempts,
         )
 
     return sink

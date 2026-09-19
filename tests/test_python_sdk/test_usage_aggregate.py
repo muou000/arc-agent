@@ -32,8 +32,9 @@ def _usage_event(
     cache_read: int = 20,
     cache_write: int = 10,
     cost: object = _UNSET,
+    latency: dict | None = None,
 ) -> dict:
-    return {
+    event = {
         "type": "llm_usage",
         "node_id": node_id,
         "phase": phase,
@@ -60,6 +61,9 @@ def _usage_event(
         },
         "timestamp": "2026-09-13 00:00:00",
     }
+    if latency is not None:
+        event["latency"] = latency
+    return event
 
 
 def _write_events(path: Path, payloads: list) -> Path:
@@ -226,6 +230,46 @@ class TestAggregateLLMUsage:
         summary = aggregate_llm_usage(events_path)
         assert summary["totals"]["prompt_tokens"] == 0
         assert summary["totals"]["cache_hit_rate"] is None
+
+    def test_latency_blocks_accumulate_per_bucket(self, tmp_path: Path) -> None:
+        """duration/transport/attempts fold into every bucket; events without
+        a latency block (older writers) still count as calls but not as
+        timed_calls, so the per-call mean stays honest."""
+
+        events_path = _write_events(
+            tmp_path / "runner-events.jsonl",
+            [
+                _usage_event(
+                    latency={"duration_s": 10.0, "transport": "streamed", "attempts": 1}
+                ),
+                _usage_event(
+                    latency={"duration_s": 30.0, "transport": "plain", "attempts": 3}
+                ),
+                _usage_event(),  # no latency block: legacy event
+            ],
+        )
+        summary = aggregate_llm_usage(events_path)
+
+        totals = summary["totals"]
+        assert totals["calls"] == 3
+        assert totals["timed_calls"] == 2
+        assert totals["duration_s"] == pytest.approx(40.0)
+        assert totals["streamed_calls"] == 1
+        assert totals["plain_calls"] == 1
+        assert totals["attempts"] == 4
+
+    def test_latency_malformed_block_is_tolerated(self, tmp_path: Path) -> None:
+        """A malformed latency block must not corrupt the token aggregation."""
+
+        event = _usage_event(latency={"duration_s": "not-a-number", "transport": 5})
+        events_path = _write_events(tmp_path / "runner-events.jsonl", [event])
+        summary = aggregate_llm_usage(events_path)
+
+        totals = summary["totals"]
+        assert totals["calls"] == 1
+        assert totals["timed_calls"] == 0
+        assert totals["duration_s"] == 0.0
+        assert totals["input"] == 90
 
 
 def _tool_event(

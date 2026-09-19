@@ -225,6 +225,9 @@ class TestLLMUsageEvents:
             reasoning_tokens=5,
             total_tokens=150,
             cost=cost,
+            duration_s=12.5,
+            transport="streamed",
+            attempts=2,
         )
 
         lines = _read_jsonl(event_paths.runner_events_path)
@@ -245,9 +248,33 @@ class TestLLMUsageEvents:
                 "reasoning": 5,
                 "total": 150,
             },
+            "latency": {"duration_s": 12.5, "transport": "streamed", "attempts": 2},
             "cost": cost,
             "timestamp": lines[0]["timestamp"],
         }
+
+    def test_latency_defaults_when_unreported(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        """Calls without telemetry (older callers, external runners) keep a
+        null-ish latency block so readers can treat all three fields as
+        optional without keying on the block's presence."""
+
+        events.record_llm_usage(node_id="REQ-1")
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["latency"] == {"duration_s": None, "transport": "", "attempts": None}
+
+    def test_latency_invalid_values_are_normalized(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_llm_usage(
+            node_id="REQ-1",
+            duration_s=-3.0,
+            transport="carrier-pigeon",
+            attempts=0,
+        )
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["latency"] == {"duration_s": None, "transport": "", "attempts": None}
 
     def test_empty_node_id_is_allowed_for_run_level_calls(
         self, events: EventClient, event_paths: RuntimePaths

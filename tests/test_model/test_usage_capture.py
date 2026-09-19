@@ -296,6 +296,54 @@ class TestAdapterIntegration:
         assert records[0].node_id == "REQ-9"
         assert records[0].input_tokens == 10
 
+    def test_async_generate_reports_latency_telemetry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The model-call record carries duration/transport/attempts so the
+        llm_usage event can attribute latency per transport."""
+
+        records: list[LLMUsageRecord] = []
+        set_llm_usage_sink(records.append)
+        monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
+        metadata_result = self._metadata_result()
+
+        async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+            return metadata_result
+
+        monkeypatch.setattr(adapter.ChatOpenAI, "_agenerate", fake_agenerate)
+
+        async def run() -> None:
+            model = adapter.ARCChatOpenAI(
+                model="gpt-4o",
+                api_key="test-key",
+                arc_api_mode="chat_completions",
+                arc_model_name="gpt-4o",
+            )
+            await model._agenerate([{"role": "user", "content": "hi"}])
+
+        asyncio.run(run())
+        assert len(records) == 1
+        record = records[0]
+        assert record.duration_s is not None and record.duration_s >= 0.0
+        # ARC_MODEL_STREAM_TRANSPORT=0: the call went plain, one attempt.
+        assert record.transport == "plain"
+        assert record.attempts == 1
+
+    def test_latency_kwargs_are_normalized(self) -> None:
+        records: list[LLMUsageRecord] = []
+        set_llm_usage_sink(records.append)
+        record_chat_result_usage(
+            self._metadata_result(),
+            model="gpt-4o",
+            api_mode="chat_completions",
+            duration_s=-1.0,
+            transport="carrier-pigeon",
+            attempts=0,
+        )
+        assert records[0].duration_s is None
+        assert records[0].transport == ""
+        assert records[0].attempts is None
+
     def test_sync_generate_reports_usage(self, monkeypatch: pytest.MonkeyPatch) -> None:
         records: list[LLMUsageRecord] = []
         set_llm_usage_sink(records.append)

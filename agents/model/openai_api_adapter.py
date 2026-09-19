@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
 
@@ -35,6 +36,14 @@ _DEFAULT_RETRY_MAX_DELAY = 60.0
 _DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
 _DEFAULT_REQUEST_TIMEOUT = 600.0
 _DEFAULT_CONNECT_TIMEOUT = 15.0
+# langchain-openai defaults the inter-chunk gap timeout to 120s. A stalled
+# stream is usually a dead gateway connection (TCP alive, zero bytes), so the
+# sooner it surfaces the less tail latency a call accumulates before the
+# transport switch. 90s sits above real inter-chunk gaps of slow reasoners
+# (long tool-call arguments still arrive as separate chunks) while cutting
+# ~30s of dead waiting per stalled attempt. 0 disables the watchdog.
+_DEFAULT_STREAM_CHUNK_TIMEOUT = 90.0
+_CHUNK_TIMEOUT_ENV = "ARC_MODEL_STREAM_CHUNK_TIMEOUT"
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
 _REACHABILITY_PROBE_TIMEOUT = 5.0
 # A dead endpoint is re-probed up to this many times per real attempt before
@@ -247,6 +256,68 @@ def _is_empty_stream_error(exc: BaseException) -> bool:
     return bool(getattr(exc, "_arc_empty_stream", False))
 
 
+def _is_stream_chunk_timeout(exc: BaseException) -> bool:
+    """Whether the failure is the streamed transport's inter-chunk gap timeout.
+
+    langchain-openai wraps every ``__anext__`` of the streamed response in
+    ``asyncio.wait_for``; a gateway that drops the connection without RST
+    (idle timeout, proxy hiccup) surfaces as ``StreamChunkTimeoutError`` — a
+    plain ``TimeoutError`` subclass, *not* an OpenAI/httpx error, so without
+    this check it escapes the adapter retry loop entirely and the agent layer
+    replays the whole session through ``ainvoke`` (which streams again and
+    hits the same stall: observed as multi-minute tail latency per call).
+    The check also looks at ``__cause__`` because ``agenerate_from_stream``
+    re-raises mid-iteration errors wrapped in ``ValueError``/``RuntimeError``.
+    """
+
+    if _has_stream_chunk_timeout_type(exc):
+        return True
+    cause = getattr(exc, "__cause__", None)
+    return cause is not exc and _has_stream_chunk_timeout_type(cause)
+
+
+def _has_stream_chunk_timeout_type(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    # Match by name: importing the class from langchain_openai would pin a
+    # symbol that older installed versions do not have.
+    return type(exc).__name__ == "StreamChunkTimeoutError" and isinstance(exc, TimeoutError)
+
+
+# Transport metadata of the most recent retry-loop call on this execution
+# context ({"transport": "streamed"|"plain", "attempts": int}). The retry
+# helpers keep returning the bare result — dozens of tests call them directly
+# — so the model classes read this after the call to attribute llm_usage
+# events with which transport actually answered and how many attempts it took.
+_last_call_meta: ContextVar[dict[str, Any] | None] = ContextVar(
+    "arc_model_last_call_meta", default=None
+)
+
+
+def _note_successful_attempt(*, transport: str, attempts: int) -> None:
+    _last_call_meta.set({"transport": transport, "attempts": attempts})
+
+
+def _record_call_usage(result: Any, *, model: str, api_mode: OpenAIAPIMode, messages, started_at: float) -> None:
+    """Emit one usage record with the call's latency/transport telemetry."""
+
+    meta = _last_call_meta.get() or {}
+    try:
+        record_chat_result_usage(
+            result,
+            model=model,
+            api_mode=api_mode,
+            messages=messages,
+            duration_s=time.monotonic() - started_at,
+            transport=str(meta.get("transport") or ""),
+            attempts=meta.get("attempts"),
+        )
+    finally:
+        # Reset even on capture failure: a stale transport marker must not
+        # attribute the next call to this call's transport.
+        _last_call_meta.set(None)
+
+
 class ARCChatOpenAI(ChatOpenAI):
     """ChatOpenAI with ARC-level API error normalization and transient-failure retries."""
 
@@ -272,6 +343,7 @@ class ARCChatOpenAI(ChatOpenAI):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
+        started_at = time.monotonic()
         result = await _acall_model_with_retries(
             lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
@@ -283,13 +355,15 @@ class ARCChatOpenAI(ChatOpenAI):
             ),
             stream_first=self._arc_should_stream_first(),
         )
-        record_chat_result_usage(
-            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
+        _record_call_usage(
+            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages,
+            started_at=started_at,
         )
         return result
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
+        started_at = time.monotonic()
         result = _call_model_with_retries(
             lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
@@ -301,8 +375,9 @@ class ARCChatOpenAI(ChatOpenAI):
             ),
             stream_first=self._arc_should_stream_first(),
         )
-        record_chat_result_usage(
-            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
+        _record_call_usage(
+            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages,
+            started_at=started_at,
         )
         return result
 
@@ -380,6 +455,7 @@ class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
+        started_at = time.monotonic()
         result = await _acall_model_with_retries(
             lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
@@ -391,13 +467,15 @@ class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
             ),
             stream_first=self._arc_should_stream_first(),
         )
-        record_chat_result_usage(
-            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
+        _record_call_usage(
+            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages,
+            started_at=started_at,
         )
         return result
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         parent = super()
+        started_at = time.monotonic()
         result = _call_model_with_retries(
             lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
             api_mode=self._arc_api_mode,
@@ -409,8 +487,9 @@ class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
             ),
             stream_first=self._arc_should_stream_first(),
         )
-        record_chat_result_usage(
-            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages
+        _record_call_usage(
+            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages,
+            started_at=started_at,
         )
         return result
 
@@ -490,6 +569,10 @@ def build_openai_chat_model(
         # SDK layer is disabled here and the timeout is set explicitly.
         "max_retries": 0,
         "request_timeout": resolve_model_request_timeout(),
+        # Binds the inter-chunk gap watchdog of streamed attempts to ARC's env
+        # (the library default of 120s is neither configurable from ARC nor
+        # aligned with the retry loop's transport-switch latency budget).
+        "stream_chunk_timeout": resolve_stream_chunk_timeout(),
     }
     if config.base_url:
         kwargs["base_url"] = config.base_url
@@ -516,6 +599,39 @@ def resolve_model_request_timeout() -> httpx.Timeout:
     request_timeout = _env_float("ARC_MODEL_TIMEOUT", _DEFAULT_REQUEST_TIMEOUT)
     connect_timeout = _env_float("ARC_MODEL_CONNECT_TIMEOUT", _DEFAULT_CONNECT_TIMEOUT)
     return httpx.Timeout(request_timeout, connect=min(connect_timeout, request_timeout))
+
+
+def resolve_stream_chunk_timeout() -> float | None:
+    """Inter-chunk gap timeout for streamed model responses (env-tunable).
+
+    ``ARC_MODEL_STREAM_CHUNK_TIMEOUT`` bounds how long a streamed call may wait
+    for the next SSE chunk. A silent gateway drop mid-generation (TCP alive,
+    no bytes) surfaces as ``StreamChunkTimeoutError`` after this many seconds
+    instead of holding the attempt for the full ``ARC_MODEL_TIMEOUT``. ``0``
+    disables the watchdog; invalid values fall back to the default. The
+    effective value is clamped to ``ARC_MODEL_TIMEOUT``: a watchdog that fires
+    later than the request's read timeout could never trigger, and silently
+    keeping it above would just re-create the pre-fix behaviour for
+    small-timeout configurations.
+    """
+
+    raw = os.getenv(_CHUNK_TIMEOUT_ENV, "").strip()
+    if not raw:
+        value: float | None = _DEFAULT_STREAM_CHUNK_TIMEOUT
+    else:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            return _DEFAULT_STREAM_CHUNK_TIMEOUT
+        if parsed < 0:
+            return _DEFAULT_STREAM_CHUNK_TIMEOUT
+        value = parsed or None
+    if value is None:
+        return None
+    request_timeout = _env_float("ARC_MODEL_TIMEOUT", _DEFAULT_REQUEST_TIMEOUT)
+    if request_timeout > 0:
+        value = min(value, request_timeout)
+    return value or None
 
 
 def reset_model_cache_for_tests() -> None:
@@ -1005,6 +1121,8 @@ def _call_model_with_retries(
     failed_attempts = 0
     probe_rounds = 0
     probe_next = False
+    attempt_count = 0
+    chunk_timeout_switches = 0
     stream_retry = bool(
         stream_first and streamed_retry is not None and not _streaming_marked_unsupported(model, base_url)
     )
@@ -1035,6 +1153,7 @@ def _call_model_with_retries(
             attempt = streamed_retry
         else:
             attempt = call
+        attempt_count += 1
         try:
             result = attempt()
         except Exception as exc:
@@ -1050,6 +1169,49 @@ def _call_model_with_retries(
                     _short_error_text(exc, limit=200),
                 )
                 stream_retry = False
+                continue
+            if _is_stream_chunk_timeout(exc) and (
+                stream_retry or chunk_timeout_switches > 0
+            ):
+                # The attempt stalled between chunks (watchdog error). The
+                # first stall on the streamed transport gets one immediate
+                # free transport switch (no probe round, no delay, no budget
+                # burn — the common case recovers here). Every further stall,
+                # on either transport, counts as a budgeted attempt so a
+                # fully stalled endpoint cannot loop for free forever.
+                # The guard routes a watchdog-shaped error from a plain
+                # attempt (no streamed transport configured, no stall seen
+                # yet) to the generic path below: there it is not a
+                # retryable model-API exception, so the budget check fails
+                # immediately and _raise_model_api_exception re-raises it
+                # as-is (the exception is not OpenAI/httpx, so the wrapper
+                # passes it through untouched — the pre-watchdog contract).
+                chunk_timeout_switches += 1
+                if chunk_timeout_switches == 1:
+                    _record_model_failure(endpoint_key)
+                    _log_model_retry(
+                        exc,
+                        failed_attempts=failed_attempts + 1,
+                        policy=policy,
+                        delay=0.0,
+                        stream_retry=not stream_retry or not _stream_transport_enabled(),
+                    )
+                    if streamed_retry is not None and _stream_transport_enabled():
+                        stream_retry = not stream_retry
+                    continue
+                failed_attempts += 1
+                _record_model_failure(endpoint_key, exc=exc)
+                if failed_attempts > policy.max_retries:
+                    _raise_model_api_exception(exc, api_mode=api_mode, model=model)
+                _log_model_retry(
+                    exc,
+                    failed_attempts=failed_attempts,
+                    policy=policy,
+                    delay=0.0,
+                    stream_retry=not stream_retry or not _stream_transport_enabled(),
+                )
+                if streamed_retry is not None and _stream_transport_enabled():
+                    stream_retry = not stream_retry
                 continue
             failed_attempts += 1
             _record_model_failure(endpoint_key, exc=exc)
@@ -1078,6 +1240,9 @@ def _call_model_with_retries(
                     stream_retry = not stream_retry
             continue
         _reset_model_failures(endpoint_key)
+        _note_successful_attempt(
+            transport="streamed" if stream_retry else "plain", attempts=attempt_count
+        )
         return result
 
 
@@ -1101,6 +1266,8 @@ async def _acall_model_with_retries(
     failed_attempts = 0
     probe_rounds = 0
     probe_next = False
+    attempt_count = 0
+    chunk_timeout_switches = 0
     stream_retry = bool(
         stream_first and streamed_retry is not None and not _streaming_marked_unsupported(model, base_url)
     )
@@ -1130,6 +1297,7 @@ async def _acall_model_with_retries(
             attempt = streamed_retry
         else:
             attempt = call
+        attempt_count += 1
         try:
             result = await _await_if_needed(attempt())
         except Exception as exc:
@@ -1145,6 +1313,49 @@ async def _acall_model_with_retries(
                     _short_error_text(exc, limit=200),
                 )
                 stream_retry = False
+                continue
+            if _is_stream_chunk_timeout(exc) and (
+                stream_retry or chunk_timeout_switches > 0
+            ):
+                # The attempt stalled between chunks (watchdog error). The
+                # first stall on the streamed transport gets one immediate
+                # free transport switch (no probe round, no delay, no budget
+                # burn — the common case recovers here). Every further stall,
+                # on either transport, counts as a budgeted attempt so a
+                # fully stalled endpoint cannot loop for free forever.
+                # The guard routes a watchdog-shaped error from a plain
+                # attempt (no streamed transport configured, no stall seen
+                # yet) to the generic path below: there it is not a
+                # retryable model-API exception, so the budget check fails
+                # immediately and _raise_model_api_exception re-raises it
+                # as-is (the exception is not OpenAI/httpx, so the wrapper
+                # passes it through untouched — the pre-watchdog contract).
+                chunk_timeout_switches += 1
+                if chunk_timeout_switches == 1:
+                    _record_model_failure(endpoint_key)
+                    _log_model_retry(
+                        exc,
+                        failed_attempts=failed_attempts + 1,
+                        policy=policy,
+                        delay=0.0,
+                        stream_retry=not stream_retry or not _stream_transport_enabled(),
+                    )
+                    if streamed_retry is not None and _stream_transport_enabled():
+                        stream_retry = not stream_retry
+                    continue
+                failed_attempts += 1
+                _record_model_failure(endpoint_key, exc=exc)
+                if failed_attempts > policy.max_retries:
+                    _raise_model_api_exception(exc, api_mode=api_mode, model=model)
+                _log_model_retry(
+                    exc,
+                    failed_attempts=failed_attempts,
+                    policy=policy,
+                    delay=0.0,
+                    stream_retry=not stream_retry or not _stream_transport_enabled(),
+                )
+                if streamed_retry is not None and _stream_transport_enabled():
+                    stream_retry = not stream_retry
                 continue
             failed_attempts += 1
             _record_model_failure(endpoint_key, exc=exc)
@@ -1173,6 +1384,9 @@ async def _acall_model_with_retries(
                     stream_retry = not stream_retry
             continue
         _reset_model_failures(endpoint_key)
+        _note_successful_attempt(
+            transport="streamed" if stream_retry else "plain", attempts=attempt_count
+        )
         return result
 
 

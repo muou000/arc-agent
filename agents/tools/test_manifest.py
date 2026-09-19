@@ -246,10 +246,21 @@ def build_declare_test_manifest_tool(
 
         unknown_interfaces = _unknown_interface_ids(rows, known_interface_ids=staged_interface_ids)
         if unknown_interfaces:
+            valid_interfaces = _valid_interface_ids(
+                known_interface_ids=staged_interface_ids,
+                referenced_ids={interface_id for row in rows for interface_id in row.interface_ids},
+            )
+            hint = ""
+            if valid_interfaces:
+                hint = (
+                    " The current interface contract defines these valid id(s): "
+                    + ", ".join(valid_interfaces)
+                    + ". Re-map the offending entries to these ids."
+                )
             errors.append(
                 "Unknown interface id(s) not present in the traceability DB: "
                 + ", ".join(sorted(unknown_interfaces))
-                + ". Use ids returned by InterfaceDesigner or the traceability tools."
+                + f".{hint} Use ids returned by InterfaceDesigner or the traceability tools."
             )
 
         if errors:
@@ -333,6 +344,62 @@ def _unknown_interface_ids(
             if interface_id not in unknown and store.get_interface(interface_id) is None:
                 unknown.add(interface_id)
     return unknown
+
+
+#: Cap on how many valid interface ids the rejection hint lists. The staged
+#: current-node ids come first (the ones the model should be mapping to); the
+#: tail is cut, not the head, so oversized DBs never bury the actionable ids.
+_MANIFEST_HINT_MAX_IDS = 12
+
+
+def _valid_interface_ids(
+    *,
+    known_interface_ids: set[str],
+    referenced_ids: set[str],
+) -> list[str]:
+    """Valid replacement ids for the rejection hint, most actionable first.
+
+    The staged current-node ids lead (the offending rows should map to them),
+    then traceability-DB ids excluding any the model already referenced
+    correctly. Sorted for deterministic output. Empty when nothing valid is
+    discoverable (missing runtime / empty DB and no staged ids), in which case
+    the caller omits the hint instead of guessing.
+    """
+
+    import logging
+
+    from core.service import get_runtime
+
+    valid: set[str] = set(known_interface_ids)
+    try:
+        store = get_runtime().traceability
+    except Exception:
+        store = None
+    if store is not None:
+        try:
+            db_ids = {
+                interface_id
+                for row in store.list_interfaces()
+                if (interface_id := str(row.get("interface_id") or "").strip())
+            }
+            valid |= db_ids
+        except Exception:
+            # The runtime resolved but the DB would not answer (locked file,
+            # concurrent writer): the hint degrades to staged ids only. That
+            # degradation is exactly what an online post-mortem needs to see,
+            # so log it instead of swallowing silently.
+            logging.getLogger(__name__).debug(
+                "manifest hint: traceability list_interfaces failed; "
+                "falling back to staged interface ids only",
+                exc_info=True,
+            )
+    candidates = sorted(valid - referenced_ids)
+    staged = [interface_id for interface_id in sorted(known_interface_ids) if interface_id in set(candidates)]
+    rest = [interface_id for interface_id in candidates if interface_id not in set(staged)]
+    ordered = staged + rest
+    if len(ordered) > _MANIFEST_HINT_MAX_IDS:
+        return ordered[:_MANIFEST_HINT_MAX_IDS] + [f"... (+{len(ordered) - _MANIFEST_HINT_MAX_IDS} more; query with the traceability tools)"]
+    return ordered
 
 
 def reconcile_declared_manifest(
