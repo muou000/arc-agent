@@ -95,6 +95,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         stage: Literal["interface_design", "test_generation", "implementation"],
         file_claim_gate: "FileClaimGate | None" = None,
         test_manifest_lock: TestManifestLock | None = None,
+        pending_contract_registry: Any | None = None,
     ) -> None:
         self._stage = stage
         self._file_claim_gate = file_claim_gate
@@ -103,6 +104,9 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # keeps non-TestGenerator uses of this middleware (tests, other
         # stages) on the classic behavior.
         self._test_manifest_lock = test_manifest_lock
+        # interface_design only: contract bookkeeping for freshly written
+        # files (see ``agents.design.contract_skeleton.PendingContractRegistry``).
+        self._pending_contract_registry = pending_contract_registry
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._written_paths: set[str] = set()
         self._failed_paths: set[str] = set()
@@ -118,7 +122,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         request = self._with_bounded_read(request)
         result = handler(request)
         self._record_result(request, result)
-        return result
+        return self._annotate_pending_contract(request, result)
 
     async def awrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
         blocked = self._validate_tool_call(request)
@@ -127,7 +131,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         request = self._with_bounded_read(request)
         result = await handler(request)
         self._record_result(request, result)
-        return result
+        return self._annotate_pending_contract(request, result)
 
     def _validate_tool_call(self, request: ToolCallRequest) -> str | None:
         name = str(request.tool_call.get("name", ""))
@@ -393,6 +397,45 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         """
 
         return sorted(self._written_paths)
+
+    def _annotate_pending_contract(self, request: ToolCallRequest, result: ToolMessage | Any) -> ToolMessage | Any:
+        """Re-state the serialization obligation on a successful design write.
+
+        The empty-``interfaces`` repair exists because the model treats the
+        final structured array as redundant labor after the files are
+        written. For every contract-embodied write this appends the derived
+        pending contract ids to the write's own tool result, so the last
+        things the model reads before composing its response are the exact
+        records it still owes. The skeleton-guided repair in
+        ``InterfaceDesigner`` remains the fallback when the response comes
+        back empty anyway.
+        """
+
+        if self._stage != "interface_design" or self._pending_contract_registry is None:
+            return result
+        name = str(request.tool_call.get("name", ""))
+        if name not in _FILE_WRITE_TOOLS and name not in _ADDITIVE_FILE_WRITE_TOOLS:
+            return result
+        if _tool_result_failed(result):
+            return result
+        path = _discipline_path(request.tool_call.get("args", {}) or {})
+        if not path or not isinstance(result, ToolMessage) or not isinstance(result.content, str):
+            return result
+        try:
+            new_ids = self._pending_contract_registry.register_materialized_file(path)
+        except Exception:
+            # The notice is an optimization, not a gate: a derivation problem
+            # must never fail the write that produced the file.
+            return result
+        if not new_ids:
+            return result
+        listed = ", ".join(new_ids)
+        result.content = (
+            f"{result.content}\n"
+            f"[ARC pending contract: {listed} — your final response's `interfaces` array "
+            "must contain one record for each of these interface_id values.]"
+        )
+        return result
 
     def _path_unlocked(self, path: str) -> bool:
         return self._validation_failed or path in self._failed_paths

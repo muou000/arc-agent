@@ -802,3 +802,143 @@ def test_manifest_lock_inactive_for_other_stages() -> None:
             make_request("write_file", {"file_path": "/workspace/src/mod.py", "content": "x\n"}),
         )
         assert result.content == "ok", f"{stage} must ignore the manifest lock"
+
+
+# ---------------------------------------------------------------------------
+# pending contract registration (interface_design write-time notice)
+# ---------------------------------------------------------------------------
+
+
+_ROUTER_SKELETON = (
+    "const express = require('express');\n"
+    "const router = express.Router();\n"
+    "router.post('/login', (req, res) => res.json({}));\n"
+    "module.exports = router;\n"
+)
+
+
+def _design_middleware_with_registry(root, stage: str = "interface_design") -> StageDisciplineMiddleware:
+    from agents.design.contract_skeleton import PendingContractRegistry
+
+    return StageDisciplineMiddleware(
+        stage=stage,
+        pending_contract_registry=PendingContractRegistry(node_id="REQ-2", workspace_root=str(root)),
+    )
+
+
+def test_design_write_appends_the_pending_contract_notice(tmp_path) -> None:
+    (tmp_path / "backend" / "src" / "routes").mkdir(parents=True)
+    (tmp_path / "backend" / "src" / "routes" / "auth_routes.js").write_text(_ROUTER_SKELETON, encoding="utf-8")
+    middleware = _design_middleware_with_registry(tmp_path)
+
+    result = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/backend/src/routes/auth_routes.js", "content": "x\n"}),
+    )
+
+    assert result.content.startswith("ok")
+    assert "[ARC pending contract: REQ-2-API-AuthRoutes" in result.content
+    assert "interfaces` array" in result.content
+
+
+def test_pending_contract_notice_only_for_contract_embodied_design_writes(tmp_path) -> None:
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "notes.txt").write_text("plain text\n", encoding="utf-8")
+    middleware = _design_middleware_with_registry(tmp_path)
+
+    plain = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/docs/notes.txt", "content": "plain text\n"}),
+    )
+    assert plain.content == "ok", "a file without a derivable contract gets no notice"
+
+    implementation = _design_middleware_with_registry(tmp_path, stage="implementation")
+    other_stage = run(
+        implementation,
+        make_request("write_file", {"file_path": "/workspace/src/other.py", "content": "y = 2\n"}),
+    )
+    assert other_stage.content == "ok", "non-design stages never annotate"
+
+    no_registry = StageDisciplineMiddleware(stage="interface_design")
+    unwired = run(
+        no_registry,
+        make_request("write_file", {"file_path": "/workspace/src/more.py", "content": "z = 3\n"}),
+    )
+    assert unwired.content == "ok", "no registry wired, no annotation"
+
+
+def test_failed_design_write_gets_no_pending_contract_notice(tmp_path) -> None:
+    (tmp_path / "backend" / "src" / "routes").mkdir(parents=True)
+    (tmp_path / "backend" / "src" / "routes" / "auth_routes.js").write_text(_ROUTER_SKELETON, encoding="utf-8")
+    middleware = _design_middleware_with_registry(tmp_path)
+
+    def failing_write(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="Error: disk full",
+            name=request.tool_call["name"],
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+    result = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/backend/src/routes/auth_routes.js", "content": "x\n"}),
+        failing_write,
+    )
+    assert "ARC pending contract" not in str(result.content)
+
+
+def test_append_notice_covers_only_newly_registered_ids(tmp_path) -> None:
+    (tmp_path / "backend" / "src" / "db").mkdir(parents=True)
+    path = "/workspace/backend/src/db/init_db.js"
+    middleware = _design_middleware_with_registry(tmp_path)
+
+    def disk_handler(request: ToolCallRequest) -> ToolMessage:
+        # Mirror the real filesystem tools so the write-time derivation sees
+        # the accumulated file content.
+        args = request.tool_call["args"]
+        rel = str(args["file_path"]).replace("/workspace/", "", 1)
+        target = tmp_path / rel
+        if request.tool_call["name"] == "append_file":
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(str(args["content"]))
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(args["content"]), encoding="utf-8")
+        return ok_tool(request)
+
+    first = run(
+        middleware,
+        make_request(
+            "write_file",
+            {
+                "file_path": path,
+                "content": "const users = `\n      CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY\n      )\n    `;\n",
+            },
+            call_id="c1",
+        ),
+        disk_handler,
+    )
+    assert "REQ-2-DB-UsersTable" in first.content
+
+    again = run(
+        middleware,
+        make_request("append_file", {"file_path": path, "content": "// trailing comment\n"}, call_id="a1"),
+        disk_handler,
+    )
+    assert again.content == "ok", "re-registering unchanged rows must not repeat the notice"
+
+    grown = run(
+        middleware,
+        make_request(
+            "append_file",
+            {
+                "file_path": path,
+                "content": "const sessions = `\n      CREATE TABLE IF NOT EXISTS sessions (\n        token TEXT PRIMARY KEY\n      )\n    `;\n",
+            },
+            call_id="a2",
+        ),
+        disk_handler,
+    )
+    assert "REQ-2-DB-SessionsTable" in grown.content
+    assert "REQ-2-DB-UsersTable" not in grown.content.split("ok\n", 1)[1], "only the new id is announced"

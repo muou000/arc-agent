@@ -14,7 +14,12 @@ from langchain.agents.structured_output import ToolStrategy
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.interface_designer import get_system_prompt, get_user_prompt
-from agents.design.contract_skeleton import ContractSkeleton, derive_contract_skeletons, merge_filled_contracts
+from agents.design.contract_skeleton import (
+    ContractSkeleton,
+    PendingContractRegistry,
+    derive_contract_skeletons,
+    merge_filled_contracts,
+)
 from agents.model.openai_api_adapter import json_schema_structured_output_supported
 from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
@@ -157,12 +162,25 @@ class InterfaceDesigner:
         )
         context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
 
+        # Write-time contract registration: every contract-embodied write is
+        # derived into pending contract ids the moment it lands, and the
+        # write's tool result carries them back into the conversation. This
+        # re-states the serialization obligation with concrete ids at the
+        # moment of writing, so the first response serializes them and the
+        # skeleton-guided repair below stays a fallback instead of the
+        # 3/3-nodes-per-run norm.
+        pending_registry = PendingContractRegistry(
+            node_id=node_id,
+            workspace_root=workspace_root,
+            interface_ids_by_file=self._registered_interfaces_by_file(),
+        )
         agent = self._build_agent(
             node_id=node_id,
             workspace_root=workspace_root,
             app_type=app_type,
             selected_skill_names=selected_skill_names,
             response_format=InterfaceDesignResponse,
+            pending_contract_registry=pending_registry,
         )
         message = get_user_prompt(
             node_id=node_id,
@@ -188,6 +206,13 @@ class InterfaceDesigner:
             log_cb=self.log_cb,
         )
         bundle = await self._normalize_with_recovery(payload, node_id=node_id, agent=agent)
+        pending_ids = pending_registry.pending_contract_ids()
+        if pending_ids:
+            await self._log(
+                f"Pending contract registration: {len(pending_ids)} contract id(s) "
+                f"registered from this pass's file writes: {', '.join(pending_ids)}.",
+                node_id=node_id,
+            )
         materialized_paths = bundle.get("materialized_paths") or []
         # Serialization-failure evidence: real writes observed by the
         # discipline, or the model's own files_written claim. A write-less
@@ -205,6 +230,7 @@ class InterfaceDesigner:
                 materialized_paths=materialized_paths,
                 app_type=app_type,
                 selected_skill_names=selected_skill_names,
+                pending_contract_registry=pending_registry,
             )
             if repaired.get("interfaces"):
                 bundle["interfaces"] = repaired["interfaces"]
@@ -226,6 +252,7 @@ class InterfaceDesigner:
         app_type: str,
         selected_skill_names: list[str],
         response_format: Any,
+        pending_contract_registry: PendingContractRegistry | None = None,
     ) -> Any:
         """Build the InterfaceDesigner deep-agent with a given response format."""
 
@@ -246,6 +273,7 @@ class InterfaceDesigner:
             tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
             node_id=node_id,
             claims_workspace_root=self.context_workspace_root or workspace_root,
+            pending_contract_registry=pending_contract_registry,
         )
 
     async def _repair_empty_interfaces(
@@ -258,6 +286,7 @@ class InterfaceDesigner:
         materialized_paths: list[str],
         app_type: str = "",
         selected_skill_names: list[str] | None = None,
+        pending_contract_registry: PendingContractRegistry | None = None,
     ) -> dict[str, Any]:
         """Re-serialize contracts after a schema-valid but semantically empty response.
 
@@ -295,6 +324,7 @@ class InterfaceDesigner:
                 app_type=app_type,
                 selected_skill_names=selected_skill_names,
                 min_items=len(skeletons),
+                pending_contract_registry=pending_contract_registry,
             )
             merged = await self._fill_skeletons(
                 fill_agent,
@@ -339,6 +369,7 @@ class InterfaceDesigner:
         app_type: str,
         selected_skill_names: list[str] | None,
         min_items: int,
+        pending_contract_registry: PendingContractRegistry | None = None,
     ) -> Any:
         """Rebuild the agent with a minItems-constrained schema when possible.
 
@@ -361,6 +392,7 @@ class InterfaceDesigner:
                 app_type=app_type,
                 selected_skill_names=selected_skill_names,
                 response_format=constrained,
+                pending_contract_registry=pending_contract_registry,
             )
         except Exception:
             return agent

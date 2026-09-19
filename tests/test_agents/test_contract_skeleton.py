@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agents.design.contract_skeleton import (
+    PendingContractRegistry,
     derive_contract_skeletons,
     merge_filled_contracts,
 )
@@ -320,3 +321,58 @@ def test_single_line_block_comment_keeps_trailing_code(tmp_path: Path) -> None:
     _write(tmp_path, "backend/src/routes/tiny_routes.js", "/* eslint-disable */ const express = require('express');\nconst router = express.Router();\nrouter.get('/x', (req, res) => res.json({}));\nmodule.exports = router;\n")
     skeletons = _skeletons(tmp_path, ["/workspace/backend/src/routes/tiny_routes.js"])
     assert skeletons[0].first_line == "const express = require('express');"
+
+
+# ---------------------------------------------------------------------------
+# PendingContractRegistry: write-time registration for the DESIGN tool layer
+# ---------------------------------------------------------------------------
+
+
+def test_pending_registry_registers_contract_ids_for_written_files(tmp_path: Path) -> None:
+    _write(tmp_path, "backend/src/routes/auth_routes.js", ROUTER_FILE)
+    _write(tmp_path, "backend/src/services/auth_service.js", SERVICE_FILE)
+    registry = PendingContractRegistry(node_id="REQ-2", workspace_root=str(tmp_path))
+
+    first = registry.register_materialized_file("/workspace/backend/src/routes/auth_routes.js")
+    second = registry.register_materialized_file("/workspace/backend/src/services/auth_service.js")
+
+    assert first == ["REQ-2-API-AuthRoutes"]
+    assert second == ["REQ-2-FUNC-AuthService"]
+    assert registry.pending_contract_ids() == ["REQ-2-API-AuthRoutes", "REQ-2-FUNC-AuthService"]
+    assert registry.pending_count() == 2
+
+
+def test_pending_registry_reregistration_yields_only_new_ids(tmp_path: Path) -> None:
+    """append_file re-registers the same path; only grown ids are new.
+
+    A DB bootstrap file gains a second CREATE TABLE via append: the first
+    registration reports the users table, the re-registration reports only
+    the sessions table, and the pending set holds both.
+    """
+
+    _write(tmp_path, "backend/src/db/init_db.js", INIT_DB_FILE)
+    registry = PendingContractRegistry(node_id="REQ-2", workspace_root=str(tmp_path))
+
+    first = registry.register_materialized_file("/workspace/backend/src/db/init_db.js")
+    grown = registry.register_materialized_file("/workspace/backend/src/db/init_db.js")
+    _write(
+        tmp_path,
+        "backend/src/db/init_db.js",
+        INIT_DB_FILE + "\nconst tickets = `\n      CREATE TABLE IF NOT EXISTS tickets (\n        id INTEGER PRIMARY KEY\n      )\n    `;\n",
+    )
+    after_append = registry.register_materialized_file("/workspace/backend/src/db/init_db.js")
+
+    assert first == ["REQ-2-DB-UsersTable", "REQ-2-DB-SessionsTable"]
+    assert grown == []
+    assert after_append == ["REQ-2-DB-TicketsTable"]
+    assert registry.pending_count() == 3
+
+
+def test_pending_registry_ignores_files_without_contracts(tmp_path: Path) -> None:
+    _write(tmp_path, "package.json", '{\n  "name": "app"\n}\n')
+    _write(tmp_path, "notes.txt", "not a module\n")
+    registry = PendingContractRegistry(node_id="REQ-2", workspace_root=str(tmp_path))
+
+    assert registry.register_materialized_file("/workspace/package.json") == []
+    assert registry.register_materialized_file("/workspace/notes.txt") == []
+    assert registry.pending_count() == 0
