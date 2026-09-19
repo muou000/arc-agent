@@ -109,6 +109,14 @@ function renderPage() {
 15. Spy the application's own API boundary — `vi.spyOn(domainApi, 'fetchDomain').mockResolvedValue(...)` — never component internals or the fetch implementation. Reset with `vi.restoreAllMocks()` in `beforeEach`.
 16. Prefer role and label queries (`screen.findByRole`, `getByLabel`) with the requirement-declared accessible names, and `waitFor`/`findBy*` for async outcomes. Assert what the user sees, not that a mock was called.
 
+## StrictMode and exact-call-count assertions
+
+The template's production entry (`frontend/src/main.tsx`) renders inside `React.StrictMode`. StrictMode intentionally double-invokes effects in development/test renders, so:
+
+- Never assert an exact count of effect-driven calls (`expect(fetchMock).toHaveBeenCalledTimes(2)`) unless the component under test explicitly deduplicates (e.g. an in-effect guard) — under StrictMode the observed count doubles.
+- Prefer boolean/ordering assertions (`toHaveBeenCalled()`, `toHaveBeenCalledWith`, "state eventually shows X") over exact counts for anything triggered from `useEffect`.
+- When the requirement genuinely demands "exactly once" semantics (a registration POST), the deduplication belongs in the implementation (guard in the effect or the service layer), and the test asserts the deduplicated observable outcome — not the raw mount-time call count.
+
 ## Recipe — Playwright E2E
 
 ```js
@@ -125,6 +133,10 @@ function uniqueSuffix() {
 20. Verify session or global state through the real API surface that shares the browser context: `const res = await page.request.get('/api/<state-endpoint>');` then assert on the JSON body.
 
 ## Anti-patterns
+
+- Asserting exact effect-driven call counts without checking whether the render environment double-invokes effects (React StrictMode).
+- Repairing a multiple-match `getByText`/`getByLabel` failure by obfuscating label text (zero-width characters, renames) instead of fixing the semantic structure (distinct accessible names, `role="alert"` for error text).
+- Continuing to edit a layer's tests after its full-layer run passed — a green layer is done; re-editing it risks turning it red again and burning budget to recover the state you had.
 
 - Creating a harness, config, setup file, or dependency to "prepare" testing instead of following a recipe against the installed files.
 - Renaming, delete-recreating, or writing numbered variants (`x2`, `x3`) of a test file; writing `.ts` bridge files that import `.tsx` tests.
