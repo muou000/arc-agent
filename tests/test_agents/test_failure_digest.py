@@ -193,6 +193,123 @@ def test_tdd_runs_readonly_permission_carveout(tmp_path: Path) -> None:
     assert _check_fs_permission(permissions, "write", "/workspace/src/app.js") == "allow"
 
 
+# ---------------------------------------------------------------------------
+# Vitest × list rows: every failed test, not only the detail-block one
+# ---------------------------------------------------------------------------
+
+
+def test_digest_parses_vitest_x_rows_with_file_header() -> None:
+    """Every failed test of a vitest run must appear, with the file location.
+
+    Vitest prints one ``× case name Nms`` row per failed test but only ONE
+    ``FAIL file > suite > case`` detail block. Before ×-row parsing the digest
+    listed a single failure out of eleven (observed on the 2026-09-19 test1
+    run's Integration log), and the follow-up session repaired one symptom
+    while ten siblings went unseen.
+    """
+
+    output = (
+        "Exit Code: 1\n"
+        "STDERR:\n"
+        " ❯ tests/routes/authRoutes.test.js (14 tests | 11 failed) 980ms\n"
+        "     × POST /auth/register with valid payload returns 200 71ms\n"
+        "     × POST /auth/register rejects duplicate usernames with 409 47ms\n"
+        "     × POST /auth/register rejects duplicate emails with 409 48ms\n"
+        "     ✓ POST /auth/options lists options 12ms\n"
+        " Test Files  1 failed (1)\n"
+        " FAIL  tests/routes/authRoutes.test.js > AuthRoutes > POST /auth/register with valid payload returns 200\n"
+        " AssertionError: expected 500 to be 200\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert len(names) == 3
+    assert "POST /auth/register rejects duplicate usernames with 409" in names
+    locations = {item["location"] for item in digest["failed_tests"]}
+    assert locations == {"tests/routes/authRoutes.test.js"}
+
+
+def test_digest_dedupes_vitest_x_row_against_fail_detail() -> None:
+    """A test named by both an × row and a FAIL detail block counts once.
+
+    The FAIL ``suite > case`` marker carries the error lines, so it wins over
+    the bare × row of the same test.
+    """
+
+    output = (
+        "Exit Code: 1\n"
+        " ❯ tests/features/SessionContext.test.tsx (5 tests | 1 failed) 230ms\n"
+        "     × refresh() re-fetches the current user 230ms\n"
+        " FAIL  tests/features/SessionContext.test.tsx > SessionProvider > refresh() re-fetches the current user\n"
+        " AssertionError: expected \"vi.fn()\" to be called 2 times, but got 4 times\n"
+    )
+    digest = build_failure_digest(output)
+    assert len(digest["failed_tests"]) == 1
+    entry = digest["failed_tests"][0]
+    assert entry["name"].startswith("SessionProvider > refresh()")
+    assert any("vi.fn()" in line for line in entry["error_lines"])
+
+
+def test_digest_ignores_x_glyphs_outside_vitest_block() -> None:
+    """A bare × line without a preceding ❯ run header is not a failed test."""
+
+    output = (
+        "Exit Code: 1\n"
+        "AssertionError: expected 500 to be 200\n"
+        " × not a vitest row 12ms\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert "not a vitest row" not in names
+
+
+def test_digest_two_suites_same_case_name_count_both_failures() -> None:
+    """Same case name under two describes yields two distinct failures.
+
+    The x-row dedup consumes the bare row via the first FAIL detail marker;
+    the second suite's FAIL marker must survive as its own entry instead of
+    being merged into the first (the dedup matches on the case tail, and
+    'A > saves' vs 'B > saves' differ there).
+    """
+
+    output = (
+        "Exit Code: 1\n"
+        " ❯ tests/a.test.js (4 tests | 2 failed) 100ms\n"
+        "     × saves 30ms\n"
+        "     × saves 30ms\n"
+        " FAIL  tests/a.test.js > A > saves\n"
+        " AssertionError: boom A\n"
+        " FAIL  tests/a.test.js > B > saves\n"
+        " AssertionError: boom B\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert names == ["A > saves", "B > saves"]
+    errors = [item["error_lines"][0] for item in digest["failed_tests"] if item["error_lines"]]
+    assert errors == ["AssertionError: boom A", "AssertionError: boom B"]
+
+
+def test_digest_resets_vitest_context_at_summary_lines() -> None:
+    """x-like rows after the vitest run summary must not be attributed.
+
+    ``Test Files`` / ``Tests`` summary lines close the per-file run block;
+    keeping the file context past them let any later "× row 12ms" from
+    unrelated output (custom loggers, CI summaries) leak into the digest
+    attributed to the last seen file.
+    """
+
+    output = (
+        "Exit Code: 1\n"
+        " ❯ tests/a.test.js (2 tests | 1 failed) 100ms\n"
+        "     × real failure 30ms\n"
+        " Test Files  1 failed (1)\n"
+        "      Tests  1 failed | 1 passed (2)\n"
+        " × unrelated summary row 12ms\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert names == ["real failure"]
+
+
 def test_persist_run_output_continues_sequence_across_passes(tmp_path: Path) -> None:
     """A second TDD pass must not overwrite the first pass's run logs.
 
@@ -256,3 +373,40 @@ def test_persist_run_output_scan_failure_propagates(tmp_path: Path, monkeypatch)
     with pytest.raises(OSError):
         persist_run_output(tmp_path, "REQ-1", "Unit", 1, "boom")
     assert calls["n"] >= 1
+
+
+def test_digest_bare_row_never_swallows_suite_named_entry() -> None:
+    """Only the fuller "suite > case" form may replace; never the bare row.
+
+    A later bare x-row carrying less identity (just the case name) must not
+    replace an existing "suite > case" entry: the old symmetric suffix
+    match let "× saves" swallow an earlier "B > saves" row, silently
+    dropping the suite identity. The merge direction is now explicit.
+    """
+
+    output = (
+        "Exit Code: 1\n"
+        " ❯ tests/a.test.js (4 tests | 2 failed) 100ms\n"
+        "     × B > saves 30ms\n"
+        "     × saves 30ms\n"
+        " FAIL  tests/a.test.js > A > saves\n"
+        " AssertionError: boom A\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert names == ["B > saves", "A > saves"]
+
+
+def test_digest_summary_reset_matches_decorated_lines() -> None:
+    """Box-drawing decorations around 'Test Files' still close the run block."""
+
+    output = (
+        "Exit Code: 1\n"
+        " ❯ tests/a.test.js (2 tests | 1 failed) 100ms\n"
+        "     × real failure 30ms\n"
+        "  ⎯⎯⎯ Test Files  1 failed (1) ⎯⎯⎯\n"
+        " × leaked row 12ms\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert names == ["real failure"]

@@ -247,3 +247,61 @@ def test_fingerprint_keeps_assertion_values_distinct() -> None:
     first = failure_fingerprint("Exit Code: 1\nAssertionError: expected 'Login' to equal 'Log in'")
     second = failure_fingerprint("Exit Code: 1\nAssertionError: add(1, 1) returned 0")
     assert first != second
+
+
+def test_fingerprint_masks_vitest_header_durations() -> None:
+    """Vitest file-header lines embed the run duration; it must be masked.
+
+    Observed on the 2026-09-19 test1 run: the first error-bearing line of a
+    failed vitest run is the ``❯ file.test.js (14 tests | 11 failed) 980ms``
+    header. The duration differs on every rerun, so every rerun got a distinct
+    fingerprint, the stall governor (three identical consecutive fingerprints)
+    never fired, and the agent burned 7 Integration calls on one unchanged
+    500-failure with zero STALL DETECTED notices.
+    """
+
+    header = "❯ tests/routes/authRoutes.test.js (14 tests | 11 failed)"
+    runs = [
+        f"Exit Code: 1\n{header} 980ms\n",
+        f"Exit Code: 1\n{header} 951ms\n",
+        f"Exit Code: 1\n{header} 1040ms\n",
+        f"Exit Code: 1\n{header} 1.2s\n",
+    ]
+    fingerprints = {failure_fingerprint(output) for output in runs}
+    assert len(fingerprints) == 1
+    assert "<dur>" in next(iter(fingerprints))
+
+
+def test_fingerprint_strips_ansi_color_codes() -> None:
+    """Color codes around durations/counts differ run to run and break matching."""
+
+    plain = "Exit Code: 1\nAssertionError: expected 500 to be 200"
+    colored = (
+        "Exit Code: 1\n"
+        "\x1b[31mAssertionError\x1b[39m: expected \x1b[31m500\x1b[39m to be \x1b[31m200\x1b[39m"
+    )
+    assert failure_fingerprint(plain) == failure_fingerprint(colored)
+
+
+def test_fingerprint_keeps_assertion_numbers() -> None:
+    """Masking must not swallow assertion values - distinct failures stay distinct."""
+
+    first = failure_fingerprint("Exit Code: 1\nAssertionError: expected 2 got 1")
+    second = failure_fingerprint("Exit Code: 1\nAssertionError: expected 2 got 3")
+    assert first != second
+
+
+def test_fingerprint_masks_assertion_embedded_durations_by_design() -> None:
+    """Durations inside assertion text collapse to one fingerprint on purpose.
+
+    A timeout drifting 500ms -> 1200ms under load is the same failing
+    assertion; the stall governor asks "did the failure change?", not "did
+    the timing change?". Pinning this so the trade-off is explicit.
+    """
+
+    fast = failure_fingerprint("Exit Code: 1\nAssertionError: expected response within 500ms but got timeout")
+    slow = failure_fingerprint("Exit Code: 1\nAssertionError: expected response within 1200ms but got timeout")
+    assert fast == slow
+    # A genuinely different assertion stays distinct.
+    other = failure_fingerprint("Exit Code: 1\nAssertionError: expected status 200 but got 500")
+    assert fast != other

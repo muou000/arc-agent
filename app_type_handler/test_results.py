@@ -206,6 +206,25 @@ _FINGERPRINT_ZERO_FAILURE_PATTERN = re.compile(r"\b0\s+(?:errors?|failed|failure
 #: failures keep distinct fingerprints.
 _FINGERPRINT_NOISE_PATTERN = re.compile(r":\d+(?::\d+)?")
 
+#: Wall-clock durations attached to reporter lines (``980ms``, ``1.2s``) are
+#: pure run-to-run noise. They matter on the vitest/jest file-header line
+#: (``❯ file.test.js (14 tests | 11 failed) 980ms``), which is often the first
+#: error-bearing line of a failed run: without masking, every rerun of the
+#: same failure got a distinct fingerprint and the stall governor (three
+#: identical consecutive fingerprints) never fired - observed on the
+#: 2026-09-19 test1 run, where Integration burned 7 calls on one unchanged
+#: failure with zero STALL DETECTED notices.
+#: The mask also applies to durations inside assertion text ("expected
+#: response within 500ms"): a timeout that drifts 500ms -> 1200ms under load
+#: is the same failing assertion, and the stall governor asks "did the
+#: failure change?", not "did the timing change?". Stability outweighs
+#: duration precision here by design.
+_FINGERPRINT_DURATION_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|m)\b")
+
+#: ANSI color codes wrap the duration (and shift between color/no-color runs),
+#: so they are stripped before line scanning.
+_ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 
 def classify_test_failure(test_output: str) -> str:
     """Return a short reason when a failed run is environmental, else ``""``.
@@ -246,13 +265,14 @@ def failure_fingerprint(test_output: str) -> str:
     ``run_tests`` failures carry the same fingerprint, the agent is patching
     neighbors of the failure instead of changing its hypothesis. The
     fingerprint pairs the exit code with the first error-bearing line, masked
-    against run-to-run noise (ports, ``line:column`` references) and skipping
-    lines that merely *mention* failure keywords (success markers, diff rows,
-    zero-failure summaries). Truncated to a bounded length because it is echoed
-    into tool results and node sessions.
+    against run-to-run noise (ANSI color codes, ports, ``line:column``
+    references, wall-clock durations) and skipping lines that merely *mention*
+    failure keywords (success markers, diff rows, zero-failure summaries).
+    Truncated to a bounded length because it is echoed into tool results and
+    node sessions.
     """
 
-    output = test_output or ""
+    output = _ANSI_PATTERN.sub("", test_output or "")
     exit_code = _extract_overall_exit_code(output)
     key_line = ""
     for line in output.splitlines():
@@ -266,6 +286,7 @@ def failure_fingerprint(test_output: str) -> str:
         lowered = stripped.lower()
         if "error" in lowered or "failed" in lowered or "expect" in lowered or "assert" in lowered:
             key_line = _FINGERPRINT_NOISE_PATTERN.sub(":#", stripped)
+            key_line = _FINGERPRINT_DURATION_PATTERN.sub("<dur>", key_line)
             break
     return f"{exit_code}|{key_line[:_FINGERPRINT_LINE_LIMIT]}"
 
