@@ -17,6 +17,7 @@ import pytest
 
 from agents.tools.test_failure_digest import (
     build_failure_digest,
+    extract_build_note,
     format_failure_digest,
     persist_run_output,
 )
@@ -148,6 +149,81 @@ def test_format_includes_pointer_and_fingerprint() -> None:
 def test_format_without_failed_tests_explains_fallback() -> None:
     text = format_failure_digest(build_failure_digest("Exit Code: 1\n"), test_type="Unit")
     assert "no per-test structure recognized" in text
+
+
+def test_format_includes_build_note_when_present() -> None:
+    text = format_failure_digest(
+        build_failure_digest("Exit Code: 1\n"),
+        test_type="E2E",
+        build="reused existing frontend/dist (fingerprint abc123def456)",
+    )
+    assert "- build: reused existing frontend/dist (fingerprint abc123def456)" in text
+
+
+def test_format_omits_build_note_when_absent() -> None:
+    text = format_failure_digest(build_failure_digest("Exit Code: 1\n"), test_type="Unit")
+    assert "build:" not in text
+
+
+_REUSE_OUTPUT = (
+    "Exit Code: 1\n"
+    "=== Frontend Build ===\n"
+    "Reused the existing `frontend/dist` because the frontend sources are unchanged "
+    "since the last successful build (fingerprint abc123def456).\n"
+)
+
+_REBUILT_OUTPUT = (
+    "Exit Code: 1\n"
+    "=== Frontend Build ===\n"
+    "Exit Code: 0\nSTDOUT:\nfake build\n\n"
+    "Built `frontend/dist` from the current sources (fingerprint abc123def456).\n"
+)
+
+
+def test_extract_build_note_reads_handler_reuse_verdict() -> None:
+    assert (
+        extract_build_note(_REUSE_OUTPUT)
+        == "reused existing frontend/dist (fingerprint abc123def456)"
+    )
+
+
+def test_extract_build_note_reads_handler_rebuild_verdict() -> None:
+    assert (
+        extract_build_note(_REBUILT_OUTPUT)
+        == "rebuilt frontend/dist from current sources (fingerprint abc123def456)"
+    )
+
+
+def test_extract_build_note_flags_pre_test_build_failure() -> None:
+    output = (
+        "Runner: Playwright\nCommand: npx playwright test\n"
+        "Frontend build failed before E2E startup.\n\n"
+        "=== Frontend Build ===\nExit Code: 1\nSTDERR:\nnpm error code ELIFECYCLE\n"
+    )
+    assert extract_build_note(output) == "frontend build failed before E2E startup"
+
+
+def test_extract_build_note_is_empty_without_frontend_build() -> None:
+    assert extract_build_note(VITEST_FAILURE) == ""
+    assert extract_build_note("") == ""
+
+
+def test_extract_build_note_ignores_its_own_digest_block() -> None:
+    """The session handoff re-extracts from a result that already embeds the digest.
+
+    ``core.phases`` appends the rendered digest to the run_tests tool result and
+    ``test_driven_developer._record_failure_state`` later extracts the build
+    note from that combined text. The digest's note phrasing therefore must
+    never re-match the handler verdict patterns.
+    """
+
+    note = extract_build_note(_REUSE_OUTPUT)
+    rendered = format_failure_digest(
+        build_failure_digest(_REUSE_OUTPUT),
+        test_type="E2E",
+        build=note,
+    )
+    assert extract_build_note(_REUSE_OUTPUT + "\n\n" + rendered) == note
 
 
 def test_persist_run_output_writes_and_prunes(tmp_path: Path) -> None:

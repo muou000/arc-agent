@@ -85,6 +85,21 @@ _VITEST_EXPECTED = re.compile(r"^\s*(?:- )?Expected(?![A-Za-z])\s*:?\s*(.*)$")
 _VITEST_RECEIVED = re.compile(r"^\s*(?:\+ )?Received(?![A-Za-z])\s*:?\s*(.*)$")
 _ERROR_HEAD = re.compile(r"^\s*(?:[A-Za-z]*Error|TimeoutError)\s*:\s*(.*)$")
 
+# Frontend build verdicts emitted by the web handler's build step
+# (app_type_handler.web._build_frontend_dist). `dist/` is deny-listed for
+# reads (generated output), and the fingerprint record lives inside it, so an
+# agent that needs to know what was actually served cannot recover the fact
+# from the workspace. The digest surfaces the system's own verdict instead.
+# The note phrasings below deliberately differ from the handler's prose so a
+# digest block appended to a result can never be re-parsed into a new note.
+_BUILD_REUSED_LINE = re.compile(
+    r"Reused the existing `frontend/dist`.*?\(fingerprint ([0-9a-f]+)\)"
+)
+_BUILD_REBUILT_LINE = re.compile(
+    r"Built `frontend/dist` from the current sources(?: \(fingerprint ([0-9a-f]+)\))?"
+)
+_BUILD_FAILED_MARKER = "Frontend build failed before E2E startup."
+
 
 def _strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text or "")
@@ -252,6 +267,30 @@ def build_failure_digest(test_output: str) -> dict[str, Any]:
     }
 
 
+def extract_build_note(test_output: str) -> str:
+    """Return the frontend build verdict carried by a run output, else ``""``.
+
+    E2E runs prepend a ``=== Frontend Build ===`` section whose reuse/rebuild
+    verdict is the only reliable statement of what the backend served; empty
+    for layers that never build a frontend (unit, integration) and for
+    non-web handlers.
+    """
+
+    output = _strip_ansi(test_output or "")
+    if _BUILD_FAILED_MARKER in output:
+        return "frontend build failed before E2E startup"
+    reused = _BUILD_REUSED_LINE.search(output)
+    if reused:
+        return f"reused existing frontend/dist (fingerprint {reused.group(1)})"
+    rebuilt = _BUILD_REBUILT_LINE.search(output)
+    if rebuilt:
+        note = "rebuilt frontend/dist from current sources"
+        if rebuilt.group(1):
+            note += f" (fingerprint {rebuilt.group(1)})"
+        return note
+    return ""
+
+
 def format_failure_digest(
     digest: dict[str, Any],
     *,
@@ -259,6 +298,7 @@ def format_failure_digest(
     raw_output_path: str | None = None,
     fingerprint: str = "",
     environment_failure: str = "",
+    build: str = "",
 ) -> str:
     """Render a digest dict into the handoff text block for the next session."""
 
@@ -271,6 +311,8 @@ def format_failure_digest(
         blocks.append(f"- fingerprint: {fingerprint}")
     if environment_failure:
         blocks.append(f"- environment_failure: {environment_failure}")
+    if build:
+        blocks.append(f"- build: {build}")
     if failed_tests:
         blocks.append(f"- failed tests ({len(failed_tests)}):")
         for item in failed_tests:
