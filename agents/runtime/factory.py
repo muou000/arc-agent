@@ -351,6 +351,7 @@ def build_stage_agent(
     node_id: str | None = None,
     claims_workspace_root: str | None = None,
     test_manifest_lock: Any | None = None,
+    pending_contract_registry: Any | None = None,
 ):
     """Create an agent instance with ARC's first-batch filesystem policy.
 
@@ -360,6 +361,10 @@ def build_stage_agent(
 
     ``test_manifest_lock`` wires the test_generation stage's manifest-first
     gate (see ``agents/tools/test_manifest.py``); other stages ignore it.
+
+    ``pending_contract_registry`` wires the interface_design stage's
+    write-time contract registration (see
+    ``agents/design/contract_skeleton.py``); other stages ignore it.
     """
 
     _apply_windows_filesystem_path_compat()
@@ -412,6 +417,7 @@ def build_stage_agent(
         stage=stage,
         file_claim_gate=file_claim_gate,
         test_manifest_lock=test_manifest_lock if stage == "test_generation" else None,
+        pending_contract_registry=pending_contract_registry if stage == "interface_design" else None,
     )
     permissions = _build_filesystem_permissions(
         root,

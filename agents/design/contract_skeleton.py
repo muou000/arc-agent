@@ -401,6 +401,74 @@ def derive_contract_skeletons(
     return skeletons
 
 
+class PendingContractRegistry:
+    """Contracts registered at write time from the design pass's own files.
+
+    The dominant reason a DESIGN pass needs the skeleton-guided repair is
+    serialization, not design: the model materializes the files, then hands
+    in a final response whose ``interfaces`` array is empty (observed 3/3
+    nodes on the 2026-09-19 ticket-booking submission). This registry moves
+    the contract bookkeeping into the tool layer: every successful design
+    write is derived into contract skeletons the moment it lands, and the
+    write's tool result carries the pending ids back into the conversation —
+    so the obligation to serialize them is re-stated with concrete ids at
+    the exact moment of writing, instead of only in the system prompt.
+
+    The skeleton-guided repair stays as the fallback for a response that
+    still comes back empty; nothing here replaces it.
+    """
+
+    def __init__(
+        self,
+        *,
+        node_id: str,
+        workspace_root: str,
+        interface_ids_by_file: dict[str, set[str]] | None = None,
+    ) -> None:
+        self._node_id = node_id
+        self._workspace_root = workspace_root
+        self._interface_ids_by_file = interface_ids_by_file or {}
+        self._skeletons_by_path: dict[str, list[ContractSkeleton]] = {}
+
+    def register_materialized_file(self, raw_path: str) -> list[str]:
+        """Derive the contract skeletons of one freshly written file.
+
+        The path's pending rows are replaced with a fresh derivation (an
+        ``append_file`` can extend a router or add ``CREATE TABLE`` rows),
+        and the return value lists only the ids that are new for this path —
+        usually empty on re-registration, which lets the caller suppress a
+        repeated notice. A file that embodies no contract (templates,
+        package manifests, unrecognized layouts) yields no ids and is not
+        tracked.
+        """
+
+        rel_path = _strip_workspace_prefix(raw_path)
+        if not rel_path:
+            return []
+        skeletons = derive_contract_skeletons(
+            node_id=self._node_id,
+            file_paths=[raw_path],
+            workspace_root=self._workspace_root,
+            interface_ids_by_file=self._interface_ids_by_file,
+        )
+        previous_ids = {skeleton.interface_id for skeleton in self._skeletons_by_path.get(rel_path, [])}
+        self._skeletons_by_path[rel_path] = skeletons
+        return [skeleton.interface_id for skeleton in skeletons if skeleton.interface_id not in previous_ids]
+
+    def pending_contract_ids(self) -> list[str]:
+        """All pending interface ids, in first-registration order, deduped."""
+
+        ids: list[str] = []
+        for skeletons in self._skeletons_by_path.values():
+            for skeleton in skeletons:
+                if skeleton.interface_id not in ids:
+                    ids.append(skeleton.interface_id)
+        return ids
+
+    def pending_count(self) -> int:
+        return len(self.pending_contract_ids())
+
+
 def _normalize_id_segment(text: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9]+", "-", str(text or "").strip()).strip("-")
     return cleaned or "Contract"

@@ -27,12 +27,13 @@ def seed_requirement(runtime, node_id: str) -> None:
     )
 
 
-def make_designer(tmp_project_dir: Path, model: FauxChatModel) -> InterfaceDesigner:
+def make_designer(tmp_project_dir: Path, model: FauxChatModel, log_cb=None) -> InterfaceDesigner:
     return InterfaceDesigner(
         model=model,
         workspace_root=str(tmp_project_dir),
         requirement_path=str(tmp_project_dir / "requirements" / "req.md"),
         app_type="web",
+        log_cb=log_cb,
     )
 
 
@@ -82,8 +83,13 @@ def test_interface_designer_writes_skeleton_and_returns_structured_bundle(
         ]
     )
 
+    logs: list[str] = []
+
+    def collect_log(agent_name: str, message: str, status: str | None, node_id: str | None) -> None:
+        logs.append(message)
+
     bundle = asyncio.run(
-        make_designer(tmp_project_dir, model).run(
+        make_designer(tmp_project_dir, model, log_cb=collect_log).run(
             node_id=node_id,
             requirement_data={"name": "Calculator", "description": "Add two numbers"},
         )
@@ -98,7 +104,13 @@ def test_interface_designer_writes_skeleton_and_returns_structured_bundle(
     assert interface["type"] == "FUNC"
     # The scripted skeleton write really landed in the workspace.
     assert (tmp_project_dir / "src" / "contracts" / "calc.py").read_text(encoding="utf-8") == skeleton
-
+    # Write-time registration wiring (factory -> discipline -> registry): the
+    # contract-embodied write was derived into a pending contract id, whose
+    # notice rode along on the write's tool result into the conversation.
+    assert any(
+        "Pending contract registration: 1" in message and "REQ-DESIGN-1-FUNC-calc" in message
+        for message in logs
+    ), logs
 
 def test_interface_designer_repairs_empty_interfaces_after_materializing_files(
     tmp_project_dir: Path, arc_runtime

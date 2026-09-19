@@ -24,6 +24,13 @@ MAX_SKELETON_LINES = _MAX_SKELETON_LINES
 MAX_APPEND_LINES = 80
 MAX_APPENDS_PER_FILE = 3
 _MAX_READ_LIMIT = 200
+# Fresh overlapping re-reads allowed per path before the block returns. The
+# hard block exists for the run7 loop (50 consecutive offset probes), but the
+# fbd4a73b TDD run showed the other edge: an agent whose legitimate re-read is
+# refused does not stop wanting the content — it burned 10 consecutive greps
+# rebuilding one file, at a higher round-trip cost than the re-read itself.
+# A small per-path budget serves the legitimate case and still caps the loop.
+_MAX_REPEATED_READS_PER_PATH = 2
 _DESIGN_MUTATION_PATTERNS = (
     re.compile(r"\b(?:INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.IGNORECASE),
     re.compile(
@@ -95,6 +102,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         stage: Literal["interface_design", "test_generation", "implementation"],
         file_claim_gate: "FileClaimGate | None" = None,
         test_manifest_lock: TestManifestLock | None = None,
+        pending_contract_registry: Any | None = None,
     ) -> None:
         self._stage = stage
         self._file_claim_gate = file_claim_gate
@@ -103,7 +111,11 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # keeps non-TestGenerator uses of this middleware (tests, other
         # stages) on the classic behavior.
         self._test_manifest_lock = test_manifest_lock
+        # interface_design only: contract bookkeeping for freshly written
+        # files (see ``agents.design.contract_skeleton.PendingContractRegistry``).
+        self._pending_contract_registry = pending_contract_registry
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
+        self._repeated_read_counts: dict[str, int] = {}
         self._written_paths: set[str] = set()
         self._failed_paths: set[str] = set()
         self._validation_failed = False
@@ -118,7 +130,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         request = self._with_bounded_read(request)
         result = handler(request)
         self._record_result(request, result)
-        return result
+        return self._annotate_pending_contract(request, result)
 
     async def awrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
         blocked = self._validate_tool_call(request)
@@ -127,7 +139,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         request = self._with_bounded_read(request)
         result = await handler(request)
         self._record_result(request, result)
-        return result
+        return self._annotate_pending_contract(request, result)
 
     def _validate_tool_call(self, request: ToolCallRequest) -> str | None:
         name = str(request.tool_call.get("name", ""))
@@ -252,11 +264,13 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if not previous or self._path_unlocked(path):
             return None
         if any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous):
-            return (
-                f"Repeated read blocked: {path} is already in this stage's read cache. "
-                "Use the earlier result and continue; if the file needs changes, follow the write "
-                "options instead of probing offsets to bypass the cache."
-            )
+            if self._repeated_read_counts.get(path, 0) >= _MAX_REPEATED_READS_PER_PATH:
+                return (
+                    f"Repeated read blocked: {path} was re-read {_MAX_REPEATED_READS_PER_PATH} time(s) "
+                    "in this stage already. Use the earlier results and continue; if the file needs "
+                    "changes, follow the write options instead of probing offsets to bypass the cache."
+                )
+            return None
         return None
 
     def _validate_write(self, args: dict[str, Any]) -> str | None:
@@ -358,13 +372,15 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 self._failed_paths.add(path)
             return
         if name == "delete" and path:
-            # The file is gone, so its write lock, read ranges and failure
-            # record describe content that no longer exists; dropping them is
-            # what makes delete-then-rewrite a real exit instead of one that
-            # depends on an accidental later failure to unlock.
+            # The file is gone, so its write lock, read ranges, repeat-read
+            # budget and failure record describe content that no longer
+            # exists; dropping them is what makes delete-then-rewrite a real
+            # exit instead of one that depends on an accidental later failure
+            # to unlock.
             self._written_paths.discard(path)
             self._failed_paths.discard(path)
             self._read_ranges.pop(path, None)
+            self._repeated_read_counts.pop(path, None)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
             self._discard_written_path(request, path)
@@ -372,6 +388,15 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if name == "read_file" and path:
             offset = _as_nonnegative_int(args.get("offset"), default=0)
             limit = _as_nonnegative_int(args.get("limit"), default=100)
+            previous = self._read_ranges.get(path, [])
+            if (
+                previous
+                and not self._path_unlocked(path)
+                and any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous)
+            ):
+                # Only a read that actually returned content consumes the
+                # fresh re-read budget; failed reads must not.
+                self._repeated_read_counts[path] = self._repeated_read_counts.get(path, 0) + 1
             self._read_ranges.setdefault(path, []).append((offset, offset + limit))
             self._cache_read_summary(request, path, offset, limit, result)
         if (name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS) and path:
@@ -393,6 +418,45 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         """
 
         return sorted(self._written_paths)
+
+    def _annotate_pending_contract(self, request: ToolCallRequest, result: ToolMessage | Any) -> ToolMessage | Any:
+        """Re-state the serialization obligation on a successful design write.
+
+        The empty-``interfaces`` repair exists because the model treats the
+        final structured array as redundant labor after the files are
+        written. For every contract-embodied write this appends the derived
+        pending contract ids to the write's own tool result, so the last
+        things the model reads before composing its response are the exact
+        records it still owes. The skeleton-guided repair in
+        ``InterfaceDesigner`` remains the fallback when the response comes
+        back empty anyway.
+        """
+
+        if self._stage != "interface_design" or self._pending_contract_registry is None:
+            return result
+        name = str(request.tool_call.get("name", ""))
+        if name not in _FILE_WRITE_TOOLS and name not in _ADDITIVE_FILE_WRITE_TOOLS:
+            return result
+        if _tool_result_failed(result):
+            return result
+        path = _discipline_path(request.tool_call.get("args", {}) or {})
+        if not path or not isinstance(result, ToolMessage) or not isinstance(result.content, str):
+            return result
+        try:
+            new_ids = self._pending_contract_registry.register_materialized_file(path)
+        except Exception:
+            # The notice is an optimization, not a gate: a derivation problem
+            # must never fail the write that produced the file.
+            return result
+        if not new_ids:
+            return result
+        listed = ", ".join(new_ids)
+        result.content = (
+            f"{result.content}\n"
+            f"[ARC pending contract: {listed} — your final response's `interfaces` array "
+            "must contain one record for each of these interface_id values.]"
+        )
+        return result
 
     def _path_unlocked(self, path: str) -> bool:
         return self._validation_failed or path in self._failed_paths
