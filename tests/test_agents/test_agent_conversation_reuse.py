@@ -46,7 +46,6 @@ def build_probe(workspace: Path, model: FauxChatModel, *, response_format: objec
         workspace_root=str(workspace),
         writable_roots=[str(workspace)],
         skills=[],
-        permitted_skill_names=[],
         memory=[],
         tools=[],
     )

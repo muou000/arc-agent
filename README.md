@@ -25,7 +25,7 @@ flowchart LR
 - **需求树驱动**：非叶节点只做 UI 壳层设计，叶节点拥有完整的 UI → API → FUNC → DB 接口链。
 - **DESIGN 空接口骨架修复**：flash 级模型常见"文件已写完、大型结构化 interfaces 数组交白卷"（schema 合法但为空）。修复轮从物化文件机械推导契约骨架（routes→API、services/repositories→FUNC、CREATE TABLE→DB、pages/组件→UI；已注册契约的共享面 edit 标记为 update），把大型自由输出降格为逐行填空（responsibility/specification ≤200 字符），单轮失败后分批（每批 3-4 行）重试一轮，仍缺失的行用可溯源的保守机械记录兜底（带 `skeleton_derived` 标记，不发明文件/表名）；端点支持 strict json_schema 时修复轮 schema 携带 minItems 下界使白卷成为约束违规。无物化文件的空响应不做二次猜测，但只允许非叶节点走该历史 warning 放行路径；叶节点返回空 `interfaces` 且无落盘文件时 DESIGN 直接失败（复用父/依赖接口必须按原 `interface_id` 写进返回列表，summary 散文不算），避免矛盾推迟到 TestGenerator 的 owned 覆盖门禁才在整树等待后爆出。
 - **测试先行 + manifest 锁定 + 基线 RED 验证**：先声明并锁定测试清单，再生成测试文件，最后由 TDD 智能体实现代码。TestGenerator 在写第一个测试文件前必须调用 `declare_test_manifest` 声明完整清单（路径 + 类型 + `coverage_scope` + 覆盖接口）：`coverage_scope=owned` 表示当前节点新增行为，`dependency` 表示依赖回归，`shared` 表示共享契约。声明时即用 app-type 放置规则和追溯库接口 id 做早期校验，锁定后测试文件的写入/编辑/删除只落在已声明路径上（`StageDisciplineMiddleware` 写入端门禁）。收尾对账：返回 manifest 中出现未声明路径的条目判为契约违规；已声明已写入但被答案漏掉的行由声明机械补回；声明了但未写入的条目剔除并告警。基线验证要求当前节点至少保留一个 `owned` 测试作为 RED witness；依赖回归和共享契约测试允许预先绿色，但会作为 exempt coverage 记录，不能替代当前节点行为证据。绿色的 owned 文件最多打回 TestGenerator 2 轮，要求删除重复覆盖或改写为对骨架必然失败的测试；修复轮的 manifest 锁用上一轮清单预置，不能通过改名逃逸。节点 git 历史已含自身 implement 检查点的重试场景除外（行为已落地，绿灯合法）。DESIGN 基线的逐文件状态写入 node session，IMPLEMENT 阶段每层首个 agent session 之前复用该状态播种（不重复跑）：全绿层由系统直接整层回归关闭，环境失败提前注入修复契约，红灯文件作为系统验证过的 RED 证据交给首个 session。TDD 循环以测试文件为微循环原子（逐文件 red→green，整层回归收口），同一失败指纹连续重复 3 次即触发假设轮换治理，测试预算耗尽即停。
-- **技能系统**（`skills/`）：DESIGN 阶段前由模型按节点规划各 stage agent 应读取的技能（skill 目录为跨节点稳定前缀，需求快照驱动按节点差异化选择）；认证一致性与失败修复两类安全底线确定性注入，规划失败时不注入任何可选技能。
+- **技能系统**（`skills/`）：通用化渐进披露——每个 stage agent 的系统提示词注入全量技能目录（name + description + 路径，跨节点字节稳定、命中前缀缓存），由各 stage agent 按任务描述自行 `read_file` 匹配的 `SKILL.md`；认证一致性与失败修复两类安全底线仍确定性注入。没有独立的按节点技能规划 agent，每节点零额外 LLM 调用。
 - **可追溯性**（`arcbench_agent_runtime/`）：requirements / scenarios / interfaces / tests / call_edges / node_states / node_contracts 七张表落盘于 `.arc/traceability/`，事件流写入 `.arc/runner-events.jsonl`，满足比赛"可复现、可审计"的要求。
 - **断点续跑**：编译队列持久化于 `.arc/processing_queue.json`，支持 `--resume`、`--retry-failed`、`--retry <NODE_ID>`。
 
@@ -39,7 +39,7 @@ flowchart LR
    - 编译工作流纯函数测试。
 2. **Auto TDD re-prompt**（`core/tdd_retry.py`）：运行结束后扫描 runner 事件中的 `test/failed` 节点，自动构造 TDD 优先的修复提示，为失败节点的重试提供上下文。
 3. **A/B 评测**（`core/evals.py` + `arc eval` 子命令）：将 baseline 与 candidate 两个编译配置对同一需求树各运行 N 次，产出 pass rate / tokens / cache hit rate / latency / est. cost 五指标提升报告（对齐 ARC-Bench 参考实现 pi 的 `evalHarnessTable` 工作流），详见下文「A/B 评测」。
-4. **模型驱动的按节点技能规划**（`agents/skills/planning.py`）：每个节点进入 DESIGN 前用一次轻量 LLM 调用（skill 目录 + 需求快照 → 单 JSON）为三个 stage agent 规划应读取的技能，写入 node session 供 resume/重试复用；关键词可选逻辑已移除，规划失败或模型选空时不注入可选技能。
+4. **通用化技能选择**（`agents/skills/selection.py`）：技能目录全量注入各 stage agent 系统提示词、按需读取（渐进式披露），取代早期"每节点 DESIGN 前一次规划 LLM 调用"的 SkillPlanner；认证/失败修复安全底线保留为确定性必读，各阶段实际读取的技能不再预先规划。
 
 ## 目录结构
 

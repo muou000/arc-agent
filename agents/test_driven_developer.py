@@ -13,7 +13,6 @@ from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
-from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_install_dependencies_tool
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
@@ -120,10 +119,9 @@ class TestDrivenDeveloper:
         )
         interface_contract = context_pipeline.get_interface_contract_context(node_id)
         context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
-        selected_skill_names = implementation_skills(
+        required_skill_names = implementation_skills(
             interface_contract=interface_contract,
             previous_failure_summary=previous_failure_summary,
-            extra_skills=load_skill_plan_extras(node_id, "implementation"),
         )
 
         async def run_tests(test_type: str | None = None, test_files: list[str] | None = None) -> str:
@@ -225,13 +223,12 @@ class TestDrivenDeveloper:
             stage="implementation",
             model=self.model,
             system_prompt="\n\n".join(
-                [get_system_prompt(), stage_skill_activation_policy(selected_skill_names)]
+                [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=None,
             workspace_root=workspace_root,
             writable_roots=[workspace_root],
-            skills=[SKILLS_SOURCE] if selected_skill_names else [],
-            permitted_skill_names=selected_skill_names,
+            skills=[SKILLS_SOURCE],
             memory=[],
             tools=[run_tests, run_build, install_dependencies, *traceability_tools],
             node_id=node_id,
@@ -246,7 +243,7 @@ class TestDrivenDeveloper:
             node_tests=current_node_tests,
             previous_failure_summary=previous_failure_summary,
         )
-        await self._log(f"skill-permitted: {', '.join(selected_skill_names) or 'none'}", node_id=node_id)
+        await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking TDD implementation.", node_id=node_id)
         payload = await ainvoke_stage_agent(
             agent,
