@@ -11,6 +11,7 @@ import signal
 import hashlib
 import inspect
 import threading
+import time
 import urllib.request
 from contextlib import suppress
 
@@ -162,6 +163,32 @@ def _tail(text: str, limit: int = 1500) -> str:
     if len(text) <= limit:
         return text
     return "...[truncated]...\n" + text[-limit:]
+
+
+class _StageTimer:
+    """Per-stage wall-clock timing for one ``run_tests`` execution.
+
+    The online-run analysis had to infer build/DB/server/test costs by diffing
+    adjacent debug-log timestamps; recording them inline in the returned body
+    (which is both model-facing and persisted under ``.arc/tdd_runs``) makes
+    each E2E round-trip's cost breakdown directly measurable.
+    """
+
+    def __init__(self) -> None:
+        self._stages: dict[str, float] = {}
+
+    async def measure(self, stage: str, awaitable):
+        started = time.monotonic()
+        try:
+            return await awaitable
+        finally:
+            self._stages[stage] = self._stages.get(stage, 0.0) + (time.monotonic() - started)
+
+    def render(self) -> str:
+        if not self._stages:
+            return ""
+        parts = [f"{stage}={elapsed:.1f}s" for stage, elapsed in self._stages.items()]
+        return "\n\n=== Stage Timing ===\n" + " | ".join(parts) + "\n"
 
 
 async def _run_npm_command(
@@ -2366,12 +2393,16 @@ class WebAppType(AppTypeHandler):
             body = f"Exit Code: {batch_exit_code}\n\n" + "\n\n".join(sections)
             return _prepend_group_execution_header(execution, body)
 
-        build_ok, frontend_build_output = await _build_frontend_dist(self.workspace_path)
+        stage_timer = _StageTimer()
+        build_ok, frontend_build_output = await stage_timer.measure(
+            "frontend_build", _build_frontend_dist(self.workspace_path)
+        )
         if not build_ok:
             return _prepend_group_execution_header(
                 execution,
                 "Frontend build failed before E2E startup.\n\n"
-                f"=== Frontend Build ===\n{frontend_build_output}",
+                f"=== Frontend Build ===\n{frontend_build_output}"
+                + stage_timer.render(),
             )
 
         e2e_runtime_env = _build_e2e_runtime_env(
@@ -2394,13 +2425,18 @@ class WebAppType(AppTypeHandler):
             os.path.join(self.workspace_path, "backend"),
         )
         try:
-            reused_session = await self._try_reuse_e2e_backend_session(
-                e2e_runtime_env,
-                resolved_port,
-                backend_fingerprint,
+            reused_session = await stage_timer.measure(
+                "backend_runtime",
+                self._try_reuse_e2e_backend_session(
+                    e2e_runtime_env,
+                    resolved_port,
+                    backend_fingerprint,
+                ),
             )
             if reused_session is not None:
-                reset_ok, reset_output = await self._reset_live_e2e_database(e2e_runtime_env)
+                reset_ok, reset_output = await stage_timer.measure(
+                    "database_prepare", self._reset_live_e2e_database(e2e_runtime_env)
+                )
                 database_prepare_output = reset_output
                 if reset_ok:
                     reused_runtime = True
@@ -2424,9 +2460,9 @@ class WebAppType(AppTypeHandler):
                     backend_cleanup_note = (
                         f"{backend_cleanup_note}\n{stale_note}" if backend_cleanup_note else stale_note
                     )
-                database_ready, database_prepare_output = await _prepare_e2e_database(
-                    self.workspace_path,
-                    e2e_runtime_env,
+                database_ready, database_prepare_output = await stage_timer.measure(
+                    "database_prepare",
+                    _prepare_e2e_database(self.workspace_path, e2e_runtime_env),
                 )
                 if not database_ready:
                     failure_body = (
@@ -2434,6 +2470,7 @@ class WebAppType(AppTypeHandler):
                         f"=== Frontend Build ===\n{frontend_build_output}\n\n"
                         f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
                         f"=== Database Prepare ===\n{database_prepare_output}"
+                        + stage_timer.render()
                     )
                     if backend_cleanup_note:
                         failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
@@ -2444,7 +2481,12 @@ class WebAppType(AppTypeHandler):
                     backend_start_command,
                     backend_startup_detail,
                     backend_instance_fingerprint,
-                ) = await _start_backend_runtime(self.workspace_path, e2e_runtime_env, web_port=resolved_port)
+                ) = await stage_timer.measure(
+                    "backend_runtime",
+                    _start_backend_runtime(
+                        self.workspace_path, e2e_runtime_env, web_port=resolved_port
+                    ),
+                )
                 if backend_process is None:
                     failure_body = (
                         "Exit Code: 1\n\n"
@@ -2453,6 +2495,7 @@ class WebAppType(AppTypeHandler):
                         f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
                         f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
                         f"STDERR:\n{backend_startup_detail or 'No startup detail recorded.'}\n"
+                        + stage_timer.render()
                     )
                     if backend_cleanup_note:
                         failure_body += f"\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
@@ -2470,12 +2513,15 @@ class WebAppType(AppTypeHandler):
             playwright_command = "npx playwright test"
             if execution.get("resolved_targets"):
                 playwright_command += " " + " ".join(execution["resolved_targets"])
-            playwright_result = await _execute_web_test_command(
-                playwright_command,
-                cwd=execution["working_directory"],
-                timeout=120.0,
-                extra_env=e2e_runtime_env,
-                web_port=resolved_port,
+            playwright_result = await stage_timer.measure(
+                "playwright",
+                _execute_web_test_command(
+                    playwright_command,
+                    cwd=execution["working_directory"],
+                    timeout=120.0,
+                    extra_env=e2e_runtime_env,
+                    web_port=resolved_port,
+                ),
             )
             playwright_exit_code = _extract_exit_code(playwright_result)
             if playwright_exit_code is None:
@@ -2511,9 +2557,13 @@ class WebAppType(AppTypeHandler):
                 f"=== Backend Instance Fingerprint ===\n{backend_instance_fingerprint or 'No backend instance fingerprint recorded.'}\n\n"
                 f"{playwright_result}\n\n"
                 f"=== Backend Runtime Cleanup ===\n{cleanup_section}"
+                + stage_timer.render()
             )
         except Exception as exc:
-            return f"Failed to start grouped E2E execution: {str(exc)}"
+            return (
+                f"Failed to start grouped E2E execution: {str(exc)}"
+                + stage_timer.render()
+            )
 
         if "Backend runtime cleanup failed:" in body and "Exit Code: 0" in body:
             body = body.replace("Exit Code: 0", "Exit Code: 1", 1)

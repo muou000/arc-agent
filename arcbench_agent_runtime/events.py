@@ -30,6 +30,35 @@ def _nullable_nonneg_int(value: Any) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+def _nonneg_float(value: Any) -> float | None:
+    """Normalize an optional duration: absent or invalid means "not reported"."""
+
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _normalized_transport(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in {"streamed", "plain"} else ""
+
+
+def _positive_int(value: Any) -> int | None:
+    """Normalize an attempt count: a call always has at least one attempt."""
+
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
 class EventClient:
     def __init__(self, paths: RuntimePaths) -> None:
         self.paths = paths
@@ -107,6 +136,9 @@ class EventClient:
         reasoning_tokens: int | None = None,
         total_tokens: int = 0,
         cost: dict[str, Any] | None = None,
+        duration_s: float | None = None,
+        transport: str = "",
+        attempts: int | None = None,
     ) -> None:
         """Append one ``llm_usage`` event for a single model call.
 
@@ -116,6 +148,13 @@ class EventClient:
         ``output``. ``source`` distinguishes provider-reported usage from a
         local token estimate. An empty ``node_id`` attributes the call to the
         run as a whole (model calls made outside any node's context).
+
+        ``latency`` carries the optional call telemetry: end-to-end
+        ``duration_s``, the HTTP ``transport`` that produced the result
+        (``streamed`` | ``plain``; empty when unknown) and the ``attempts``
+        count spent by the adapter retry loop. All three stay ``None``/empty
+        for events written by older callers, so readers must treat them as
+        optional.
         """
         append_jsonl(
             self.paths.runner_events_path,
@@ -134,6 +173,11 @@ class EventClient:
                     "cache_write_1h": _nullable_nonneg_int(cache_write_1h_tokens),
                     "reasoning": _nullable_nonneg_int(reasoning_tokens),
                     "total": _nonneg_int(total_tokens),
+                },
+                "latency": {
+                    "duration_s": _nonneg_float(duration_s),
+                    "transport": _normalized_transport(transport),
+                    "attempts": _positive_int(attempts),
                 },
                 "cost": cost if isinstance(cost, dict) else None,
                 "timestamp": utc_timestamp(),

@@ -1447,3 +1447,249 @@ def test_empty_stream_skips_the_reachability_probe(monkeypatch: pytest.MonkeyPat
     assert result == "plain-ok"
     assert probe_calls["count"] == 0  # no probe round before the plain retry
     assert sleeps == [5.0]  # only the retry delay, no probe-wait sleeps
+
+
+# ---------------------------------------------------------------------------
+# StreamChunkTimeoutError: the streamed transport's inter-chunk gap watchdog
+# ---------------------------------------------------------------------------
+
+
+class _StreamChunkTimeoutError(TimeoutError):
+    """Local stand-in for langchain_openai's exception (name-matched)."""
+
+    def __init__(self, timeout_s: float = 120.0) -> None:
+        super().__init__(f"No streaming chunk received for {timeout_s:.1f}s")
+        self.timeout_s = timeout_s
+
+
+# The adapter classifies the watchdog by class NAME (importing the symbol would
+# pin one that older langchain_openai versions lack), so the stand-in must
+# carry the production name.
+_StreamChunkTimeoutError.__name__ = "StreamChunkTimeoutError"
+
+
+def test_stream_chunk_timeout_detected_direct_and_wrapped() -> None:
+    """The watchdog error is recognized both raw and wrapped in the ValueError
+    that agenerate_from_stream re-raises mid-iteration; unrelated timeouts and
+    other exceptions are not."""
+
+    direct = _StreamChunkTimeoutError()
+    wrapped = ValueError("No generations found in stream.")
+    wrapped.__cause__ = _StreamChunkTimeoutError()
+    plain_timeout = TimeoutError("unrelated asyncio timeout")
+
+    assert adapter._is_stream_chunk_timeout(direct) is True
+    assert adapter._is_stream_chunk_timeout(wrapped) is True
+    assert adapter._is_stream_chunk_timeout(plain_timeout) is False
+    assert adapter._is_stream_chunk_timeout(_connection_error()) is False
+    assert adapter._is_stream_chunk_timeout(_status_error(500)) is False
+
+
+def test_stream_first_chunk_timeout_switches_transport_without_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The online-run failure mode: a streamed attempt stalls between chunks.
+    The loop must re-attempt over plain immediately — no probe round, no retry
+    delay, no budget burn — instead of letting the error escape to the agent
+    layer, whose ainvoke fallback would replay the whole session (and stream
+    again, hitting the same stall)."""
+
+    _clear_stream_env(monkeypatch)
+    sleeps: list[float] = []
+    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+    probe_calls = {"count": 0}
+    monkeypatch.setattr(
+        adapter, "_endpoint_reachable", lambda *args, **kwargs: probe_calls.__setitem__("count", probe_calls["count"] + 1) or True
+    )
+    recorder = _TransportRecorder([_StreamChunkTimeoutError()])
+
+    result = _call_model_with_retries(
+        recorder.plain,
+        api_mode="chat_completions",
+        model="test-model",
+        streamed_retry=recorder.streamed,
+        stream_first=True,
+    )
+
+    assert result == "plain-ok"
+    assert recorder.streamed_calls == 1
+    assert recorder.plain_calls == 1
+    assert probe_calls["count"] == 0  # endpoint provably alive: no probe round
+    assert sleeps == []  # transport switch is immediate
+
+
+def test_async_stream_chunk_timeout_switches_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async variant: the chunk watchdog on a streamed attempt retries over
+    plain on the same call, without probe rounds."""
+
+    _clear_stream_env(monkeypatch)
+    sleeps: list[float] = []
+    monkeypatch.setattr(adapter, "_asleep", sleeps.append)
+    recorder = _AsyncTransportRecorder([_StreamChunkTimeoutError()])
+
+    result = asyncio.run(
+        _acall_model_with_retries(
+            recorder.plain,
+            api_mode="chat_completions",
+            model="test-model",
+            streamed_retry=recorder.streamed,
+            stream_first=True,
+        )
+    )
+
+    assert result == "plain-ok"
+    assert recorder.streamed_calls == 1
+    assert recorder.plain_calls == 1
+    assert sleeps == []
+
+
+def test_plain_attempt_chunk_timeout_shape_still_retries_via_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watchdog-shaped error raised by a *plain* attempt (no streamed
+    transport configured) is not an OpenAI/httpx exception, so the retry
+    budget contract keeps its old behaviour: it propagates unwrapped instead
+    of being silently retried forever."""
+
+    _clear_stream_env(monkeypatch)
+    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
+
+    def plain() -> str:
+        raise _StreamChunkTimeoutError()
+
+    with pytest.raises(_StreamChunkTimeoutError):
+        _call_model_with_retries(
+            plain,
+            api_mode="chat_completions",
+            model="test-model",
+        )
+
+
+def test_resolve_stream_chunk_timeout_env_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ARC_MODEL_STREAM_CHUNK_TIMEOUT: unset -> 90 (below the library's 120 so
+    stalls surface earlier), explicit values pass through, 0 disables the
+    watchdog, invalid/negative values fall back to the default."""
+
+    cases = {
+        "": 90.0,
+        "45": 45.0,
+        "0": None,
+        "0.0": None,
+        "300": 300.0,
+        "abc": 90.0,
+        "-5": 90.0,
+    }
+    for raw, expected in cases.items():
+        monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raw) if raw else monkeypatch.delenv(
+            "ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False
+        )
+        assert adapter.resolve_stream_chunk_timeout() == expected, f"env={raw!r}"
+
+
+def test_resolve_stream_chunk_timeout_clamped_to_request_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watchdog firing later than the request's read timeout could never
+    trigger, so small ARC_MODEL_TIMEOUT configurations clamp the chunk
+    timeout down instead of silently disabling it."""
+
+    monkeypatch.delenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False)
+    monkeypatch.setenv("ARC_MODEL_TIMEOUT", "30")
+    assert adapter.resolve_stream_chunk_timeout() == 30.0
+
+    monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", "60")
+    assert adapter.resolve_stream_chunk_timeout() == 30.0
+
+    monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", "0")  # explicit disable wins
+    assert adapter.resolve_stream_chunk_timeout() is None
+
+    monkeypatch.delenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False)
+    monkeypatch.setenv("ARC_MODEL_TIMEOUT", "300")
+    assert adapter.resolve_stream_chunk_timeout() == 90.0  # no clamp below default
+
+
+def test_build_openai_chat_model_passes_stream_chunk_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The constructed ChatOpenAI carries ARC's chunk-timeout so the library
+    default (120s, not tunable from ARC before) no longer governs stall
+    detection."""
+
+    adapter.reset_model_cache_for_tests()
+    monkeypatch.delenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False)
+    model = adapter.build_openai_chat_model("chunk-timeout-model", api_key="k")
+    assert model.stream_chunk_timeout == 90.0
+
+    monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", "33")
+    adapter.reset_model_cache_for_tests()
+    model33 = adapter.build_openai_chat_model("chunk-timeout-model-33", api_key="k")
+    assert model33.stream_chunk_timeout == 33.0
+    adapter.reset_model_cache_for_tests()
+
+
+def test_successful_attempt_records_transport_meta(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The retry loop publishes which transport answered and how many attempts
+    it took, so llm_usage events can attribute latency per transport."""
+
+    _clear_stream_env(monkeypatch)
+    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
+
+    token = adapter._last_call_meta.set(None)
+    try:
+        recorder = _TransportRecorder([_StreamChunkTimeoutError()])
+        result = _call_model_with_retries(
+            recorder.plain,
+            api_mode="chat_completions",
+            model="test-model",
+            streamed_retry=recorder.streamed,
+            stream_first=True,
+        )
+        assert result == "plain-ok"
+        meta = adapter._last_call_meta.get()
+        assert meta == {"transport": "plain", "attempts": 2}
+
+        recorder2 = _TransportRecorder()
+        result2 = _call_model_with_retries(
+            recorder2.plain,
+            api_mode="chat_completions",
+            model="test-model",
+            streamed_retry=recorder2.streamed,
+            stream_first=True,
+        )
+        assert result2 == "streamed-ok"
+        assert adapter._last_call_meta.get() == {"transport": "streamed", "attempts": 1}
+    finally:
+        adapter._last_call_meta.reset(token)
+
+
+def test_repeated_chunk_timeouts_are_bounded_by_the_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both transports stalling must terminate through the retry budget,
+    never spin in a zero-delay retry loop. The watchdog error is not an
+    OpenAI/httpx exception, so it surfaces raw (the historical contract for
+    non-model-API exceptions), but only after the budget is spent."""
+
+    _clear_stream_env(monkeypatch)
+    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
+    adapter.reset_consecutive_failure_budget_for_tests()
+    # Every attempt on either transport raises the watchdog error.
+    recorder = _TransportRecorder([_StreamChunkTimeoutError()] * 20)
+
+    with pytest.raises(TimeoutError):
+        _call_model_with_retries(
+            recorder.plain,
+            api_mode="chat_completions",
+            model="test-model",
+            streamed_retry=recorder.streamed,
+            stream_first=True,
+        )
+
+    # 1 free switch + (max_retries + 1) budgeted attempts (the last one is
+    # the attempt that trips the budget and raises) = 5 with defaults.
+    max_retries = adapter._resolve_retry_policy().max_retries
+    assert recorder.streamed_calls + recorder.plain_calls == 1 + max_retries + 1

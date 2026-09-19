@@ -62,6 +62,13 @@ class LLMUsageRecord:
     reasoning_tokens: int | None
     total_tokens: int
     cost: dict[str, float] | None = field(default=None)
+    # Latency/transport telemetry: wall-clock duration of the call, which HTTP
+    # transport produced the result ("streamed" | "plain" | "" unknown) and
+    # how many attempts the adapter retry loop spent. Trailing defaults keep
+    # positional construction from older callers valid.
+    duration_s: float | None = None
+    transport: str = ""
+    attempts: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -104,11 +111,22 @@ def record_chat_result_usage(
     model: str,
     api_mode: str,
     messages: Sequence[Any] | None = None,
+    duration_s: float | None = None,
+    transport: str = "",
+    attempts: int | None = None,
 ) -> None:
     """Best-effort usage capture for one model call; never raises."""
 
     try:
-        _record_chat_result_usage(result, model=model, api_mode=api_mode, messages=messages)
+        _record_chat_result_usage(
+            result,
+            model=model,
+            api_mode=api_mode,
+            messages=messages,
+            duration_s=duration_s,
+            transport=transport,
+            attempts=attempts,
+        )
     except Exception:
         logger.debug("LLM usage capture failed", exc_info=True)
 
@@ -119,6 +137,9 @@ def _record_chat_result_usage(
     model: str,
     api_mode: str,
     messages: Sequence[Any] | None,
+    duration_s: float | None = None,
+    transport: str = "",
+    attempts: int | None = None,
 ) -> None:
     sink = get_llm_usage_sink()
     if sink is None:
@@ -146,8 +167,36 @@ def _record_chat_result_usage(
             reasoning_tokens=usage.get("reasoning"),
             total_tokens=int(usage["total"]),
             cost=compute_model_cost(model, usage),
+            duration_s=_elapsed_seconds(duration_s),
+            transport=_normalized_transport(transport),
+            attempts=_attempt_count(attempts),
         )
     )
+
+
+def _elapsed_seconds(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        elapsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return elapsed if elapsed >= 0 else None
+
+
+def _normalized_transport(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"streamed", "plain"} else ""
+
+
+def _attempt_count(value: int | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 1 else None
 
 
 def extract_usage_from_chat_result(result: Any) -> dict[str, Any] | None:

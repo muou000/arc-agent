@@ -395,3 +395,148 @@ def test_reconcile_empty_lock_is_a_passthrough() -> None:
     )
     assert result["tests"] == items
     assert result["undeclared_paths"] == []
+
+
+# ---------------------------------------------------------------------------
+# Unknown interface id rejection: the error must teach the valid ids
+# ---------------------------------------------------------------------------
+
+
+class _StubTraceability:
+    """Minimal store stand-in: get_interface/list_interfaces over a dict."""
+
+    def __init__(self, interfaces: dict[str, dict[str, Any]]) -> None:
+        self._interfaces = interfaces
+
+    def get_interface(self, interface_id: str) -> dict[str, Any] | None:
+        return self._interfaces.get(interface_id)
+
+    def list_interfaces(self) -> list[dict[str, Any]]:
+        return [dict(row, interface_id=interface_id) for interface_id, row in self._interfaces.items()]
+
+
+class _StubRuntime:
+    def __init__(self, traceability: _StubTraceability) -> None:
+        self.traceability = traceability
+
+
+def _declare_with_store(
+    declaration: Any,
+    *,
+    store_interfaces: dict[str, dict[str, Any]],
+    current_interface_ids: list[str] | None = None,
+) -> str:
+    import agents.tools.test_manifest as test_manifest_module
+
+    lock = TestManifestLock()
+    tool = build_declare_test_manifest_tool(
+        node_id="REQ-X",
+        manifest_lock=lock,
+        current_interface_ids=current_interface_ids,
+    )
+    original_get_runtime = test_manifest_module.__dict__.get("get_runtime")
+    # Both the unknown-id check and the hint resolve the runtime lazily via
+    # core.service.get_runtime; patch the module they import it from.
+    import core.service as service_module
+
+    stub = _StubRuntime(_StubTraceability(store_interfaces))
+    monkey_runtime = service_module.get_runtime
+    service_module.get_runtime = lambda: stub
+    try:
+        return str(asyncio.run(tool(files=declaration)))
+    finally:
+        service_module.get_runtime = monkey_runtime
+        del original_get_runtime
+
+
+def test_unknown_interface_error_lists_valid_ids_staged_first() -> None:
+    """The rejection must name the currently valid interface ids (staged
+    current-node ids first), so the model can re-map in one round instead of
+    guessing — the online run showed 5+ redeclarations per node."""
+
+    content = _declare_with_store(
+        [
+            {
+                "file_path": "tests/unit/calc.test.ts",
+                "type": "Unit",
+                "interface_ids": ["REQ-X-FUNC-MISSPELLED"],
+            }
+        ],
+        store_interfaces={
+            "REQ-W-API-NOTES": {"req_ids": ["REQ-W"]},
+            "REQ-V-DB-USERS": {"req_ids": ["REQ-V"]},
+        },
+        current_interface_ids=["REQ-X-FUNC-CALC"],
+    )
+
+    assert "Unknown interface id(s)" in content
+    assert "REQ-X-FUNC-MISSPELLED" in content
+    # Staged current-node ids lead the hint; DB ids follow.
+    assert "REQ-X-FUNC-CALC" in content
+    assert "REQ-W-API-NOTES" in content
+    assert content.index("REQ-X-FUNC-CALC") < content.index("REQ-W-API-NOTES")
+
+
+def test_unknown_interface_error_omits_hint_without_any_valid_ids() -> None:
+    """No staged ids and an empty DB: the hint is omitted instead of
+    misleading the model with an empty id list."""
+
+    content = _declare_with_store(
+        [
+            {
+                "file_path": "tests/unit/calc.test.ts",
+                "type": "Unit",
+                "interface_ids": ["IF-GHOST"],
+            }
+        ],
+        store_interfaces={},
+    )
+
+    assert "Unknown interface id(s)" in content
+    assert "valid id(s)" not in content
+
+
+def test_unknown_interface_error_excludes_correctly_referenced_ids() -> None:
+    """Ids the model already mapped correctly are not repeated in the hint."""
+
+    content = _declare_with_store(
+        [
+            {
+                "file_path": "tests/unit/a.test.ts",
+                "type": "Unit",
+                "interface_ids": ["REQ-W-API-NOTES", "IF-GHOST"],
+            },
+            {
+                "file_path": "tests/unit/b.test.ts",
+                "type": "Unit",
+                "interface_ids": ["IF-GHOST"],
+            },
+        ],
+        store_interfaces={"REQ-W-API-NOTES": {"req_ids": ["REQ-W"]}},
+    )
+
+    assert "Unknown interface id(s)" in content
+    assert "IF-GHOST" in content
+    # REQ-W-API-NOTES is referenced correctly and excluded from the hint.
+    assert "valid id(s): REQ-W-API-NOTES" not in content
+
+
+def test_unknown_interface_hint_caps_long_id_lists() -> None:
+    """A large DB must not flood the error; the hint caps at 12 ids with a
+    pointer to the traceability query tools."""
+
+    store = {f"REQ-N{i:02d}-FUNC-X": {"req_ids": [f"REQ-N{i:02d}"]} for i in range(20)}
+    content = _declare_with_store(
+        [
+            {
+                "file_path": "tests/unit/calc.test.ts",
+                "type": "Unit",
+                "interface_ids": ["IF-GHOST"],
+            }
+        ],
+        store_interfaces=store,
+    )
+
+    assert "valid id(s)" in content
+    assert "+8 more" in content
+    assert "traceability tools" in content
