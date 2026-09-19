@@ -113,6 +113,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         file_claim_gate: "FileClaimGate | None" = None,
         test_manifest_lock: TestManifestLock | None = None,
         pending_contract_registry: Any | None = None,
+        template_shared_surfaces: frozenset[str] | None = None,
     ) -> None:
         self._stage = stage
         self._file_claim_gate = file_claim_gate
@@ -124,6 +125,12 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # interface_design only: contract bookkeeping for freshly written
         # files (see ``agents.design.contract_skeleton.PendingContractRegistry``).
         self._pending_contract_registry = pending_contract_registry
+        # Workspace-relative template files no stage may replace wholesale
+        # (see ``AppTypeHandler.template_shared_surfaces``). ``edit_file`` /
+        # ``append_file`` stay allowed; the ban is absolute within the stage
+        # and is deliberately not unlocked by validation failures — a failing
+        # test never makes destroying runtime wiring the right repair.
+        self._template_shared_surfaces = template_shared_surfaces or frozenset()
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._repeated_read_counts: dict[str, int] = {}
         self._written_paths: set[str] = set()
@@ -174,8 +181,41 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if name in _ADDITIVE_FILE_WRITE_TOOLS:
             return self._validate_append(args)
         if name in _FILE_WRITE_TOOLS:
+            if name == "write_file" and self._template_shared_surfaces:
+                if blocked := self._validate_shared_surface(args):
+                    return blocked
             return self._validate_write(args)
         return None
+
+    def _validate_shared_surface(self, args: dict[str, Any]) -> str | None:
+        """Reject whole-file rewrites of the template's shared runtime surfaces.
+
+        The template's app entry, server bootstrap, database lifecycle, and
+        root render files carry wiring that no node owns: static serving, the
+        SPA fallback, health/PORT contracts, the DB lifecycle the test harness
+        shares with the runtime, and the root React render. In the 0aca31c5
+        run a DESIGN skeleton replaced app.js wholesale, TDD rebuilt the
+        static serving from scratch, and the worktree-relative dist path
+        404'd every asset — a 47-minute blank-page debug loop. Extending these
+        files additively is exactly the intended integration pattern, so
+        ``edit_file``/``append_file`` stay allowed; the ban is deliberately
+        not unlockable by validation failures.
+        """
+
+        path = _discipline_path(args)
+        if not path:
+            return None
+        if normalize_manifest_path(path) not in self._template_shared_surfaces:
+            return None
+        return (
+            f"Template shared surface blocked: {path} carries the copied template's runtime "
+            "wiring (static serving, SPA fallback, server/DB bootstrap, or the root render) "
+            "and no stage may replace it wholesale — that is how a past run lost its static "
+            "serving and burned the budget debugging blank pages and 404 assets. Read the "
+            "current file and extend it with `edit_file` (or `append_file`) at the "
+            "established mount point, keep every existing export/mount intact, and declare "
+            "the file as a reused interface in your response."
+        )
 
     def _validate_append(self, args: dict[str, Any]) -> str | None:
         """Validate the DESIGN-only additive continuation tool.

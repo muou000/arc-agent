@@ -137,6 +137,7 @@ class TestGenerator:
             node_id=node_id,
             claims_workspace_root=self.context_workspace_root or workspace_root,
             test_manifest_lock=manifest_lock,
+            app_type=app_type,
         )
 
         message = get_user_prompt(
@@ -398,6 +399,7 @@ class TestGenerator:
             node_id=node_id,
             claims_workspace_root=self.context_workspace_root or workspace_root,
             test_manifest_lock=manifest_lock,
+            app_type=app_type,
         )
         message = self._green_rejection_message(
             node_id=node_id,

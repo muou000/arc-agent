@@ -276,7 +276,6 @@ class InterfaceDesigner:
         policy on top.
         """
 
-        del app_type  # kept in the signature for parity with run()'s resolution
         return build_stage_agent(
             name="interface_designer",
             stage="interface_design",
@@ -293,6 +292,7 @@ class InterfaceDesigner:
             node_id=node_id,
             claims_workspace_root=self.context_workspace_root or workspace_root,
             pending_contract_registry=pending_contract_registry,
+            app_type=app_type,
         )
 
     async def _repair_empty_interfaces(

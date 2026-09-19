@@ -24,6 +24,13 @@ def list_app_types() -> list[str]:
     return list(APP_TYPE_HANDLERS.keys())
 
 
+def template_shared_surfaces(app_type: str) -> frozenset[str]:
+    """Workspace-relative template files stage discipline protects from
+    whole-file rewrites (see ``AppTypeHandler.template_shared_surfaces``)."""
+
+    return get_app_type_handler_class(app_type).template_shared_surfaces
+
+
 def create_app_type_handler(
     app_type: str,
     workspace_path: str,
