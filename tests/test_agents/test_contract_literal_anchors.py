@@ -42,6 +42,10 @@ def test_tdd_prompt_requires_quoted_anchors_verbatim() -> None:
     # forcing English-only copy on a Chinese-locale UI.
     assert "Bilingual visible text" in prompt
     assert "do not rewrite the test's selector to the translation" in prompt
+    # Requirement-stated anchors outrank test-defined selectors; a generated
+    # selector contradicting the requirement is a test defect (review round 2).
+    assert "takes precedence over aligning to a test-defined selector" in prompt
+    assert "repair the test to the requirement's literal" in prompt
 
 
 def test_tdd_prompt_requires_alert_region_and_native_labels() -> None:
@@ -67,9 +71,12 @@ def test_design_prompt_fixes_error_taxonomy_once() -> None:
         dynamic_context="",
     )
     assert "fix the error taxonomy once" in prompt
-    # Per-field codes are the default; an aggregated code needs explicit
-    # requirement backing (review round 1, suggestion 2).
+    # Per-field codes are the default with a concrete attribution criterion;
+    # an aggregated code needs a non-field-attributable failure or explicit
+    # requirement backing (review round 2).
     assert "Prefer per-field codes" in prompt
+    assert "give each violating field its own code/key" in prompt
+    assert "not attributable to a single field" in prompt
     assert "DUPLICATE_USERNAME" in prompt
     assert "DUPLICATE_FIELDS" in prompt
 
