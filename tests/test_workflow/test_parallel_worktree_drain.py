@@ -568,6 +568,51 @@ def test_failed_dependency_blocks_only_declared_dependents(tmp_path: Path) -> No
     assert state["node_states"]["RC"] == "UNSEEN"
 
 
+def test_dependency_block_propagation_is_idempotent_and_saves_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain calls propagation before every pick, so it must converge.
+
+    A second call over already-blocked state must not re-mark anything or
+    touch disk: only a state change saves the queue.
+    """
+    manager = _make_parallel_manager(tmp_path)
+    state = {
+        "tasks": [
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_PENDING},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_RUNNING},
+        ],
+        "node_states": {"RA": NODE_FAILED, "RB": "UNSEEN"},
+        "dependencies": {"RB": ["RA"]},
+    }
+    saves: list[int] = []
+    original_save = manager._save_processing_queue
+
+    def counting_save(queue_state: dict[str, Any]) -> None:
+        saves.append(len(queue_state["tasks"]))
+        original_save(queue_state)
+
+    monkeypatch.setattr(manager, "_save_processing_queue", counting_save)
+
+    asyncio.run(manager._propagate_dependency_blocks(state))
+    assert len(saves) == 1
+    assert [task["status"] for task in state["tasks"]] == [
+        TASK_FAILED,
+        TASK_BLOCKED,
+        TASK_BLOCKED,
+    ]
+
+    asyncio.run(manager._propagate_dependency_blocks(state))
+    assert len(saves) == 1, "a second pass over blocked state must not save again"
+    assert [task["status"] for task in state["tasks"]] == [
+        TASK_FAILED,
+        TASK_BLOCKED,
+        TASK_BLOCKED,
+    ]
+    assert state["node_states"]["RB"] == NODE_BLOCKED_BY_DEPENDENCY
+
+
 def test_failed_child_blocks_parent_implementation(tmp_path: Path) -> None:
     manager = _make_parallel_manager(tmp_path)
     state = {

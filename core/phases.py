@@ -282,8 +282,8 @@ class WorkflowPhaseRunner:
             await self._log(
                 "TestGenerator",
                 (
-                    "DESIGN failed: `owned` test coverage points only to interfaces "
-                    "outside the current node: "
+                    "DESIGN failed: `owned` test coverage does not point to any "
+                    "interface owned by the current node: "
                     + ", ".join(foreign_owned_tests)
                 ),
                 status="error",

@@ -26,7 +26,10 @@ MAX_APPENDS_PER_FILE = 3
 _MAX_READ_LIMIT = 200
 _DESIGN_MUTATION_PATTERNS = (
     re.compile(r"\b(?:INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.IGNORECASE),
-    re.compile(r"\.\s*(?:execute|exec|run|query|prepare|insert|update|delete|save|create)\s*\(", re.IGNORECASE),
+    re.compile(
+        r"\.\s*(?:execute|exec|run|query|prepare|insert|upsert|update|delete|save|create)\s*\(",
+        re.IGNORECASE,
+    ),
 )
 
 # Stage-specific exits appended to the repeated-write block: a generic
@@ -286,7 +289,16 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         return None
 
     def _validate_design_content(self, content: str) -> str | None:
-        """Reject obvious business mutations from the DESIGN skeleton channel."""
+        """Reject obvious business mutations from the DESIGN skeleton channel.
+
+        Deliberately a pattern heuristic: it catches the plain SQL and
+        repository-method shapes observed leaking whole implementations into
+        DESIGN skeletons, and does not attempt semantic analysis of ORM
+        wrappers, async side effects, or frontend handlers. The authoritative
+        false-green gates are elsewhere - the owned-RED baseline witness and
+        the IMPLEMENT-stage ownership rules - so this guard only needs to stop
+        the obvious case early, not to be exhaustive.
+        """
 
         if self._stage != "interface_design":
             return None

@@ -438,6 +438,26 @@ def test_interface_design_blocks_obvious_business_mutations() -> None:
     assert "contract skeletons" in result.content
 
 
+def test_interface_design_blocks_repository_upsert_mutation() -> None:
+    middleware = make("interface_design")
+    result = run(
+        middleware,
+        make_request(
+            "write_file",
+            {
+                "file_path": "/workspace/backend/src/services/notes.js",
+                "content": (
+                    "export function createNote(repo, note) {\n"
+                    "  return repo.upsert({ table: 'notes', values: note });\n"
+                    "}\n"
+                ),
+            },
+        ),
+    )
+    assert result.status == "error"
+    assert "contract skeletons" in result.content
+
+
 def test_interface_design_allows_contract_only_content() -> None:
     middleware = make("interface_design")
     result = run(

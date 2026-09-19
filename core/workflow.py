@@ -487,8 +487,14 @@ class ARCWorkflowManager:
         in_flight: dict[asyncio.Task[None], dict[str, Any]] = {}
         try:
             while True:
-                await self._propagate_dependency_blocks(queue_state)
                 while len(in_flight) < max_concurrency:
+                    # Propagation runs before every pick because a task that
+                    # just finished may have failed and blocked its dependents.
+                    # It cannot race the in-flight executions: the marking
+                    # section has no await, a RUNNING task's own prerequisites
+                    # were satisfied when it was picked, and an already-blocked
+                    # node has no pending/running task left to re-mark. The
+                    # scan is in-memory and only a state change saves the queue.
                     await self._propagate_dependency_blocks(queue_state)
                     task = self._next_affinity_task(queue_state, in_flight.values())
                     if task is None:

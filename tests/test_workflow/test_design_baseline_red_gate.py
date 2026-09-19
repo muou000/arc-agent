@@ -259,7 +259,7 @@ def test_design_baseline_rejects_owned_test_mapped_only_to_foreign_interface(
     ok = _run_design(runner, node_id)
 
     assert ok is False
-    assert any("outside the current node" in entry[1] for entry in logs)
+    assert any("does not point to any interface owned by the current node" in entry[1] for entry in logs)
 
 
 def test_design_baseline_green_file_deleted_by_repair_passes(tmp_project_dir, arc_runtime) -> None:
