@@ -205,6 +205,19 @@ class AppTypeHandler(ABC):
     async def install_dependencies(self) -> bool:
         return True
 
+    async def install_package(self, package: str, target: str = "") -> str:
+        """Install one named package into a workspace target (no-op default).
+
+        App types without an npm-style dependency tree have nothing to install;
+        the TDD-stage tool surfaces this default so the agent knows the
+        operation is unsupported rather than silently ignored.
+        """
+        return (
+            "Exit Code: 1\n"
+            "STDERR:\n"
+            f"Package installation is not configured for app_type={self.name}.\n"
+        )
+
     async def run_build(self) -> str:
         return (
             "Exit Code: 1\n"

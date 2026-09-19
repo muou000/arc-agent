@@ -15,6 +15,7 @@ from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
 from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
+from agents.tools.build import build_install_dependencies_tool
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
 from agents.tools.test_manifest import normalize_manifest_path
 from agents.tools.test_failure_digest import build_failure_digest, format_failure_digest
@@ -196,6 +197,20 @@ class TestDrivenDeveloper:
         else:
             run_build = build_system_run_build_tool(app_handler=self.app_handler, node_id=node_id, log_cb=self.log_cb)
 
+        if self.app_handler is None:
+            async def install_dependencies(package: str, target: str = "backend") -> str:
+                """Install one npm package into the workspace when an app handler is configured."""
+
+                return (
+                    "Exit Code: 1\n"
+                    "STDERR:\n"
+                    "Package installation is not configured for this TDD session.\n"
+                )
+        else:
+            install_dependencies = build_install_dependencies_tool(
+                app_handler=self.app_handler, node_id=node_id, log_cb=self.log_cb
+            )
+
         traceability_tools = build_traceability_tools(node_id=node_id, log_cb=self.log_cb)
         agent = build_stage_agent(
             name="test_driven_developer",
@@ -210,7 +225,7 @@ class TestDrivenDeveloper:
             skills=[SKILLS_SOURCE] if selected_skill_names else [],
             permitted_skill_names=selected_skill_names,
             memory=[],
-            tools=[run_tests, run_build, *traceability_tools],
+            tools=[run_tests, run_build, install_dependencies, *traceability_tools],
             node_id=node_id,
             claims_workspace_root=self.context_workspace_root or workspace_root,
         )
