@@ -228,6 +228,77 @@ def test_fingerprint_skips_success_and_diff_lines() -> None:
     assert failure_fingerprint(output) == "1|AssertionError: cart total mismatch"
 
 
+def test_fingerprint_skips_informational_note_lines() -> None:
+    """Informational notes must not become the key line, even when they carry
+    keyword substrings.
+
+    Observed on the 2026-09-19 test1 run: the web handler's E2E result
+    preamble ends with ``Note: launcher PID does not own the port directly.
+    This is expected when ...`` - the word "expected" matched the keyword scan,
+    and because the note prints in EVERY E2E run on Windows, all failed E2E
+    attempts keyed on it. The stall governor then read any three consecutive
+    E2E failures as one stalled hypothesis, and the handoff digest carried the
+    note as the failure headline instead of the Playwright error below it.
+    """
+    output = (
+        "=== Backend Instance Fingerprint ===\n"
+        "Platform: win32\n"
+        "Launcher PID: 49792\n"
+        "Port Owner PID(s): 55492\n"
+        "Note: launcher PID does not own the port directly. "
+        "This is expected when `npm` or a shell spawns the actual backend child process.\n"
+        "- PID 49792\n"
+        "  Command: C:\\WINDOWS\\system32\\cmd.exe /c \"npm run start\"\n"
+        "\n"
+        "Exit Code: 1\n"
+        "  1) test-e2e\\auth-login.spec.js:67:3 › SCENARIO-1 ────\n"
+        "\n"
+        "    Error: expect(locator).toBeVisible() failed\n"
+    )
+    assert (
+        failure_fingerprint(output) == "1|Error: expect(locator).toBeVisible() failed"
+    )
+
+
+def test_fingerprint_skips_generic_section_headers() -> None:
+    """A section header ("=== Backend Runtime Error ===") names a section, not
+    the failure; the specific error text sits on the line right below it."""
+
+    output = (
+        "=== Frontend Build ===\n"
+        "Exit Code: 1\n"
+        "=== Backend Runtime Error ===\n"
+        "Failed to start backend runtime with `npm run start` on port 3302 within 20 seconds.\n"
+    )
+    fingerprint = failure_fingerprint(output)
+    assert "Backend Runtime Error" not in fingerprint
+    assert fingerprint.endswith("within 20 seconds.")
+
+
+def test_fingerprint_distinguishes_e2e_failures_sharing_the_note_preamble() -> None:
+    """Two DIFFERENT E2E failures must keep distinct fingerprints even though
+    both outputs carry the identical informational note preamble - the stall
+    governor compares consecutive fingerprints, and keying both on the note
+    made any three consecutive E2E failures look like one stalled hypothesis
+    (observed on the 2026-09-19 test1 run, attempts 3/4/6 of REQ-2)."""
+
+    def e2e_output(error_line: str) -> str:
+        return (
+            "=== Backend Instance Fingerprint ===\n"
+            "Note: launcher PID does not own the port directly. "
+            "This is expected when `npm` or a shell spawns the actual backend child process.\n"
+            "Exit Code: 1\n"
+            f"    {error_line}\n"
+        )
+
+    first = failure_fingerprint(e2e_output("Error: expect(locator).toBeVisible() failed"))
+    second = failure_fingerprint(
+        e2e_output("Error: locator.fill: Test timeout of 30000ms exceeded.")
+    )
+    assert first != second
+    assert "Note:" not in first and "Note:" not in second
+
+
 def test_fingerprint_masks_ports_and_line_numbers() -> None:
     """The same connection failure on a restarted server (different port) or a
     shifted stack frame must keep the same fingerprint so the stall detector

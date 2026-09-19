@@ -1036,9 +1036,64 @@ E2E_FAILURE_OUTPUT = """Exit Code: 1
 
 Running 2 tests using 1 worker
 
-  ✘  1 test-e2e\register.e2e.spec.js:20:3 › register › rejects invalid input (5.1s)
+  ✘  1 test-e2e\\register.e2e.spec.js:20:3 › register › rejects invalid input (5.1s)
 
-  1) test-e2e\register.e2e.spec.js:20:3 › register › rejects invalid input ─────
+  1) test-e2e\\register.e2e.spec.js:20:3 › register › rejects invalid input ─────
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByLabel('用户名')
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+Exit Code: 1
+"""
+
+
+# The web handler's E2E result preamble (see app_type_handler.web) prepends
+# the frontend build, database prepare and backend instance fingerprint
+# sections ahead of the Playwright output. On Windows the launcher-PID note
+# prints in EVERY E2E run and contains the keyword substring "expected"
+# ("This is expected when `npm` ..."), so a keyword-scan fingerprint keyed on
+# it instead of the real Playwright error (2026-09-19 test1 run, REQ-2 E2E
+# attempts 3/4/6 all shared one fingerprint).
+E2E_FAILURE_OUTPUT_WITH_NOTE_PREAMBLE = """Runner: Playwright
+Batch Test Type: E2E
+Web Port: 3302
+
+=== Frontend Build ===
+Exit Code: 0
+
+=== E2E Runtime Env ===
+DB Path: D:\\ws\\.arc-test-db\\register-410b239d.sqlite
+DB Label: register
+
+=== Database Prepare ===
+Exit Code: 0
+
+=== Backend Runtime ===
+Command: npm run start
+Port: 3302
+Startup Cleanup: Pre-start port cleanup: port 3302 is released.
+
+=== Backend Instance Fingerprint ===
+Platform: win32
+Launcher PID: 49792
+Port Owner PID(s): 55492
+Note: launcher PID does not own the port directly. This is expected when `npm` or a shell spawns the actual backend child process.
+- PID 49792
+  Name: cmd.exe
+  Command: C:\\WINDOWS\\system32\\cmd.exe /c "npm run start"
+
+Exit Code: 1
+STDOUT:
+
+Running 2 tests using 1 worker
+
+  ✘  1 test-e2e\\register.e2e.spec.js:20:3 › register › rejects invalid input (5.1s)
+
+  1) test-e2e\\register.e2e.spec.js:20:3 › register › rejects invalid input ─────
 
     Error: expect(locator).toBeVisible() failed
 
@@ -1097,6 +1152,55 @@ def test_run_tests_result_carries_digest_and_log_pointer(tmp_project_dir: Path, 
     log_files = sorted((tmp_project_dir / ".arc" / "tdd_runs" / node_id).glob("*.log"))
     assert len(log_files) == 1
     assert "getByLabel('用户名')" in log_files[0].read_text(encoding="utf-8")
+
+
+def test_note_preamble_never_becomes_the_failure_headline(tmp_project_dir: Path, arc_runtime) -> None:
+    """The informational note preamble must not hijack failure fingerprints.
+
+    The digest's ``fingerprint:`` line and the verifier report's fingerprint
+    both feed the cross-session handoff and the stall governor. Before the fix
+    both keyed on the launcher-PID note (it contains "expected"), so every
+    failed E2E run shared one fingerprint and the handoff led the next session
+    on a five-minute dist-build goose chase instead of the real Playwright
+    error. Adapter-level test: drives the real adapter with a canned executor
+    so both fingerprint exits are exercised.
+    """
+
+    node_id = "REQ-TDD-NOTE"
+    seed_node(arc_runtime, node_id, [{"test_id": "T1", "type": "E2E", "file_path": E2E_TEST_FILE}])
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {"test_type": "E2E"}, call_id="c1"),
+            faux_text("giving up this session"),
+        ]
+    )
+
+    async def executor(test_type, test_files):
+        return E2E_FAILURE_OUTPUT_WITH_NOTE_PREAMBLE
+
+    tdd = make_tdd(tmp_project_dir, model, FakeAppHandler())
+    asyncio.run(
+        tdd.run(
+            node_id=node_id,
+            test_files=[E2E_TEST_FILE],
+            test_type="E2E",
+            node_tests=[{"test_id": "T1", "type": "E2E", "file_path": E2E_TEST_FILE}],
+            run_tests_executor=executor,
+        )
+    )
+
+    digest_text = tdd.get_last_failure_digest()
+    verifier_text = tdd.get_last_verifier_report()
+    # The fingerprint line is the headline of both exits; neither may key on
+    # the note. (The verifier report's raw tail excerpt legitimately still
+    # contains the note as part of the output itself.)
+    assert "fingerprint: 1|Note:" not in digest_text
+    assert "fingerprint: 1|Note:" not in verifier_text
+    assert "fingerprint: 1|Error: expect(locator).toBeVisible() failed" in digest_text
+    assert "fingerprint: 1|Error: expect(locator).toBeVisible() failed" in verifier_text
+    # The digest still lists the real failed test with its per-test detail.
+    assert "rejects invalid input" in digest_text
+    assert "getByLabel('用户名')" in digest_text
 
 
 def test_tdd_handoff_records_modified_files(tmp_project_dir: Path, arc_runtime) -> None:

@@ -24,7 +24,11 @@ from agents.tools.test_failure_digest import (
     format_failure_digest,
 )
 from agents.tools.traceability import build_traceability_tools
-from app_type_handler.test_results import classify_test_failure, failure_fingerprint
+from app_type_handler.test_results import (
+    _extract_overall_exit_code,
+    classify_test_failure,
+    failure_fingerprint,
+)
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -333,20 +337,14 @@ class TestDrivenDeveloper:
             environment_failure=classify_test_failure(result),
             build=extract_build_note(result),
         )
-        key_line = ""
-        for line in (result or "").splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            lowered = stripped.lower()
-            if "error" in lowered or "failed" in lowered or "expect" in lowered:
-                key_line = stripped[:240]
-                break
         lines = [line for line in (result or "").splitlines() if line.strip()]
         excerpt = "\n".join(lines[-40:])
+        # Same fingerprint source as the digest above: the inline keyword scan
+        # this replaced keyed on the E2E preamble's informational "Note:" line
+        # ("This is expected when ...") and mislabeled every E2E failure.
         self._last_verifier_report_text = (
             "<failure_analysis>\n"
-            f"fingerprint: {exit_code}|{key_line}\n"
+            f"fingerprint: {failure_fingerprint(result)}\n"
             "latest_test_output_excerpt:\n"
             f"{excerpt}\n"
             "</failure_analysis>"
@@ -354,15 +352,12 @@ class TestDrivenDeveloper:
 
     @staticmethod
     def _extract_exit_code(tool_result: str) -> int | None:
-        for line in (tool_result or "").splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("Exit Code:"):
-                continue
-            try:
-                return int(stripped.split("Exit Code:", 1)[1].strip())
-            except ValueError:
-                return None
-        return None
+        # Nested-aware extraction: an E2E result embeds several staged
+        # sections (frontend build "Exit Code: 0", database prepare, then the
+        # Playwright run), so the FIRST "Exit Code:" line can be a passing
+        # stage ahead of a failed test run. The shared parser already picks
+        # the first failing stage's code.
+        return _extract_overall_exit_code(tool_result)
 
     @staticmethod
     def _extract_run_log_path(tool_result: str) -> str | None:

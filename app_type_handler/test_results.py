@@ -199,6 +199,21 @@ _FINGERPRINT_LINE_LIMIT = 160
 _FINGERPRINT_SKIP_LINE_PREFIXES = ("✓", "√", "✔", "PASS ", "Expected", "Received")
 _FINGERPRINT_ZERO_FAILURE_PATTERN = re.compile(r"\b0\s+(?:errors?|failed|failures?)\b", re.IGNORECASE)
 
+#: Informational labels and section headers that can carry keyword substrings
+#: without being errors. The launcher-PID note in the E2E result preamble
+#: contains "expected" ("This is expected when `npm` ...") and appears in EVERY
+#: E2E run on Windows, so before this guard every failed E2E run of the
+#: 2026-09-19 test1 run keyed on that note instead of the real Playwright error
+#: below it, and any three consecutive E2E failures looked like one stalled
+#: hypothesis to the stall governor. Section headers ("=== Backend Runtime
+#: Error ===") are skipped for the mirror-image reason: a header is generic, so
+#: keying on it would give every distinct failure in a run the same
+#: fingerprint while the specific error text sits on the line right below it.
+_FINGERPRINT_INFORMATIONAL_PATTERN = re.compile(
+    r"^(?:===.*===|(?:Note|Info|Warning)\s*:)",
+    re.IGNORECASE,
+)
+
 #: Ports, line:column references and similar colon-number pairs drift between
 #: runs of the same failure (restarted dev server, shifted stack frames).
 #: Masking them keeps the fingerprint stable across reruns of one failure while
@@ -282,6 +297,8 @@ def failure_fingerprint(test_output: str) -> str:
         if stripped.startswith(_FINGERPRINT_SKIP_LINE_PREFIXES):
             continue
         if _FINGERPRINT_ZERO_FAILURE_PATTERN.search(stripped):
+            continue
+        if _FINGERPRINT_INFORMATIONAL_PATTERN.match(stripped):
             continue
         lowered = stripped.lower()
         if "error" in lowered or "failed" in lowered or "expect" in lowered or "assert" in lowered:
