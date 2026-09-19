@@ -276,20 +276,20 @@ def _next_run_log_sequence(directory: Path, safe_type: str, requested: int) -> i
     """Continue numbering past existing logs of the same layer.
 
     Without this, a second TDD pass re-numbers from 1 and overwrites the
-    first pass's evidence files.
+    first pass's evidence files. Scan failures (permissions, transient IO)
+    propagate as OSError to ``persist_run_output``'s caller, which logs and
+    skips the log pointer - falling back to the requested sequence here
+    would silently reintroduce the overwrite this continuation prevents.
     """
 
     prefix = f"{safe_type}-"
     highest = 0
-    try:
-        for item in directory.iterdir():
-            if not (item.is_file() and item.suffix == ".log" and item.name.startswith(prefix)):
-                continue
-            digits = item.name[len(prefix) : -len(".log")]
-            if digits.isdigit():
-                highest = max(highest, int(digits))
-    except OSError:
-        return max(0, int(requested))
+    for item in directory.iterdir():
+        if not (item.is_file() and item.suffix == ".log" and item.name.startswith(prefix)):
+            continue
+        digits = item.name[len(prefix) : -len(".log")]
+        if digits.isdigit():
+            highest = max(highest, int(digits))
     return max(max(0, int(requested)), highest + 1)
 
 

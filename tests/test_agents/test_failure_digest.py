@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agents.tools.test_failure_digest import (
     build_failure_digest,
     format_failure_digest,
@@ -231,3 +233,26 @@ def test_persist_run_output_prunes_oldest_across_passes(tmp_path: Path) -> None:
     assert len(kept) == 20
     assert kept[0] == "Unit-005.log"
     assert kept[-1] == "Unit-024.log"
+
+
+def test_persist_run_output_scan_failure_propagates(tmp_path: Path, monkeypatch) -> None:
+    """A directory-scan failure must not silently fall back to the old numbering.
+
+    Falling back to ``requested`` on OSError would reintroduce the exact
+    overwrite this continuation prevents (a second pass clobbering the
+    first pass's evidence) with no log line anywhere - the internal
+    swallow made the outer OSError handler in ``core.phases`` unreachable.
+    The scan failure now propagates so that handler logs and skips the
+    pointer instead.
+    """
+
+    calls = {"n": 0}
+
+    def broken_iterdir(self):
+        calls["n"] += 1
+        raise OSError("scan denied")
+
+    monkeypatch.setattr(Path, "iterdir", broken_iterdir)
+    with pytest.raises(OSError):
+        persist_run_output(tmp_path, "REQ-1", "Unit", 1, "boom")
+    assert calls["n"] >= 1
