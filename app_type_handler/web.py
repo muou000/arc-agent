@@ -2150,6 +2150,9 @@ class WebAppType(AppTypeHandler):
             "System",
             f"Installing npm package '{name}' into {label}/ (no-save)...",
         )
+        # LEGACY_PEER_DEPS_FLAG is a single-token npm flag; split() keeps the
+        # argv form honest if it ever grows, and a multi-token value would be
+        # a breaking change to audit at its definition, not at each use site.
         returncode, _stdout, stderr = await _run_npm_command(
             [
                 "npm",
