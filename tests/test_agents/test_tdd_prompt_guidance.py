@@ -38,7 +38,13 @@ def test_prompt_forbids_post_green_edits() -> None:
 def test_prompt_forbids_adversarial_test_silencing() -> None:
     prompt = _prompt()
     assert "zero-width" in prompt
-    assert "Never silence a test by adversarial means" in prompt
+    # Anchor the full prohibition sentence, not just topic words: a weaker
+    # rewording ("avoid zero-width...") must fail this pin, because the
+    # prohibition is the contract, not the vocabulary.
+    assert (
+        "Never silence a test by adversarial means: no zero-width or invisible "
+        "characters in labels, no deleting assertions" in prompt
+    )
     assert "distinct accessible names" in prompt
 
 
@@ -46,6 +52,7 @@ def test_prompt_requires_strictmode_check_before_exact_counts() -> None:
     prompt = _prompt()
     assert "StrictMode" in prompt
     assert "double-invokes effects" in prompt
+    assert "Do not blindly re-run the same count assertion" in prompt
 
 
 def test_repair_skill_rules_pinned() -> None:
