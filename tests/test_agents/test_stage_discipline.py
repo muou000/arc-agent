@@ -201,18 +201,65 @@ def test_non_interface_stages_do_not_allocate_design_write_block_counter() -> No
         assert "Unlock condition" not in blocked.content
 
 
-def test_repeated_read_block_does_not_offer_offset_probing() -> None:
+def test_repeated_read_blocked_only_after_the_fresh_reread_budget() -> None:
     # run7 evidence: 50 consecutive offset=0..49 probe reads, each accepted as
     # a "non-overlapping range" by the old message that suggested paginated
     # re-reads as a justification. The message must not invite that again.
+    # The fbd4a73b TDD run showed the other edge: a hard block on the first
+    # re-read pushed the agent to rebuild file content with 10 consecutive
+    # greps. The budget serves the legitimate fresh re-reads first and only
+    # then blocks the loop.
     middleware = make("implementation")
     path = "/workspace/src/calc.py"
     run(middleware, make_request("read_file", {"file_path": path, "offset": 0, "limit": 100}, call_id="r1"))
-    blocked = run(middleware, make_request("read_file", {"file_path": path, "offset": 10, "limit": 50}, call_id="r2"))
+    first = run(middleware, make_request("read_file", {"file_path": path, "offset": 10, "limit": 50}, call_id="r2"))
+    assert first.content == "ok"
+    second = run(middleware, make_request("read_file", {"file_path": path, "offset": 0, "limit": 100}, call_id="r3"))
+    assert second.content == "ok"
+    blocked = run(middleware, make_request("read_file", {"file_path": path, "offset": 10, "limit": 50}, call_id="r4"))
     assert blocked.status == "error"
     assert "Repeated read blocked" in blocked.content
     assert "non-overlapping" not in blocked.content
     assert "offset" in blocked.content
+
+
+def test_failed_read_unlocks_the_path_beyond_the_read_budget() -> None:
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    read = {"file_path": path, "offset": 0, "limit": 100}
+    run(middleware, make_request("read_file", read, call_id="r1"))
+    run(middleware, make_request("read_file", read, call_id="r2"))
+    run(middleware, make_request("read_file", read, call_id="r3"))
+    blocked = run(middleware, make_request("read_file", read, call_id="r4"))
+    assert blocked.status == "error"
+
+    # A failed file operation is the generic unlock: the very next re-read
+    # must pass regardless of the budget (only successful reads consume it).
+    middleware._record_result(
+        make_request("read_file", read),
+        ToolMessage(content="Error: transient read failure", name="read_file", tool_call_id="t0", status="error"),
+    )
+    assert run(middleware, make_request("read_file", read, call_id="r5")).content == "ok"
+
+
+def test_validation_failure_unlocks_re_reads_beyond_the_budget() -> None:
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    read = {"file_path": path, "offset": 0, "limit": 100}
+    run(middleware, make_request("read_file", read, call_id="r1"))
+    run(middleware, make_request("read_file", read, call_id="r2"))
+    run(middleware, make_request("read_file", read, call_id="r3"))
+    blocked = run(middleware, make_request("read_file", read, call_id="r4"))
+    assert blocked.status == "error"
+
+    middleware._record_result(
+        make_request("run_tests"),
+        ToolMessage(content="Exit Code: 1\nfailed", name="run_tests", tool_call_id="t1"),
+    )
+    # A failing validation unlocks the paths: the TDD fail->fix loop must be
+    # able to re-read its own edits without any budget limit.
+    assert run(middleware, make_request("read_file", read, call_id="r5")).content == "ok"
+    assert run(middleware, make_request("read_file", read, call_id="r6")).content == "ok"
 
 
 def test_read_of_written_file_block_points_to_next_action() -> None:
@@ -277,17 +324,21 @@ def test_test_generator_delete_releases_read_cache_for_rewritten_file() -> None:
     read_args = {"file_path": path, "offset": 0, "limit": 100}
 
     assert run(middleware, make_request("read_file", read_args, call_id="r1")).content == "ok"
-    blocked = run(middleware, make_request("read_file", read_args, call_id="r2"))
+    # The fresh re-read budget serves two overlapping re-reads first...
+    assert run(middleware, make_request("read_file", read_args, call_id="r2")).content == "ok"
+    assert run(middleware, make_request("read_file", read_args, call_id="r3")).content == "ok"
+    # ...then the loop cap kicks in.
+    blocked = run(middleware, make_request("read_file", read_args, call_id="r4"))
     assert blocked.status == "error" and "Repeated read blocked" in blocked.content
 
     assert run(middleware, make_request("delete", {"file_path": path}, call_id="d1")).content == "ok"
     # Same range as before the delete: the cache entry died with the file.
-    assert run(middleware, make_request("read_file", read_args, call_id="r3")).content == "ok"
+    assert run(middleware, make_request("read_file", read_args, call_id="r5")).content == "ok"
 
     # After the delete-then-rewrite cycle, reads of the new content are
     # governed by the written-path rule — never by the stale pre-delete range.
     assert run(middleware, make_request("write_file", {"file_path": path, "content": "test v2\n"}, call_id="c1")).content == "ok"
-    rewrite_read = run(middleware, make_request("read_file", read_args, call_id="r4"))
+    rewrite_read = run(middleware, make_request("read_file", read_args, call_id="r6"))
     assert rewrite_read.status == "error" and "Read blocked" in rewrite_read.content
 
 
@@ -597,9 +648,15 @@ def test_repeated_overlapping_read_blocked_but_new_range_allowed() -> None:
     path = "/workspace/src/calc.py"
     first = run(middleware, make_request("read_file", {"file_path": path, "offset": 0, "limit": 100}, call_id="r1"))
     assert first.content == "ok"
+    # The overlapping re-reads are served fresh while the budget lasts...
     repeated = run(middleware, make_request("read_file", {"file_path": path, "offset": 10, "limit": 50}, call_id="r2"))
-    assert repeated.status == "error" and "Repeated read blocked" in repeated.content
-    next_page = run(middleware, make_request("read_file", {"file_path": path, "offset": 100, "limit": 100}, call_id="r3"))
+    assert repeated.content == "ok"
+    second = run(middleware, make_request("read_file", {"file_path": path, "offset": 10, "limit": 50}, call_id="r3"))
+    assert second.content == "ok"
+    capped = run(middleware, make_request("read_file", {"file_path": path, "offset": 10, "limit": 50}, call_id="r4"))
+    assert capped.status == "error" and "Repeated read blocked" in capped.content
+    # ...and pagination into a new range is never part of the budget.
+    next_page = run(middleware, make_request("read_file", {"file_path": path, "offset": 100, "limit": 100}, call_id="r5"))
     assert next_page.content == "ok"
 
 

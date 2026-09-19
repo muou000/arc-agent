@@ -24,6 +24,13 @@ MAX_SKELETON_LINES = _MAX_SKELETON_LINES
 MAX_APPEND_LINES = 80
 MAX_APPENDS_PER_FILE = 3
 _MAX_READ_LIMIT = 200
+# Fresh overlapping re-reads allowed per path before the block returns. The
+# hard block exists for the run7 loop (50 consecutive offset probes), but the
+# fbd4a73b TDD run showed the other edge: an agent whose legitimate re-read is
+# refused does not stop wanting the content — it burned 10 consecutive greps
+# rebuilding one file, at a higher round-trip cost than the re-read itself.
+# A small per-path budget serves the legitimate case and still caps the loop.
+_MAX_REPEATED_READS_PER_PATH = 2
 _DESIGN_MUTATION_PATTERNS = (
     re.compile(r"\b(?:INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.IGNORECASE),
     re.compile(
@@ -108,6 +115,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # files (see ``agents.design.contract_skeleton.PendingContractRegistry``).
         self._pending_contract_registry = pending_contract_registry
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
+        self._repeated_read_counts: dict[str, int] = {}
         self._written_paths: set[str] = set()
         self._failed_paths: set[str] = set()
         self._validation_failed = False
@@ -256,11 +264,13 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if not previous or self._path_unlocked(path):
             return None
         if any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous):
-            return (
-                f"Repeated read blocked: {path} is already in this stage's read cache. "
-                "Use the earlier result and continue; if the file needs changes, follow the write "
-                "options instead of probing offsets to bypass the cache."
-            )
+            if self._repeated_read_counts.get(path, 0) >= _MAX_REPEATED_READS_PER_PATH:
+                return (
+                    f"Repeated read blocked: {path} was re-read {_MAX_REPEATED_READS_PER_PATH} time(s) "
+                    "in this stage already. Use the earlier results and continue; if the file needs "
+                    "changes, follow the write options instead of probing offsets to bypass the cache."
+                )
+            return None
         return None
 
     def _validate_write(self, args: dict[str, Any]) -> str | None:
@@ -362,13 +372,15 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 self._failed_paths.add(path)
             return
         if name == "delete" and path:
-            # The file is gone, so its write lock, read ranges and failure
-            # record describe content that no longer exists; dropping them is
-            # what makes delete-then-rewrite a real exit instead of one that
-            # depends on an accidental later failure to unlock.
+            # The file is gone, so its write lock, read ranges, repeat-read
+            # budget and failure record describe content that no longer
+            # exists; dropping them is what makes delete-then-rewrite a real
+            # exit instead of one that depends on an accidental later failure
+            # to unlock.
             self._written_paths.discard(path)
             self._failed_paths.discard(path)
             self._read_ranges.pop(path, None)
+            self._repeated_read_counts.pop(path, None)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
             self._discard_written_path(request, path)
@@ -376,6 +388,15 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if name == "read_file" and path:
             offset = _as_nonnegative_int(args.get("offset"), default=0)
             limit = _as_nonnegative_int(args.get("limit"), default=100)
+            previous = self._read_ranges.get(path, [])
+            if (
+                previous
+                and not self._path_unlocked(path)
+                and any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous)
+            ):
+                # Only a read that actually returned content consumes the
+                # fresh re-read budget; failed reads must not.
+                self._repeated_read_counts[path] = self._repeated_read_counts.get(path, 0) + 1
             self._read_ranges.setdefault(path, []).append((offset, offset + limit))
             self._cache_read_summary(request, path, offset, limit, result)
         if (name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS) and path:
