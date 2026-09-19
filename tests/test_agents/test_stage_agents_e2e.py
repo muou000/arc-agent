@@ -808,6 +808,136 @@ def test_interface_designer_zero_write_leaf_without_candidates_skips_backfill(
     assert bundle["interfaces"] == []
 
 
+def test_interface_designer_backfill_enumeration_failure_is_logged(
+    tmp_project_dir: Path, arc_runtime, monkeypatch
+) -> None:
+    """A registry read failure must be visible, not silently degrade to the gate.
+
+    The backfill helper fails safe to the workflow leaf gate either way, but
+    an operator reading the log must be able to tell "enumeration crashed"
+    apart from "legally no candidates" — otherwise a registry bug masquerades
+    as a design failure.
+    """
+    node_id = "REQ-BROKEN-REGISTRY"
+    seed_requirement(arc_runtime, node_id)
+
+    def raise_runtime_error():
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr("core.service.get_runtime", raise_runtime_error)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "InterfaceDesignResponse",
+                {"summary": "Nothing owned here.", "interfaces": [], "files_written": []},
+                call_id="c1",
+            ),
+        ]
+    )
+
+    logs: list[str] = []
+
+    def collect_log(agent_name: str, message: str, status: str | None, node_id: str | None) -> None:
+        logs.append(message)
+
+    bundle = asyncio.run(
+        make_designer(tmp_project_dir, model, log_cb=collect_log).run(
+            node_id=node_id,
+            requirement_data={"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    # The backfill never fired; the failure reason is on the log instead.
+    assert model.call_count == 1
+    assert bundle["interfaces"] == []
+    assert any("Reuse candidate enumeration failed" in message for message in logs)
+
+
+def test_interface_designer_backfill_reports_unlanded_dependency_anchor(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A declared dependency with no landed contracts must not shrink silently.
+
+    Declared dependencies are scheduling gates, not landed-contract
+    guarantees (a failed dependency releases its dependents), so the
+    backfill proceeds on the parent anchor but logs the dependency as
+    contributing nothing — the operator can see why the candidate list is
+    parent-only.
+    """
+    arc_runtime.traceability.store_requirement_tree(
+        {
+            "id": "REQ-SHELL-DEP",
+            "name": "Homepage",
+            "description": "Homepage shell",
+            "children": [
+                {
+                    "id": "REQ-OPEN-DEP",
+                    "name": "Open Homepage",
+                    "description": "Opening the application URL shows the homepage",
+                    "dependencies": ["REQ-UNLANDED"],
+                },
+                {"id": "REQ-UNLANDED", "name": "Dependency feature", "description": "Not landed yet"},
+            ],
+        }
+    )
+    arc_runtime.traceability.upsert_interface(
+        interface_id="REQ-SHELL-DEP-UI-HOMESHELL",
+        req_ids=["REQ-SHELL-DEP"],
+        type="UI",
+        content=(
+            '{"interface_id": "REQ-SHELL-DEP-UI-HOMESHELL", "type": "UI", "name": "HomeShell", '
+            '"responsibility": "Homepage shell."}'
+        ),
+        file_path="frontend/src/pages/HomePage.tsx",
+    )
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "InterfaceDesignResponse",
+                {"summary": "Only reuses the parent homepage shell.", "interfaces": [], "files_written": []},
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "InterfaceDesignRepairResponse",
+                {
+                    "summary": "Reuse recorded against the parent shell.",
+                    "interfaces": [
+                        {
+                            "interface_id": "REQ-SHELL-DEP-UI-HOMESHELL",
+                            "relation": "reused",
+                            "responsibility": "Homepage shell rendered for the default route.",
+                        }
+                    ],
+                    "files_written": [],
+                },
+                call_id="c2",
+            ),
+        ]
+    )
+
+    logs: list[str] = []
+
+    def collect_log(agent_name: str, message: str, status: str | None, node_id: str | None) -> None:
+        logs.append(message)
+
+    bundle = asyncio.run(
+        make_designer(tmp_project_dir, model, log_cb=collect_log).run(
+            node_id="REQ-OPEN-DEP",
+            requirement_data={"name": "Open Homepage", "description": "Opening the URL shows the homepage"},
+        )
+    )
+
+    # The backfill still fires on the parent anchor; the unlanded dependency
+    # is called out on the log instead of silently shrinking the anchor set.
+    assert model.call_count == 2
+    assert [item["interface_id"] for item in bundle["interfaces"]] == [
+        "REQ-SHELL-DEP-UI-HOMESHELL"
+    ]
+    assert any("REQ-UNLANDED" in message and "no registered interface" in message for message in logs)
+
+
 def test_test_generator_writes_test_asset_and_returns_manifest(
     tmp_project_dir: Path, arc_runtime
 ) -> None:

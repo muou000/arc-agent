@@ -405,7 +405,7 @@ class InterfaceDesigner:
         back empty.
         """
 
-        candidates = self._leaf_reuse_candidates(node_id=node_id)
+        candidates = await self._leaf_reuse_candidates(node_id=node_id)
         if not candidates:
             return {}
         await self._log(
@@ -464,15 +464,17 @@ class InterfaceDesigner:
         )
         return {}
 
-    def _leaf_reuse_candidates(self, *, node_id: str) -> list[dict[str, str]] | None:
+    async def _leaf_reuse_candidates(self, *, node_id: str) -> list[dict[str, str]] | None:
         """Parent/dependency interfaces a write-less leaf can anchor reuse to.
 
         Leaf-ness comes from the traceability record's ``children_ids`` — the
         same source the workflow leaf gate reads — so a non-leaf's legal empty
-        response never triggers a backfill. ``None`` means the backfill does
-        not apply: non-leaf, no registry record, or no stored parent/
-        dependency contract to anchor to (an empty registry must not be
-        papered over with invented contracts).
+        response never triggers a backfill (and stays silent). ``None`` means
+        the backfill does not apply. Every ``None`` on the leaf path is logged
+        with its reason — enumeration failure, or no registered anchor at all
+        — so an operator can tell why a node fell through to the gate instead
+        of getting a backfill ask; an empty registry must not be papered over
+        with invented contracts.
         """
 
         try:
@@ -489,6 +491,7 @@ class InterfaceDesigner:
                 if dependency_id and dependency_id not in anchor_ids:
                     anchor_ids.append(dependency_id)
             candidates: list[dict[str, str]] = []
+            counts: dict[str, int] = {}
             seen: set[str] = set()
             for anchor_id in anchor_ids:
                 for row in store.list_interfaces(req_id=anchor_id):
@@ -496,6 +499,7 @@ class InterfaceDesigner:
                     if not interface_id or interface_id in seen:
                         continue
                     seen.add(interface_id)
+                    counts[anchor_id] = counts.get(anchor_id, 0) + 1
                     try:
                         content = json.loads(str(row.get("content") or "{}"))
                     except (json.JSONDecodeError, ValueError):
@@ -512,9 +516,38 @@ class InterfaceDesigner:
                             "responsibility": str(content.get("responsibility") or "").strip(),
                         }
                     )
-        except Exception:
+        except Exception as exc:
+            await self._log(
+                f"Reuse candidate enumeration failed ({type(exc).__name__}: {exc}); "
+                "skipping the backfill and leaving the empty response to the workflow gate.",
+                status="warning",
+                node_id=node_id,
+            )
             return None
-        return candidates or None
+        if not candidates:
+            await self._log(
+                "No registered parent/dependency interface is available to anchor a "
+                "reuse backfill; skipping the backfill (the workflow leaf gate owns "
+                "the failure).",
+                status="warning",
+                node_id=node_id,
+            )
+            return None
+        # Declared dependencies are scheduling gates, not landed-contract
+        # guarantees (a failed dependency releases its dependents), so an
+        # anchor can legitimately contribute zero interfaces. Surface that
+        # degradation instead of letting the candidate list silently shrink
+        # to the parent's contracts.
+        empty_anchors = [anchor_id for anchor_id in anchor_ids if counts.get(anchor_id, 0) == 0]
+        if empty_anchors:
+            await self._log(
+                "Reuse anchor(s) with no registered interface yet: "
+                f"{', '.join(empty_anchors)} (a declared dependency may not have "
+                "landed its contracts).",
+                status="warning",
+                node_id=node_id,
+            )
+        return candidates
 
     @staticmethod
     def _reuse_backfill_message(candidates: list[dict[str, str]]) -> str:
