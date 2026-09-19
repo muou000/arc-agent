@@ -47,6 +47,16 @@ class FailedTestDigest:
 _FAIL_LIST_LINE = re.compile(r"^\s*FAIL\s+(.+?)\s+>\s+(.+)$")
 _FAIL_FILE_LINE = re.compile(r"^\s*FAIL\s+(.+)$")
 
+# Vitest per-file run header: " ❯ tests/routes/authRoutes.test.js (14 tests | 11 failed) 980ms".
+# It is the only place vitest names the FILE for the × lines that follow it.
+_VITEST_FILE_HEADER = re.compile(r"^\s*❯\s+(\S+.*?)\s+\(\d+\s+tests?\s*\|\s*\d+\s+failed\)")
+
+# Vitest failed-test list row: "     × POST /auth/register rejects ... 47ms".
+# Vitest prints one of these per failed test but only ONE detail block (the
+# "FAIL file > suite > test" marker below); the × rows are how the digest
+# reaches every failed test, not just the detail-block one.
+_VITEST_X_LINE = re.compile(r"^\s*[×✘x]\s+(.+?)\s+\d+(?:\.\d+)?\s*m?s\s*$")
+
 # Playwright detail block head (the per-failure section that carries the
 # error, locator and expected/received):
 #   "  1) test-e2e\spec.js:53:3 › suite › case ─────"
@@ -94,6 +104,9 @@ def build_failure_digest(test_output: str) -> dict[str, Any]:
     failed: list[FailedTestDigest] = []
     marker_lines: dict[int, FailedTestDigest] = {}
     seen: set[str] = set()
+    # File context for vitest × rows (reset to "" when no ❯ header has been
+    # seen, so stray × glyphs outside a vitest run block are ignored).
+    vitest_current_file = ""
 
     def add(name: str, location: str, line_index: int) -> None:
         key = name if not location else f"{location}::{name}"
@@ -111,6 +124,29 @@ def build_failure_digest(test_output: str) -> dict[str, Any]:
                     marker_lines[line_index] = existing
                     break
             return
+        # Vitest names the same test twice: a bare "× case name" list row and
+        # a "FAIL file > suite > case" detail marker. Both match on file;
+        # replace the earlier bare row with the fuller detail marker (it
+        # carries the suite prefix and the error block anchor) instead of
+        # listing the failure twice.
+        for position, existing in enumerate(failed):
+            if not existing.location or not location:
+                continue
+            same_file = existing.location.split(":")[0] == location.split(":")[0]
+            if same_file and (
+                existing.name.endswith(f"> {name}")
+                or name.endswith(f"> {existing.name}")
+                or f"> {existing.name}" in name
+                or existing.name.endswith(f"> {name}")
+            ):
+                if existing.name == name:
+                    return
+                # The incoming marker is the "suite > case" form.
+                failed[position] = FailedTestDigest(name=name, location=location)
+                for old_index in [i for i, e in marker_lines.items() if e is existing]:
+                    del marker_lines[old_index]
+                marker_lines[line_index] = failed[position]
+                return
         seen.add(key)
         entry = FailedTestDigest(name=name, location=location)
         failed.append(entry)
@@ -118,6 +154,12 @@ def build_failure_digest(test_output: str) -> dict[str, Any]:
 
     for index, raw_line in enumerate(lines):
         line = raw_line.rstrip()
+        header_match = _VITEST_FILE_HEADER.match(line)
+        if header_match:
+            # Track the file context for the × rows that follow; the header
+            # itself is not a failed test.
+            vitest_current_file = header_match.group(1).strip()
+            continue
         match = _FAIL_LIST_LINE.match(line)
         if match:
             add(match.group(2).strip(), match.group(1).strip(), index)
@@ -131,6 +173,13 @@ def build_failure_digest(test_output: str) -> dict[str, Any]:
         if match:
             path, line_no, name = match.group(1).strip(), match.group(2), match.group(3).strip()
             add(name, f"{path}:{line_no}", index)
+            continue
+        match = _VITEST_X_LINE.match(line)
+        if match:
+            # Only inside a vitest run block (a ❯ header was seen); the same
+            # glyph could appear in unrelated output.
+            if vitest_current_file:
+                add(match.group(1).strip(), vitest_current_file, index)
             continue
         match = _FAIL_FILE_LINE.match(line)
         if match:
