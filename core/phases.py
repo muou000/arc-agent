@@ -177,6 +177,27 @@ class WorkflowPhaseRunner:
                     node_id=node_id,
                 )
                 return False
+            if not is_non_leaf:
+                # Hard gate: a leaf DESIGN pass that records no interface
+                # contracts and materializes no files has produced nothing
+                # downstream stages can anchor to. The observed failure shape
+                # is the reuse shortcut - the pass claims parent/dependency
+                # contracts in `summary` prose and returns an empty
+                # `interfaces` array - which only surfaced one stage later as
+                # a confusing TestGenerator ownership failure after the whole
+                # tree had waited on this node. The way out is to return the
+                # reused interfaces with their original interface_id.
+                await self._log(
+                    "InterfaceDesigner",
+                    "DESIGN failed: the leaf node recorded no interface contracts and "
+                    "materialized no files, so TestGenerator and TDD have no contract to "
+                    "anchor to. Reused parent/dependency interfaces must still be returned "
+                    "in `interfaces` with their original interface_id; summary prose alone "
+                    "does not attach the node to a contract.",
+                    status="error",
+                    node_id=node_id,
+                )
+                return False
             await self._log(
                 "InterfaceDesigner",
                 "Interface design returned no current-node owned interface definitions.",
@@ -285,6 +306,8 @@ class WorkflowPhaseRunner:
                     "DESIGN failed: `owned` test coverage does not point to any "
                     "interface owned by the current node: "
                     + ", ".join(foreign_owned_tests)
+                    + ". If the current node's DESIGN recorded no owned interface "
+                    "contracts, inspect the interface design output first."
                 ),
                 status="error",
                 node_id=node_id,

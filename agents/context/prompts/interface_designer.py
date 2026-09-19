@@ -104,6 +104,7 @@ def get_user_prompt(
                 "On retry, prefer returning updated versions of existing current-node interfaces with the same `interface_id`; do not mint duplicate ids for the same contract.",
                 "In `summary`, include a concise design rationale: owned boundary, reused interfaces, and how the chain remains connected to the app.",
                 "Do not return an empty interface list unless the node truly has no current-node owned contract to record; explain that case in `summary`.",
+                "A leaf node always has contracts to record: its `interfaces` array must be non-empty, and every reused parent/dependency interface must appear there with its original `interface_id` exactly as registered - recording a reuse only in `summary` attaches the node to no contract and fails the DESIGN phase. Only a non-leaf node without visual references may return an empty list.",
             ],
         ),
     ]
