@@ -379,6 +379,149 @@ def test_materialized_paths_excludes_deleted_paths() -> None:
 
 
 # ---------------------------------------------------------------------------
+# test_generation stage: delete-rewrite cycle budget (arc-output3 regression)
+# ---------------------------------------------------------------------------
+
+
+def test_test_generator_delete_rewrite_budget_blocks_third_cycle() -> None:
+    """arc-output3 (2026-09-19) evidence: the model ran the delete+write
+    escape 5-7 times per file until the step budget crashed the whole DESIGN
+    task. Two full cycles stay legal (the legitimate fix path); the third
+    delete is refused, so the last written version stands on disk."""
+
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+    for cycle in range(2):
+        written = run(
+            middleware,
+            make_request("write_file", {"file_path": path, "content": f"v{cycle}\n"}, call_id=f"w{cycle}"),
+        )
+        assert written.content == "ok"
+        deleted = run(middleware, make_request("delete", {"file_path": path}, call_id=f"d{cycle}"))
+        assert not isinstance(deleted, ToolMessage) or deleted.status != "error"
+    final = run(
+        middleware,
+        make_request("write_file", {"file_path": path, "content": "final\n"}, call_id="w-final"),
+    )
+    assert final.content == "ok"
+
+    blocked = run(middleware, make_request("delete", {"file_path": path}, call_id="d-3rd"))
+    assert blocked.status == "error"
+    assert "Rewrite budget blocked" in blocked.content
+    assert "2 delete-rewrite cycles" in blocked.content
+
+
+def test_delete_rewrite_budget_message_points_to_final_response_when_manifest_complete() -> None:
+    """When every declared file is already materialized, the block must name
+    the real exit (return the manifest) — the model in the arc-output3 run
+    kept polishing because nothing told it the work was done."""
+
+    middleware = make_locked(declared=["tests/unit/a.test.py", "tests/unit/b.test.py"])
+    for path in ("a", "b"):
+        full = f"/workspace/tests/unit/{path}.test.py"
+        result = run(middleware, make_request("write_file", {"file_path": full, "content": "v1\n"}, call_id=f"w1{path}"))
+        assert result.content == "ok"
+
+    # One full cycle on a.test.py (legal), then the third delete refuses.
+    run(middleware, make_request("delete", {"file_path": "/workspace/tests/unit/a.test.py"}, call_id="d1"))
+    run(middleware, make_request("write_file", {"file_path": "/workspace/tests/unit/a.test.py", "content": "v2\n"}, call_id="w2"))
+    run(middleware, make_request("delete", {"file_path": "/workspace/tests/unit/a.test.py"}, call_id="d2"))
+    run(middleware, make_request("write_file", {"file_path": "/workspace/tests/unit/a.test.py", "content": "v3\n"}, call_id="w3"))
+
+    blocked = run(middleware, make_request("delete", {"file_path": "/workspace/tests/unit/a.test.py"}, call_id="d3"))
+    assert blocked.status == "error" and "Rewrite budget blocked" in blocked.content
+    assert "every declared manifest file is written" in blocked.content
+    assert "return your manifest response now" in blocked.content
+    assert "tests/unit/b.test.py" in blocked.content
+
+
+def test_failed_write_keeps_the_delete_rewrite_exit_open() -> None:
+    """The budget limits self-review churn, not repair after an error: a
+    failed file operation unlocks the path and the delete passes again."""
+
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="w1")).content == "ok"
+
+    def failing_write(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="Error: disk full",
+            name=request.tool_call["name"],
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+    failed = run(
+        middleware,
+        make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="w2"),
+        failing_write,
+    )
+    assert failed.status == "error"
+    unlocked_delete = run(middleware, make_request("delete", {"file_path": path}, call_id="d1"))
+    assert not isinstance(unlocked_delete, ToolMessage) or unlocked_delete.status != "error"
+
+
+def test_failed_delete_does_not_consume_the_rewrite_budget() -> None:
+    """Only a *successful* delete starts a rewrite cycle: a failed delete
+    (e.g. the file was already gone) leaves the budget untouched."""
+
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+
+    def failing_delete(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="Error: path not found",
+            name=request.tool_call["name"],
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="w1")).content == "ok"
+    failed = run(middleware, make_request("delete", {"file_path": path}, call_id="d0"), failing_delete)
+    assert failed.status == "error"
+    # The path was unlocked by the failure, and the cycle count is still 0:
+    # two more full delete-rewrite cycles remain legal.
+    for cycle in range(2):
+        written = run(
+            middleware,
+            make_request("write_file", {"file_path": path, "content": f"v{cycle}\n"}, call_id=f"w{cycle}"),
+        )
+        assert written.content == "ok"
+        deleted = run(middleware, make_request("delete", {"file_path": path}, call_id=f"d{cycle}"))
+        assert not isinstance(deleted, ToolMessage) or deleted.status != "error"
+
+
+def test_delete_rewrite_budget_is_per_path() -> None:
+    """The cap limits polishing one file; other declared files keep their
+    own full budget."""
+
+    middleware = make("test_generation")
+    hot = "/workspace/tests/unit/hot.test.py"
+    other = "/workspace/tests/unit/other.test.py"
+    for cycle in range(2):
+        assert run(middleware, make_request("write_file", {"file_path": hot, "content": f"v{cycle}\n"}, call_id=f"wh{cycle}")).content == "ok"
+        assert run(middleware, make_request("delete", {"file_path": hot}, call_id=f"dh{cycle}")).content == "ok"
+    assert run(middleware, make_request("write_file", {"file_path": hot, "content": "final\n"}, call_id="wh2")).content == "ok"
+
+    assert run(middleware, make_request("write_file", {"file_path": other, "content": "v1\n"}, call_id="wo1")).content == "ok"
+    fresh = run(middleware, make_request("delete", {"file_path": other}, call_id="do1"))
+    assert not isinstance(fresh, ToolMessage) or fresh.status != "error"
+
+
+def test_read_block_after_write_warns_against_rewrite_verification() -> None:
+    """The arc-output3 model could not re-read its written test file, drew
+    the wrong conclusion ("can't re-read") and started rewriting instead.
+    The block message must close that door explicitly."""
+
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="w1")).content == "ok"
+    blocked = run(middleware, make_request("read_file", {"file_path": path, "offset": 0, "limit": 100}, call_id="r1"))
+    assert blocked.status == "error"
+    assert "never rewrite the file to verify it" in blocked.content
+
+
+# ---------------------------------------------------------------------------
 # implementation stage: write lock and unlock semantics
 # ---------------------------------------------------------------------------
 

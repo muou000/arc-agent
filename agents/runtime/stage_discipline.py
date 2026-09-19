@@ -31,6 +31,15 @@ _MAX_READ_LIMIT = 200
 # rebuilding one file, at a higher round-trip cost than the re-read itself.
 # A small per-path budget serves the legitimate case and still caps the loop.
 _MAX_REPEATED_READS_PER_PATH = 2
+# Successful delete-then-rewrite cycles allowed per test-file path in one
+# test_generation pass. The delete release exists so a legitimate fix does not
+# wait for an accidental failure to unlock; the 2026-09-19 arc-output3 run
+# showed its unbounded edge: a TestGenerator that *believed* its writes had
+# been truncated (they had not — no truncation error ever occurred) re-ran the
+# delete+write cycle 5-7 times per file, ~10M input tokens, until the step
+# budget crashed the whole DESIGN task. Counting cycles on the delete keeps
+# the last written version on disk when the cap trips.
+_MAX_DELETE_REWRITES_PER_PATH = 2
 _DESIGN_MUTATION_PATTERNS = (
     re.compile(r"\b(?:INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.IGNORECASE),
     re.compile(
@@ -62,8 +71,9 @@ def _without_comment_lines(content: str) -> str:
 # the message re-enters the context on every blocked attempt.
 _WRITE_BLOCK_EXITS = {
     "test_generation": (
-        "To change it: delete this test asset first and then write it back; if the test "
-        "assets are ready, stop editing and return the updated manifest."
+        "To change it: delete this test asset first and then write it back "
+        "(at most two delete-rewrite cycles per path); if the test assets are "
+        "ready, stop editing and return the updated manifest."
     ),
     "implementation": (
         "To change it: run the tests (a failing run unlocks written files for fixes) "
@@ -121,6 +131,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         self._validation_failed = False
         self._design_write_count = 0
         self._append_counts: dict[str, int] = {}
+        self._rewrite_counts: dict[str, int] = {}
         self._write_block_counts: dict[str, int] | None = {} if stage == "interface_design" else None
 
     def wrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
@@ -151,7 +162,10 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 # A green-baseline rejection may legitimately remove a test
                 # asset (duplicate or tautological coverage); deleting
                 # anything else stays blocked for every stage.
-                return self._validate_test_manifest_path(args, operation="delete")
+                manifest_block = self._validate_test_manifest_path(args, operation="delete")
+                if manifest_block:
+                    return manifest_block
+                return self._validate_delete_rewrite_budget(args)
             return f"`{name}` is disabled in ARC's staged file workflow."
         if self._stage == "test_generation" and name in _VALIDATION_TOOLS:
             return "TestGenerator only creates tests and its manifest; it must not run validation."
@@ -249,6 +263,54 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             "declared file instead."
         )
 
+    def _validate_delete_rewrite_budget(self, args: dict[str, Any]) -> str | None:
+        """Cap the delete-then-rewrite escape per test-file path.
+
+        A successful delete releases the write lock by design, so nothing in
+        the write path can see how often the cycle repeated. The cycle count
+        lives on the delete itself: once a path has gone through
+        ``_MAX_DELETE_REWRITES_PER_PATH`` full delete-rewrite cycles, the next
+        delete is refused and the last written version stands. A failed file
+        operation on the path keeps its generic unlock (``_path_unlocked``):
+        the budget limits self-review churn, not repair after an error.
+        """
+
+        path = _discipline_path(args)
+        if not path or self._path_unlocked(path):
+            return None
+        if self._rewrite_counts.get(path, 0) < _MAX_DELETE_REWRITES_PER_PATH:
+            return None
+        fully_written = self._manifest_fully_written()
+        if fully_written is not None:
+            declared = ", ".join(fully_written)
+            return (
+                f"Rewrite budget blocked: {path} has already gone through "
+                f"{_MAX_DELETE_REWRITES_PER_PATH} delete-rewrite cycles in this pass, and every "
+                f"declared manifest file is written ({declared}). The current files are final for "
+                "this stage: stop editing and return your manifest response now."
+            )
+        return (
+            f"Rewrite budget blocked: {path} has already gone through "
+            f"{_MAX_DELETE_REWRITES_PER_PATH} delete-rewrite cycles in this pass; the version on "
+            "disk stands and the content you wrote is in your context. Continue with your "
+            "remaining declared files and return the manifest instead of polishing this one."
+        )
+
+    def _manifest_fully_written(self) -> list[str] | None:
+        """Declared manifest paths when every one of them is materialized.
+
+        ``None`` when there is no locked manifest or at least one declared
+        file was never written — the caller then falls back to the generic
+        rewrite-budget wording.
+        """
+
+        if self._test_manifest_lock is None or not self._test_manifest_lock.locked:
+            return None
+        written = {normalize_manifest_path(path) for path in self._written_paths}
+        if not all(path in written for path in self._test_manifest_lock.declared_files):
+            return None
+        return sorted(self._test_manifest_lock.declared_files)
+
     def _validate_read(self, args: dict[str, Any]) -> str | None:
         path = _discipline_path(args)
         if not path:
@@ -256,7 +318,9 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if path in self._written_paths and not self._path_unlocked(path):
             return (
                 f"Read blocked: {path} was already written in this stage; you know its content. "
-                "Continue with the next action instead of re-reading it."
+                "Continue with the next action instead of re-reading it, and never rewrite the "
+                "file to verify it — the written version stands and a suspected imperfection is "
+                "not evidence."
             )
         offset = _as_nonnegative_int(args.get("offset"), default=0)
         limit = min(_as_nonnegative_int(args.get("limit"), default=100), _MAX_READ_LIMIT)
@@ -376,13 +440,18 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             # budget and failure record describe content that no longer
             # exists; dropping them is what makes delete-then-rewrite a real
             # exit instead of one that depends on an accidental later failure
-            # to unlock.
+            # to unlock. The rewrite-cycle count is the one exception: it
+            # exists precisely to observe how often that exit repeats, so it
+            # survives the delete.
+            was_written = path in self._written_paths
             self._written_paths.discard(path)
             self._failed_paths.discard(path)
             self._read_ranges.pop(path, None)
             self._repeated_read_counts.pop(path, None)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
+            if was_written:
+                self._rewrite_counts[path] = self._rewrite_counts.get(path, 0) + 1
             self._discard_written_path(request, path)
             return
         if name == "read_file" and path:
