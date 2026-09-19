@@ -31,6 +31,23 @@ _DESIGN_MUTATION_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+_COMMENT_LINE_PREFIXES = ("//", "#", "--", "/*", "<!--")
+
+
+def _without_comment_lines(content: str) -> str:
+    """Drop whole-line comments so documented SQL never trips the guard."""
+
+    kept: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_COMMENT_LINE_PREFIXES):
+            continue
+        # JSDoc/block-comment continuation. A `*gen()` declaration is kept:
+        # only an asterisk followed by whitespace (or nothing) is a comment.
+        if stripped.startswith("*") and (len(stripped) == 1 or stripped[1] in " \t"):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 # Stage-specific exits appended to the repeated-write block: a generic
 # "wait for an error" gave stages without reachable errors (test_generation
@@ -298,11 +315,17 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         false-green gates are elsewhere - the owned-RED baseline witness and
         the IMPLEMENT-stage ownership rules - so this guard only needs to stop
         the obvious case early, not to be exhaustive.
+
+        Whole-line comments are dropped before matching, because a contract
+        skeleton legitimately documents row shapes and endpoints with SQL or
+        query verbs in comments. Dropping them can only reduce blocking; the
+        authoritative gates above still cover anything hidden this way.
         """
 
         if self._stage != "interface_design":
             return None
-        if any(pattern.search(content) for pattern in _DESIGN_MUTATION_PATTERNS):
+        code = _without_comment_lines(content)
+        if any(pattern.search(code) for pattern in _DESIGN_MUTATION_PATTERNS):
             return (
                 "InterfaceDesigner may only materialize contract skeletons; this write contains "
                 "an apparent persistence or business mutation. Keep signatures, routes, types, "
