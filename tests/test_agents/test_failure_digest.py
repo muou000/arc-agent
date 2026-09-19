@@ -258,3 +258,29 @@ def test_digest_ignores_x_glyphs_outside_vitest_block() -> None:
     digest = build_failure_digest(output)
     names = [item["name"] for item in digest["failed_tests"]]
     assert "not a vitest row" not in names
+
+
+def test_digest_two_suites_same_case_name_count_both_failures() -> None:
+    """Same case name under two describes yields two distinct failures.
+
+    The x-row dedup consumes the bare row via the first FAIL detail marker;
+    the second suite's FAIL marker must survive as its own entry instead of
+    being merged into the first (the dedup matches on the case tail, and
+    'A > saves' vs 'B > saves' differ there).
+    """
+
+    output = (
+        "Exit Code: 1\n"
+        " ❯ tests/a.test.js (4 tests | 2 failed) 100ms\n"
+        "     × saves 30ms\n"
+        "     × saves 30ms\n"
+        " FAIL  tests/a.test.js > A > saves\n"
+        " AssertionError: boom A\n"
+        " FAIL  tests/a.test.js > B > saves\n"
+        " AssertionError: boom B\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert names == ["A > saves", "B > saves"]
+    errors = [item["error_lines"][0] for item in digest["failed_tests"] if item["error_lines"]]
+    assert errors == ["AssertionError: boom A", "AssertionError: boom B"]

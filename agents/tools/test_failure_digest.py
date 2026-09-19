@@ -137,7 +137,6 @@ def build_failure_digest(test_output: str) -> dict[str, Any]:
                 existing.name.endswith(f"> {name}")
                 or name.endswith(f"> {existing.name}")
                 or f"> {existing.name}" in name
-                or existing.name.endswith(f"> {name}")
             ):
                 if existing.name == name:
                     return

@@ -289,3 +289,19 @@ def test_fingerprint_keeps_assertion_numbers() -> None:
     first = failure_fingerprint("Exit Code: 1\nAssertionError: expected 2 got 1")
     second = failure_fingerprint("Exit Code: 1\nAssertionError: expected 2 got 3")
     assert first != second
+
+
+def test_fingerprint_masks_assertion_embedded_durations_by_design() -> None:
+    """Durations inside assertion text collapse to one fingerprint on purpose.
+
+    A timeout drifting 500ms -> 1200ms under load is the same failing
+    assertion; the stall governor asks "did the failure change?", not "did
+    the timing change?". Pinning this so the trade-off is explicit.
+    """
+
+    fast = failure_fingerprint("Exit Code: 1\nAssertionError: expected response within 500ms but got timeout")
+    slow = failure_fingerprint("Exit Code: 1\nAssertionError: expected response within 1200ms but got timeout")
+    assert fast == slow
+    # A genuinely different assertion stays distinct.
+    other = failure_fingerprint("Exit Code: 1\nAssertionError: expected status 200 but got 500")
+    assert fast != other

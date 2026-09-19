@@ -214,6 +214,11 @@ _FINGERPRINT_NOISE_PATTERN = re.compile(r":\d+(?::\d+)?")
 #: identical consecutive fingerprints) never fired - observed on the
 #: 2026-09-19 test1 run, where Integration burned 7 calls on one unchanged
 #: failure with zero STALL DETECTED notices.
+#: The mask also applies to durations inside assertion text ("expected
+#: response within 500ms"): a timeout that drifts 500ms -> 1200ms under load
+#: is the same failing assertion, and the stall governor asks "did the
+#: failure change?", not "did the timing change?". Stability outweighs
+#: duration precision here by design.
 _FINGERPRINT_DURATION_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|m)\b")
 
 #: ANSI color codes wrap the duration (and shift between color/no-color runs),
