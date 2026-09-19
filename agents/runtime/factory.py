@@ -922,19 +922,17 @@ def _template_shared_surfaces(app_type: str | None) -> frozenset[str]:
 
     Lazy import: the app-type registry pulls handler modules with heavier
     dependencies, and ``build_stage_agent`` runs on every stage construction.
-    Unknown or unset app types protect nothing (classic behavior).
+    No exception handling here: ``normalize_app_type`` falls back to ``web``
+    for unknown values instead of raising, so any failure that reaches this
+    function is a real bug and must surface (silently protecting nothing is
+    the regression this guard exists to prevent).
     """
 
     if not app_type:
         return frozenset()
     from app_type_handler import template_shared_surfaces
 
-    try:
-        return template_shared_surfaces(app_type)
-    except Exception:
-        # The guard is a safety net, not a dependency: an app-type lookup
-        # problem must never fail agent construction.
-        return frozenset()
+    return template_shared_surfaces(app_type)
 
 
 def _normalize_virtual_path(path: str) -> str:

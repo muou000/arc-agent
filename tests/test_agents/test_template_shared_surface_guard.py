@@ -217,6 +217,19 @@ def test_factory_maps_app_type_to_surfaces(tmp_path: Path) -> None:
     assert unwired.arc_stage_discipline._template_shared_surfaces == frozenset()
 
 
+def test_factory_helper_resolution_semantics(tmp_path: Path) -> None:
+    # Direct unit pin of the lookup helper: None protects nothing, unknown
+    # app types fall back to "web" through normalize_app_type (never raises,
+    # so no try/except may swallow real bugs here), and non-web app types
+    # resolve to their own (currently empty) lists.
+    from agents.runtime.factory import _template_shared_surfaces
+
+    assert _template_shared_surfaces(None) == frozenset()
+    assert _template_shared_surfaces("web") == surfaces_for("web")
+    assert _template_shared_surfaces("android") == frozenset()
+    assert _template_shared_surfaces("totally-unknown") == surfaces_for("web")
+
+
 # ---------------------------------------------------------------------------
 # Prompt / skill pins
 # ---------------------------------------------------------------------------
