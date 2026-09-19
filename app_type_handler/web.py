@@ -2560,7 +2560,10 @@ class WebAppType(AppTypeHandler):
                 + stage_timer.render()
             )
         except Exception as exc:
-            return f"Failed to start grouped E2E execution: {str(exc)}"
+            return (
+                f"Failed to start grouped E2E execution: {str(exc)}"
+                + stage_timer.render()
+            )
 
         if "Backend runtime cleanup failed:" in body and "Exit Code: 0" in body:
             body = body.replace("Exit Code: 0", "Exit Code: 1", 1)

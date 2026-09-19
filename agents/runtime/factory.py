@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -35,6 +36,7 @@ DISABLED_BUILTIN_TOOLS = frozenset({"execute", "write_todos"})
 _WINDOWS_PATH_COMPAT_APPLIED = False
 _READ_FILE_FORMAT_PATCHED = False
 _PERMISSION_HINT_PATCHED = False
+_PERMISSION_HINT_PATCH_LOCK = threading.Lock()
 _DELETE_NOT_FOUND_PATCHED = False
 
 # Sentinel so callers can explicitly pass ``checkpointer=None`` (cold start)
@@ -504,22 +506,30 @@ def _apply_permission_denied_hint() -> None:
     if _PERMISSION_HINT_PATCHED:
         return
 
-    from deepagents.middleware.filesystem import FilesystemMiddleware
+    with _PERMISSION_HINT_PATCH_LOCK:
+        if _PERMISSION_HINT_PATCHED:
+            return
 
-    original_awrap = FilesystemMiddleware.awrap_tool_call
-    if not callable(original_awrap):
-        return
+        from deepagents.middleware.filesystem import FilesystemMiddleware
 
-    async def awrap_tool_call_with_hint(self, request, handler):
-        tool_result = await original_awrap(self, request, handler)
-        content = getattr(tool_result, "content", None)
-        if isinstance(content, str) and content.startswith(_PERMISSION_DENIED_PREFIX):
-            if _PERMISSION_DENIED_HINT not in content:
-                tool_result.content = content + _PERMISSION_DENIED_HINT
-        return tool_result
+        original_awrap = FilesystemMiddleware.awrap_tool_call
+        if not callable(original_awrap) or getattr(original_awrap, "_arc_permission_hint", False):
+            return
 
-    FilesystemMiddleware.awrap_tool_call = awrap_tool_call_with_hint
-    _PERMISSION_HINT_PATCHED = True
+        async def awrap_tool_call_with_hint(self, request, handler):
+            tool_result = await original_awrap(self, request, handler)
+            content = getattr(tool_result, "content", None)
+            if isinstance(content, str) and content.startswith(_PERMISSION_DENIED_PREFIX):
+                if _PERMISSION_DENIED_HINT not in content:
+                    tool_result.content = content + _PERMISSION_DENIED_HINT
+            return tool_result
+
+        # Sentinel so a second patch application (or another monkey patch that
+        # captured the un-wrapped method) can detect the wrapper instead of
+        # stacking a second hint layer on every denied result.
+        awrap_tool_call_with_hint._arc_permission_hint = True  # type: ignore[attr-defined]
+        FilesystemMiddleware.awrap_tool_call = awrap_tool_call_with_hint
+        _PERMISSION_HINT_PATCHED = True
 
 
 def _apply_delete_not_found_precedence() -> None:

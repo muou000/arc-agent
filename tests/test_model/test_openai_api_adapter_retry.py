@@ -1590,6 +1590,28 @@ def test_resolve_stream_chunk_timeout_env_matrix(
         assert adapter.resolve_stream_chunk_timeout() == expected, f"env={raw!r}"
 
 
+def test_resolve_stream_chunk_timeout_clamped_to_request_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watchdog firing later than the request's read timeout could never
+    trigger, so small ARC_MODEL_TIMEOUT configurations clamp the chunk
+    timeout down instead of silently disabling it."""
+
+    monkeypatch.delenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False)
+    monkeypatch.setenv("ARC_MODEL_TIMEOUT", "30")
+    assert adapter.resolve_stream_chunk_timeout() == 30.0
+
+    monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", "60")
+    assert adapter.resolve_stream_chunk_timeout() == 30.0
+
+    monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", "0")  # explicit disable wins
+    assert adapter.resolve_stream_chunk_timeout() is None
+
+    monkeypatch.delenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False)
+    monkeypatch.setenv("ARC_MODEL_TIMEOUT", "300")
+    assert adapter.resolve_stream_chunk_timeout() == 90.0  # no clamp below default
+
+
 def test_build_openai_chat_model_passes_stream_chunk_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

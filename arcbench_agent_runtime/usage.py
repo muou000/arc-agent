@@ -51,9 +51,14 @@ def empty_usage_bucket() -> dict[str, Any]:
         "cache_hit_rate": None,
         **{key: 0 for key in _TOKEN_KEYS},
         "cost": {key: 0.0 for key in _COST_KEYS},
-        # Latency telemetry (absent on events written before the field
-        # existed): ``duration_s`` sums only over ``timed_calls``, so
-        # per-call averages stay honest when old and new events share a file.
+        # Latency telemetry. ``duration_s`` is a SUM over ``timed_calls``
+        # calls only; events without a latency block (written before the
+        # field existed / by external runners) count toward ``calls`` but
+        # neither bucket here. ``timed_calls == 0`` therefore means "latency
+        # unmeasured", and consumers must read the mean as
+        # ``duration_s / timed_calls`` only when ``timed_calls > 0`` — the
+        # CLI renders the Latency line under exactly that guard. Attempts is
+        # likewise a sum over the calls that reported it.
         "duration_s": 0.0,
         "timed_calls": 0,
         "streamed_calls": 0,

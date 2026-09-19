@@ -140,3 +140,19 @@ def test_other_error_messages_are_untouched(tmp_project_dir: Path) -> None:
 
     assert "not found" in content.lower()
     assert "/workspace/<path>" not in content
+
+
+def test_patch_double_apply_is_idempotent() -> None:
+    """Re-running the patch (concurrent first call, explicit re-apply) must
+    not stack a second wrapper: the wrapper carries a sentinel, and the
+    second application detects it and leaves the method alone."""
+
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    _apply_permission_denied_hint()
+    wrapped = FilesystemMiddleware.awrap_tool_call
+    assert getattr(wrapped, "_arc_permission_hint", False) is True
+
+    # A second apply sees the sentinel and keeps the existing wrapper.
+    _apply_permission_denied_hint()
+    assert FilesystemMiddleware.awrap_tool_call is wrapped

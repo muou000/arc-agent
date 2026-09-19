@@ -302,16 +302,20 @@ def _record_call_usage(result: Any, *, model: str, api_mode: OpenAIAPIMode, mess
     """Emit one usage record with the call's latency/transport telemetry."""
 
     meta = _last_call_meta.get() or {}
-    record_chat_result_usage(
-        result,
-        model=model,
-        api_mode=api_mode,
-        messages=messages,
-        duration_s=time.monotonic() - started_at,
-        transport=str(meta.get("transport") or ""),
-        attempts=meta.get("attempts"),
-    )
-    _last_call_meta.set(None)
+    try:
+        record_chat_result_usage(
+            result,
+            model=model,
+            api_mode=api_mode,
+            messages=messages,
+            duration_s=time.monotonic() - started_at,
+            transport=str(meta.get("transport") or ""),
+            attempts=meta.get("attempts"),
+        )
+    finally:
+        # Reset even on capture failure: a stale transport marker must not
+        # attribute the next call to this call's transport.
+        _last_call_meta.set(None)
 
 
 class ARCChatOpenAI(ChatOpenAI):
@@ -604,18 +608,29 @@ def resolve_stream_chunk_timeout() -> float | None:
     for the next SSE chunk. A silent gateway drop mid-generation (TCP alive,
     no bytes) surfaces as ``StreamChunkTimeoutError`` after this many seconds
     instead of holding the attempt for the full ``ARC_MODEL_TIMEOUT``. ``0``
-    disables the watchdog; invalid values fall back to the default.
+    disables the watchdog; invalid values fall back to the default. The
+    effective value is clamped to ``ARC_MODEL_TIMEOUT``: a watchdog that fires
+    later than the request's read timeout could never trigger, and silently
+    keeping it above would just re-create the pre-fix behaviour for
+    small-timeout configurations.
     """
 
     raw = os.getenv(_CHUNK_TIMEOUT_ENV, "").strip()
     if not raw:
-        return _DEFAULT_STREAM_CHUNK_TIMEOUT
-    try:
-        value = float(raw)
-    except ValueError:
-        return _DEFAULT_STREAM_CHUNK_TIMEOUT
-    if value < 0:
-        return _DEFAULT_STREAM_CHUNK_TIMEOUT
+        value: float | None = _DEFAULT_STREAM_CHUNK_TIMEOUT
+    else:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            return _DEFAULT_STREAM_CHUNK_TIMEOUT
+        if parsed < 0:
+            return _DEFAULT_STREAM_CHUNK_TIMEOUT
+        value = parsed or None
+    if value is None:
+        return None
+    request_timeout = _env_float("ARC_MODEL_TIMEOUT", _DEFAULT_REQUEST_TIMEOUT)
+    if request_timeout > 0:
+        value = min(value, request_timeout)
     return value or None
 
 
@@ -1163,11 +1178,14 @@ def _call_model_with_retries(
                 # free transport switch (no probe round, no delay, no budget
                 # burn — the common case recovers here). Every further stall,
                 # on either transport, counts as a budgeted attempt so a
-                # fully stalled endpoint cannot loop for free forever. The
-                # guard keeps a watchdog-shaped error from a plain attempt
-                # with no streamed transport configured on the generic path
-                # (it is not an OpenAI/httpx exception, so it propagates
-                # unwrapped there, preserving the old contract).
+                # fully stalled endpoint cannot loop for free forever.
+                # The guard routes a watchdog-shaped error from a plain
+                # attempt (no streamed transport configured, no stall seen
+                # yet) to the generic path below: there it is not a
+                # retryable model-API exception, so the budget check fails
+                # immediately and _raise_model_api_exception re-raises it
+                # as-is (the exception is not OpenAI/httpx, so the wrapper
+                # passes it through untouched — the pre-watchdog contract).
                 chunk_timeout_switches += 1
                 if chunk_timeout_switches == 1:
                     _record_model_failure(endpoint_key)
@@ -1304,11 +1322,14 @@ async def _acall_model_with_retries(
                 # free transport switch (no probe round, no delay, no budget
                 # burn — the common case recovers here). Every further stall,
                 # on either transport, counts as a budgeted attempt so a
-                # fully stalled endpoint cannot loop for free forever. The
-                # guard keeps a watchdog-shaped error from a plain attempt
-                # with no streamed transport configured on the generic path
-                # (it is not an OpenAI/httpx exception, so it propagates
-                # unwrapped there, preserving the old contract).
+                # fully stalled endpoint cannot loop for free forever.
+                # The guard routes a watchdog-shaped error from a plain
+                # attempt (no streamed transport configured, no stall seen
+                # yet) to the generic path below: there it is not a
+                # retryable model-API exception, so the budget check fails
+                # immediately and _raise_model_api_exception re-raises it
+                # as-is (the exception is not OpenAI/httpx, so the wrapper
+                # passes it through untouched — the pre-watchdog contract).
                 chunk_timeout_switches += 1
                 if chunk_timeout_switches == 1:
                     _record_model_failure(endpoint_key)

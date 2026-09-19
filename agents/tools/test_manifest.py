@@ -366,6 +366,8 @@ def _valid_interface_ids(
     the caller omits the hint instead of guessing.
     """
 
+    import logging
+
     from core.service import get_runtime
 
     valid: set[str] = set(known_interface_ids)
@@ -374,10 +376,23 @@ def _valid_interface_ids(
     except Exception:
         store = None
     if store is not None:
-        for row in store.list_interfaces():
-            interface_id = str(row.get("interface_id") or "").strip()
-            if interface_id:
-                valid.add(interface_id)
+        try:
+            db_ids = {
+                interface_id
+                for row in store.list_interfaces()
+                if (interface_id := str(row.get("interface_id") or "").strip())
+            }
+            valid |= db_ids
+        except Exception:
+            # The runtime resolved but the DB would not answer (locked file,
+            # concurrent writer): the hint degrades to staged ids only. That
+            # degradation is exactly what an online post-mortem needs to see,
+            # so log it instead of swallowing silently.
+            logging.getLogger(__name__).debug(
+                "manifest hint: traceability list_interfaces failed; "
+                "falling back to staged interface ids only",
+                exc_info=True,
+            )
     candidates = sorted(valid - referenced_ids)
     staged = [interface_id for interface_id in sorted(known_interface_ids) if interface_id in set(candidates)]
     rest = [interface_id for interface_id in candidates if interface_id not in set(staged)]
