@@ -602,3 +602,50 @@ def test_wait_for_http_server_accepts_any_http_response_and_rejects_silence() ->
             await silent_server.wait_closed()
 
     asyncio.run(_scenario())
+
+
+def test_e2e_result_contains_stage_timing_breakdown(tmp_path, monkeypatch) -> None:
+    """Each E2E round-trip reports the wall-clock cost of its stages
+    (frontend build, database prep, backend runtime, playwright), so the
+    model-facing output and the persisted tdd-run log carry the cost
+    breakdown that previously had to be inferred from debug-log timestamps."""
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+
+    handler = _make_handler(workspace)
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+
+    result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    assert "=== Stage Timing ===" in result
+    # A fresh E2E run pays all four stages; each is reported as name=<n>s.
+    for stage in ("frontend_build", "database_prepare", "backend_runtime", "playwright"):
+        assert stage + "=" in result
+
+
+def test_e2e_stage_timing_reports_reused_stages(tmp_path, monkeypatch) -> None:
+    """A reused runtime run still renders the timing section (build reuse is
+    fast, the reset shows up under database_prepare)."""
+
+    workspace, fingerprint = _make_workspace(tmp_path)
+    env = web_handler._build_e2e_runtime_env(str(workspace), ["test-e2e/login.spec.ts"], web_port=4321)
+    _make_sqlite(env["ARC_E2E_DB_PATH"])
+
+    handler = _make_handler(workspace)
+    handler._e2e_runtime_session = _make_session(env["ARC_E2E_DB_PATH"], fingerprint)
+
+    async def _fake_reset(runtime_env: dict) -> tuple[bool, str]:
+        return True, "reset ok"
+
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+    monkeypatch.setattr(handler, "_reset_live_e2e_database", _fake_reset)
+
+    result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    assert "=== Stage Timing ===" in result
+    assert "database_prepare=" in result
+    assert start_calls == []  # reuse confirmed: no fresh backend start

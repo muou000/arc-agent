@@ -852,6 +852,19 @@ def _print_llm_usage_body(totals: dict, summary: dict) -> None:
     if totals["calls"] > totals.get("unpriced_calls", 0):
         print(f"{Fore.WHITE}Cost:{Style.RESET_ALL}      {_format_cost_detail(totals.get('cost', {}))}")
 
+    timed_calls = totals.get("timed_calls", 0)
+    if timed_calls:
+        duration = totals.get("duration_s", 0.0)
+        streamed = totals.get("streamed_calls", 0)
+        plain = totals.get("plain_calls", 0)
+        attempts = totals.get("attempts", 0)
+        transport_note = f" ({streamed} streamed | {plain} plain)" if streamed or plain else ""
+        print(
+            f"{Fore.WHITE}Latency:{Style.RESET_ALL}    total {duration:,.0f}s over {timed_calls} timed call(s)"
+            f"{transport_note}; mean {duration / timed_calls:.1f}s/call,"
+            f" {attempts / timed_calls:.2f} attempts/call"
+        )
+
     for title, section_key in (("By phase", "by_phase"), ("By node", "by_node"), ("By model", "by_model")):
         section = summary.get(section_key, {})
         if not section:

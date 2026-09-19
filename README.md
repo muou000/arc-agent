@@ -112,6 +112,10 @@ ARC_MODEL_STREAM_TRANSPORT=stream        # 模型调用的流式传输策略（�
                                        # 端点对流式请求回 4xx 时自动回退纯非流式并进程内记住该端点）；
                                        # retry=首次非流式，仅连接类失败后的重试切流式；
                                        # 0/false/no/off=完全关闭流式（恢复旧行为）
+ARC_MODEL_STREAM_CHUNK_TIMEOUT=90      # 流式响应相邻 SSE chunk 的最大间隔秒数（默认 90，低于 langchain-openai
+                                       # 的 120s）：流中途静默卡死（TCP 存活但零字节）在该时限内被发现并按
+                                       # 连接类失败换传输方式重试，而不是等到 600s 读超时或把整个 agent
+                                       # 会话回退重放；设 0 关闭该看门狗
 ARC_VISUAL_PRECOMPUTE=1                # 编译前并发预分析需求参考图（设 0/false/no/off 关闭）
 ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
 ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_format）开关：auto（默认，对自定义
@@ -185,8 +189,10 @@ ARC-Bench 平台入口为 `main.py`，会自动附加 `compile` 子命令并读�
 
 每次模型调用的 token 用量与成本会在编译过程中写入 `.arc/runner-events.jsonl`（`llm_usage`
 事件，pi 风格语义：`input` 不含缓存读写，`reasoning` 是 `output` 的子集；provider 未返回
-usage 时以 tiktoken 估算并标记 `source: estimated`）。编译结束后可聚合查看每节点 / 每阶段 /
-每模型的用量与成本，以及 provider 前缀缓存命中率：
+usage 时以 tiktoken 估算并标记 `source: estimated`）。每个事件还携带可选的 `latency` 块
+（`duration_s` 端到端耗时、`transport` 实际应答的传输方式 `streamed`/`plain`、`attempts`
+适配器重试循环消耗的尝试次数；旧版本事件无该块，读取方需按可选处理）。编译结束后可聚合
+查看每节点 / 每阶段 / 每模型的用量、成本、调用延迟与传输分布，以及 provider 前缀缓存命中率：
 
 ```bash
 python arc_main.py usage --project-dir path/to/output          # 汇总报表

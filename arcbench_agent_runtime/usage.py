@@ -51,6 +51,14 @@ def empty_usage_bucket() -> dict[str, Any]:
         "cache_hit_rate": None,
         **{key: 0 for key in _TOKEN_KEYS},
         "cost": {key: 0.0 for key in _COST_KEYS},
+        # Latency telemetry (absent on events written before the field
+        # existed): ``duration_s`` sums only over ``timed_calls``, so
+        # per-call averages stay honest when old and new events share a file.
+        "duration_s": 0.0,
+        "timed_calls": 0,
+        "streamed_calls": 0,
+        "plain_calls": 0,
+        "attempts": 0,
     }
 
 
@@ -124,12 +132,47 @@ def _accumulate(bucket: dict[str, Any], record: dict[str, Any]) -> None:
             + _int(usage_dict.get("cache_read"))
             + _int(usage_dict.get("cache_write"))
         )
+    _accumulate_latency(bucket, record)
     cost = record.get("cost")
     if not isinstance(cost, dict):
         bucket["unpriced_calls"] += 1
         return
     for key in _COST_KEYS:
         bucket["cost"][key] += _float(cost.get(key))
+
+
+def _accumulate_latency(bucket: dict[str, Any], record: dict[str, Any]) -> None:
+    """Fold the optional per-call ``latency`` block into the bucket.
+
+    Events written before the telemetry existed (or by external runners) have
+    no block; their calls still count toward ``calls`` but not toward
+    ``timed_calls``, so ``duration_s / timed_calls`` is a true mean. A block
+    whose duration fails to parse does not count as timed either.
+    """
+
+    latency = record.get("latency")
+    if not isinstance(latency, dict):
+        return
+    duration = latency.get("duration_s")
+    if duration is not None and _is_float(duration):
+        bucket["timed_calls"] += 1
+        bucket["duration_s"] += _float(duration)
+    transport = str(latency.get("transport") or "")
+    if transport == "streamed":
+        bucket["streamed_calls"] += 1
+    elif transport == "plain":
+        bucket["plain_calls"] += 1
+    attempts = latency.get("attempts")
+    if attempts is not None:
+        bucket["attempts"] += _int(attempts)
+
+
+def _is_float(value: Any) -> bool:
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _cache_hit_rate(bucket: dict[str, Any]) -> float | None:
