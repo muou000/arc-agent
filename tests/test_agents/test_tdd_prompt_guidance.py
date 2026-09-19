@@ -30,12 +30,16 @@ def test_prompt_forbids_post_green_edits() -> None:
     prompt = _prompt()
     assert "layer is DONE" in prompt
     assert "do not edit its tests" in prompt
+    # The full constraint: green closes both the tests AND the code they
+    # cover (the REQ-1 failure mode was re-editing covered code, not tests).
+    assert "do not edit its tests or the code they cover anymore" in prompt
 
 
 def test_prompt_forbids_adversarial_test_silencing() -> None:
     prompt = _prompt()
     assert "zero-width" in prompt
     assert "Never silence a test by adversarial means" in prompt
+    assert "distinct accessible names" in prompt
 
 
 def test_prompt_requires_strictmode_check_before_exact_counts() -> None:
