@@ -60,9 +60,13 @@ def test_tdd_prompt_requires_quoted_anchors_verbatim() -> None:
     # matched neither branch of the external anchored locator
     # getByLabel(/^密码$|^password$/i).
     assert "exactly ONE requirement-quoted literal" in prompt
-    assert "Never concatenate several quoted literals" in prompt
+    assert "never merge several quoted literals into one visible string" in prompt
     assert "getByLabel(/^密码$|^password$/i)" in prompt
+    # The shared-control exception is phrased as a sanctioned exception, not
+    # a trailing "concatenate only when" that contradicted the absolute
+    # prohibition in the same bullet (review round 2).
     assert "intersection of the quoted-literal sets" in prompt
+    assert "sanctioned exception" in prompt
     assert "do not rewrite the test's selector to the translation" in prompt
     # Requirement-stated anchors outrank test-defined selectors; a generated
     # selector contradicting the requirement is a test defect (review round 2).
