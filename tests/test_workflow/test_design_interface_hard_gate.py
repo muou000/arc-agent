@@ -139,13 +139,7 @@ def test_design_phase_materialized_gate_also_covers_non_leaf(
     )
 
     ok = asyncio.run(
-        runner.run_design_phase(
-            node_id,
-            # children_ids must ride on the passed-in requirement data: the
-            # leaf/non-leaf split reads it before the traceability re-read,
-            # the same way core.workflow._run_task feeds this method.
-            {"name": "Home Shell", "description": "Shell", "children_ids": ["REQ-GATE-1B-CHILD"]},
-        )
+        runner.run_design_phase(node_id, {"name": "Home Shell", "description": "Shell"})
     )
 
     assert ok is False
@@ -201,6 +195,7 @@ def test_design_phase_fails_fast_for_leaf_claiming_files_it_never_wrote(
 ) -> None:
     node_id = "REQ-GATE-4"
     _seed_leaf_requirement(arc_runtime, node_id)
+    generator = _StubGenerator()
     runner, logs = _make_runner(
         tmp_project_dir,
         {
@@ -209,6 +204,7 @@ def test_design_phase_fails_fast_for_leaf_claiming_files_it_never_wrote(
             "files_written": ["frontend/src/pages/RegisterPage.tsx"],
             "materialized_paths": [],
         },
+        test_generator=generator,
     )
 
     ok = asyncio.run(
@@ -218,6 +214,9 @@ def test_design_phase_fails_fast_for_leaf_claiming_files_it_never_wrote(
     assert ok is False
     errors = [entry for entry in logs if entry[2] == "error"]
     assert any("DESIGN failed" in entry[1] for entry in errors)
+    # Fail fast here too: the self-reported files_written list is not write
+    # evidence, so the pass must not reach TestGenerator.
+    assert generator.run_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -241,10 +240,7 @@ def test_design_phase_warns_but_does_not_gate_when_non_leaf_records_nothing(
     )
 
     ok = asyncio.run(
-        runner.run_design_phase(
-            node_id,
-            {"name": "Home Shell", "description": "Shell", "children_ids": ["REQ-GATE-2-CHILD"]},
-        )
+        runner.run_design_phase(node_id, {"name": "Home Shell", "description": "Shell"})
     )
 
     assert ok is True

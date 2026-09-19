@@ -81,7 +81,6 @@ class WorkflowPhaseRunner:
         return get_runtime().traceability
 
     async def run_design_phase(self, node_id: str, requirement_data: dict[str, Any]) -> bool:
-        is_non_leaf = bool(requirement_data.get("children_ids"))
         requirement_data = await analyze_and_attach_visual_references(
             workspace_path=self.context_workspace_path,
             requirements_dir=str(Path(self.requirement_path).expanduser().resolve().parent),
@@ -89,6 +88,9 @@ class WorkflowPhaseRunner:
             log_cb=self._log,
         )
         requirement_data = self.traceability.get_requirement(node_id) or requirement_data
+        # The leaf/non-leaf split must use the traceability record's
+        # children_ids, not a caller's possibly-partial requirement snapshot.
+        is_non_leaf = bool(requirement_data.get("children_ids"))
         visual_reference = requirement_data.get("visual_reference") or []
         self._update_node_session(
             node_id,
