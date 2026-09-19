@@ -17,7 +17,14 @@ guidance now pins each control to exactly one requirement-quoted literal
 matchers in generated tests so concatenated labels turn red inside TDD, and
 treats visual-reference section titles as structural anchors (the same run
 asserted the register page's 账户信息 heading, which no requirement text
-mentions). These tests pin the prompt and skill wording that guards each mode.
+mentions).
+
+Coupling convention: the locators pinned below (for example
+``getByLabel(/^密码$|^password$/i)``) are the exact example strings the
+guidance teaches. Changing an example in a prompt or skill is a conscious
+edit that must update the matching pin in the same commit - the pins fail
+on purpose when examples drift, so reviewers see prose and tests move
+together.
 """
 from __future__ import annotations
 
@@ -55,7 +62,7 @@ def test_tdd_prompt_requires_quoted_anchors_verbatim() -> None:
     assert "exactly ONE requirement-quoted literal" in prompt
     assert "Never concatenate several quoted literals" in prompt
     assert "getByLabel(/^密码$|^password$/i)" in prompt
-    assert "intersection of their allowed literal sets" in prompt
+    assert "intersection of the quoted-literal sets" in prompt
     assert "do not rewrite the test's selector to the translation" in prompt
     # Requirement-stated anchors outrank test-defined selectors; a generated
     # selector contradicting the requirement is a test defect (review round 2).
@@ -108,7 +115,7 @@ def test_testgen_skill_literal_rules_pinned() -> None:
     assert "distinctly capitalized UI name" in skill
     assert "{ exact: true }" in skill
     assert "16b." in skill
-    assert "intersection of the referencing requirements' allowed sets" in skill
+    assert "intersection of the quoted-literal sets" in skill
     assert "16c." in skill
     assert "getByRole('alert')" in skill
 
@@ -127,7 +134,7 @@ def test_design_skills_shared_shell_literal_rules_pinned() -> None:
     assert "Carry requirement-stated UI anchors into the interface contract verbatim" in leaf_full
     assert "distinctly capitalized UI name" in leaf_full
     assert "exactly ONE requirement-quoted literal" in leaf_full
-    assert "intersection of the referencing requirements' allowed literal sets" in leaf_full
+    assert "intersection of the quoted-literal sets" in leaf_full
     assert "<label htmlFor>" in leaf_full
     # Visual-reference section titles are structural anchors: run 2 asserted
     # the register page's 账户信息 heading, which no requirement text mentions.
