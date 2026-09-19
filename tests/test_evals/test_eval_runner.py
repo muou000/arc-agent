@@ -78,6 +78,9 @@ def test_eval_table_end_to_end(tmp_path):
     assert comparison["est_cost"]["baseline"] == pytest.approx(0.02)
     assert comparison["est_cost"]["delta"] == pytest.approx(-0.002)
     assert comparison["latency_ms"]["baseline"] > comparison["latency_ms"]["candidate"] > 0
+    assert report["diagnostics"]["by_arm"]["baseline"]["outcomes"] == {"node_failed": 2}
+    assert report["diagnostics"]["by_arm"]["candidate"]["outcomes"] == {"passed": 2}
+    assert report["diagnostics"]["by_arm"]["baseline"]["llm"]["calls"] == 4
 
     # runs.jsonl: one record per run, in baseline-then-candidate interleaved order
     run_lines = (artifacts / "runs.jsonl").read_text(encoding="utf-8").strip().splitlines()
@@ -131,6 +134,46 @@ def test_eval_table_keep_workspaces(tmp_path):
     )
     assert (work / "baseline-rep001" / ".arc" / "runner-events.jsonl").exists()
     assert (work / "candidate-rep001" / ".arc" / "runner-events.jsonl").exists()
+
+
+def test_eval_table_alternate_arm_order_and_redacts_secrets(tmp_path):
+    baseline = ArmConfig(
+        label="b",
+        env={
+            "OPENAI_API_KEY": "secret",
+            "EVAL_FAKE_TOKENS": "10",
+            "API_KEYWORD": "visible config",
+            "ARC_FOO_APIKEY": "secret-value",
+            "NOTE": "token=sk-proj-test-secret-value-12345",
+            "CUSTOM_HEADER": "Bearer test-header-token-12345",
+        },
+    )
+    candidate = ArmConfig(label="c", env={"EVAL_FAKE_TOKENS": "10"})
+    result = eval_table(
+        "alternate",
+        baseline,
+        candidate,
+        requirement_path=_make_requirement(tmp_path),
+        repetitions=2,
+        runner_command=[sys.executable, str(FAKE_RUNNER)],
+        artifacts_dir=tmp_path / "artifacts",
+        work_root=tmp_path / "work",
+        arm_order="alternate",
+        log=lambda _message: None,
+    )
+    assert [run["arm"] for run in result.runs] == [
+        "baseline",
+        "candidate",
+        "candidate",
+        "baseline",
+    ]
+    assert result.report["arm_order"] == "alternate"
+    assert result.report["baseline"]["env"]["OPENAI_API_KEY"] == "<redacted>"
+    assert result.report["baseline"]["env"]["API_KEYWORD"] == "visible config"
+    assert result.report["baseline"]["env"]["ARC_FOO_APIKEY"] == "<redacted>"
+    assert result.report["baseline"]["env"]["NOTE"] == "<redacted>"
+    assert result.report["baseline"]["env"]["CUSTOM_HEADER"] == "<redacted>"
+    assert result.runs[0]["env"]["OPENAI_API_KEY"] == "<redacted>"
 
 
 def _work_root_from_log(logs: list[str]) -> Path:

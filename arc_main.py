@@ -412,6 +412,15 @@ def build_eval_parser(subparsers) -> None:
         help="Runs per arm; use one while iterating and 5 when reporting lift (default: 1)",
     )
     parser.add_argument(
+        "--arm-order",
+        choices=("baseline-first", "candidate-first", "alternate"),
+        default="baseline-first",
+        help=(
+            "Execution order per repetition; use alternate to reduce temporal bias "
+            "(default: baseline-first)"
+        ),
+    )
+    parser.add_argument(
         "-t",
         "--type",
         dest="app_type",
@@ -501,6 +510,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
             artifacts_dir=args.out_dir,
             work_root=args.work_root,
             keep_workspaces=args.keep_workspaces,
+            arm_order=args.arm_order,
         )
     except (ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}")

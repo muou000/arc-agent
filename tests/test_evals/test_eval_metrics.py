@@ -12,6 +12,7 @@ from core.evals import (
     parse_env_overrides,
     render_report_text,
     summarize_runs,
+    task_outcome_counts,
 )
 
 import pytest
@@ -38,6 +39,18 @@ def test_node_outcome_counts_empty():
     assert node_outcome_counts(None) == {"total": 0, "passed": 0, "failed": 0, "blocked": 0, "other": 0}
 
 
+def test_task_outcome_counts_buckets_queue_statuses():
+    assert task_outcome_counts(
+        [
+            {"status": "COMPLETED"},
+            {"status": "FAILED"},
+            {"status": "PENDING"},
+            {"status": "RUNNING"},
+            {"status": "unknown"},
+        ]
+    ) == {"total": 5, "completed": 1, "failed": 1, "pending": 1, "running": 1, "other": 1}
+
+
 # ---------------------------------------------------------------------------
 # collect_run_record
 # ---------------------------------------------------------------------------
@@ -46,6 +59,8 @@ def _write_workspace(
     *,
     node_states: dict[str, str] | None,
     usage_events: list[dict] | None,
+    tasks: list[dict] | None = None,
+    traceability_tests: dict | None = None,
 ):
     workspace = tmp_path / "ws"
     arc = workspace / ".arc"
@@ -55,9 +70,13 @@ def _write_workspace(
         (arc / "runner-events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     if node_states is not None:
         (arc / "processing_queue.json").write_text(
-            json.dumps({"root_id": "root", "tasks": [], "node_states": node_states}),
+            json.dumps({"root_id": "root", "tasks": tasks or [], "node_states": node_states}),
             encoding="utf-8",
         )
+    if traceability_tests is not None:
+        traceability_dir = arc / "traceability"
+        traceability_dir.mkdir()
+        (traceability_dir / "tests.json").write_text(json.dumps(traceability_tests), encoding="utf-8")
     return workspace
 
 
@@ -95,6 +114,9 @@ def test_collect_run_record_passed_run(tmp_path):
         "prompt_tokens": 20,
         "cache_hit_rate": 0.0,
     }
+    assert record["outcome"] == "passed"
+    assert record["diagnostics"]["tasks"]["present"] is False
+    assert record["diagnostics"]["llm_usage"]["by_phase"]["IMPLEMENT"]["total"] == 60
 
 
 def test_collect_run_record_usage_cache_hit_rate(tmp_path):
@@ -131,12 +153,108 @@ def test_collect_run_record_failed_node_is_not_passed(tmp_path):
     assert record["nodes_failed"] == 1
 
 
+def test_collect_run_record_blocked_node_is_not_passed(tmp_path):
+    workspace = _write_workspace(
+        tmp_path,
+        node_states={"n1": "PASSED", "n2": "BLOCKED_BY_DEPENDENCY"},
+        usage_events=[_USAGE_EVENT],
+    )
+    record = collect_run_record(workspace, exit_code=0, latency_ms=100.0)
+    assert record["passed"] is False
+    assert record["outcome"] == "node_blocked"
+    assert record["nodes_blocked"] == 1
+
+
 def test_collect_run_record_nonzero_exit_is_not_passed(tmp_path):
     workspace = _write_workspace(
         tmp_path, node_states={"n1": "PASSED"}, usage_events=[_USAGE_EVENT]
     )
     record = collect_run_record(workspace, exit_code=1, latency_ms=100.0)
     assert record["passed"] is False
+
+
+def test_collect_run_record_rejects_incomplete_queue(tmp_path):
+    workspace = _write_workspace(
+        tmp_path,
+        node_states={"n1": "DESIGNED"},
+        tasks=[{"task_id": "n1:IMPLEMENT", "status": "PENDING"}],
+        usage_events=[_USAGE_EVENT],
+    )
+    record = collect_run_record(workspace, exit_code=0, latency_ms=100.0)
+    assert record["passed"] is False
+    assert record["outcome"] == "incomplete_tasks"
+    assert record["tasks_pending"] == 1
+
+
+def test_collect_run_record_distinguishes_task_failure(tmp_path):
+    workspace = _write_workspace(
+        tmp_path,
+        node_states={"n1": "PASSED"},
+        tasks=[{"task_id": "n1:TEST", "status": "FAILED"}],
+        usage_events=[_USAGE_EVENT],
+    )
+    record = collect_run_record(workspace, exit_code=0, latency_ms=100.0)
+    assert record["passed"] is False
+    assert record["outcome"] == "task_failed"
+
+
+def test_collect_run_record_rejects_nonterminal_node_state(tmp_path):
+    workspace = _write_workspace(
+        tmp_path,
+        node_states={"n1": "DESIGNING"},
+        usage_events=[_USAGE_EVENT],
+    )
+    record = collect_run_record(workspace, exit_code=0, latency_ms=100.0)
+    assert record["passed"] is False
+    assert record["outcome"] == "incomplete_node_state"
+
+
+def test_collect_run_record_includes_failure_and_test_diagnostics(tmp_path):
+    failure_event = {
+        "type": "requirement_state",
+        "node_id": "n1",
+        "phase": "test",
+        "status": "failed",
+        "message": "Exit Code: 1\nError: assertion failed",
+    }
+    tool_event = {
+        "type": "tool_usage",
+        "node_id": "n1",
+        "phase": "IMPLEMENT",
+        "tool": "run_tests",
+        "status": "error",
+        "detail": {"result_empty": False, "limit": None},
+    }
+    workspace = _write_workspace(
+        tmp_path,
+        node_states={"n1": "FAILED"},
+        usage_events=[_USAGE_EVENT, failure_event, tool_event],
+        traceability_tests={
+            "t1": {"type": "Unit", "passed": True},
+            "t2": {"type": "E2E", "passed": False},
+            "t3": {"type": "E2E", "passed": None},
+        },
+    )
+    record = collect_run_record(workspace, exit_code=0, latency_ms=123.0)
+    diagnostics = record["diagnostics"]
+    assert diagnostics["events"]["counts"] == {
+        "llm_usage": 1,
+        "requirement_state": 1,
+        "tool_usage": 1,
+    }
+    assert diagnostics["events"]["failure_count"] == 1
+    assert diagnostics["events"]["failures"][0]["node_id"] == "n1"
+    assert diagnostics["tool_usage"]["totals"]["errors"] == 1
+    assert diagnostics["traceability_tests"] == {
+        "total": 3,
+        "passed": 1,
+        "failed": 1,
+        "unmeasured": 1,
+        "by_type": {
+            "Unit": {"total": 1, "passed": 1, "failed": 0, "unmeasured": 0},
+            "E2E": {"total": 2, "passed": 0, "failed": 1, "unmeasured": 1},
+        },
+    }
 
 
 def test_collect_run_record_without_artifacts(tmp_path):
@@ -146,6 +264,21 @@ def test_collect_run_record_without_artifacts(tmp_path):
     assert record["passed"] is False
     assert record["nodes_total"] == 0
     assert record["usage"] is None
+
+
+def test_collect_run_record_without_events_keeps_pass_and_marks_unmeasured(tmp_path):
+    workspace = _write_workspace(
+        tmp_path,
+        node_states={"n1": "PASSED"},
+        usage_events=None,
+    )
+    record = collect_run_record(workspace, exit_code=0, latency_ms=100.0)
+    assert record["passed"] is True
+    assert record["outcome"] == "passed"
+    assert record["usage"] is None
+    assert record["diagnostics"]["events_present"] is False
+    assert record["diagnostics"]["llm_usage"]["totals"]["calls"] == 0
+    assert record["diagnostics"]["tool_usage"]["totals"]["calls"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +319,9 @@ def test_summarize_paired_deltas():
     assert comparison["cache_hit_rate"]["delta"] == pytest.approx(20.0)
     assert comparison["latency_ms"]["delta"] == -10500.0
     assert comparison["est_cost"]["delta"] == pytest.approx(-0.0028)
+    assert comparison["latency_distribution"]["baseline"]["p95"] == pytest.approx(21900.0)
+    assert comparison["latency_distribution"]["candidate"]["median"] == pytest.approx(10500.0)
+    assert comparison["latency_distribution"]["paired_delta"]["max"] == pytest.approx(-10000.0)
 
 
 def test_summarize_missing_telemetry_keeps_other_side():
@@ -291,6 +427,28 @@ def test_render_report_text_unavailable_branches():
     assert "    Candidate  c (0/5 pairs)" in text
     assert "unavailable (0/5 pairs)" in text
     assert text.count("unavailable (missing telemetry)") == 4
+
+
+def test_render_report_text_annotates_latency_p95_sample_counts():
+    report = {
+        "set_name": "small sample",
+        "baseline": {"label": "b"},
+        "candidate": {"label": "c"},
+        "comparison": {
+            "pairs": 1,
+            "repetitions": 1,
+            "pass_rate": {"baseline": 100.0, "candidate": 100.0, "delta_pp": 0.0},
+            "tokens": {"baseline": 1.0, "candidate": 1.0, "delta": 0.0},
+            "cache_hit_rate": {"baseline": None, "candidate": None, "delta": None},
+            "latency_ms": {"baseline": 100.0, "candidate": 90.0, "delta": -10.0},
+            "latency_distribution": {
+                "baseline": {"n": 1, "p95": 100.0},
+                "candidate": {"n": 1, "p95": 90.0},
+            },
+            "est_cost": {"baseline": 0.0, "candidate": 0.0, "delta": 0.0},
+        },
+    }
+    assert "Latency p95  candidate 90.0ms (n=1), baseline 100.0ms (n=1)" in render_report_text(report)
 
 
 # ---------------------------------------------------------------------------
