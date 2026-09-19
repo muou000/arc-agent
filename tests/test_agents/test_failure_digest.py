@@ -284,3 +284,25 @@ def test_digest_two_suites_same_case_name_count_both_failures() -> None:
     assert names == ["A > saves", "B > saves"]
     errors = [item["error_lines"][0] for item in digest["failed_tests"] if item["error_lines"]]
     assert errors == ["AssertionError: boom A", "AssertionError: boom B"]
+
+
+def test_digest_resets_vitest_context_at_summary_lines() -> None:
+    """x-like rows after the vitest run summary must not be attributed.
+
+    ``Test Files`` / ``Tests`` summary lines close the per-file run block;
+    keeping the file context past them let any later "× row 12ms" from
+    unrelated output (custom loggers, CI summaries) leak into the digest
+    attributed to the last seen file.
+    """
+
+    output = (
+        "Exit Code: 1\n"
+        " ❯ tests/a.test.js (2 tests | 1 failed) 100ms\n"
+        "     × real failure 30ms\n"
+        " Test Files  1 failed (1)\n"
+        "      Tests  1 failed | 1 passed (2)\n"
+        " × unrelated summary row 12ms\n"
+    )
+    digest = build_failure_digest(output)
+    names = [item["name"] for item in digest["failed_tests"]]
+    assert names == ["real failure"]

@@ -159,6 +159,13 @@ def build_failure_digest(test_output: str) -> dict[str, Any]:
             # itself is not a failed test.
             vitest_current_file = header_match.group(1).strip()
             continue
+        if line.lstrip().startswith(("Test Files", "Tests ")):
+            # The vitest run block ended: its per-file summary lines close the
+            # section the × rows belong to, so drop the file context. A later
+            # "× row" outside a run block is unrelated output (custom loggers,
+            # CI summaries) and must not be attributed to the last file.
+            vitest_current_file = ""
+            continue
         match = _FAIL_LIST_LINE.match(line)
         if match:
             add(match.group(2).strip(), match.group(1).strip(), index)
