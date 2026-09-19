@@ -1323,3 +1323,26 @@ def test_install_tool_reaches_agent_without_shell() -> None:
     result = asyncio.run(broken(package="cookie-parser"))
     assert "Exit Code: 1" in result
     assert "not configured" in result
+
+
+def test_install_command_uses_argv_list() -> None:
+    """The install command must bypass the shell (review round-1 hardening).
+
+    ``_run_npm_command`` now accepts argv lists and uses
+    ``create_subprocess_exec`` for them; ``install_package`` passes the
+    validated package name as a single argv element so no shell quoting or
+    injection surface remains even if the name validation is ever relaxed.
+    """
+
+    import inspect
+
+    from app_type_handler import web as web_mod
+
+    # The public helper must route list commands through exec, not shell.
+    source = inspect.getsource(web_mod._run_npm_command)
+    assert "create_subprocess_exec" in source
+    assert "isinstance(command, list)" in source
+    # And install_package builds a list command containing the bare name.
+    install_source = inspect.getsource(web_mod.WebAppType.install_package)
+    assert '"npm",' in install_source
+    assert 'name,' in install_source

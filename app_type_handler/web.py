@@ -165,16 +165,27 @@ def _tail(text: str, limit: int = 1500) -> str:
 
 
 async def _run_npm_command(
-    command: str,
+    command: str | list[str],
     target_dir: str,
     timeout: float = NPM_INSTALL_TIMEOUT_SECONDS,
 ) -> tuple[int, str, str]:
-    process = await asyncio.create_subprocess_shell(
-        command,
-        cwd=target_dir,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    # A list command bypasses the shell entirely (no quoting/injection
+    # surface); a string command keeps the historical shell behavior for
+    # the flag-carrying install lines built from module constants.
+    if isinstance(command, list):
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=target_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    else:
+        process = await asyncio.create_subprocess_shell(
+            command,
+            cwd=target_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
     try:
         stdout, stderr = await asyncio.wait_for(
             process.communicate(),
@@ -2140,7 +2151,14 @@ class WebAppType(AppTypeHandler):
             f"Installing npm package '{name}' into {label}/ (no-save)...",
         )
         returncode, _stdout, stderr = await _run_npm_command(
-            f"npm install --no-save --no-package-lock {LEGACY_PEER_DEPS_FLAG} \"{name}\"",
+            [
+                "npm",
+                "install",
+                "--no-save",
+                "--no-package-lock",
+                *LEGACY_PEER_DEPS_FLAG.split(),
+                name,
+            ],
             target_dir,
             NPM_INSTALL_TIMEOUT_SECONDS,
         )

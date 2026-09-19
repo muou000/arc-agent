@@ -213,10 +213,13 @@ def classify_test_failure(test_output: str) -> str:
     Some failures are not the implementation's fault: a dependency is missing,
     the test runner was never installed, or ``node_modules`` is empty. Most of
     these have no in-run repair, so retrying only burns the TDD budget and
-    callers use this to stop the loop early. The exception is a bare missing
-    package name: the TDD-stage ``install_dependencies`` tool can install it,
-    so ``missing dependency: <pkg>`` reasons get an extra repair cycle in
-    ``core.phases`` instead of closing the layer.
+    callers use this to stop the loop early. The exception: reasons of the
+    exact form ``missing dependency: <pkg>`` (a bare package name surfaced by
+    ``Cannot find module`` / ``Cannot find package``) name something the
+    TDD-stage ``install_dependencies`` tool can install, so ``core.phases``
+    grants those one extra install-and-revalidate cycle before closing the
+    layer; every other reason, including relative-specifier ``Cannot find
+    module './helper'`` forms, keeps the close-the-layer behavior.
 
     Unresolved *relative* specifiers (``./helper``, ``../src/module``) are the
     exception: they point at workspace files the agent can create or import
