@@ -18,7 +18,11 @@ from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_install_dependencies_tool
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
 from agents.tools.test_manifest import normalize_manifest_path
-from agents.tools.test_failure_digest import build_failure_digest, format_failure_digest
+from agents.tools.test_failure_digest import (
+    build_failure_digest,
+    extract_build_note,
+    format_failure_digest,
+)
 from agents.tools.traceability import build_traceability_tools
 from app_type_handler.test_results import classify_test_failure, failure_fingerprint
 
@@ -327,6 +331,7 @@ class TestDrivenDeveloper:
             raw_output_path=self._extract_run_log_path(result),
             fingerprint=failure_fingerprint(result),
             environment_failure=classify_test_failure(result),
+            build=extract_build_note(result),
         )
         key_line = ""
         for line in (result or "").splitlines():

@@ -99,6 +99,35 @@ def test_rebuilds_when_a_source_file_changes(tmp_path, monkeypatch) -> None:
     assert len(recorder.calls) == 2
 
 
+def test_rebuild_output_states_the_verdict_with_source_fingerprint(tmp_path, monkeypatch) -> None:
+    """A fresh build must name what it served, like the reuse path does.
+
+    `dist/` is deny-listed for reads, so the run result's build verdict is the
+    only way a TDD session can know whether the backend serves the current
+    sources; the failure digest parses this exact line.
+    """
+
+    workspace = _make_workspace(tmp_path)
+    recorder = _BuildRecorder()
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+
+    fingerprint_v1 = web_handler._frontend_source_fingerprint(str(workspace / "frontend"))
+    first_ok, first_output = _build(workspace)
+    (workspace / "frontend" / "src" / "main.js").write_text("console.log('v2')\n", encoding="utf-8")
+    fingerprint_v2 = web_handler._frontend_source_fingerprint(str(workspace / "frontend"))
+    second_ok, second_output = _build(workspace)
+
+    assert first_ok and second_ok
+    assert (
+        f"Built `frontend/dist` from the current sources (fingerprint {fingerprint_v1[:12]})"
+        in first_output
+    )
+    assert (
+        f"Built `frontend/dist` from the current sources (fingerprint {fingerprint_v2[:12]})"
+        in second_output
+    )
+
+
 def test_rebuilds_when_a_dist_artifact_changes(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     recorder = _BuildRecorder()

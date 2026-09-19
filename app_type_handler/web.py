@@ -1159,6 +1159,15 @@ async def _build_frontend_dist(workspace_path: str) -> tuple[bool, str]:
         rebuilt_dist_fingerprint = _frontend_dist_fingerprint(frontend_path)
         if fingerprint is not None and rebuilt_dist_fingerprint is not None:
             _record_frontend_fingerprint(frontend_path, fingerprint, rebuilt_dist_fingerprint)
+        if fingerprint is not None:
+            # The reuse path states its verdict in prose; the rebuild path used
+            # to leave only raw npm output, so nothing in the run result named
+            # what was actually served. Emit the same kind of deterministic
+            # verdict (with the source fingerprint) the failure digest parses.
+            frontend_build_output += (
+                "\nBuilt `frontend/dist` from the current sources "
+                f"(fingerprint {fingerprint[:12]}).\n"
+            )
         return True, frontend_build_output
 
     if dist_index_path.exists():
