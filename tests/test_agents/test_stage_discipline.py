@@ -422,6 +422,106 @@ def test_interface_design_blocks_large_files() -> None:
     assert result.status == "error" and "small skeletons (at most 160 lines" in result.content
 
 
+def test_interface_design_blocks_obvious_business_mutations() -> None:
+    middleware = make("interface_design")
+    result = run(
+        middleware,
+        make_request(
+            "write_file",
+            {
+                "file_path": "/workspace/backend/src/services/notes.js",
+                "content": "export function createNote(db, note) {\n  return db.insert(note);\n}\n",
+            },
+        ),
+    )
+    assert result.status == "error"
+    assert "contract skeletons" in result.content
+
+
+def test_interface_design_blocks_repository_upsert_mutation() -> None:
+    middleware = make("interface_design")
+    result = run(
+        middleware,
+        make_request(
+            "write_file",
+            {
+                "file_path": "/workspace/backend/src/services/notes.js",
+                "content": (
+                    "export function createNote(repo, note) {\n"
+                    "  return repo.upsert({ table: 'notes', values: note });\n"
+                    "}\n"
+                ),
+            },
+        ),
+    )
+    assert result.status == "error"
+    assert "contract skeletons" in result.content
+
+
+def test_interface_design_allows_contract_only_content() -> None:
+    middleware = make("interface_design")
+    result = run(
+        middleware,
+        make_request(
+            "write_file",
+            {
+                "file_path": "/workspace/backend/src/services/notes.js",
+                "content": "export function createNote(note) {\n  throw new Error('NOT_IMPLEMENTED');\n}\n",
+            },
+        ),
+    )
+    assert result.content == "ok"
+
+
+def test_interface_design_allows_sql_documented_in_comments() -> None:
+    """Row shapes and queries documented in comments are not mutations."""
+    middleware = make("interface_design")
+    result = run(
+        middleware,
+        make_request(
+            "write_file",
+            {
+                "file_path": "/workspace/backend/src/repositories/notes.js",
+                "content": (
+                    "/**\n"
+                    " * Note persistence contract.\n"
+                    " * Row shape: {id, body}. Backing store performs\n"
+                    " * INSERT INTO notes (body) VALUES (?) on create.\n"
+                    " */\n"
+                    "// Purge removes rows with DELETE FROM notes WHERE trashed = 1.\n"
+                    "// Provider adapter owns UPDATE notes SET body = ?.\n"
+                    "export function createNote(note) {\n"
+                    "  throw new Error('NOT_IMPLEMENTED');\n"
+                    "}\n"
+                ),
+            },
+        ),
+    )
+    assert result.content == "ok"
+
+
+def test_interface_design_still_blocks_mutation_after_comment_lines() -> None:
+    """Comment stripping must not open a hole: real calls still block."""
+    middleware = make("interface_design")
+    result = run(
+        middleware,
+        make_request(
+            "write_file",
+            {
+                "file_path": "/workspace/backend/src/repositories/notes.js",
+                "content": (
+                    "// marks the insert path below\n"
+                    "export function createNote(db, note) {\n"
+                    "  return db.insert(note);\n"
+                    "}\n"
+                ),
+            },
+        ),
+    )
+    assert result.status == "error"
+    assert "contract skeletons" in result.content
+
+
 def test_interface_design_allows_bounded_append_continuations() -> None:
     middleware = make("interface_design")
     path = "/workspace/src/page.tsx"

@@ -31,12 +31,12 @@ def test_node_outcome_counts_buckets_states():
             "n5": "CONVERGED_WITH_FAILED_CHILDREN",
         }
     )
-    assert counts == {"total": 5, "passed": 2, "failed": 1, "other": 2}
+    assert counts == {"total": 5, "passed": 2, "failed": 1, "blocked": 0, "other": 2}
 
 
 def test_node_outcome_counts_empty():
-    assert node_outcome_counts({}) == {"total": 0, "passed": 0, "failed": 0, "other": 0}
-    assert node_outcome_counts(None) == {"total": 0, "passed": 0, "failed": 0, "other": 0}
+    assert node_outcome_counts({}) == {"total": 0, "passed": 0, "failed": 0, "blocked": 0, "other": 0}
+    assert node_outcome_counts(None) == {"total": 0, "passed": 0, "failed": 0, "blocked": 0, "other": 0}
 
 
 def test_task_outcome_counts_buckets_queue_statuses():
@@ -151,6 +151,18 @@ def test_collect_run_record_failed_node_is_not_passed(tmp_path):
     record = collect_run_record(workspace, exit_code=0, latency_ms=100.0)
     assert record["passed"] is False
     assert record["nodes_failed"] == 1
+
+
+def test_collect_run_record_blocked_node_is_not_passed(tmp_path):
+    workspace = _write_workspace(
+        tmp_path,
+        node_states={"n1": "PASSED", "n2": "BLOCKED_BY_DEPENDENCY"},
+        usage_events=[_USAGE_EVENT],
+    )
+    record = collect_run_record(workspace, exit_code=0, latency_ms=100.0)
+    assert record["passed"] is False
+    assert record["outcome"] == "node_blocked"
+    assert record["nodes_blocked"] == 1
 
 
 def test_collect_run_record_nonzero_exit_is_not_passed(tmp_path):

@@ -71,6 +71,7 @@ TASK_PENDING = "PENDING"
 TASK_RUNNING = "RUNNING"
 TASK_COMPLETED = "COMPLETED"
 TASK_FAILED = "FAILED"
+TASK_BLOCKED = "BLOCKED"
 
 NODE_UNSEEN = "UNSEEN"
 NODE_DESIGNING = "DESIGNING"
@@ -80,6 +81,7 @@ NODE_PASSED = "PASSED"
 NODE_CONVERGED = "CONVERGED"
 NODE_CONVERGED_WITH_FAILED_CHILDREN = "CONVERGED_WITH_FAILED_CHILDREN"
 NODE_FAILED = "FAILED"
+NODE_BLOCKED_BY_DEPENDENCY = "BLOCKED_BY_DEPENDENCY"
 
 
 def _worktrees_enabled() -> bool:
@@ -299,9 +301,16 @@ class ARCWorkflowManager:
         else:
             self.runtime.events.mark_run_failed("ARC compilation finished with failures.")
             failed_nodes = result.get("failed_nodes", [])
+            blocked_nodes = result.get("blocked_nodes", [])
+            unvalidated_tasks = result.get("unvalidated_tasks", [])
+            details = [f"failed: {', '.join(failed_nodes)}"] if failed_nodes else []
+            if blocked_nodes:
+                details.append(f"blocked: {', '.join(blocked_nodes)}")
+            if unvalidated_tasks:
+                details.append(f"unvalidated tasks: {', '.join(unvalidated_tasks)}")
             await self._log(
                 "Compiler",
-                f"Compilation finished with {len(failed_nodes)} failed node(s): {', '.join(failed_nodes)}",
+                "Compilation finished without an accepted result (" + "; ".join(details) + ")",
                 "error",
             )
         return result
@@ -461,6 +470,7 @@ class ARCWorkflowManager:
         max_concurrency = self._max_concurrent_tasks()
         if max_concurrency <= 1:
             while True:
+                await self._propagate_dependency_blocks(queue_state)
                 task = self._next_runnable_task(queue_state)
                 if task is None:
                     break
@@ -478,6 +488,14 @@ class ARCWorkflowManager:
         try:
             while True:
                 while len(in_flight) < max_concurrency:
+                    # Propagation runs before every pick because a task that
+                    # just finished may have failed and blocked its dependents.
+                    # It cannot race the in-flight executions: the marking
+                    # section has no await, it never rewrites a RUNNING task,
+                    # and an already-blocked node has no pending task left to
+                    # re-mark. The scan is in-memory and only a state change
+                    # saves the queue.
+                    await self._propagate_dependency_blocks(queue_state)
                     task = self._next_affinity_task(queue_state, in_flight.values())
                     if task is None:
                         break
@@ -502,6 +520,7 @@ class ARCWorkflowManager:
                     pending.cancel()
             if in_flight:
                 await asyncio.gather(*in_flight, return_exceptions=True)
+        await self._propagate_dependency_blocks(queue_state)
         # Normal completion only (cancellation re-raises through the finally):
         # the reusable subtree worktrees are no longer needed this run.
         await self._cleanup_reusable_worktrees()
@@ -597,6 +616,82 @@ class ARCWorkflowManager:
             return PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS
         return min(max(1, value), MAX_PARALLEL_TASKS)
 
+    async def _propagate_dependency_blocks(self, queue_state: dict[str, Any]) -> None:
+        """Mark pending dependents blocked when a prerequisite has failed.
+
+        A failed prerequisite must not be treated as a satisfied scheduling
+        edge. Independent nodes continue draining, while direct and
+        transitive dependents become explicit ``BLOCKED`` tasks instead of
+        remaining ambiguous ``PENDING`` work at the end of the run.
+
+        Only never-started ``PENDING`` work is marked, and a node with a
+        ``RUNNING`` task is skipped until that task ends: rewriting the
+        status of work that is already executing cannot stop it and would
+        only corrupt the record. The invariant still holds at drain end,
+        where nothing runs and every dependent of a failure is marked.
+        """
+
+        changed: list[tuple[str, list[str]]] = []
+        while True:
+            progress = False
+            for node_id in list(queue_state.get("node_states", {})):
+                blocked_by = self._failed_prerequisite_ids(queue_state, node_id)
+                if not blocked_by:
+                    continue
+                node_tasks = [
+                    task
+                    for task in queue_state.get("tasks", [])
+                    if str(task.get("node_id", "")) == node_id
+                ]
+                if any(task.get("status") == TASK_RUNNING for task in node_tasks):
+                    continue
+                pending_tasks = [
+                    task for task in node_tasks if task.get("status") == TASK_PENDING
+                ]
+                if not pending_tasks:
+                    continue
+                for task in pending_tasks:
+                    task["status"] = TASK_BLOCKED
+                self._set_node_state(
+                    queue_state["node_states"],
+                    node_id,
+                    NODE_BLOCKED_BY_DEPENDENCY,
+                )
+                changed.append((node_id, blocked_by))
+                progress = True
+            if not progress:
+                break
+
+        if not changed:
+            return
+        self._save_processing_queue(queue_state)
+        for node_id, dependency_ids in changed:
+            await self._log(
+                "Compiler",
+                (
+                    f"Blocked node {node_id}: prerequisite node(s) failed or were blocked "
+                    f"({', '.join(dependency_ids)}). Its tasks will not be treated as successful; "
+                    "independent nodes may continue for diagnostics."
+                ),
+                "warning",
+                node_id,
+            )
+
+    @staticmethod
+    def _failed_prerequisite_ids(queue_state: dict[str, Any], node_id: str) -> list[str]:
+        """Return failed declared dependencies and failed child work."""
+
+        failed: list[str] = []
+        for dependency_id in (queue_state.get("dependencies") or {}).get(node_id, []):
+            dependency_state = ARCWorkflowManager._implement_status(queue_state, dependency_id)
+            if dependency_state in {TASK_FAILED, TASK_BLOCKED}:
+                failed.append(str(dependency_id))
+        for descendant_id in (queue_state.get("descendants") or {}).get(node_id, []):
+            descendant_state = ARCWorkflowManager._implement_status(queue_state, descendant_id)
+            if descendant_state in {TASK_FAILED, TASK_BLOCKED}:
+                failed.append(str(descendant_id))
+        return failed
+
     def _begin_task(self, task: dict[str, Any], queue_state: dict[str, Any]) -> None:
         node_id = task["node_id"]
         phase = task["phase"]
@@ -641,37 +736,52 @@ class ARCWorkflowManager:
         merged = True
         merge_conflict: list[str] = []
         if ctx is not None:
-            # Commit the worktree and merge its branch back; a merge conflict
-            # fails the node even when its phase succeeded, because the work
-            # never reached the integration workspace. One narrow exception:
-            # the first DESIGN conflict re-queues the node once with the
-            # conflicting paths as guidance, so a parallel sibling that won
-            # the file does not cost the whole node.
-            merged, _detail, merge_conflict = await self._integrate_task_workspace(
-                ctx,
-                node_id,
-                phase if task_ok else f"{phase}-FAILED",
-                requirement_data,
-            )
-            if task_ok and not merged:
-                if (
-                    merge_conflict
-                    and phase == PHASE_DESIGN
-                    and not sessions.load_node_session(node_id).get("merge_conflict_retry_used")
-                ):
-                    requeued = await self._requeue_design_after_merge_conflict(
-                        ctx, queue_state, node_id, merge_conflict
-                    )
-                    if requeued:
-                        await self._close_task_workspace(ctx)
-                        return
-                # Requeue declined (already used, not a DESIGN conflict, or
-                # the requeue itself failed): fall through to the failure
-                # branch. The method tail still closes ctx with
-                # preserve=True there, so a declined requeue never leaks the
-                # worktree - it is preserved for --retry exactly like any
-                # other failed merge.
-                task_ok = False
+            if not task_ok:
+                # A failed phase may leave useful diagnostics in its isolated
+                # worktree, but it must never be merged into the accepted
+                # integration HEAD. Merging a ``DESIGN-FAILED`` checkpoint
+                # makes downstream nodes observe an unverified shell and was
+                # the source of false-successful continuation in failed runs.
+                merged = False
+                await self._log(
+                    "Compiler",
+                    f"Skipping integration for failed {phase} task of node {node_id}; preserving the isolated worktree for inspection/retry.",
+                    "warning",
+                    node_id,
+                )
+            else:
+                # Commit the worktree and merge its branch back; a merge
+                # conflict fails the node even when its phase succeeded,
+                # because the work never reached the integration workspace.
+                # One narrow exception: the first DESIGN conflict re-queues
+                # the node once with the conflicting paths as guidance, so a
+                # parallel sibling that won the file does not cost the whole
+                # node.
+                merged, _detail, merge_conflict = await self._integrate_task_workspace(
+                    ctx,
+                    node_id,
+                    phase,
+                    requirement_data,
+                )
+                if not merged:
+                    if (
+                        merge_conflict
+                        and phase == PHASE_DESIGN
+                        and not sessions.load_node_session(node_id).get("merge_conflict_retry_used")
+                    ):
+                        requeued = await self._requeue_design_after_merge_conflict(
+                            ctx, queue_state, node_id, merge_conflict
+                        )
+                        if requeued:
+                            await self._close_task_workspace(ctx)
+                            return
+                    # Requeue declined (already used, not a DESIGN conflict,
+                    # or the requeue itself failed): fall through to the
+                    # failure branch. The method tail still closes ctx with
+                    # preserve=True there, so a declined requeue never leaks
+                    # the worktree - it is preserved for --retry exactly like
+                    # any other failed merge.
+                    task_ok = False
 
         if task_ok:
             task["status"] = TASK_COMPLETED
@@ -1455,6 +1565,8 @@ class ARCWorkflowManager:
                 task["status"] = TASK_COMPLETED
             elif node_state == NODE_FAILED:
                 task["status"] = TASK_FAILED
+            elif node_state == NODE_BLOCKED_BY_DEPENDENCY:
+                task["status"] = TASK_BLOCKED
 
     def _recover_interrupted_queue(self, queue_state: dict[str, Any]) -> list[dict[str, str]]:
         recovered: list[dict[str, str]] = []
@@ -1541,18 +1653,15 @@ class ARCWorkflowManager:
         its own auth routes precisely because its design ran before the
         registration node's routes existed. A node's IMPLEMENT waits for its
         own DESIGN, for every descendant node's IMPLEMENT (children before
-        their parent; a failed descendant does not block its parent, matching
-        the historical rule that an earlier failed IMPLEMENT does not either),
+        their parent; a failed descendant keeps the parent IMPLEMENT from
+        claiming completion over an incomplete subtree),
         and for the IMPLEMENT of every declared dependency: the node's
         scenarios routinely read runtime state (accounts, routes, orders) that
         only those nodes create, so implementing earlier turns a missing
-        prerequisite into a false test failure. A failed dependency unblocks
-        both phases exactly like the failed-descendant rule (a failed
-        dependency lands nothing reusable, so the dependent works against the
-        integration state as it is and must supply its own prerequisites -
-        the alternative is a stalled queue), so the gate costs wall clock only
-        along declared dependency chains; independent subtrees still drain in
-        parallel. Sibling subtrees otherwise impose no order on each other,
+        prerequisite into a false test failure. A failed dependency blocks both
+        phases and is propagated as ``BLOCKED_BY_DEPENDENCY``; only a completed
+        dependency exposes a verified reusable surface. Independent subtrees
+        still drain in parallel. Sibling subtrees otherwise impose no order on each other,
         which is what makes parallel draining sound.
         """
 
@@ -1589,22 +1698,19 @@ class ARCWorkflowManager:
                 for other in queue_state["tasks"]
                 if other["phase"] == PHASE_IMPLEMENT and other["node_id"] in descendants
             ]
-            return all(
-                other["status"] in {TASK_COMPLETED, TASK_FAILED}
-                for other in descendant_tasks
-            )
+            return all(other["status"] == TASK_COMPLETED for other in descendant_tasks)
         return True
 
     @staticmethod
     def _declared_dependencies_satisfied(queue_state: dict[str, Any], node_id: str) -> bool:
-        """True when every declared dependency's IMPLEMENT task has ended.
+        """True when every declared dependency's IMPLEMENT task has passed.
 
         An IMPLEMENT completes only after its work is merged, so satisfied
         dependencies mean the dependency's surfaces are already on the
-        integration HEAD the task starts from. A failed dependency counts as
-        satisfied: the queue must keep draining instead of deadlocking,
-        matching the failed-descendant rule, and the dependent works against
-        whatever the dependency did land. A dependency with no IMPLEMENT task
+        integration HEAD the task starts from. A failed dependency is not
+        satisfied; the scheduler propagates an explicit blocked state to the
+        dependent instead of designing or implementing against an unverified
+        surface. A dependency with no IMPLEMENT task
         means the queue is inconsistent with the tree it was built from
         (restored maps are validated against this): block, matching the
         unknown-parent rule.
@@ -1612,7 +1718,7 @@ class ARCWorkflowManager:
 
         for dependency_id in (queue_state.get("dependencies") or {}).get(node_id, []):
             dependency_status = ARCWorkflowManager._implement_status(queue_state, dependency_id)
-            if dependency_status is None or dependency_status not in {TASK_COMPLETED, TASK_FAILED}:
+            if dependency_status != TASK_COMPLETED:
                 return False
         return True
 
@@ -1643,7 +1749,7 @@ class ARCWorkflowManager:
             requested_ids = [
                 node_id
                 for node_id, state in queue_state.get("node_states", {}).items()
-                if str(state or "").strip().upper() == NODE_FAILED
+                if str(state or "").strip().upper() in {NODE_FAILED, NODE_BLOCKED_BY_DEPENDENCY}
             ]
         elif retry_node_ids:
             requested_ids = [str(node_id).strip() for node_id in retry_node_ids if str(node_id).strip()]
@@ -1680,7 +1786,7 @@ class ARCWorkflowManager:
         design_status = str(design_task.get("status") or "").strip().upper()
         implement_status = str(implement_task.get("status") or "").strip().upper()
         design_failed = design_status == TASK_FAILED
-        implement_failed = implement_status == TASK_FAILED
+        implement_failed = implement_status in {TASK_FAILED, TASK_BLOCKED}
 
         if design_failed or design_status != TASK_COMPLETED:
             self._reset_node_from_design_retry(queue_state, node_id, design_task, implement_task)
@@ -1833,11 +1939,25 @@ class ARCWorkflowManager:
         failed_nodes = sorted(
             node_id for node_id, state in queue_state["node_states"].items() if state == NODE_FAILED
         )
+        blocked_nodes = sorted(
+            node_id
+            for node_id, state in queue_state["node_states"].items()
+            if state == NODE_BLOCKED_BY_DEPENDENCY
+        )
         completed_tasks = [task["task_id"] for task in queue_state["tasks"] if task["status"] == TASK_COMPLETED]
         all_completed = all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
+        pending_tasks = [
+            task["task_id"]
+            for task in queue_state["tasks"]
+            if task["status"] not in {TASK_COMPLETED, TASK_FAILED, TASK_BLOCKED}
+        ]
+        accepted = all_completed and not failed_nodes and not blocked_nodes
         return {
-            "ok": all_completed and not failed_nodes,
+            "ok": accepted,
+            "status": "PASS" if accepted else "FAIL",
             "failed_nodes": failed_nodes,
+            "blocked_nodes": blocked_nodes,
+            "unvalidated_tasks": pending_tasks,
             "visit_order": completed_tasks,
             "states": dict(queue_state["node_states"]),
         }

@@ -26,12 +26,14 @@ import pytest
 
 from core.workflow import (
     ARCWorkflowManager,
+    NODE_BLOCKED_BY_DEPENDENCY,
     NODE_FAILED,
     NODE_PASSED,
     PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS,
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
     TASK_COMPLETED,
+    TASK_BLOCKED,
     TASK_FAILED,
     TASK_PENDING,
     TASK_RUNNING,
@@ -509,6 +511,146 @@ def test_task_workspace_failure_fails_the_node_without_running_it(
     assert queue_state["node_states"]["RA"] == NODE_FAILED
     assert design_task["status"] == TASK_FAILED
     assert manager._port_slots == {}
+
+
+def test_failed_phase_is_not_integrated_and_worktree_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "1")
+    manager = _make_parallel_manager(tmp_path)
+    queue_state = _queue_state(manager, _requirement_tree())
+    task = next(task for task in queue_state["tasks"] if task["task_id"] == "RA:DESIGN")
+
+    async def failed_phase(current_task: dict[str, Any], ctx: Any = None) -> bool:
+        assert ctx is not None
+        Path(ctx.handle.path, "failed-design.js").write_text("unaccepted;\n", encoding="utf-8")
+        return False
+
+    monkeypatch.setattr(manager, "_run_task", failed_phase)
+    asyncio.run(manager._execute_task(task, queue_state))
+
+    workspace = Path(manager.workspace_path)
+    assert task["status"] == TASK_FAILED
+    assert queue_state["node_states"]["RA"] == NODE_FAILED
+    assert not (workspace / "failed-design.js").exists()
+    preserved = list((workspace / ".arc" / "worktrees").iterdir())
+    assert len(preserved) == 1 and "RA" in preserved[0].name
+
+
+def test_failed_dependency_blocks_only_declared_dependents(tmp_path: Path) -> None:
+    manager = _make_parallel_manager(tmp_path)
+    state = {
+        "tasks": [
+            {"task_id": "RA:DESIGN", "node_id": "RA", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_PENDING},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+            {"task_id": "RC:DESIGN", "node_id": "RC", "phase": PHASE_DESIGN, "status": TASK_PENDING},
+            {"task_id": "RC:IMPLEMENT", "node_id": "RC", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+        ],
+        "node_states": {"RA": NODE_FAILED, "RB": "UNSEEN", "RC": "UNSEEN"},
+        "dependencies": {"RB": ["RA"]},
+    }
+    manager.runtime.traceability.requirements["RC"] = {
+        "id": "RC",
+        "name": "RC",
+        "description": "req",
+    }
+
+    asyncio.run(manager._propagate_dependency_blocks(state))
+
+    rb_tasks = [task for task in state["tasks"] if task["node_id"] == "RB"]
+    rc_tasks = [task for task in state["tasks"] if task["node_id"] == "RC"]
+    assert all(task["status"] == TASK_BLOCKED for task in rb_tasks)
+    assert state["node_states"]["RB"] == NODE_BLOCKED_BY_DEPENDENCY
+    assert all(task["status"] == TASK_PENDING for task in rc_tasks)
+    assert state["node_states"]["RC"] == "UNSEEN"
+
+
+def test_dependency_block_propagation_is_idempotent_and_saves_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain calls propagation before every pick, so it must converge.
+
+    A second call over already-blocked state must not re-mark anything or
+    touch disk: only a state change saves the queue. A node with in-flight
+    work is left untouched - blocking a running task cannot stop it.
+    """
+    manager = _make_parallel_manager(tmp_path)
+    state = {
+        "tasks": [
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_PENDING},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+            {"task_id": "RC:DESIGN", "node_id": "RC", "phase": PHASE_DESIGN, "status": TASK_RUNNING},
+            {"task_id": "RC:IMPLEMENT", "node_id": "RC", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+        ],
+        "node_states": {"RA": NODE_FAILED, "RB": "UNSEEN", "RC": "UNSEEN"},
+        "dependencies": {"RB": ["RA"], "RC": ["RA"]},
+    }
+    saves: list[int] = []
+    original_save = manager._save_processing_queue
+
+    def counting_save(queue_state: dict[str, Any]) -> None:
+        saves.append(len(queue_state["tasks"]))
+        original_save(queue_state)
+
+    monkeypatch.setattr(manager, "_save_processing_queue", counting_save)
+
+    asyncio.run(manager._propagate_dependency_blocks(state))
+    assert len(saves) == 1
+    assert [task["status"] for task in state["tasks"]] == [
+        TASK_FAILED,
+        TASK_BLOCKED,
+        TASK_BLOCKED,
+        TASK_RUNNING,
+        TASK_PENDING,
+    ], "RB is blocked; RC keeps its running task and is skipped"
+    assert state["node_states"]["RB"] == NODE_BLOCKED_BY_DEPENDENCY
+    assert state["node_states"]["RC"] == "UNSEEN"
+
+    asyncio.run(manager._propagate_dependency_blocks(state))
+    assert len(saves) == 1, "a second pass over blocked state must not save again"
+    assert [task["status"] for task in state["tasks"]] == [
+        TASK_FAILED,
+        TASK_BLOCKED,
+        TASK_BLOCKED,
+        TASK_RUNNING,
+        TASK_PENDING,
+    ]
+
+    # Once RC's running task ends, the next pass still blocks its pending work.
+    state["tasks"][3]["status"] = TASK_COMPLETED
+    asyncio.run(manager._propagate_dependency_blocks(state))
+    assert [task["status"] for task in state["tasks"]] == [
+        TASK_FAILED,
+        TASK_BLOCKED,
+        TASK_BLOCKED,
+        TASK_COMPLETED,
+        TASK_BLOCKED,
+    ]
+    assert state["node_states"]["RC"] == NODE_BLOCKED_BY_DEPENDENCY
+    assert len(saves) == 2
+
+
+def test_failed_child_blocks_parent_implementation(tmp_path: Path) -> None:
+    manager = _make_parallel_manager(tmp_path)
+    state = {
+        "tasks": [
+            {"task_id": "R:DESIGN", "node_id": "R", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+            {"task_id": "R:IMPLEMENT", "node_id": "R", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+        ],
+        "node_states": {"R": "DESIGNED", "RA": NODE_FAILED},
+        "descendants": {"R": ["RA"]},
+        "dependencies": {},
+    }
+
+    asyncio.run(manager._propagate_dependency_blocks(state))
+
+    assert state["tasks"][2]["status"] == TASK_BLOCKED
+    assert state["node_states"]["R"] == NODE_BLOCKED_BY_DEPENDENCY
 
 
 def test_subtree_tasks_share_one_worktree_directory(
@@ -995,8 +1137,8 @@ def test_design_gate_applies_declared_dependencies_to_the_root() -> None:
     assert ARCWorkflowManager._task_dependencies_met(state, root) is True
 
     state["tasks"][2]["status"] = TASK_FAILED
-    assert ARCWorkflowManager._task_dependencies_met(state, root) is True, (
-        "a failed dependency releases the dependent root, matching the IMPLEMENT rule"
+    assert ARCWorkflowManager._task_dependencies_met(state, root) is False, (
+        "a failed dependency must block the dependent root"
     )
 
 

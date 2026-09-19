@@ -78,6 +78,7 @@ _QUEUE_FILENAME = "processing_queue.json"  # core.workflow QUEUE_FILENAME
 # FAILED entries, so CONVERGED_WITH_FAILED_CHILDREN is counted as neither.
 _NODE_PASSED_STATES = frozenset({"PASSED", "CONVERGED"})
 _NODE_FAILED_STATES = frozenset({"FAILED"})
+_NODE_BLOCKED_STATES = frozenset({"BLOCKED_BY_DEPENDENCY"})
 _TASK_COMPLETED_STATES = frozenset({"COMPLETED"})
 _TASK_FAILED_STATES = frozenset({"FAILED"})
 _ARM_ORDER_VALUES = frozenset({"baseline-first", "candidate-first", "alternate"})
@@ -153,13 +154,15 @@ def parse_env_overrides(pairs: Sequence[str], *, flag: str) -> dict[str, str]:
 def node_outcome_counts(node_states: dict[str, Any]) -> dict[str, int]:
     """Bucket a ``processing_queue.json`` ``node_states`` map."""
 
-    counts = {"total": 0, "passed": 0, "failed": 0, "other": 0}
+    counts = {"total": 0, "passed": 0, "failed": 0, "blocked": 0, "other": 0}
     for state in (node_states or {}).values():
         counts["total"] += 1
         if state in _NODE_PASSED_STATES:
             counts["passed"] += 1
         elif state in _NODE_FAILED_STATES:
             counts["failed"] += 1
+        elif state in _NODE_BLOCKED_STATES:
+            counts["blocked"] += 1
         else:
             counts["other"] += 1
     return counts
@@ -314,6 +317,8 @@ def _run_outcome(
         return False, "missing_node_states"
     if node_counts["failed"]:
         return False, "node_failed"
+    if node_counts["blocked"]:
+        return False, "node_blocked"
     if task_counts["failed"]:
         return False, "task_failed"
     if tasks_present and (
@@ -437,8 +442,9 @@ def collect_run_record(
     ``.arc/runner-events.jsonl`` for token/cost/tool/failure diagnostics; all
     evidence is optional so a run that crashed before producing artifacts still
     yields a usable record. A run counts as passed only when the queue is
-    complete (when present), every recorded node is terminal-successful, and
-    the runner exited 0.
+    complete (when present), every recorded node is terminal-successful (both
+    failed and ``BLOCKED_BY_DEPENDENCY`` nodes fail the run), and the runner
+    exited 0.
     """
 
     workspace = Path(workspace)
@@ -487,6 +493,7 @@ def collect_run_record(
         "nodes_total": counts["total"],
         "nodes_passed": counts["passed"],
         "nodes_failed": counts["failed"],
+        "nodes_blocked": counts["blocked"],
         "nodes_other": counts["other"],
         "node_states": node_states,
         "tasks_total": task_counts["total"],

@@ -24,7 +24,7 @@ flowchart LR
 
 - **需求树驱动**：非叶节点只做 UI 壳层设计，叶节点拥有完整的 UI → API → FUNC → DB 接口链。
 - **DESIGN 空接口骨架修复**：flash 级模型常见"文件已写完、大型结构化 interfaces 数组交白卷"（schema 合法但为空）。修复轮从物化文件机械推导契约骨架（routes→API、services/repositories→FUNC、CREATE TABLE→DB、pages/组件→UI；已注册契约的共享面 edit 标记为 update），把大型自由输出降格为逐行填空（responsibility/specification ≤200 字符），单轮失败后分批（每批 3-4 行）重试一轮，仍缺失的行用可溯源的保守机械记录兜底（带 `skeleton_derived` 标记，不发明文件/表名）；端点支持 strict json_schema 时修复轮 schema 携带 minItems 下界使白卷成为约束违规。无物化文件的空响应不做二次猜测（纯复用设计不受影响）。
-- **测试先行 + manifest 锁定 + 基线 RED 验证**：先声明并锁定测试清单，再生成测试文件，最后由 TDD 智能体实现代码。TestGenerator 在写第一个测试文件前必须调用 `declare_test_manifest` 声明完整清单（路径 + 类型 + 覆盖接口）：声明时即用 app-type 放置规则和追溯库接口 id 做早期校验，锁定后测试文件的写入/编辑/删除只落在已声明路径上（`StageDisciplineMiddleware` 写入端门禁）——改名重写、同一覆盖双格式重复建文件这类路径未定型的 churn 在写入时即被拒绝（run7 的 REQ-1 sessionHeader 系列改名与 passwordStrength 双格式尝试即此类产物）；测试 helper 与 runner 配置不占清单条目、不受锁约束。收尾对账：返回 manifest 中出现未声明路径的条目（幽灵条目）判为契约违规、DESIGN 失败；已声明已写入但被答案漏掉的行由声明机械补回；声明了但未写入的条目剔除并告警。基线验证分两道门：DESIGN 阶段测试生成完成后，系统立即在工作区仍只有设计骨架时逐文件预跑一次全 manifest（基线全红是测试设计的契约：生成测试必须驱动需求的最终行为，不允许对占位骨架通过）——绿灯文件按文件名打回 TestGenerator（同线程修复，最多 2 轮），要求删除或改写为对骨架必然失败的测试；修复轮的 manifest 锁用上一轮清单预置（只能删/改既有路径，不能引入新路径，rename 逃逸在写入端被堵死）；修复后仍绿则 DESIGN 阶段失败。节点 git 历史已含自身 implement 检查点的重试场景除外（行为已落地，绿灯合法，直接复用 tautology 快速通道）。DESIGN 基线的逐文件状态写入 node session，IMPLEMENT 阶段每层首个 agent session 之前复用该状态播种（不重复跑）：全绿层由系统直接整层回归关闭（tautology 快速通道），环境失败提前注入修复契约，红灯文件作为系统验证过的 RED 证据交给首个 session。TDD 循环以测试文件为微循环原子（逐文件 red→green，整层回归收口），同一失败指纹连续重复 3 次即触发假设轮换治理，测试预算耗尽即停。
+- **测试先行 + manifest 锁定 + 基线 RED 验证**：先声明并锁定测试清单，再生成测试文件，最后由 TDD 智能体实现代码。TestGenerator 在写第一个测试文件前必须调用 `declare_test_manifest` 声明完整清单（路径 + 类型 + `coverage_scope` + 覆盖接口）：`coverage_scope=owned` 表示当前节点新增行为，`dependency` 表示依赖回归，`shared` 表示共享契约。声明时即用 app-type 放置规则和追溯库接口 id 做早期校验，锁定后测试文件的写入/编辑/删除只落在已声明路径上（`StageDisciplineMiddleware` 写入端门禁）。收尾对账：返回 manifest 中出现未声明路径的条目判为契约违规；已声明已写入但被答案漏掉的行由声明机械补回；声明了但未写入的条目剔除并告警。基线验证要求当前节点至少保留一个 `owned` 测试作为 RED witness；依赖回归和共享契约测试允许预先绿色，但会作为 exempt coverage 记录，不能替代当前节点行为证据。绿色的 owned 文件最多打回 TestGenerator 2 轮，要求删除重复覆盖或改写为对骨架必然失败的测试；修复轮的 manifest 锁用上一轮清单预置，不能通过改名逃逸。节点 git 历史已含自身 implement 检查点的重试场景除外（行为已落地，绿灯合法）。DESIGN 基线的逐文件状态写入 node session，IMPLEMENT 阶段每层首个 agent session 之前复用该状态播种（不重复跑）：全绿层由系统直接整层回归关闭，环境失败提前注入修复契约，红灯文件作为系统验证过的 RED 证据交给首个 session。TDD 循环以测试文件为微循环原子（逐文件 red→green，整层回归收口），同一失败指纹连续重复 3 次即触发假设轮换治理，测试预算耗尽即停。
 - **技能系统**（`skills/`）：DESIGN 阶段前由模型按节点规划各 stage agent 应读取的技能（skill 目录为跨节点稳定前缀，需求快照驱动按节点差异化选择）；认证一致性与失败修复两类安全底线确定性注入，规划失败时不注入任何可选技能。
 - **可追溯性**（`arcbench_agent_runtime/`）：requirements / scenarios / interfaces / tests / call_edges / node_states / node_contracts 七张表落盘于 `.arc/traceability/`，事件流写入 `.arc/runner-events.jsonl`，满足比赛"可复现、可审计"的要求。
 - **断点续跑**：编译队列持久化于 `.arc/processing_queue.json`，支持 `--resume`、`--retry-failed`、`--retry <NODE_ID>`。
@@ -131,14 +131,14 @@ ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_for
 # DESIGN 完成并合并后才调度，子节点从包含父壳层（app 入口、布局、共享面）的
 # integration HEAD 分支出工作区，对共享面做增量注册不再与父节点的改写冲突
 # （父节点 DESIGN 失败不阻塞子节点）。需求树声明的 dependencies 参与调度：节点的
-# DESIGN 和 IMPLEMENT 都等到其依赖节点的 IMPLEMENT 结束（完成或失败，IMPLEMENT
-# 完成即工作已合并进 integration HEAD）后才开始——依赖方的设计因此从依赖节点
+# DESIGN 和 IMPLEMENT 都等到其依赖节点的 IMPLEMENT 成功并合并进 integration HEAD
+# 后才开始。依赖节点失败时，直接和传递依赖节点标记为 BLOCKED_BY_DEPENDENCY，
+# 不会在未验证的接口上继续实现；无依赖的独立节点仍可继续用于诊断，但整个编译结果
+# 不能因此变成成功。依赖方的设计因此从依赖节点
 # 真实落地的接口出发做增量复用（如登录节点直接复用注册节点的 auth 路由与会话
 # 头），不再并行重复设计同一套共享面；依赖节点的场景也常依赖其创建的运行期数据
 # （如登录节点的演示账号由注册节点创建），提前实现会把缺失前置状态变成假失败；
-# 依赖 IMPLEMENT 失败时依赖方照常放行（与失败后代不阻塞父节点同一权衡：失败的
-# 依赖没有落任何可复用接口，依赖方从当时的 integration HEAD 出发自行补齐，避免
-# 队列停摆）；依赖成环（含仅通过父子调度规则闭合的环，如叔侄交叉依赖）、祖先与
+# 依赖成环（含仅通过父子调度规则闭合的环，如叔侄交叉依赖）、祖先与
 # 自己的后代之间的边（父子规则本就保证其顺序），或恢复的队列里引用了本队列无法
 # 调度的节点（手改/外来队列文件）时，对应边丢弃并告警，避免队列停摆。亲和权重按
 # "本组剩余任务 + 等待它的各组剩余任务"计算，避免被全树依赖的小枢纽子树排在大型
