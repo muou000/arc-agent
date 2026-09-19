@@ -75,6 +75,16 @@ def test_selection_auth_floor():
     ) == ["auth-session-consistency"]
 
 
+def test_selection_test_generation_auth_floor_is_leaf_agnostic():
+    # Deliberate asymmetry with interface_design_skills: non-leaf nodes that
+    # carry a visual reference still run test generation (only non-leaf nodes
+    # *without* one skip the phase), and their snapshot's auth context stays
+    # safety-floor relevant. Unchanged from the planner era.
+    auth_req = {"name": "Login shell", "description": "register and log in users", "children_ids": ["c1", "c2"]}
+    assert select_test_generation_skills(auth_req) == ["auth-session-consistency"]
+    assert interface_design_skills(auth_req) == []
+
+
 def test_selection_failure_repair_floor():
     assert implementation_skills(
         interface_contract="",
