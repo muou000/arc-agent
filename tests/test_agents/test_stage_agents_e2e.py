@@ -18,6 +18,7 @@ from pathlib import Path
 from core import sessions
 from agents.interface_designer import InterfaceDesigner
 from agents.test_generator import TestGenerator
+from agents.tools.test_manifest import DeclaredTestFile, TestManifestLock
 from tests.helpers.faux import FauxChatModel, faux_tool_call
 
 
@@ -37,12 +38,13 @@ def make_designer(tmp_project_dir: Path, model: FauxChatModel, log_cb=None) -> I
     )
 
 
-def make_generator(tmp_project_dir: Path, model: FauxChatModel) -> TestGenerator:
+def make_generator(tmp_project_dir: Path, model: FauxChatModel, log_cb=None) -> TestGenerator:
     return TestGenerator(
         model=model,
         workspace_root=str(tmp_project_dir),
         requirement_path=str(tmp_project_dir / "requirements" / "req.md"),
         app_type="web",
+        log_cb=log_cb,
     )
 
 
@@ -1320,6 +1322,243 @@ def test_test_generator_repair_pass_cannot_introduce_new_test_paths(
     assert tests[0]["file_path"] == "backend/tests/unit/green.test.js"
     assert not (tmp_project_dir / "backend" / "tests" / "unit" / "greenV2.test.js").exists()
     assert current_interface_id_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# step-budget salvage (arc-output3 regression)
+# ---------------------------------------------------------------------------
+
+
+def test_test_generator_salvages_step_budget_when_all_declared_files_written(
+    tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """arc-output3 (2026-09-19): the model wrote every declared test file,
+    then looped on delete-rewrite cycles until the session step budget
+    raised GraphRecursionError — failing the whole DESIGN task although the
+    complete test suite was on disk and untouched. With the same shape (a
+    session crash after the declared files are materialized), the stage must
+    complete via the mechanical manifest re-attachment instead.
+
+    The crash is injected at the ``ainvoke_stage_agent`` seam — the real
+    session runs to normal completion first (declare, write, structured
+    answer), then the wrapper raises exactly what LangGraph raises on a
+    step-budget trip. Tripping the real limit would make the test depend on
+    opaque graph step accounting; the budget trip itself is covered by
+    ``test_agent_step_budget.py``.
+    """
+
+    import agents.test_generator as test_generator_module
+    from langgraph.errors import GraphRecursionError
+
+    node_id = "REQ-STEP-BUDGET-1"
+    seed_requirement(arc_runtime, node_id)
+
+    test_code = "test('add', () => { expect(add(1, 1)).toBe(2); });\n"
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "declare_test_manifest",
+                {"files": [{"file_path": "backend/tests/unit/calc.test.js", "type": "Unit", "interface_ids": []}]},
+                call_id="c0",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": test_code},
+                call_id="c1",
+            ),
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "One unit test for add().",
+                    "tests": [
+                        {
+                            "test_id": "T-ADD",
+                            "req_id": node_id,
+                            "interface_ids": [],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "first_line": "test('add', () => {",
+                        }
+                    ],
+                    "files_written": ["backend/tests/unit/calc.test.js"],
+                },
+                call_id="c2",
+            ),
+        ]
+    )
+
+    real_ainvoke = test_generator_module.ainvoke_stage_agent
+
+    async def crash_after_full_session(agent, **kwargs):
+        await real_ainvoke(agent, **kwargs)
+        raise GraphRecursionError("Recursion limit of 300 reached without hitting a stop condition.")
+
+    monkeypatch.setattr(test_generator_module, "ainvoke_stage_agent", crash_after_full_session)
+
+    logs: list[str] = []
+
+    def collect_log(agent_name: str, message: str, status: str | None, node_id: str | None) -> None:
+        logs.append(message)
+
+    tests, output_text = asyncio.run(
+        make_generator(tmp_project_dir, model, log_cb=collect_log).run(
+            node_id,
+            {"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    assert tests is not None and len(tests) == 1
+    row = tests[0]
+    assert row["file_path"] == "backend/tests/unit/calc.test.js"
+    assert row["manifest_reattached"] is True
+    # Mechanical id shape: <NODE>-T-<file stem with dots dashed> (the .test
+    # marker is part of the stem for `calc.test.js`).
+    assert row["test_id"] == "REQ-STEP-BUDGET-1-T-CALC-TEST"
+    assert row["type"] == "Unit"
+    assert "REQ-STEP-BUDGET-1-T-CALC-TEST" in output_text
+    # The salvaged suite is the real on-disk artifact.
+    assert (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").read_text(encoding="utf-8") == test_code
+    # The salvage is observable, not silent.
+    assert any("step budget" in message and "salvaging" in message for message in logs), logs
+
+
+def test_step_budget_salvage_declines_when_a_declared_file_is_missing(tmp_project_dir: Path) -> None:
+    """A crashed session that never finished the declared work must keep
+    failing the node: salvaging a partial suite is a silent quality cut."""
+
+    generator = _salvage_probe_generator(tmp_project_dir)
+    manifest_lock = TestManifestLock(
+        declared_files={
+            "backend/tests/unit/a.test.js": DeclaredTestFile(
+                file_path="backend/tests/unit/a.test.js", test_type="Unit"
+            ),
+            "backend/tests/unit/b.test.js": DeclaredTestFile(
+                file_path="backend/tests/unit/b.test.js", test_type="Unit"
+            ),
+        }
+    )
+    agent = _stub_agent_with_written_paths(["/workspace/backend/tests/unit/a.test.js"])
+
+    import asyncio as _asyncio
+    from langgraph.errors import GraphRecursionError
+
+    payload = _asyncio.run(
+        generator._salvage_step_budget(
+            node_id="REQ-SALVAGE-1",
+            manifest_lock=manifest_lock,
+            agent=agent,
+            exc=GraphRecursionError("Recursion limit of 300 reached"),
+        )
+    )
+    assert payload is None
+
+
+def test_step_budget_salvage_declines_without_a_locked_manifest(tmp_project_dir: Path) -> None:
+    generator = _salvage_probe_generator(tmp_project_dir)
+    agent = _stub_agent_with_written_paths(["/workspace/backend/tests/unit/a.test.js"])
+
+    import asyncio as _asyncio
+    from langgraph.errors import GraphRecursionError
+
+    payload = _asyncio.run(
+        generator._salvage_step_budget(
+            node_id="REQ-SALVAGE-1",
+            manifest_lock=TestManifestLock(),
+            agent=agent,
+            exc=GraphRecursionError("Recursion limit of 300 reached"),
+        )
+    )
+    assert payload is None
+
+
+def test_step_budget_salvage_declines_without_materialized_paths(tmp_project_dir: Path) -> None:
+    generator = _salvage_probe_generator(tmp_project_dir)
+    manifest_lock = TestManifestLock(
+        declared_files={
+            "backend/tests/unit/a.test.js": DeclaredTestFile(
+                file_path="backend/tests/unit/a.test.js", test_type="Unit"
+            )
+        }
+    )
+
+    import asyncio as _asyncio
+    from langgraph.errors import GraphRecursionError
+
+    payload = _asyncio.run(
+        generator._salvage_step_budget(
+            node_id="REQ-SALVAGE-1",
+            manifest_lock=manifest_lock,
+            agent=_stub_agent_with_written_paths([]),
+            exc=GraphRecursionError("Recursion limit of 300 reached"),
+        )
+    )
+    assert payload is None
+
+
+def test_step_budget_salvage_rows_flow_through_the_normal_reconciliation(tmp_project_dir: Path) -> None:
+    """The salvaged payload must satisfy the same post-pass contract as a
+    model-authored one: normalize keeps every row and the first-pass
+    reconciliation re-attaches nothing new and rejects nothing."""
+
+    import asyncio as _asyncio
+    from langgraph.errors import GraphRecursionError
+
+    from agents.results import normalize_test_manifest_payload
+
+    node_id = "REQ-SALVAGE-2"
+    generator = _salvage_probe_generator(tmp_project_dir)
+    manifest_lock = TestManifestLock(
+        declared_files={
+            "backend/tests/unit/a.test.js": DeclaredTestFile(
+                file_path="backend/tests/unit/a.test.js",
+                test_type="Unit",
+                interface_ids=["IF-A"],
+            )
+        }
+    )
+    written = ["/workspace/backend/tests/unit/a.test.js"]
+    payload = _asyncio.run(
+        generator._salvage_step_budget(
+            node_id=node_id,
+            manifest_lock=manifest_lock,
+            agent=_stub_agent_with_written_paths(written),
+            exc=GraphRecursionError("Recursion limit of 300 reached"),
+        )
+    )
+    assert payload is not None
+
+    tests = normalize_test_manifest_payload(payload)
+    reconciled, output_text = _asyncio.run(
+        generator._reconcile_first_pass(
+            node_id=node_id,
+            tests=tests,
+            raw_payload=payload,
+            manifest_lock=manifest_lock,
+            agent=_stub_agent_with_written_paths(written),
+        )
+    )
+    assert reconciled is not None and len(reconciled) == 1
+    assert reconciled[0]["test_id"] == "REQ-SALVAGE-2-T-A-TEST"
+    assert reconciled[0]["interface_ids"] == ["IF-A"]
+    assert payload["files_written"] == ["backend/tests/unit/a.test.js"]
+    assert "REQ-SALVAGE-2-T-A-TEST" in output_text
+
+
+def _salvage_probe_generator(tmp_project_dir: Path) -> TestGenerator:
+    return TestGenerator(
+        model="faux:probe",
+        workspace_root=str(tmp_project_dir),
+        requirement_path=str(tmp_project_dir / "requirements" / "req.md"),
+        app_type="web",
+    )
+
+
+def _stub_agent_with_written_paths(paths: list[str]):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        arc_stage_discipline=SimpleNamespace(materialized_paths=lambda: list(paths))
+    )
 
 
 # ---------------------------------------------------------------------------

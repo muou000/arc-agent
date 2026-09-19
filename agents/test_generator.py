@@ -24,9 +24,11 @@ from agents.tools.test_manifest import (
     build_declare_test_manifest_tool,
     canonical_test_type,
     normalize_coverage_scope,
+    normalize_manifest_path,
     reconcile_declared_manifest,
 )
 from agents.tools.traceability import build_traceability_tools
+from langgraph.errors import GraphRecursionError
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -145,20 +147,27 @@ class TestGenerator:
         )
         await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking test generation.", node_id=node_id)
-        raw_payload = await ainvoke_stage_agent(
-            agent,
-            message=message,
-            context=AgentRuntimeContext(
-                node_id=node_id,
-                phase="DESIGN",
-                app_type=app_type,
-                workspace_root=workspace_root,
-                requirement_path=self.requirement_path,
-            ),
-            thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:TestGenerator",
-            label=self.agent_name,
-            log_cb=self.log_cb,
-        )
+        try:
+            raw_payload = await ainvoke_stage_agent(
+                agent,
+                message=message,
+                context=AgentRuntimeContext(
+                    node_id=node_id,
+                    phase="DESIGN",
+                    app_type=app_type,
+                    workspace_root=workspace_root,
+                    requirement_path=self.requirement_path,
+                ),
+                thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:TestGenerator",
+                label=self.agent_name,
+                log_cb=self.log_cb,
+            )
+        except GraphRecursionError as exc:
+            raw_payload = await self._salvage_step_budget(
+                node_id=node_id, manifest_lock=manifest_lock, agent=agent, exc=exc
+            )
+            if raw_payload is None:
+                raise
         tests = normalize_test_manifest_payload(raw_payload)
         tests, output_text = await self._reconcile_first_pass(
             node_id=node_id,
@@ -171,6 +180,65 @@ class TestGenerator:
             return None, output_text
         await self._log(f"Test generation returned {len(tests)} test artifact(s).", node_id=node_id)
         return tests, output_text
+
+    async def _salvage_step_budget(
+        self,
+        *,
+        node_id: str,
+        manifest_lock: TestManifestLock,
+        agent: Any,
+        exc: GraphRecursionError,
+    ) -> dict[str, Any] | None:
+        """Complete a first pass whose step budget ran out with all work done.
+
+        The 2026-09-19 arc-output3 run crashed exactly here: the model wrote
+        every declared test file, then looped on delete-rewrite cycles until
+        LangGraph raised ``GraphRecursionError`` — failing the whole DESIGN
+        task while the complete, on-disk test suite was usable. When the
+        discipline's materialized paths cover the locked manifest, the
+        declared rows are re-attached mechanically (the same reconciliation
+        the normal path applies to a dropped row) and the pass completes
+        with a warning. Anything less — no locked manifest, nothing
+        materialized, or a declared file missing — returns ``None`` so the
+        error propagates: a partial suite salvaged from a crashed session is
+        a silent quality cut, not a rescue.
+        """
+
+        discipline = getattr(agent, "arc_stage_discipline", None)
+        written_paths = discipline.materialized_paths() if discipline is not None else []
+        if not manifest_lock.locked or not written_paths:
+            return None
+        written = {normalize_manifest_path(path) for path in written_paths}
+        missing = sorted(path for path in manifest_lock.declared_files if path not in written)
+        if missing:
+            await self._log(
+                "Test generation hit its step budget with declared file(s) never written: "
+                f"{', '.join(missing)}; not salvaging, failing the stage.",
+                status="warning",
+                node_id=node_id,
+            )
+            return None
+        tests = reconcile_declared_manifest(
+            manifest_items=[],
+            manifest_lock=manifest_lock,
+            written_paths=written_paths,
+            node_id=node_id,
+        )["tests"]
+        await self._log(
+            "Test generation session hit its step budget after every declared manifest file "
+            f"was written; salvaging {len(tests)} manifest row(s) mechanically instead of "
+            "failing the node.",
+            status="warning",
+            node_id=node_id,
+        )
+        return {
+            "summary": (
+                "Step budget reached after all declared test files were written; manifest "
+                "rows re-attached from the locked declaration."
+            ),
+            "tests": tests,
+            "files_written": [normalize_manifest_path(path) for path in written_paths],
+        }
 
     async def _reconcile_first_pass(
         self,
