@@ -82,7 +82,6 @@ class WorkflowPhaseRunner:
         return get_runtime().traceability
 
     async def run_design_phase(self, node_id: str, requirement_data: dict[str, Any]) -> bool:
-        is_non_leaf = bool(requirement_data.get("children_ids"))
         requirement_data = await analyze_and_attach_visual_references(
             workspace_path=self.context_workspace_path,
             requirements_dir=str(Path(self.requirement_path).expanduser().resolve().parent),
@@ -90,6 +89,9 @@ class WorkflowPhaseRunner:
             log_cb=self._log,
         )
         requirement_data = self.traceability.get_requirement(node_id) or requirement_data
+        # The leaf/non-leaf split must use the traceability record's
+        # children_ids, not a caller's possibly-partial requirement snapshot.
+        is_non_leaf = bool(requirement_data.get("children_ids"))
         visual_reference = requirement_data.get("visual_reference") or []
         self._update_node_session(
             node_id,
@@ -174,6 +176,27 @@ class WorkflowPhaseRunner:
                     "DESIGN failed: "
                     + f"{len(materialized_paths)} skeleton file(s) were materialized (e.g. {materialized_paths[0]}) "
                     + "but the response recorded no interface contracts; downstream stages would be blind to the design.",
+                    status="error",
+                    node_id=node_id,
+                )
+                return False
+            if not is_non_leaf:
+                # Hard gate: a leaf DESIGN pass that records no interface
+                # contracts and materializes no files has produced nothing
+                # downstream stages can anchor to. The observed failure shape
+                # is the reuse shortcut - the pass claims parent/dependency
+                # contracts in `summary` prose and returns an empty
+                # `interfaces` array - which only surfaced one stage later as
+                # a confusing TestGenerator ownership failure after the whole
+                # tree had waited on this node. The way out is to return the
+                # reused interfaces with their original interface_id.
+                await self._log(
+                    "InterfaceDesigner",
+                    "DESIGN failed: the leaf node recorded no interface contracts and "
+                    "materialized no files, so TestGenerator and TDD have no contract to "
+                    "anchor to. Reused parent/dependency interfaces must still be returned "
+                    "in `interfaces` with their original interface_id; summary prose alone "
+                    "does not attach the node to a contract.",
                     status="error",
                     node_id=node_id,
                 )
@@ -286,6 +309,8 @@ class WorkflowPhaseRunner:
                     "DESIGN failed: `owned` test coverage does not point to any "
                     "interface owned by the current node: "
                     + ", ".join(foreign_owned_tests)
+                    + ". If the current node's DESIGN recorded no owned interface "
+                    "contracts, inspect the interface design output first."
                 ),
                 status="error",
                 node_id=node_id,
