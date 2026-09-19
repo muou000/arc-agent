@@ -860,6 +860,10 @@ class WorkflowPhaseRunner:
         # failed run_tests call appends its fingerprint; three identical
         # consecutive fingerprints force a hypothesis-rotation directive.
         fingerprint_history: dict[str, list[str]] = {test_type: [] for test_type in ordered_types}
+        # Missing-package environment failures get one install_dependencies
+        # repair cycle per layer (see _installable_environment_failure); other
+        # environmental failures keep the original close-the-layer behavior.
+        environment_install_attempts: dict[str, int] = {test_type: 0 for test_type in ordered_types}
         await self._log(
             "TestDrivenDeveloper",
             "Running leaf TDD sessions in ordered layers with independent budgets: " + " -> ".join(ordered_types) + ".",
@@ -1089,19 +1093,42 @@ class WorkflowPhaseRunner:
                             node_id=node_id,
                         )
                 elif failure_now:
-                    # Still environmental after the one re-validation attempt:
-                    # spend the rest of this layer's budget up front so the
-                    # outer loop breaks instead of re-running a doomed command.
-                    await self._log(
-                        "TestDrivenDeveloper",
-                        (
-                            f"`run_tests` {selected_type} still fails for an environmental reason "
-                            f"({failure_now}); stopping the TDD loop instead of retrying."
-                        ),
-                        status="error",
-                        node_id=node_id,
-                    )
-                    usage_by_type[selected_type] = TDD_RUN_TESTS_BUDGET
+                    # Still environmental after the one re-validation attempt.
+                    # A missing-package failure is now recoverable through the
+                    # install_dependencies tool, so it gets one extra
+                    # repair-and-revalidate cycle instead of burning the layer;
+                    # every other environmental failure (empty node_modules,
+                    # missing runner, broken browser install) has no in-run
+                    # repair, so spend the rest of this layer's budget up
+                    # front and let the outer loop break instead of re-running
+                    # a doomed command.
+                    installable = _installable_environment_failure(failure_now)
+                    if environment_install_attempts.get(selected_type, 0) < 1 and installable:
+                        environment_install_attempts[selected_type] = (
+                            environment_install_attempts.get(selected_type, 0) + 1
+                        )
+                        await self._log(
+                            "TestDrivenDeveloper",
+                            (
+                                f"`run_tests` {selected_type} still reports {failure_now}; the missing "
+                                "package can be installed with the `install_dependencies` tool. "
+                                "Allowing one install-and-revalidate attempt."
+                            ),
+                            status="error",
+                            node_id=node_id,
+                        )
+                        environment_failure = failure_now
+                    else:
+                        await self._log(
+                            "TestDrivenDeveloper",
+                            (
+                                f"`run_tests` {selected_type} still fails for an environmental reason "
+                                f"({failure_now}); stopping the TDD loop instead of retrying."
+                            ),
+                            status="error",
+                            node_id=node_id,
+                        )
+                        usage_by_type[selected_type] = TDD_RUN_TESTS_BUDGET
                 else:
                     # The run now fails on assertions, not the environment: the
                     # earlier environment failure was repaired, so the normal
@@ -1814,6 +1841,25 @@ def collect_test_files(tests: list[dict[str, Any]]) -> list[str]:
         if file_path and file_path not in seen:
             seen.append(file_path)
     return seen
+
+
+#: Environment-failure reasons that name a concrete npm package. These are
+#: recoverable through the TDD-stage ``install_dependencies`` tool, so the
+#: loop grants one extra repair-and-revalidate cycle instead of closing the
+#: layer. Everything else (empty node_modules, missing runner, browser
+#: install) has no in-run repair.
+_INSTALLABLE_ENVIRONMENT_PREFIX = "missing dependency: "
+
+
+def _installable_environment_failure(reason: str | None) -> str:
+    """Return the missing package name when the environmental failure is installable."""
+
+    text = (reason or "").strip()
+    if text.startswith(_INSTALLABLE_ENVIRONMENT_PREFIX):
+        package = text[len(_INSTALLABLE_ENVIRONMENT_PREFIX):].strip()
+        if package:
+            return package
+    return ""
 
 
 def summarize_interface_artifacts(interfaces: list[dict[str, Any]]) -> dict[str, Any]:

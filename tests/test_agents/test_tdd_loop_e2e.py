@@ -18,6 +18,7 @@ from typing import Any
 from agents.test_driven_developer import TestDrivenDeveloper
 from core import sessions
 from core.phases import TDD_RUN_TESTS_BUDGET, TDD_STALL_THRESHOLD, WorkflowPhaseRunner
+from agents.tools.build import build_install_dependencies_tool
 from tests.helpers.faux import (
     FakeAppHandler,
     FauxChatModel,
@@ -394,10 +395,11 @@ MISSING_DEP_OUTPUT = "Error: Cannot find module '@testing-library/dom'"
 def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Path, arc_runtime) -> None:
     """A broken workspace must not burn the budget on every layer.
 
-    The agent cannot install a missing dependency mid-compile, so retrying the
-    same doomed command is pure waste. The executor grants exactly one
-    repair-and-revalidate attempt: an unrepaired retry executes once more,
-    fails environmentally again, and then the layer is closed for good.
+    Missing-package failures are installable via the ``install_dependencies``
+    tool, so they get one extra cycle before the layer closes (see the
+    install-cycle tests below). This test scripts an agent that never repairs
+    anything: every grant is wasted, and the layer still closes for good long
+    before the budget is spent.
     """
 
     node_id = "REQ-TDD-ENV"
@@ -411,17 +413,18 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
     script = [faux_tool_call("run_tests", {}, call_id=f"c{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
     script.append(faux_text("BLOCKED"))
     model = FauxChatModel(responses=script)
-    # Baseline env failure, agent env failure, unrepaired re-validation.
-    fake = FakeAppHandler([failing_test_output(detail=MISSING_DEP_OUTPUT) for _ in range(3)])
+    # Baseline env failure, agent env failure, unrepaired re-validation, and
+    # the still-environmental run after the wasted install cycle.
+    fake = FakeAppHandler([failing_test_output(detail=MISSING_DEP_OUTPUT) for _ in range(4)])
     runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
 
     final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
 
     assert final_ok is False
-    # Baseline + one failing attempt + one unrepaired re-validation, then the
-    # layer closes - Integration is never reached and no further doomed
-    # command runs.
-    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * 3
+    # Baseline + one failing attempt + one unrepaired re-validation + the
+    # post-install-cycle failure, then the layer closes - Integration is never
+    # reached and no further doomed command runs.
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * 4
     # NOTE: the agent *session* still runs to the end of its script. Ending the
     # LangGraph loop early needs a runtime hook that does not exist yet, so the
     # model keeps polling `run_tests` and getting "budget exhausted". Those
@@ -1188,3 +1191,135 @@ def test_followup_session_receives_digest_and_diff_hint(tmp_project_dir: Path, a
     assert "Structured Failure Digest" in session2_handoff
     # And the persisted raw output pointer reached the next session.
     assert ".arc/tdd_runs/" in session2_handoff
+
+
+# ---------------------------------------------------------------------------
+# Missing-package environment failures get one install_dependencies cycle
+# ---------------------------------------------------------------------------
+
+
+def test_missing_package_failure_grants_install_cycle(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A missing npm package must not close the layer on the second failure.
+
+    Observed on the 2026-09-19 test1 run: the agent required 'cookie-parser'
+    (not in the template), the second environmental failure burned the whole
+    Integration budget via the short-circuit, and the hand-written replacement
+    was never validated. The ``install_dependencies`` tool now exists, so a
+    ``missing dependency: <pkg>`` failure gets one extra repair-and-revalidate
+    cycle before the layer closes.
+    """
+
+    node_id = "REQ-TDD-INSTALL"
+    tests = [
+        {"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T2", "type": "Integration", "file_path": INTEGRATION_TEST_FILE},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    model = FauxChatModel(
+        responses=[
+            # Baseline env failure is reported to the first session.
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="u1"),
+            # Agent run fails environmentally (missing dependency).
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="u2"),
+            # Second env failure: the layer now offers the install path
+            # instead of closing. The agent installs and re-validates.
+            faux_tool_call(
+                "install_dependencies",
+                {"package": "cookie-parser", "target": "backend"},
+                call_id="i1",
+            ),
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="u3"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    fake = FakeAppHandler(
+        [
+            # Unit baseline (red, environmental), agent failure, still-env
+            # failure that grants the install cycle, post-install pass.
+            failing_test_output(detail=MISSING_DEP_OUTPUT),
+            failing_test_output(detail=MISSING_DEP_OUTPUT),
+            failing_test_output(detail=MISSING_DEP_OUTPUT),
+            passing_test_output(),
+            # Integration baseline is green, and the tautology fast path then
+            # runs one full-layer regression (system-run, no agent budget).
+            passing_test_output(),
+            passing_test_output(),
+        ]
+    )
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert fake.install_calls == [("cookie-parser", "backend")]
+    # Four Unit executions: baseline, agent failure, still-env failure (the
+    # one that used to burn the budget), post-install re-validation pass. The
+    # green Integration baseline closes the node without another agent run.
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * 4 + [
+        ("Integration", [INTEGRATION_TEST_FILE]),
+        ("Integration", [INTEGRATION_TEST_FILE]),
+    ]
+    all_tool_results = tool_results_text(model)
+    # The install result must name the package/target and tell the agent to
+    # re-run run_tests to validate the repair.
+    assert "cookie-parser" in all_tool_results
+    assert "backend/node_modules" in all_tool_results
+    assert "Re-run run_tests" in all_tool_results
+
+
+def test_missing_package_install_fails_closes_layer(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """After one failed install cycle the layer closes like any env failure.
+
+    The extra cycle is granted once per layer; a still-environmental failure
+    after it falls back to the original short-circuit (burn the remaining
+    budget, stop the loop) so a doomed command cannot spin forever.
+    """
+
+    node_id = "REQ-TDD-INSTALL-FAIL"
+    tests = [
+        {"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T2", "type": "Integration", "file_path": INTEGRATION_TEST_FILE},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    script = [faux_tool_call("run_tests", {}, call_id=f"c{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
+    script.append(faux_text("BLOCKED"))
+    model = FauxChatModel(responses=script)
+    # Baseline, failure, still-env failure (grants install), failure after the
+    # used-up install cycle (closes the layer for good).
+    fake = FakeAppHandler([failing_test_output(detail=MISSING_DEP_OUTPUT) for _ in range(4)])
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is False
+    # The layer closed after the second still-environmental failure; the
+    # Integration layer is never reached.
+    unit_calls = [call for call in fake.calls if call[0] == "Unit"]
+    assert len(unit_calls) == 4
+    integration_calls = [call for call in fake.calls if call[0] == "Integration"]
+    assert integration_calls == []
+    node_session = sessions.load_node_session(node_id)
+    assert "missing dependency" in node_session["recent_failure_summary"]
+
+
+def test_install_tool_reaches_agent_without_shell() -> None:
+    """The install tool is a plain function tool over the app handler."""
+
+    fake = FakeAppHandler()
+    tool = build_install_dependencies_tool(app_handler=fake, node_id="REQ-X")
+    result = asyncio.run(tool(package="cookie-parser", target="backend"))
+    assert "Exit Code: 0" in result
+    assert fake.install_calls == [("cookie-parser", "backend")]
+
+    missing = FakeAppHandler()
+    missing.run_build = None  # type: ignore[method-assign]
+    broken = build_install_dependencies_tool(app_handler=object(), node_id="REQ-X")
+    result = asyncio.run(broken(package="cookie-parser"))
+    assert "Exit Code: 1" in result
+    assert "not configured" in result

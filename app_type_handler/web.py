@@ -2098,6 +2098,72 @@ class WebAppType(AppTypeHandler):
         )
         return False
 
+    async def install_package(self, package: str, target: str = "") -> str:
+        """Install one named npm package into ``backend`` or ``frontend``.
+
+        Used by the TDD-stage ``install_dependencies`` tool when ``run_tests``
+        reports a missing package (``Cannot find module 'x'``). The package is
+        installed with ``--no-save --no-package-lock`` so the provided
+        template's ``package.json`` and lockfile stay untouched — the install
+        only fixes the runtime ``node_modules`` tree of this workspace. The
+        agent is still free to declare the dependency in ``package.json`` by
+        editing it (the file is writable), but nothing forces that edit.
+
+        ``--legacy-peer-deps`` matches the fallback posture of the primary
+        install: on npm 10.x a plain resolution can crash arborist on vitest's
+        optional peers, and reaching this method means the plain tree already
+        exists — the incremental add must not regress it.
+        """
+        name = (package or "").strip().strip("'\"")
+        if not re.match(r"^@?[A-Za-z0-9][A-Za-z0-9._/@-]*$", name):
+            return (
+                "Exit Code: 1\n"
+                "STDERR:\n"
+                f"Invalid package name: {name!r}. Pass a single npm package name, e.g. 'cookie-parser'.\n"
+            )
+        label = (target or "backend").strip().lower()
+        if label not in ("backend", "frontend"):
+            return (
+                "Exit Code: 1\n"
+                "STDERR:\n"
+                f"Unknown install target: {target!r}. Use 'backend' or 'frontend'.\n"
+            )
+        target_dir = os.path.join(self.workspace_path, label)
+        if not os.path.isdir(target_dir):
+            return (
+                "Exit Code: 1\n"
+                "STDERR:\n"
+                f"Install target directory does not exist: {label}/\n"
+            )
+        await self._log(
+            "System",
+            f"Installing npm package '{name}' into {label}/ (no-save)...",
+        )
+        returncode, _stdout, stderr = await _run_npm_command(
+            f"npm install --no-save --no-package-lock {LEGACY_PEER_DEPS_FLAG} \"{name}\"",
+            target_dir,
+            NPM_INSTALL_TIMEOUT_SECONDS,
+        )
+        if returncode != 0:
+            await self._log(
+                "System",
+                f"npm install of '{name}' into {label}/ failed: {_tail(stderr)}",
+                "warning",
+            )
+            return (
+                "Exit Code: 1\n"
+                "STDERR:\n"
+                f"npm install of '{name}' into {label}/ failed:\n{_tail(stderr)}\n"
+                "If the package name is wrong or the registry is unreachable, fall back to "
+                "a standard-library or local implementation.\n"
+            )
+        await self._log("System", f"npm install of '{name}' into {label}/ succeeded.")
+        return (
+            f"Exit Code: 0\n"
+            f"Installed '{name}' into {label}/node_modules (no-save; package.json and "
+            "lockfile untouched). Re-run run_tests to validate the repair.\n"
+        )
+
     async def run_build(self) -> str:
         frontend_result = await _execute_web_test_command(
             "npm run build",

@@ -211,10 +211,12 @@ def classify_test_failure(test_output: str) -> str:
     """Return a short reason when a failed run is environmental, else ``""``.
 
     Some failures are not the implementation's fault: a dependency is missing,
-    the test runner was never installed, or ``node_modules`` is empty. The agent
-    cannot fix any of these - it has no way to install packages mid-compile - so
-    retrying only burns the TDD budget. Callers use this to stop the loop early
-    instead of spending every attempt on an un-fixable failure.
+    the test runner was never installed, or ``node_modules`` is empty. Most of
+    these have no in-run repair, so retrying only burns the TDD budget and
+    callers use this to stop the loop early. The exception is a bare missing
+    package name: the TDD-stage ``install_dependencies`` tool can install it,
+    so ``missing dependency: <pkg>`` reasons get an extra repair cycle in
+    ``core.phases`` instead of closing the layer.
 
     Unresolved *relative* specifiers (``./helper``, ``../src/module``) are the
     exception: they point at workspace files the agent can create or import
