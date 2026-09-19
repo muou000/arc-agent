@@ -273,10 +273,11 @@ class InterfaceDesigner:
         The skills source is attached unconditionally: the runtime skills
         section lists the whole catalog and this stage agent picks what to
         read; ``required_skill_names`` only adds the safety-floor activation
-        policy on top.
+        policy on top. ``app_type`` selects the template shared surfaces that
+        stage discipline protects from whole-file rewrites (see
+        ``AppTypeHandler.template_shared_surfaces``).
         """
 
-        del app_type  # kept in the signature for parity with run()'s resolution
         return build_stage_agent(
             name="interface_designer",
             stage="interface_design",
@@ -293,6 +294,7 @@ class InterfaceDesigner:
             node_id=node_id,
             claims_workspace_root=self.context_workspace_root or workspace_root,
             pending_contract_registry=pending_contract_registry,
+            app_type=app_type,
         )
 
     async def _repair_empty_interfaces(

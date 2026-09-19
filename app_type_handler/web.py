@@ -1589,6 +1589,30 @@ async def probe_backend_health(workspace_path: str, port: int | None = None) -> 
 class WebAppType(AppTypeHandler):
     name = "web"
 
+    # Template files whose whole-file rewrite silently drops runtime wiring:
+    # static serving + SPA fallback + health (app.js), the server entry with
+    # the PORT contract (index.js), the database lifecycle the test harness
+    # and the runtime share (database/*), the root React render that owns
+    # BrowserRouter/StrictMode (main.tsx), the route table (App.tsx), and the
+    # shared axios client with the relative /api baseURL (api/index.ts).
+    # Distinct from ``workspace_glue_anchor_specs``: those drive workspace-map
+    # summaries, this list is the stage-discipline write policy.
+    template_shared_surfaces: frozenset[str] = frozenset(
+        {
+            "backend/src/app.js",
+            "backend/src/index.js",
+            "backend/src/database/index.js",
+            "backend/src/database/init_db.js",
+            "backend/src/database/db_runtime.js",
+            "backend/src/database/seed_db.js",
+            "backend/src/database/prepare_e2e.js",
+            "backend/src/database/test_harness.js",
+            "frontend/src/main.tsx",
+            "frontend/src/App.tsx",
+            "frontend/src/api/index.ts",
+        }
+    )
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Session-scoped E2E backend runtime (see `_try_reuse_e2e_backend_session`).

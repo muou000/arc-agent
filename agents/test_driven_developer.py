@@ -233,6 +233,7 @@ class TestDrivenDeveloper:
             tools=[run_tests, run_build, install_dependencies, *traceability_tools],
             node_id=node_id,
             claims_workspace_root=self.context_workspace_root or workspace_root,
+            app_type=app_type,
         )
         message = get_user_prompt(
             node_id=node_id,

@@ -351,6 +351,7 @@ def build_stage_agent(
     claims_workspace_root: str | None = None,
     test_manifest_lock: Any | None = None,
     pending_contract_registry: Any | None = None,
+    app_type: str | None = None,
 ):
     """Create an agent instance with ARC's first-batch filesystem policy.
 
@@ -364,6 +365,11 @@ def build_stage_agent(
     ``pending_contract_registry`` wires the interface_design stage's
     write-time contract registration (see
     ``agents/design/contract_skeleton.py``); other stages ignore it.
+
+    ``app_type`` selects the template shared surfaces stage discipline
+    protects from whole-file rewrites (see
+    ``AppTypeHandler.template_shared_surfaces``); ``None``/unknown types
+    protect nothing.
     """
 
     _apply_windows_filesystem_path_compat()
@@ -417,6 +423,7 @@ def build_stage_agent(
         file_claim_gate=file_claim_gate,
         test_manifest_lock=test_manifest_lock if stage == "test_generation" else None,
         pending_contract_registry=pending_contract_registry if stage == "interface_design" else None,
+        template_shared_surfaces=_template_shared_surfaces(app_type),
     )
     permissions = _build_filesystem_permissions(
         root,
@@ -908,6 +915,24 @@ def _to_virtual_workspace_path(path: str, root: Path) -> str:
 
 def _compiler_skills_root() -> Path:
     return Path(__file__).resolve().parents[2] / "skills"
+
+
+def _template_shared_surfaces(app_type: str | None) -> frozenset[str]:
+    """Shared template surfaces stage discipline protects from rewrites.
+
+    Lazy import: the app-type registry pulls handler modules with heavier
+    dependencies, and ``build_stage_agent`` runs on every stage construction.
+    No exception handling here: ``normalize_app_type`` falls back to ``web``
+    for unknown values instead of raising, so any failure that reaches this
+    function is a real bug and must surface (silently protecting nothing is
+    the regression this guard exists to prevent).
+    """
+
+    if not app_type:
+        return frozenset()
+    from app_type_handler import template_shared_surfaces
+
+    return template_shared_surfaces(app_type)
 
 
 def _normalize_virtual_path(path: str) -> str:

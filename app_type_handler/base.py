@@ -55,6 +55,16 @@ def template_candidates(template_id: str) -> list[str]:
 class AppTypeHandler(ABC):
     name = "web"
 
+    # Workspace-relative paths of template files that carry runtime wiring no
+    # generation stage owns. Stage discipline rejects whole-file ``write_file``
+    # on them (``edit_file``/``append_file`` stay allowed) so a skeleton can
+    # never drop the wiring — the 0aca31c5 run lost the web template's static
+    # serving to a DESIGN skeleton and burned 47 minutes of TDD on the resulting
+    # blank-page E2E loop. Keep the list to files whose loss produces silent,
+    # hard-to-diagnose breakage; loud-failing files (configs, package.json)
+    # stay freely editable.
+    template_shared_surfaces: frozenset[str] = frozenset()
+
     def __init__(
         self,
         workspace_path: str,
