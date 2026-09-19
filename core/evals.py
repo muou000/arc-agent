@@ -71,6 +71,7 @@ _QUEUE_FILENAME = "processing_queue.json"  # core.workflow QUEUE_FILENAME
 # FAILED entries, so CONVERGED_WITH_FAILED_CHILDREN is counted as neither.
 _NODE_PASSED_STATES = frozenset({"PASSED", "CONVERGED"})
 _NODE_FAILED_STATES = frozenset({"FAILED"})
+_NODE_BLOCKED_STATES = frozenset({"BLOCKED_BY_DEPENDENCY"})
 
 _CNY = "¥"
 _ARM_KEYS = ("baseline", "candidate")
@@ -125,13 +126,15 @@ def parse_env_overrides(pairs: Sequence[str], *, flag: str) -> dict[str, str]:
 def node_outcome_counts(node_states: dict[str, Any]) -> dict[str, int]:
     """Bucket a ``processing_queue.json`` ``node_states`` map."""
 
-    counts = {"total": 0, "passed": 0, "failed": 0, "other": 0}
+    counts = {"total": 0, "passed": 0, "failed": 0, "blocked": 0, "other": 0}
     for state in (node_states or {}).values():
         counts["total"] += 1
         if state in _NODE_PASSED_STATES:
             counts["passed"] += 1
         elif state in _NODE_FAILED_STATES:
             counts["failed"] += 1
+        elif state in _NODE_BLOCKED_STATES:
+            counts["blocked"] += 1
         else:
             counts["other"] += 1
     return counts
@@ -151,8 +154,8 @@ def collect_run_record(
     run that crashed before producing artifacts still yields a usable record.
     ``cache_hit_rate`` is ``None`` when no call reported a provider cache
     breakdown (denominator ``prompt_tokens`` stayed 0). A run counts as passed
-    only when the runner exited 0, no node stayed in a failed state, and at
-    least one node was recorded.
+    only when the runner exited 0, no node stayed in a failed or
+    ``BLOCKED_BY_DEPENDENCY`` state, and at least one node was recorded.
     """
 
     workspace = Path(workspace)
@@ -179,9 +182,15 @@ def collect_run_record(
         "nodes_total": counts["total"],
         "nodes_passed": counts["passed"],
         "nodes_failed": counts["failed"],
+        "nodes_blocked": counts["blocked"],
         "nodes_other": counts["other"],
         "node_states": node_states,
-        "passed": bool(ok and counts["total"] > 0 and counts["failed"] == 0),
+        "passed": bool(
+            ok
+            and counts["total"] > 0
+            and counts["failed"] == 0
+            and counts["blocked"] == 0
+        ),
         "usage": usage,
     }
 

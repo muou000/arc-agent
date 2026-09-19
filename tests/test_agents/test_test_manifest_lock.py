@@ -98,6 +98,38 @@ def test_declaration_locks_the_manifest() -> None:
         "backend/test-e2e/login.spec.js",
         "tests/unit/a.test.ts",
     ]
+    assert all(row["coverage_scope"] == "owned" for row in payload["manifest"])
+
+
+def test_declaration_preserves_explicit_coverage_scope() -> None:
+    payload = _parse(
+        _declare(
+            [
+                {
+                    "file_path": "tests/unit/dependency.test.ts",
+                    "type": "Unit",
+                    "coverage_scope": "dependency",
+                },
+                {
+                    "file_path": "tests/unit/shared.test.ts",
+                    "type": "Unit",
+                    "coverage_scope": "shared",
+                },
+            ]
+        )
+    )
+    assert payload["status"] == "locked"
+    assert {row["coverage_scope"] for row in payload["manifest"]} == {"dependency", "shared"}
+
+
+def test_declaration_rejects_unknown_coverage_scope() -> None:
+    payload = _parse(
+        _declare(
+            [{"file_path": "tests/unit/a.test.ts", "type": "Unit", "coverage_scope": "fixture"}]
+        )
+    )
+    assert payload["status"] == "error"
+    assert "coverage_scope` must be one of" in payload["error"]
 
 
 def test_declaration_rejects_bad_type_and_missing_path() -> None:
@@ -324,6 +356,7 @@ def test_reconcile_reattaches_written_files_dropped_from_the_answer() -> None:
     assert reattached["file_path"] == "tests/unit/a.test.ts"
     assert reattached["type"] == "Unit"
     assert reattached["interface_ids"] == ["IF-A"]
+    assert reattached["coverage_scope"] == "owned"
     assert reattached["manifest_reattached"] is True
     # The node prefix keeps ids globally unique and traceable per the
     # manifest contract; req_id names the owning node.

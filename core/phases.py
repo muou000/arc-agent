@@ -23,6 +23,7 @@ from core.path_compat import normalize_windows_extended_prefix_text
 from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 from core.visual_analysis import analyze_and_attach_visual_references
 from app_type_handler.test_results import classify_test_failure, failure_fingerprint, parse_test_results
+from agents.tools.test_manifest import normalize_coverage_scope
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -263,6 +264,33 @@ class WorkflowPhaseRunner:
             await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
             return False
 
+        owned_interface_ids = {
+            str(item.get("interface_id") or "").strip()
+            for item in prepared_interfaces
+            if str(item.get("interface_id") or "").strip()
+        }
+        foreign_owned_tests = [
+            str(item.get("file_path") or "").strip()
+            for item in stored_tests
+            if normalize_coverage_scope(item.get("coverage_scope")) == "owned"
+            and normalize_string_list(item.get("interface_ids"))
+            and not (
+                set(normalize_string_list(item.get("interface_ids"))) & owned_interface_ids
+            )
+        ]
+        if foreign_owned_tests:
+            await self._log(
+                "TestGenerator",
+                (
+                    "DESIGN failed: `owned` test coverage points only to interfaces "
+                    "outside the current node: "
+                    + ", ".join(foreign_owned_tests)
+                ),
+                status="error",
+                node_id=node_id,
+            )
+            return False
+
         # Static satisfiability check, before any baseline run spends real
         # test executions: extract the observable hooks the E2E/Integration
         # tests drive and classify them against the requirement + interface
@@ -293,6 +321,7 @@ class WorkflowPhaseRunner:
             node_id=node_id,
             requirement_data=requirement_data,
             prepared_tests=stored_tests,
+            owned_interface_ids=owned_interface_ids,
         )
         # The E2E baseline runs may have started the session-scoped backend
         # runtime; DESIGN must not leave it holding the task's port (the
@@ -442,19 +471,17 @@ class WorkflowPhaseRunner:
         node_id: str,
         requirement_data: dict[str, Any],
         prepared_tests: list[dict[str, Any]],
+        owned_interface_ids: set[str],
     ) -> dict[str, Any] | None:
-        """System-run baseline RED gate over the freshly generated manifest.
+        """System-run baseline gate over the freshly generated manifest.
 
-        Runs every manifest file once through the real test executor right
-        after test generation, while the workspace still only contains the
-        DESIGN skeletons. The intended state is all-RED: the TestGenerator
-        contract requires tests that drive the requirement's final behavior
-        and never pass against placeholder scaffolds. Green files are
-        rejected back to the TestGenerator (same thread) with the exact file
-        list; it must delete or rework each one. After
-        ``DESIGN_BASELINE_MAX_REJECTIONS`` rounds, surviving green files fail
-        the DESIGN phase instead of being waved through by the tautology
-        fast path at IMPLEMENT time.
+        Current-node behavior is governed by an ownership witness: at least
+        one ``owned`` test must be genuinely RED before IMPLEMENT. Tests
+        explicitly marked ``dependency`` or ``shared`` are regression checks;
+        they may already be green and are recorded as exempt evidence instead
+        of forcing a rejection round. This keeps baseline validation strict
+        for new behavior without requiring inherited/shared coverage to be
+        artificially broken.
 
         Returns ``None`` when the gate hard-fails, otherwise a dict with:
         - ``file_state``: ``{file_path: "red" | "green" | None}`` seeds for
@@ -470,12 +497,23 @@ class WorkflowPhaseRunner:
         intended outcome there).
         """
         del requirement_data
-        layer_files: list[tuple[str, str]] = []
+        layer_files: list[tuple[str, str, str]] = []
         for test_type in TDD_BATCH_ORDER:
-            for path in collect_test_files(
-                [item for item in prepared_tests if str(item.get("type", "")).strip().lower() == test_type.lower()]
-            ):
-                layer_files.append((test_type, path))
+            layer_items = [
+                item
+                for item in prepared_tests
+                if str(item.get("type", "")).strip().lower() == test_type.lower()
+            ]
+            items_by_path = {
+                str(item.get("file_path", "") or "").strip(): item
+                for item in layer_items
+                if str(item.get("file_path", "") or "").strip()
+            }
+            for path in collect_test_files(layer_items):
+                item = items_by_path.get(path, {})
+                layer_files.append(
+                    (test_type, path, normalize_coverage_scope(item.get("coverage_scope")) or "owned")
+                )
         if not layer_files:
             return {"file_state": {}, "revised_tests": None, "skipped": "no tests"}
 
@@ -513,19 +551,25 @@ class WorkflowPhaseRunner:
         manifest_revised = False
         file_state: dict[str, str | None] = {}
         green_evidence: list[dict[str, Any]] = []
+        exempt_green_evidence: list[dict[str, Any]] = []
+        owned_paths = {
+            path
+            for _test_type, path, scope in layer_files
+            if scope == "owned"
+        }
 
-        for test_type, path in layer_files:
+        for test_type, path, scope in layer_files:
             baseline_output = await self._run_design_baseline_file(test_type, path)
             exit_code = int(parse_test_results(baseline_output).get("exit_code", -1))
             if exit_code == 0:
                 file_state[path] = "green"
-                green_evidence.append(
-                    {
-                        "file_path": path,
-                        "type": test_type,
-                        "output_summary": summarize_batch_output(baseline_output, max_lines=4),
-                    }
-                )
+                evidence = {
+                    "file_path": path,
+                    "type": test_type,
+                    "coverage_scope": scope,
+                    "output_summary": summarize_batch_output(baseline_output, max_lines=4),
+                }
+                (green_evidence if scope == "owned" else exempt_green_evidence).append(evidence)
                 continue
             baseline_env = classify_test_failure(baseline_output)
             file_state[path] = "red" if not baseline_env else None
@@ -549,9 +593,9 @@ class WorkflowPhaseRunner:
 
         if not green_evidence and any(state is None for state in file_state.values()):
             # Nothing was verified green, but not everything is provably red
-            # either: the manifest leaves DESIGN with unverified files rather
-            # than the contract's all-RED state. Make that visible; the gate
-            # itself must not fail the node over an environment problem.
+            # either: the manifest leaves DESIGN with unverified files. Make
+            # that visible; the gate itself must not fail the node over an
+            # environment problem.
             await self._log(
                 "TestGenerator",
                 (
@@ -563,6 +607,31 @@ class WorkflowPhaseRunner:
                 status="warning",
                 node_id=node_id,
             )
+
+        if exempt_green_evidence:
+            await self._log(
+                "TestGenerator",
+                (
+                    f"Baseline recorded {len(exempt_green_evidence)} pre-existing green "
+                    "dependency/shared test file(s) as exempt coverage: "
+                    + ", ".join(item["file_path"] for item in exempt_green_evidence)
+                ),
+                status="info",
+                node_id=node_id,
+            )
+
+        if owned_interface_ids and not owned_paths:
+            await self._log(
+                "TestGenerator",
+                (
+                    "DESIGN failed: the node owns interface contract(s) but the test "
+                    "manifest contains no `owned` coverage witness. Dependency/shared "
+                    "regression tests cannot substitute for current-node behavior."
+                ),
+                status="error",
+                node_id=node_id,
+            )
+            return None
 
         if prior_implementation:
             await self._log(
@@ -675,17 +744,22 @@ class WorkflowPhaseRunner:
                     for item in current_tests
                     if item.get("file_path") == path
                 )
+                scope = next(
+                    normalize_coverage_scope(item.get("coverage_scope")) or "owned"
+                    for item in current_tests
+                    if item.get("file_path") == path
+                )
                 baseline_output = await self._run_design_baseline_file(test_type, path)
                 exit_code = int(parse_test_results(baseline_output).get("exit_code", -1))
                 if exit_code == 0:
                     file_state[path] = "green"
-                    green_evidence.append(
-                        {
-                            "file_path": path,
-                            "type": test_type,
-                            "output_summary": summarize_batch_output(baseline_output, max_lines=4),
-                        }
-                    )
+                    evidence = {
+                        "file_path": path,
+                        "type": test_type,
+                        "coverage_scope": scope,
+                        "output_summary": summarize_batch_output(baseline_output, max_lines=4),
+                    }
+                    (green_evidence if scope == "owned" else exempt_green_evidence).append(evidence)
                 else:
                     # Same semantics as the first pass: an environmental
                     # failure leaves the file unverified for IMPLEMENT's
@@ -699,6 +773,22 @@ class WorkflowPhaseRunner:
         # invites confusion on later reads.
         final_paths = {str(item.get("file_path", "") or "").strip() for item in current_tests}
         file_state = {path: state for path, state in file_state.items() if path in final_paths}
+        final_owned_paths = {
+            str(item.get("file_path", "") or "").strip()
+            for item in current_tests
+            if normalize_coverage_scope(item.get("coverage_scope")) == "owned"
+        }
+        if owned_interface_ids and not final_owned_paths:
+            await self._log(
+                "TestGenerator",
+                (
+                    "DESIGN failed: green-baseline repair removed every owned "
+                    "coverage witness; dependency/shared tests cannot validate this node."
+                ),
+                status="error",
+                node_id=node_id,
+            )
+            return None
         await self._log(
             "TestGenerator",
             (
@@ -1589,6 +1679,12 @@ class WorkflowPhaseRunner:
             validation_error = self.app_handler.validate_test_path(test_type, file_path)
             if validation_error:
                 raise ValueError(f"Generated test `{raw_test_id}` has an invalid path. {validation_error}")
+            coverage_scope = normalize_coverage_scope(test.get("coverage_scope"))
+            if not coverage_scope:
+                raise ValueError(
+                    f"Generated test `{raw_test_id}` has invalid `coverage_scope`; "
+                    "expected owned, dependency, or shared."
+                )
             if raw_test_id in generated_ids:
                 raise ValueError(f"Generated duplicate test id `{raw_test_id}`.")
             generated_ids.add(raw_test_id)
@@ -1598,6 +1694,7 @@ class WorkflowPhaseRunner:
                 "req_id": node_id,
                 "type": test_type,
                 "file_path": file_path,
+                "coverage_scope": coverage_scope,
                 "interface_ids": normalize_string_list(test.get("interface_ids")),
                 "first_line": str(test.get("first_line", "")).strip(),
             }

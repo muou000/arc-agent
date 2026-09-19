@@ -79,7 +79,7 @@ def test_implement_waits_for_pending_descendant_implement() -> None:
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
-def test_implement_unblocked_when_descendants_finished_or_failed() -> None:
+def test_implement_stays_blocked_when_a_descendant_failed() -> None:
     queue = _queue(
         [
             _task("R", PHASE_DESIGN, TASK_COMPLETED, 0),
@@ -89,7 +89,7 @@ def test_implement_unblocked_when_descendants_finished_or_failed() -> None:
         ],
         {"R": ["RA", "RB"]},
     )
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][3]) is True
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][3]) is False
 
 
 def test_sibling_implements_do_not_block_each_other() -> None:
@@ -368,21 +368,20 @@ def test_implement_waits_for_declared_dependency_implement() -> None:
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
-def test_implement_unblocked_when_dependency_finished_or_failed() -> None:
-    """A failed dependency unblocks its dependents exactly like the
-    descendant rule: the queue must keep draining instead of deadlocking."""
-    for dependency_status in (TASK_COMPLETED, TASK_FAILED):
-        queue = _queue(
-            [
-                _task("RA", PHASE_IMPLEMENT, dependency_status, 0),
-                _task("RB", PHASE_DESIGN, TASK_COMPLETED, 1),
-                _task("RB", PHASE_IMPLEMENT, TASK_PENDING, 2),
-            ],
-            {"R": ["RA", "RB"]},
-        )
-        queue["dependencies"] = {"RB": ["RA"]}
+def test_implement_requires_a_successful_dependency() -> None:
+    queue = _queue(
+        [
+            _task("RA", PHASE_IMPLEMENT, TASK_COMPLETED, 0),
+            _task("RB", PHASE_DESIGN, TASK_COMPLETED, 1),
+            _task("RB", PHASE_IMPLEMENT, TASK_PENDING, 2),
+        ],
+        {"R": ["RA", "RB"]},
+    )
+    queue["dependencies"] = {"RB": ["RA"]}
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
 
-        assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
+    queue["tasks"][0]["status"] = TASK_FAILED
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
 def test_design_waits_for_declared_dependency_implement() -> None:
@@ -405,21 +404,20 @@ def test_design_waits_for_declared_dependency_implement() -> None:
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
-def test_design_unblocked_when_dependency_finished_or_failed() -> None:
-    """A failed dependency unblocks the dependent's DESIGN exactly like the
-    IMPLEMENT rule: the queue must keep draining instead of deadlocking."""
-    for dependency_status in (TASK_COMPLETED, TASK_FAILED):
-        queue = _queue(
-            [
-                _task("RA", PHASE_DESIGN, TASK_COMPLETED, 0),
-                _task("RA", PHASE_IMPLEMENT, dependency_status, 1),
-                _task("RB", PHASE_DESIGN, TASK_PENDING, 2),
-            ],
-            {"R": ["RA", "RB"]},
-        )
-        queue["dependencies"] = {"RB": ["RA"]}
+def test_design_requires_a_successful_dependency() -> None:
+    queue = _queue(
+        [
+            _task("RA", PHASE_DESIGN, TASK_COMPLETED, 0),
+            _task("RA", PHASE_IMPLEMENT, TASK_COMPLETED, 1),
+            _task("RB", PHASE_DESIGN, TASK_PENDING, 2),
+        ],
+        {"R": ["RA", "RB"]},
+    )
+    queue["dependencies"] = {"RB": ["RA"]}
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
 
-        assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
+    queue["tasks"][1]["status"] = TASK_FAILED
+    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
 def test_design_blocks_when_a_declared_dependency_has_no_task() -> None:

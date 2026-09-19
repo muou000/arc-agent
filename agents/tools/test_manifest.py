@@ -30,15 +30,24 @@ from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
 _TOOL_NAME = "declare_test_manifest"
+TEST_COVERAGE_SCOPES = frozenset({"owned", "dependency", "shared"})
+
+
+def normalize_coverage_scope(value: Any) -> str:
+    """Return the manifest coverage scope, defaulting old manifests to owned."""
+
+    scope = str(value or "owned").strip().lower() or "owned"
+    return scope if scope in TEST_COVERAGE_SCOPES else ""
 
 
 @dataclass
 class DeclaredTestFile:
-    """One declared manifest row: a test file plus its type and interfaces."""
+    """One declared manifest row: a file, scope, type, and interfaces."""
 
     file_path: str
     test_type: str
     interface_ids: list[str] = field(default_factory=list)
+    coverage_scope: str = "owned"
 
 
 @dataclass
@@ -147,8 +156,10 @@ def build_declare_test_manifest_tool(
         """Declare and lock the test-file manifest for this stage run.
 
         Call this exactly once, before writing any test file, with one entry
-        per test file you intend to create or update:
-        [{"file_path": "backend/tests/unit/auth_service.test.js", "type": "Unit", "interface_ids": ["IF-AUTH-SERVICE"]}].
+        per test file you intend to create or update. ``coverage_scope`` is
+        ``owned`` for behavior introduced by this node, ``dependency`` for a
+        dependency regression, and ``shared`` for a shared-contract check:
+        [{"file_path": "backend/tests/unit/auth_service.test.js", "type": "Unit", "coverage_scope": "owned", "interface_ids": ["IF-AUTH-SERVICE"]}].
 
         The declaration is validated (placement rules, interface ids, type)
         and then LOCKED for the rest of this stage run: write_file, edit_file
@@ -164,7 +175,7 @@ def build_declare_test_manifest_tool(
         if not isinstance(files, list) or not files:
             return _tool_error(
                 "The manifest declaration must be a non-empty list of "
-                "{file_path, type, interface_ids} entries. If this node should "
+                "{file_path, type, coverage_scope, interface_ids} entries. If this node should "
                 "own no local tests, skip declaring and return an empty `tests` "
                 "manifest instead."
             )
@@ -181,6 +192,7 @@ def build_declare_test_manifest_tool(
             interface_ids = [
                 str(value).strip() for value in item.get("interface_ids") or [] if str(value or "").strip()
             ]
+            coverage_scope = normalize_coverage_scope(item.get("coverage_scope"))
             if not file_path:
                 errors.append(f"Entry {index} is missing `file_path`.")
                 continue
@@ -193,6 +205,12 @@ def build_declare_test_manifest_tool(
                 errors.append(
                     f"Entry {index} (`{file_path}`): `type` must be one of "
                     f"{', '.join(CANONICAL_TEST_TYPES)} (received `{raw_type or 'empty'}`)."
+                )
+                continue
+            if not coverage_scope:
+                errors.append(
+                    f"Entry {index} (`{file_path}`): `coverage_scope` must be one of "
+                    "owned, dependency, or shared."
                 )
                 continue
             if not is_test_file_path(file_path):
@@ -213,6 +231,7 @@ def build_declare_test_manifest_tool(
                     file_path=file_path,
                     test_type=test_type,
                     interface_ids=interface_ids,
+                    coverage_scope=coverage_scope,
                 )
             )
 
@@ -258,6 +277,7 @@ def build_declare_test_manifest_tool(
                     {
                         "file_path": row.file_path,
                         "type": row.test_type,
+                        "coverage_scope": row.coverage_scope,
                         "interface_ids": row.interface_ids,
                     }
                     for row in sorted(manifest_lock.declared_files.values(), key=lambda row: row.file_path)
@@ -388,6 +408,7 @@ def reconcile_declared_manifest(
                 "test_id": _mechanical_test_id(node_hint=node_id, file_path=path),
                 "req_id": str(node_id or "").strip(),
                 "interface_ids": list(row.interface_ids),
+                "coverage_scope": row.coverage_scope,
                 "type": row.test_type,
                 "file_path": path,
                 "first_line": "",

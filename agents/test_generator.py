@@ -24,6 +24,7 @@ from agents.tools.test_manifest import (
     TestManifestLock,
     build_declare_test_manifest_tool,
     canonical_test_type,
+    normalize_coverage_scope,
     reconcile_declared_manifest,
 )
 from agents.tools.traceability import build_traceability_tools
@@ -36,6 +37,10 @@ class TestManifestItem(BaseModel):
     test_id: str = Field(description="Stable test artifact id.")
     req_id: str = Field(description="Requirement node id covered by this test.")
     interface_ids: list[str] = Field(default_factory=list, description="Covered interface ids.")
+    coverage_scope: str = Field(
+        default="owned",
+        description="owned for current-node behavior, dependency for dependency regression, shared for shared contract coverage.",
+    )
     type: str = Field(description="Unit, Integration, or E2E.")
     file_path: str = Field(description="Workspace-relative test file path; must be a path that was declared via declare_test_manifest and actually written in this pass.")
     first_line: str = Field(default="", description="Exact first line in the written test file.")
@@ -296,6 +301,7 @@ class TestGenerator:
                     file_path=path,
                     test_type=canonical_test_type(item.get("type")) or "Unit",
                     interface_ids=[str(i) for i in item.get("interface_ids") or [] if str(i or "").strip()],
+                    coverage_scope=normalize_coverage_scope(item.get("coverage_scope")) or "owned",
                 )
                 for item in previous_manifest
                 if (path := str(item.get("file_path", "") or "").strip())

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from agents.tools.test_manifest import TestManifestLock, is_test_file_path, normalize_manifest_path
@@ -23,6 +24,10 @@ MAX_SKELETON_LINES = _MAX_SKELETON_LINES
 MAX_APPEND_LINES = 80
 MAX_APPENDS_PER_FILE = 3
 _MAX_READ_LIMIT = 200
+_DESIGN_MUTATION_PATTERNS = (
+    re.compile(r"\b(?:INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.IGNORECASE),
+    re.compile(r"\.\s*(?:execute|exec|run|query|prepare|insert|update|delete|save|create)\s*\(", re.IGNORECASE),
+)
 
 # Stage-specific exits appended to the repeated-write block: a generic
 # "wait for an error" gave stages without reachable errors (test_generation
@@ -153,6 +158,8 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         content = args.get("content", "")
         if not isinstance(content, str) or not content.strip():
             return "append_file requires non-empty string content."
+        if violation := self._validate_design_content(content):
+            return violation
         line_count = len(content.splitlines())
         if line_count > MAX_APPEND_LINES:
             return (
@@ -263,6 +270,8 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                     "Record remaining interfaces in the response for TDD."
                 )
             content = str(args.get("content", args.get("new_string", "")) or "")
+            if violation := self._validate_design_content(content):
+                return violation
             if content.count("\n") + 1 > _MAX_SKELETON_LINES:
                 return (
                     f"InterfaceDesigner may only materialize small skeletons (at most {_MAX_SKELETON_LINES} lines per write). "
@@ -274,6 +283,20 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             # claim is recorded only for writes the discipline allows above,
             # so a skeleton-limit rejection never claims a path.
             return self._file_claim_gate.check_and_claim(path)
+        return None
+
+    def _validate_design_content(self, content: str) -> str | None:
+        """Reject obvious business mutations from the DESIGN skeleton channel."""
+
+        if self._stage != "interface_design":
+            return None
+        if any(pattern.search(content) for pattern in _DESIGN_MUTATION_PATTERNS):
+            return (
+                "InterfaceDesigner may only materialize contract skeletons; this write contains "
+                "an apparent persistence or business mutation. Keep signatures, routes, types, "
+                "and explicit TODO/unsupported boundaries in DESIGN, and leave complete behavior "
+                "to TestDrivenDeveloper."
+            )
         return None
 
     def _with_bounded_read(self, request: ToolCallRequest) -> ToolCallRequest:

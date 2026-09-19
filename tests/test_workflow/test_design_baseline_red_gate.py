@@ -70,11 +70,18 @@ class _StubTDD:
         self.app_handler = None
 
 
-def _manifest_item(test_id: str, file_path: str, test_type: str = "Unit") -> dict[str, Any]:
+def _manifest_item(
+    test_id: str,
+    file_path: str,
+    test_type: str = "Unit",
+    coverage_scope: str = "owned",
+    interface_ids: list[str] | None = None,
+) -> dict[str, Any]:
     return {
         "test_id": test_id,
         "req_id": "REQ-BASE-1",
-        "interface_ids": [],
+        "interface_ids": list(interface_ids or []),
+        "coverage_scope": coverage_scope,
         "type": test_type,
         "file_path": file_path,
         "first_line": "def test_x():",
@@ -192,6 +199,69 @@ def test_design_baseline_green_file_is_rejected_and_repaired(tmp_project_dir, ar
     assert baseline[UNIT_TEST_FILE_2] == "red"
 
 
+def test_design_baseline_allows_green_dependency_regression_with_owned_red_witness(
+    tmp_project_dir, arc_runtime
+) -> None:
+    node_id = "REQ-BASE-SCOPED"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    generator = _StubGenerator(
+        [[
+            _manifest_item("T-OWNED", UNIT_TEST_FILE, coverage_scope="owned"),
+            _manifest_item("T-DEP", UNIT_TEST_FILE_2, coverage_scope="dependency"),
+        ]]
+    )
+    fake = FakeAppHandler([failing_test_output(), passing_test_output()])
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is True
+    assert generator.rejection_calls == []
+    assert any("dependency/shared test file(s) as exempt coverage" in entry[1] for entry in logs)
+    baseline = sessions.load_node_session(node_id).get("design_baseline")
+    assert baseline == {UNIT_TEST_FILE: "red", UNIT_TEST_FILE_2: "green"}
+
+
+def test_design_baseline_rejects_manifest_without_owned_witness(
+    tmp_project_dir, arc_runtime
+) -> None:
+    node_id = "REQ-BASE-NO-OWNED"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    generator = _StubGenerator(
+        [[_manifest_item("T-DEP", UNIT_TEST_FILE, coverage_scope="dependency")]]
+    )
+    fake = FakeAppHandler([failing_test_output()])
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is False
+    assert any("no `owned` coverage witness" in entry[1] for entry in logs)
+
+
+def test_design_baseline_rejects_owned_test_mapped_only_to_foreign_interface(
+    tmp_project_dir, arc_runtime
+) -> None:
+    node_id = "REQ-BASE-FOREIGN-OWNED"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    generator = _StubGenerator(
+        [[
+            _manifest_item(
+                "T-FOREIGN",
+                UNIT_TEST_FILE,
+                interface_ids=["IF-DEPENDENCY"],
+            )
+        ]]
+    )
+    fake = FakeAppHandler([failing_test_output()])
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is False
+    assert any("outside the current node" in entry[1] for entry in logs)
+
+
 def test_design_baseline_green_file_deleted_by_repair_passes(tmp_project_dir, arc_runtime) -> None:
     """The repair may legitimately drop the tautological file from the manifest."""
     node_id = "REQ-BASE-GREEN-DELETE"
@@ -204,7 +274,7 @@ def test_design_baseline_green_file_deleted_by_repair_passes(tmp_project_dir, ar
         ]
     )
     fake = FakeAppHandler([passing_test_output(), failing_test_output()])
-    runner, _logs = _make_runner(tmp_project_dir, generator, fake)
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
 
     ok = _run_design(runner, node_id)
 
@@ -345,8 +415,10 @@ def test_design_baseline_repair_returning_invalid_items_fails_design(tmp_project
     assert any("only invalid manifest item(s)" in entry[1] for entry in errors)
 
 
-def test_design_baseline_repair_explicitly_empty_manifest_passes(tmp_project_dir, arc_runtime) -> None:
-    """An explicitly empty repair manifest is a valid full delete."""
+def test_design_baseline_repair_explicitly_empty_manifest_fails_without_owned_witness(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """Deleting every green file cannot remove the only owned witness."""
     node_id = "REQ-BASE-REPAIR-EMPTY"
     _seed_leaf_requirement(arc_runtime, node_id)
 
@@ -357,14 +429,14 @@ def test_design_baseline_repair_explicitly_empty_manifest_passes(tmp_project_dir
 
     generator = _EmptyDeleteGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
     fake = FakeAppHandler([passing_test_output()])
-    runner, _logs = _make_runner(tmp_project_dir, generator, fake)
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
 
     ok = _run_design(runner, node_id)
 
-    assert ok is True
+    assert ok is False
     stored = arc_runtime.traceability.list_tests(req_id=node_id)
     assert stored == []
-    assert sessions.load_node_session(node_id).get("design_baseline") == {}
+    assert any("removed every owned" in entry[1] for entry in logs)
 
 
 def test_design_baseline_prior_implementation_requires_id_anchor(tmp_project_dir, arc_runtime) -> None:

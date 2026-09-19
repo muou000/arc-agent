@@ -30,12 +30,12 @@ def test_node_outcome_counts_buckets_states():
             "n5": "CONVERGED_WITH_FAILED_CHILDREN",
         }
     )
-    assert counts == {"total": 5, "passed": 2, "failed": 1, "other": 2}
+    assert counts == {"total": 5, "passed": 2, "failed": 1, "blocked": 0, "other": 2}
 
 
 def test_node_outcome_counts_empty():
-    assert node_outcome_counts({}) == {"total": 0, "passed": 0, "failed": 0, "other": 0}
-    assert node_outcome_counts(None) == {"total": 0, "passed": 0, "failed": 0, "other": 0}
+    assert node_outcome_counts({}) == {"total": 0, "passed": 0, "failed": 0, "blocked": 0, "other": 0}
+    assert node_outcome_counts(None) == {"total": 0, "passed": 0, "failed": 0, "blocked": 0, "other": 0}
 
 
 # ---------------------------------------------------------------------------
