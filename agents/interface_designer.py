@@ -245,7 +245,7 @@ class InterfaceDesigner:
                 node_id=node_id,
                 agent_context=agent_context,
                 app_type=app_type,
-                selected_skill_names=selected_skill_names,
+                required_skill_names=required_skill_names,
                 pending_contract_registry=pending_registry,
             )
             if repaired.get("interfaces"):
@@ -386,7 +386,7 @@ class InterfaceDesigner:
         node_id: str,
         agent_context: AgentRuntimeContext,
         app_type: str = "",
-        selected_skill_names: list[str] | None = None,
+        required_skill_names: list[str] | None = None,
         pending_contract_registry: PendingContractRegistry | None = None,
     ) -> dict[str, Any]:
         """Re-serialize a write-less leaf that claimed reuse only in summary prose.
@@ -421,7 +421,7 @@ class InterfaceDesigner:
             node_id=node_id,
             workspace_root=agent_context.workspace_root,
             app_type=app_type,
-            selected_skill_names=selected_skill_names,
+            required_skill_names=required_skill_names,
             min_items=1,
             pending_contract_registry=pending_contract_registry,
         )
