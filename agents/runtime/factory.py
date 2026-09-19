@@ -344,7 +344,6 @@ def build_stage_agent(
     workspace_root: str,
     writable_roots: list[str],
     skills: list[str] | None = None,
-    permitted_skill_names: list[str] | None = None,
     memory: list[str] | None = None,
     tools: list[object] | None = None,
     checkpointer: Any = _UNSET,
@@ -425,7 +424,6 @@ def build_stage_agent(
         skill_instruction_paths=_resolve_skill_instruction_paths(
             resolved_skills,
             skills_root,
-            permitted_skill_names=permitted_skill_names,
         ),
     )
     stage_tools = list(tools or [])
@@ -734,22 +732,14 @@ def _build_filesystem_permissions(
 def _resolve_skill_instruction_paths(
     sources: list[str],
     skills_root: Path,
-    *,
-    permitted_skill_names: list[str] | None = None,
 ) -> list[str]:
-    """Allow direct reads only for stage-selected skill instruction files.
+    """Allow direct reads for every declared skill instruction file.
 
-    Deep Agents discovers frontmatter by scanning skill *source* directories. ARC
-    therefore passes `/skills/` as the source, then constrains model tool access
-    to the exact instruction files selected for the current stage.
+    Deep Agents discovers frontmatter by scanning skill *source* directories and
+    lists the whole catalog in the system prompt; the stage agent then picks and
+    reads whichever ``SKILL.md`` files match its task, so all of them stay
+    readable. ``ls``/``glob``/``grep`` under ``/skills`` remain denied.
     """
-
-    if permitted_skill_names is not None:
-        return [
-            f"{SKILLS_PREFIX}/{name}/SKILL.md"
-            for name in dict.fromkeys(permitted_skill_names)
-            if (skills_root / name / "SKILL.md").is_file()
-        ]
 
     paths: list[str] = []
     for source in sources:

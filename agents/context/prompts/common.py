@@ -128,7 +128,12 @@ def workspace_tool_policy() -> str:
 
 
 def stage_skill_activation_policy(skill_names: list[str]) -> str:
-    """Tell the model which discovered skills this deterministic stage requires."""
+    """Tell the model which safety-floor skills this deterministic stage requires.
+
+    The full skill catalog is already listed by the runtime skills section;
+    beyond the required floor, the stage agent itself decides which catalog
+    skills to read by matching their descriptions to the task.
+    """
 
     if not skill_names:
         return ""
@@ -136,9 +141,10 @@ def stage_skill_activation_policy(skill_names: list[str]) -> str:
     return section(
         "Stage Skill Activation",
         [
-            f"ARC has selected these required stage skills: {', '.join(paths)}.",
+            f"ARC requires these stage skills: {', '.join(paths)}.",
             "Before any `/workspace` exploration, directly `read_file` every listed `SKILL.md` and follow its instructions.",
-            "Only the listed skill files are readable for this stage. Do not attempt to read, list, search, or infer unlisted skills.",
+            "Other skills in the available-skills list are optional: when one's description matches the current node's work, `read_file` its SKILL.md and follow it; when none matches, read none.",
+            "Never use `ls`, `glob`, or `grep` under `/skills`; only direct `read_file` on a known `SKILL.md` path.",
         ],
     )
 

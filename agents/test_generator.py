@@ -17,7 +17,6 @@ from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
-from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, test_generation_skills
 from agents.tools.test_manifest import (
     DeclaredTestFile,
@@ -90,10 +89,7 @@ class TestGenerator:
             or os.getcwd()
         ).expanduser().resolve())
         app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
-        selected_skill_names = test_generation_skills(
-            requirement_data,
-            extra_skills=load_skill_plan_extras(node_id, "test_generation"),
-        )
+        required_skill_names = test_generation_skills(requirement_data)
         context_pipeline.configure(
             workspace_dir=self.context_workspace_root or workspace_root,
             app_type=app_type,
@@ -114,13 +110,12 @@ class TestGenerator:
             stage="test_generation",
             model=self.model,
             system_prompt="\n\n".join(
-                [get_system_prompt(), stage_skill_activation_policy(selected_skill_names)]
+                [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=TestGenerationResponse,
             workspace_root=workspace_root,
             writable_roots=[workspace_root],
-            skills=[SKILLS_SOURCE] if selected_skill_names else [],
-            permitted_skill_names=selected_skill_names,
+            skills=[SKILLS_SOURCE],
             memory=[],
             tools=[
                 *build_traceability_tools(
@@ -148,7 +143,7 @@ class TestGenerator:
             dynamic_context=context_text,
             interface_contract=interface_contract,
         )
-        await self._log(f"skill-permitted: {', '.join(selected_skill_names) or 'none'}", node_id=node_id)
+        await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking test generation.", node_id=node_id)
         raw_payload = await ainvoke_stage_agent(
             agent,

@@ -8,7 +8,7 @@
 
 - `agents/context/prompts/`：各阶段 agent 的系统提示词和任务协议；
 - `agents/runtime/stage_discipline.py`：工具调用、阶段边界和文件操作限制；
-- `skills/`：按节点特征加载的生成阶段指导。
+- `skills/`：全量目录注入各阶段 agent 系统提示词、由模型按需读取的生成阶段指导（认证/失败修复底线确定性注入，`agents/skills/selection.py`）。
 
 如果修改了这些运行时规则，应更新对应测试；不要把下游 agent 的详细行为复制到本文件。
 

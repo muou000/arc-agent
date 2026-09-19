@@ -25,7 +25,6 @@ from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent, salvage_json_objects
-from agents.skills.planning import load_skill_plan_extras
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
 from agents.tools.traceability import build_traceability_tools
 
@@ -147,10 +146,7 @@ class InterfaceDesigner:
             or os.getcwd()
         ).expanduser().resolve())
         app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
-        selected_skill_names = interface_design_skills(
-            requirement_data,
-            extra_skills=load_skill_plan_extras(node_id, "design"),
-        )
+        required_skill_names = interface_design_skills(requirement_data)
         context_pipeline.configure(
             workspace_dir=self.context_workspace_root or workspace_root,
             app_type=app_type,
@@ -178,7 +174,7 @@ class InterfaceDesigner:
             node_id=node_id,
             workspace_root=workspace_root,
             app_type=app_type,
-            selected_skill_names=selected_skill_names,
+            required_skill_names=required_skill_names,
             response_format=InterfaceDesignResponse,
             pending_contract_registry=pending_registry,
         )
@@ -188,7 +184,7 @@ class InterfaceDesigner:
             dynamic_context=context_text,
             merge_conflict=self._load_merge_conflict_context(node_id),
         )
-        await self._log(f"skill-permitted: {', '.join(selected_skill_names) or 'none'}", node_id=node_id)
+        await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking interface design.", node_id=node_id)
         agent_context = AgentRuntimeContext(
             node_id=node_id,
@@ -229,7 +225,7 @@ class InterfaceDesigner:
                 evidence_paths=evidence_paths,
                 materialized_paths=materialized_paths,
                 app_type=app_type,
-                selected_skill_names=selected_skill_names,
+                required_skill_names=required_skill_names,
                 pending_contract_registry=pending_registry,
             )
             if repaired.get("interfaces"):
@@ -250,11 +246,17 @@ class InterfaceDesigner:
         node_id: str,
         workspace_root: str,
         app_type: str,
-        selected_skill_names: list[str],
+        required_skill_names: list[str],
         response_format: Any,
         pending_contract_registry: PendingContractRegistry | None = None,
     ) -> Any:
-        """Build the InterfaceDesigner deep-agent with a given response format."""
+        """Build the InterfaceDesigner deep-agent with a given response format.
+
+        The skills source is attached unconditionally: the runtime skills
+        section lists the whole catalog and this stage agent picks what to
+        read; ``required_skill_names`` only adds the safety-floor activation
+        policy on top.
+        """
 
         del app_type  # kept in the signature for parity with run()'s resolution
         return build_stage_agent(
@@ -262,13 +264,12 @@ class InterfaceDesigner:
             stage="interface_design",
             model=self.model,
             system_prompt="\n\n".join(
-                [get_system_prompt(), stage_skill_activation_policy(selected_skill_names)]
+                [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=response_format,
             workspace_root=workspace_root,
             writable_roots=[workspace_root],
-            skills=[SKILLS_SOURCE] if selected_skill_names else [],
-            permitted_skill_names=selected_skill_names,
+            skills=[SKILLS_SOURCE],
             memory=[],
             tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
             node_id=node_id,
@@ -285,7 +286,7 @@ class InterfaceDesigner:
         evidence_paths: list[str],
         materialized_paths: list[str],
         app_type: str = "",
-        selected_skill_names: list[str] | None = None,
+        required_skill_names: list[str] | None = None,
         pending_contract_registry: PendingContractRegistry | None = None,
     ) -> dict[str, Any]:
         """Re-serialize contracts after a schema-valid but semantically empty response.
@@ -322,7 +323,7 @@ class InterfaceDesigner:
                 node_id=node_id,
                 workspace_root=agent_context.workspace_root,
                 app_type=app_type,
-                selected_skill_names=selected_skill_names,
+                required_skill_names=required_skill_names,
                 min_items=len(skeletons),
                 pending_contract_registry=pending_contract_registry,
             )
@@ -367,7 +368,7 @@ class InterfaceDesigner:
         node_id: str,
         workspace_root: str,
         app_type: str,
-        selected_skill_names: list[str] | None,
+        required_skill_names: list[str] | None,
         min_items: int,
         pending_contract_registry: PendingContractRegistry | None = None,
     ) -> Any:
@@ -380,7 +381,7 @@ class InterfaceDesigner:
         the mechanical fallback.
         """
 
-        if not workspace_root or selected_skill_names is None:
+        if not workspace_root or required_skill_names is None:
             return agent
         constrained = _dynamic_repair_response_format(min_items)
         if constrained is None:
@@ -390,7 +391,7 @@ class InterfaceDesigner:
                 node_id=node_id,
                 workspace_root=workspace_root,
                 app_type=app_type,
-                selected_skill_names=selected_skill_names,
+                required_skill_names=required_skill_names,
                 response_format=constrained,
                 pending_contract_registry=pending_contract_registry,
             )
