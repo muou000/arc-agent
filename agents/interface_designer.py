@@ -234,6 +234,24 @@ class InterfaceDesigner:
                     bundle["files_written"] = repaired["files_written"]
                 if repaired.get("summary"):
                     bundle["summary"] = repaired["summary"]
+        if not bundle["interfaces"] and not evidence_paths:
+            # Zero-write empty response — the reuse-in-prose shortcut observed
+            # live on deepseek-v4-flash (2026-09-19, bookstack REQ-1.1). The
+            # workflow leaf gate fails this shape; for leaves the adapter
+            # first spends one backfill ask anchored on the parent/dependency
+            # contracts already stored in the registry.
+            repaired = await self._repair_reuse_only_interfaces(
+                agent,
+                node_id=node_id,
+                agent_context=agent_context,
+                app_type=app_type,
+                selected_skill_names=selected_skill_names,
+                pending_contract_registry=pending_registry,
+            )
+            if repaired.get("interfaces"):
+                bundle["interfaces"] = repaired["interfaces"]
+                if repaired.get("summary"):
+                    bundle["summary"] = repaired["summary"]
         await self._log(
             f"Interface design returned {len(bundle.get('interfaces', []))} interface(s).",
             node_id=node_id,
@@ -360,6 +378,200 @@ class InterfaceDesigner:
             node_id=node_id,
         )
         return {}
+
+    async def _repair_reuse_only_interfaces(
+        self,
+        agent: Any,
+        *,
+        node_id: str,
+        agent_context: AgentRuntimeContext,
+        app_type: str = "",
+        selected_skill_names: list[str] | None = None,
+        pending_contract_registry: PendingContractRegistry | None = None,
+    ) -> dict[str, Any]:
+        """Re-serialize a write-less leaf that claimed reuse only in summary prose.
+
+        Second live shape of the empty-interfaces failure (2026-09-19,
+        deepseek-v4-flash, bookstack REQ-1.1): the leaf decides its scenarios
+        are covered by the parent shell and the shared backend, writes
+        nothing, and returns a schema-valid empty ``interfaces`` array while
+        describing the reused parent/dependency contracts in ``summary``
+        prose. No file exists to derive a skeleton from, so the anchor here
+        is the traceability registry itself: the parent's and declared
+        dependencies' stored interfaces are real contracts this node can
+        attach to under their original ``interface_id``. The repair hands
+        them back as candidates and asks for one structured record per
+        reused id — plus any owned contract the pass actually designed. The
+        workflow leaf gate stays the backstop when the backfill also comes
+        back empty.
+        """
+
+        candidates = await self._leaf_reuse_candidates(node_id=node_id)
+        if not candidates:
+            return {}
+        await self._log(
+            f"Response recorded no interface contracts and materialized no files; "
+            f"requesting reuse backfill anchored on {len(candidates)} registered "
+            "parent/dependency interface(s).",
+            status="warning",
+            node_id=node_id,
+        )
+        fill_agent = self._constrained_repair_agent(
+            agent,
+            node_id=node_id,
+            workspace_root=agent_context.workspace_root,
+            app_type=app_type,
+            selected_skill_names=selected_skill_names,
+            min_items=1,
+            pending_contract_registry=pending_contract_registry,
+        )
+        try:
+            payload = await ainvoke_stage_agent(
+                fill_agent,
+                message=self._reuse_backfill_message(candidates),
+                context=agent_context,
+                thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:InterfaceDesigner",
+                label=self.agent_name,
+                log_cb=self.log_cb,
+            )
+        except Exception as exc:
+            # The constrained repair schema raises on minItems violations; the
+            # offending structured tool call often still carries valid rows.
+            salvaged = self._salvage_structured_records(exc)
+            if not salvaged:
+                await self._log(
+                    f"Reuse backfill pass failed with {type(exc).__name__}.",
+                    status="warning",
+                    node_id=node_id,
+                )
+                return {}
+            await self._log(
+                f"Reuse backfill pass failed ({type(exc).__name__}) but salvaged "
+                f"{len(salvaged)} record(s) from the structured tool call.",
+                status="warning",
+                node_id=node_id,
+            )
+            return {"interfaces": salvaged}
+        repaired = await self._normalize_with_recovery(payload, node_id=node_id, agent=fill_agent)
+        if repaired["interfaces"]:
+            # Nothing was written in this shape, so the repair must not adopt
+            # a files_written claim either — the workflow gate stays keyed on
+            # the discipline's ground truth only.
+            return {"interfaces": repaired["interfaces"], "summary": repaired["summary"]}
+        await self._log(
+            "Reuse backfill returned no interface records either.",
+            status="error",
+            node_id=node_id,
+        )
+        return {}
+
+    async def _leaf_reuse_candidates(self, *, node_id: str) -> list[dict[str, str]] | None:
+        """Parent/dependency interfaces a write-less leaf can anchor reuse to.
+
+        Leaf-ness comes from the traceability record's ``children_ids`` — the
+        same source the workflow leaf gate reads — so a non-leaf's legal empty
+        response never triggers a backfill (and stays silent). ``None`` means
+        the backfill does not apply. Every ``None`` on the leaf path is logged
+        with its reason — enumeration failure, or no registered anchor at all
+        — so an operator can tell why a node fell through to the gate instead
+        of getting a backfill ask; an empty registry must not be papered over
+        with invented contracts.
+        """
+
+        try:
+            from core.service import get_runtime
+
+            store = get_runtime().traceability
+            record = store.get_requirement(node_id) or {}
+            if record.get("children_ids"):
+                return None
+            parent_id = str(record.get("parent_id") or "").strip()
+            anchor_ids = [parent_id] if parent_id else []
+            for dependency_id in record.get("dependencies") or []:
+                dependency_id = str(dependency_id or "").strip()
+                if dependency_id and dependency_id not in anchor_ids:
+                    anchor_ids.append(dependency_id)
+            candidates: list[dict[str, str]] = []
+            counts: dict[str, int] = {}
+            seen: set[str] = set()
+            for anchor_id in anchor_ids:
+                for row in store.list_interfaces(req_id=anchor_id):
+                    interface_id = str(row.get("interface_id") or "").strip()
+                    if not interface_id or interface_id in seen:
+                        continue
+                    seen.add(interface_id)
+                    counts[anchor_id] = counts.get(anchor_id, 0) + 1
+                    try:
+                        content = json.loads(str(row.get("content") or "{}"))
+                    except (json.JSONDecodeError, ValueError):
+                        content = {}
+                    if not isinstance(content, dict):
+                        content = {}
+                    candidates.append(
+                        {
+                            "interface_id": interface_id,
+                            "owner_req_id": anchor_id,
+                            "type": str(row.get("type") or content.get("type") or "").strip(),
+                            "name": str(content.get("name") or "").strip(),
+                            "file_path": str(row.get("file_path") or content.get("file_path") or "").strip(),
+                            "responsibility": str(content.get("responsibility") or "").strip(),
+                        }
+                    )
+        except Exception as exc:
+            await self._log(
+                f"Reuse candidate enumeration failed ({type(exc).__name__}: {exc}); "
+                "skipping the backfill and leaving the empty response to the workflow gate.",
+                status="warning",
+                node_id=node_id,
+            )
+            return None
+        if not candidates:
+            await self._log(
+                "No registered parent/dependency interface is available to anchor a "
+                "reuse backfill; skipping the backfill (the workflow leaf gate owns "
+                "the failure).",
+                status="warning",
+                node_id=node_id,
+            )
+            return None
+        # Declared dependencies are scheduling gates, not landed-contract
+        # guarantees (a failed dependency releases its dependents), so an
+        # anchor can legitimately contribute zero interfaces. Surface that
+        # degradation instead of letting the candidate list silently shrink
+        # to the parent's contracts.
+        empty_anchors = [anchor_id for anchor_id in anchor_ids if counts.get(anchor_id, 0) == 0]
+        if empty_anchors:
+            await self._log(
+                "Reuse anchor(s) with no registered interface yet: "
+                f"{', '.join(empty_anchors)} (a declared dependency may not have "
+                "landed its contracts).",
+                status="warning",
+                node_id=node_id,
+            )
+        return candidates
+
+    @staticmethod
+    def _reuse_backfill_message(candidates: list[dict[str, str]]) -> str:
+        rows = "\n".join(
+            f"- {candidate['interface_id']} ({candidate['type'] or 'UI'}, owned by "
+            f"{candidate['owner_req_id']}, {candidate['file_path'] or 'no file'}): "
+            f"{candidate['responsibility'][:160]}"
+            for candidate in candidates
+        )
+        return "\n".join(
+            [
+                "Your design pass recorded no files and an empty `interfaces` array, so no contract reached the traceability store.",
+                "Reusing a parent/dependency surface attaches this node to a contract only when the reused interface is returned as a structured record under its ORIGINAL `interface_id`; prose in `summary` attaches the node to nothing.",
+                "Return now a single `InterfaceDesignResponse` whose `interfaces` array contains:",
+                "1. one record for every interface below that this node's design reuses — only `interface_id` (exact, original) plus `relation: \"reused\"` are required, the registry already holds their identity and semantics; and",
+                "2. any contract this node newly owns that your design introduced (for example a route registration), with the full schema fields from your original instructions.",
+                "Do not invent contracts beyond this list and your own design. Keep each record compact: `responsibility` and `specification` at most ~200 characters each.",
+                "Return the structured fields themselves. Do NOT wrap the JSON in markdown code fences and do NOT nest the response JSON inside the `summary` string; keep `files_written` empty for pure reuse.",
+                "",
+                "Reusable parent/dependency interfaces:",
+                rows,
+            ]
+        )
 
     def _constrained_repair_agent(
         self,
