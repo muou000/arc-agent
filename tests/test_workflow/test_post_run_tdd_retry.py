@@ -162,3 +162,62 @@ def test_build_reprompt_forbids_weakening_tests() -> None:
     lowered = prompt.lower()
     assert "do not weaken the test" in lowered
     assert "do not skip step 1" in lowered
+
+
+# ---------------------------------------------------------------------------
+# build_tdd_reprompt: previous-round handoff evidence
+# ---------------------------------------------------------------------------
+
+
+def test_build_reprompt_appends_handoff_evidence() -> None:
+    """Fingerprint history and layer usage from the failed round reach the retry.
+
+    A retried session starts with fresh budgets; without the "already tried"
+    evidence it repeats hypotheses the previous round burned its budget on
+    (observed on the 2026-09-19 test1 run: the retry re-hit the same
+    StrictMode failure for another full 10-call budget).
+    """
+
+    handoff = {
+        "layer_usage": {"Unit": 10, "Integration": 4},
+        "fingerprint_history": {"Unit": ["1|x", "1|x", "1|x"]},
+    }
+    reprompt = build_tdd_reprompt("REQ-1", "Unit: assertion failed", handoff=handoff)
+    assert "Unit: 10/10 run_tests calls" in reprompt
+    assert "Integration: 4/10 run_tests calls" in reprompt
+    assert "Budgets are fresh this round" in reprompt
+    assert "Failure fingerprints from the previous round (already tried)" in reprompt
+    assert "unchanged across runs - the hypothesis was wrong, do not retry it" in reprompt
+    assert "Do not repeat an approach" in reprompt
+
+
+def test_build_reprompt_handoff_without_fingerprints_omits_block() -> None:
+    """A handoff with only usage still shows budgets but no fingerprint block."""
+
+    reprompt = build_tdd_reprompt("REQ-1", "boom", handoff={"layer_usage": {"Unit": 3}})
+    assert "Unit: 3/10" in reprompt
+    assert "Failure fingerprints" not in reprompt
+
+
+def test_build_reprompt_ignores_malformed_handoff() -> None:
+    """Malformed handoff payloads degrade to the plain reprompt, never raise."""
+
+    for bad in (None, "string", 42, {"layer_usage": "nope"}, {"fingerprint_history": [1, 2]}):
+        reprompt = build_tdd_reprompt("REQ-1", "boom", handoff=bad)
+        assert "TDD follow-up for REQ-1" in reprompt
+        assert "boom" in reprompt
+
+
+def test_build_reprompt_dedupes_across_layers() -> None:
+    """Distinct fingerprints across layers are listed per layer, last one shown."""
+
+    handoff = {
+        "fingerprint_history": {
+            "Unit": ["1|a", "1|b"],
+            "E2E": ["1|c"],
+        }
+    }
+    reprompt = build_tdd_reprompt("REQ-1", "boom", handoff=handoff)
+    assert "Unit: 1|b" in reprompt
+    assert "E2E: 1|c" in reprompt
+    assert "unchanged across runs" not in reprompt

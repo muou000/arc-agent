@@ -1607,6 +1607,22 @@ class WorkflowPhaseRunner:
                     # edited, from the stage discipline rather than the
                     # model's own self-report.
                     "modified_files": sorted(modified_files_round),
+                    # Evidence for the next TDD round's prompt: failing
+                    # layers' run_tests usage and fingerprint history. A
+                    # post-run auto retry starts with fresh budgets, and
+                    # without this history the retried session re-derives -
+                    # or worse, repeats - hypotheses the previous round
+                    # already burned its budget on.
+                    "layer_usage": {
+                        test_type: usage_by_type.get(test_type, 0)
+                        for test_type in ordered_types
+                        if usage_by_type.get(test_type, 0)
+                    },
+                    "fingerprint_history": {
+                        test_type: fingerprints[-5:]
+                        for test_type, fingerprints in fingerprint_history.items()
+                        if fingerprints
+                    },
                 },
             },
         )

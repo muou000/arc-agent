@@ -819,7 +819,15 @@ class ARCWorkflowManager:
                     )
             else:
                 self.runtime.events.mark_implementation_failed(node_id)
-                self.runtime.events.mark_test_failed(node_id)
+                # The auto TDD retry reads this event's message into its
+                # re-prompt; without it the retried session starts from
+                # "(no detail provided)" and re-explores a failure the
+                # previous round already diagnosed. The node session's
+                # failure summary is the freshest evidence at this point.
+                failure_detail = str(
+                    sessions.load_node_session(node_id).get("recent_failure_summary", "") or ""
+                ).strip()
+                self.runtime.events.mark_test_failed(node_id, message=failure_detail or None)
             if ctx is None:
                 await self._commit_phase_checkpoint(node_id, f"{phase}-FAILED", requirement_data)
             await self._log("Compiler", f"{phase} failed for node {node_id}.", "error", node_id)
@@ -1118,7 +1126,8 @@ class ARCWorkflowManager:
         for node_id, message in eligible:
             if node_id not in retry_node_ids:
                 continue
-            reprompt = build_tdd_reprompt(node_id, message)
+            handoff = sessions.load_node_session(node_id).get("tdd_handoff") or {}
+            reprompt = build_tdd_reprompt(node_id, message, handoff=handoff if isinstance(handoff, dict) else None)
             sessions.merge_node_session(
                 node_id,
                 {

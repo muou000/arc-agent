@@ -250,17 +250,47 @@ def persist_run_output(
     The directory lives under the runtime-ignored ``.arc/`` tree, so it never
     reaches Git checkpoints or merges. Only the most recent
     ``_MAX_RETAINED_RUN_LOGS`` files per node are kept.
+
+    ``sequence`` is the per-layer run counter of the current TDD pass. A node
+    can go through several passes (post-run auto retry, ``--retry-failed``),
+    and each pass restarts the counter at 1 - a later pass would silently
+    overwrite the previous pass's logs, breaking the failure-evidence chain
+    (a ``tdd_handoff`` written by pass N would point at pass N+1's content).
+    The on-disk counter therefore continues past the highest existing log of
+    the same layer instead of trusting the in-memory sequence.
     """
 
     safe_node = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(node_id or "").strip()) or "node"
     safe_type = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(test_type or "").strip()) or "layer"
     directory = Path(workspace_root) / ".arc" / "tdd_runs" / safe_node
     directory.mkdir(parents=True, exist_ok=True)
-    file_name = f"{safe_type}-{max(0, int(sequence)):03d}.log"
+    actual_sequence = _next_run_log_sequence(directory, safe_type, sequence)
+    file_name = f"{safe_type}-{actual_sequence:03d}.log"
     path = directory / file_name
     path.write_text((output or "") + "\n", encoding="utf-8", errors="replace")
     _prune_run_logs(directory, keep=_MAX_RETAINED_RUN_LOGS)
     return f".arc/tdd_runs/{safe_node}/{file_name}"
+
+
+def _next_run_log_sequence(directory: Path, safe_type: str, requested: int) -> int:
+    """Continue numbering past existing logs of the same layer.
+
+    Without this, a second TDD pass re-numbers from 1 and overwrites the
+    first pass's evidence files. Scan failures (permissions, transient IO)
+    propagate as OSError to ``persist_run_output``'s caller, which logs and
+    skips the log pointer - falling back to the requested sequence here
+    would silently reintroduce the overwrite this continuation prevents.
+    """
+
+    prefix = f"{safe_type}-"
+    highest = 0
+    for item in directory.iterdir():
+        if not (item.is_file() and item.suffix == ".log" and item.name.startswith(prefix)):
+            continue
+        digits = item.name[len(prefix) : -len(".log")]
+        if digits.isdigit():
+            highest = max(highest, int(digits))
+    return max(max(0, int(requested)), highest + 1)
 
 
 def _prune_run_logs(directory: Path, keep: int) -> None:
