@@ -189,3 +189,45 @@ def test_tdd_runs_readonly_permission_carveout(tmp_path: Path) -> None:
     assert _check_fs_permission(permissions, "write", "/workspace/.arc/queue.json") == "deny"
     # Regular workspace files stay writable.
     assert _check_fs_permission(permissions, "write", "/workspace/src/app.js") == "allow"
+
+
+def test_persist_run_output_continues_sequence_across_passes(tmp_path: Path) -> None:
+    """A second TDD pass must not overwrite the first pass's run logs.
+
+    ``sequence`` is the per-layer counter of the current pass, which restarts
+    at 1 on every pass (post-run auto retry, ``--retry-failed``). Trusting it
+    verbatim made pass N+1 overwrite pass N's logs (observed on the 2026-09-19
+    test1 run: the first round's Integration-003.log was replaced by the
+    second round's, so a handoff written by round 1 pointed at round 2's
+    content). The on-disk counter must continue past the highest existing log
+    of the same layer.
+    """
+
+    # Pass 1: three Unit runs.
+    for i in (1, 2, 3):
+        persist_run_output(tmp_path, "REQ-1", "Unit", i, f"pass1 attempt {i}")
+    # Pass 2: the layer counter restarts at 1.
+    rel = persist_run_output(tmp_path, "REQ-1", "Unit", 1, "pass2 attempt 1")
+    assert rel == ".arc/tdd_runs/REQ-1/Unit-004.log"
+    assert (tmp_path / ".arc" / "tdd_runs" / "REQ-1" / "Unit-003.log").read_text(
+        encoding="utf-8"
+    ).startswith("pass1 attempt 3")
+    assert (tmp_path / rel).read_text(encoding="utf-8").startswith("pass2 attempt 1")
+    # Layers are independent counters: a first Integration run stays at 001.
+    rel_integration = persist_run_output(tmp_path, "REQ-1", "Integration", 1, "integration 1")
+    assert rel_integration == ".arc/tdd_runs/REQ-1/Integration-001.log"
+
+
+def test_persist_run_output_prunes_oldest_across_passes(tmp_path: Path) -> None:
+    """Cross-pass continuation still respects the retention cap."""
+
+    for i in range(1, 25):
+        persist_run_output(tmp_path, "REQ-1", "Unit", 1, f"attempt {i}")
+    kept = sorted(
+        item.name
+        for item in (tmp_path / ".arc" / "tdd_runs" / "REQ-1").iterdir()
+        if item.suffix == ".log"
+    )
+    assert len(kept) == 20
+    assert kept[0] == "Unit-005.log"
+    assert kept[-1] == "Unit-024.log"

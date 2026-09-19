@@ -53,7 +53,12 @@ def scan_test_failures(runner_events_path: Path) -> list[tuple[str, str | None]]
     return list(failures.items())
 
 
-def build_tdd_reprompt(node_id: str, message: str | None) -> str:
+def build_tdd_reprompt(
+    node_id: str,
+    message: str | None,
+    *,
+    handoff: dict | None = None,
+) -> str:
     """Build the TDD-first follow-up injected into a failing node's retry session.
 
     The text is fed to ``TestDrivenDeveloper`` as ``previous_failure_summary`` and
@@ -62,13 +67,21 @@ def build_tdd_reprompt(node_id: str, message: str | None) -> str:
     test just to silence it. Wording matches ARC's ``tdd-test-failure-repair``
     skill: progress is reported through ``run_tests`` and the layer ladder
     ``Unit -> Integration -> E2E``, and success is declared with ``IMPLEMENTED``.
+
+    ``handoff`` is the node session's ``tdd_handoff`` from the failed round.
+    Its fingerprint history and layer usage are appended as "already tried"
+    evidence: a retried session starts with fresh budgets, and without that
+    evidence it re-derives - or repeats - hypotheses the previous round
+    already burned its budget on.
     """
     detail = message.strip() if isinstance(message, str) and message.strip() else "(no detail provided)"
+    evidence_lines = _handoff_evidence_lines(handoff)
+    evidence_block = ("\n" + evidence_lines + "\n") if evidence_lines else ""
     return textwrap.dedent(
         f"""
         TDD follow-up for {node_id}:
         Your previous implementation reported a test failure: {detail}
-
+        {evidence_block}
         Follow this exact TDD sequence before declaring the fix done:
         1. Add or update a failing test (or e2e scenario) that reproduces the reported failure.
         2. Run it with `run_tests` and confirm it fails for the right reason.
@@ -77,6 +90,35 @@ def build_tdd_reprompt(node_id: str, message: str | None) -> str:
         5. Return `IMPLEMENTED` only once every scheduled layer passes. If you cannot make it pass, keep
            the failure recorded with an explicit reason instead of declaring success.
 
-        Do not skip step 1. Do not modify tests just to silence them.
+        Do not skip step 1. Do not modify tests just to silence them. Do not repeat an approach
+        already listed in the previous-round evidence above.
         """
     ).strip()
+
+
+def _handoff_evidence_lines(handoff: dict | None) -> str:
+    """Render the previous round's fingerprint/budget evidence, if any."""
+
+    if not isinstance(handoff, dict):
+        return ""
+    blocks: list[str] = []
+    usage = handoff.get("layer_usage")
+    if isinstance(usage, dict) and usage:
+        spent = ", ".join(
+            f"{layer}: {count}/10 run_tests calls" for layer, count in sorted(usage.items())
+        )
+        blocks.append(f"- Previous round budgets spent ({spent}). Budgets are fresh this round.")
+    fingerprints = handoff.get("fingerprint_history")
+    if isinstance(fingerprints, dict) and fingerprints:
+        rows = []
+        for layer, entries in sorted(fingerprints.items()):
+            if isinstance(entries, list) and entries:
+                repeated = len(entries) > 1 and len(set(entries)) == 1
+                marker = " (unchanged across runs - the hypothesis was wrong, do not retry it)" if repeated else ""
+                rows.append(f"  - {layer}: {entries[-1]}{marker}")
+        if rows:
+            blocks.append(
+                "- Failure fingerprints from the previous round (already tried):\n"
+                + "\n".join(rows)
+            )
+    return "\n".join(blocks)
