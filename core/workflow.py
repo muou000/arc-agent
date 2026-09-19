@@ -491,10 +491,10 @@ class ARCWorkflowManager:
                     # Propagation runs before every pick because a task that
                     # just finished may have failed and blocked its dependents.
                     # It cannot race the in-flight executions: the marking
-                    # section has no await, a RUNNING task's own prerequisites
-                    # were satisfied when it was picked, and an already-blocked
-                    # node has no pending/running task left to re-mark. The
-                    # scan is in-memory and only a state change saves the queue.
+                    # section has no await, it never rewrites a RUNNING task,
+                    # and an already-blocked node has no pending task left to
+                    # re-mark. The scan is in-memory and only a state change
+                    # saves the queue.
                     await self._propagate_dependency_blocks(queue_state)
                     task = self._next_affinity_task(queue_state, in_flight.values())
                     if task is None:
@@ -623,6 +623,12 @@ class ARCWorkflowManager:
         edge. Independent nodes continue draining, while direct and
         transitive dependents become explicit ``BLOCKED`` tasks instead of
         remaining ambiguous ``PENDING`` work at the end of the run.
+
+        Only never-started ``PENDING`` work is marked, and a node with a
+        ``RUNNING`` task is skipped until that task ends: rewriting the
+        status of work that is already executing cannot stop it and would
+        only corrupt the record. The invariant still holds at drain end,
+        where nothing runs and every dependent of a failure is marked.
         """
 
         changed: list[tuple[str, list[str]]] = []
@@ -636,11 +642,15 @@ class ARCWorkflowManager:
                     task
                     for task in queue_state.get("tasks", [])
                     if str(task.get("node_id", "")) == node_id
-                    and task.get("status") in {TASK_PENDING, TASK_RUNNING}
                 ]
-                if not node_tasks:
+                if any(task.get("status") == TASK_RUNNING for task in node_tasks):
                     continue
-                for task in node_tasks:
+                pending_tasks = [
+                    task for task in node_tasks if task.get("status") == TASK_PENDING
+                ]
+                if not pending_tasks:
+                    continue
+                for task in pending_tasks:
                     task["status"] = TASK_BLOCKED
                 self._set_node_state(
                     queue_state["node_states"],

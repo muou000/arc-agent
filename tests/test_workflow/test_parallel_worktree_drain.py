@@ -574,17 +574,20 @@ def test_dependency_block_propagation_is_idempotent_and_saves_once(
     """The drain calls propagation before every pick, so it must converge.
 
     A second call over already-blocked state must not re-mark anything or
-    touch disk: only a state change saves the queue.
+    touch disk: only a state change saves the queue. A node with in-flight
+    work is left untouched - blocking a running task cannot stop it.
     """
     manager = _make_parallel_manager(tmp_path)
     state = {
         "tasks": [
             {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
             {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_PENDING},
-            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_RUNNING},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+            {"task_id": "RC:DESIGN", "node_id": "RC", "phase": PHASE_DESIGN, "status": TASK_RUNNING},
+            {"task_id": "RC:IMPLEMENT", "node_id": "RC", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
         ],
-        "node_states": {"RA": NODE_FAILED, "RB": "UNSEEN"},
-        "dependencies": {"RB": ["RA"]},
+        "node_states": {"RA": NODE_FAILED, "RB": "UNSEEN", "RC": "UNSEEN"},
+        "dependencies": {"RB": ["RA"], "RC": ["RA"]},
     }
     saves: list[int] = []
     original_save = manager._save_processing_queue
@@ -601,7 +604,11 @@ def test_dependency_block_propagation_is_idempotent_and_saves_once(
         TASK_FAILED,
         TASK_BLOCKED,
         TASK_BLOCKED,
-    ]
+        TASK_RUNNING,
+        TASK_PENDING,
+    ], "RB is blocked; RC keeps its running task and is skipped"
+    assert state["node_states"]["RB"] == NODE_BLOCKED_BY_DEPENDENCY
+    assert state["node_states"]["RC"] == "UNSEEN"
 
     asyncio.run(manager._propagate_dependency_blocks(state))
     assert len(saves) == 1, "a second pass over blocked state must not save again"
@@ -609,8 +616,22 @@ def test_dependency_block_propagation_is_idempotent_and_saves_once(
         TASK_FAILED,
         TASK_BLOCKED,
         TASK_BLOCKED,
+        TASK_RUNNING,
+        TASK_PENDING,
     ]
-    assert state["node_states"]["RB"] == NODE_BLOCKED_BY_DEPENDENCY
+
+    # Once RC's running task ends, the next pass still blocks its pending work.
+    state["tasks"][3]["status"] = TASK_COMPLETED
+    asyncio.run(manager._propagate_dependency_blocks(state))
+    assert [task["status"] for task in state["tasks"]] == [
+        TASK_FAILED,
+        TASK_BLOCKED,
+        TASK_BLOCKED,
+        TASK_COMPLETED,
+        TASK_BLOCKED,
+    ]
+    assert state["node_states"]["RC"] == NODE_BLOCKED_BY_DEPENDENCY
+    assert len(saves) == 2
 
 
 def test_failed_child_blocks_parent_implementation(tmp_path: Path) -> None:
