@@ -379,6 +379,11 @@ class ARCWorkflowManager:
             retry_failed=retry_failed,
             retry_node_ids=retry_node_ids,
         )
+        if retry_plan:
+            # A reset un-fails the retried node; dependents that propagation
+            # blocked through it must return to schedulable state or the run
+            # ends "blocked" even after every retry succeeds.
+            await self._release_dependency_blocks(queue_state)
         self._save_processing_queue(queue_state)
         for recovered in recovered_tasks:
             await self._log(
@@ -721,6 +726,63 @@ class ARCWorkflowManager:
             if descendant_state in {TASK_FAILED, TASK_BLOCKED}:
                 failed.append(str(descendant_id))
         return failed
+
+    async def _release_dependency_blocks(self, queue_state: dict[str, Any]) -> list[str]:
+        """Return ``BLOCKED`` nodes to schedulable state after a retry reset.
+
+        ``_propagate_dependency_blocks`` is one-way: a failed prerequisite
+        blocks its dependents immediately, but nothing ever un-blocks them.
+        When a retry resets a previously failed node, its dependents' BLOCKED
+        tasks would stay frozen forever — the 2026-09-20 test1 run passed
+        REQ-1's retry yet finished "blocked: REQ-2, ROOT" precisely because of
+        this asymmetry. This mirror runs after every retry reset: a node whose
+        failed prerequisites were all reset goes back to PENDING, and the
+        drain's per-pick propagation re-blocks anything whose prerequisites
+        fail again, so releasing is never unsafe. Like propagation, releasing
+        iterates to a fixpoint because BLOCKED is transitive (A fails -> B
+        blocked -> C blocked through B).
+        """
+        released: list[str] = []
+        while True:
+            progress = False
+            for node_id in list(queue_state.get("node_states", {})):
+                if (
+                    str(queue_state["node_states"].get(node_id, "")).strip().upper()
+                    != NODE_BLOCKED_BY_DEPENDENCY
+                ):
+                    continue
+                if self._failed_prerequisite_ids(queue_state, node_id):
+                    continue
+                design_completed = any(
+                    task.get("phase") == PHASE_DESIGN
+                    and str(task.get("node_id", "")) == node_id
+                    and task.get("status") == TASK_COMPLETED
+                    for task in queue_state.get("tasks", [])
+                )
+                for task in queue_state.get("tasks", []):
+                    if str(task.get("node_id", "")) == node_id and task.get("status") == TASK_BLOCKED:
+                        task["status"] = TASK_PENDING
+                self._set_node_state(
+                    queue_state["node_states"],
+                    node_id,
+                    NODE_DESIGNED if design_completed else NODE_UNSEEN,
+                )
+                released.append(node_id)
+                progress = True
+            if not progress:
+                break
+        if released:
+            self._save_processing_queue(queue_state)
+        for node_id in released:
+            await self._log(
+                "Compiler",
+                (
+                    f"Unblocked node {node_id}: its prerequisite node(s) were reset for retry, "
+                    "so its tasks are schedulable again."
+                ),
+                node_id=node_id,
+            )
+        return released
 
     def _begin_task(self, task: dict[str, Any], queue_state: dict[str, Any]) -> None:
         node_id = task["node_id"]
@@ -1150,6 +1212,12 @@ class ARCWorkflowManager:
             retry_node_ids.append(node_id)
         if not retry_node_ids:
             return []
+        # The reset un-failed the retried nodes; dependents that propagation
+        # blocked through them must return to schedulable state, or the second
+        # drain ends "blocked" even after every retry succeeds (observed: the
+        # 2026-09-20 test1 run passed REQ-1's retry yet REQ-2/ROOT stayed
+        # BLOCKED_BY_DEPENDENCY and the run finished failed).
+        await self._release_dependency_blocks(queue_state)
         self._save_processing_queue(queue_state)
 
         # Inject the follow-up AFTER the reset so it survives into the implement

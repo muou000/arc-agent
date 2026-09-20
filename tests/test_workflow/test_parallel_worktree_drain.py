@@ -27,8 +27,10 @@ import pytest
 from core.workflow import (
     ARCWorkflowManager,
     NODE_BLOCKED_BY_DEPENDENCY,
+    NODE_DESIGNED,
     NODE_FAILED,
     NODE_PASSED,
+    NODE_UNSEEN,
     PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS,
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
@@ -653,6 +655,254 @@ def test_failed_child_blocks_parent_implementation(tmp_path: Path) -> None:
 
     assert state["tasks"][2]["status"] == TASK_BLOCKED
     assert state["node_states"]["R"] == NODE_BLOCKED_BY_DEPENDENCY
+
+
+# ---------------------------------------------------------------------------
+# releasing blocked dependents after a retry reset (the mirror of propagation)
+# ---------------------------------------------------------------------------
+
+
+def _blocked_state() -> dict[str, Any]:
+    """Queue state reproducing the 2026-09-20 test1 failure shape.
+
+    RA's IMPLEMENT failed, so propagation blocked RB (declared dependent) and
+    R (parent waiting on RA's IMPLEMENT). This is the state the run ended in
+    before the auto TDD retry reset RA.
+    """
+    return {
+        "tasks": [
+            {"task_id": "R:DESIGN", "node_id": "R", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "R:IMPLEMENT", "node_id": "R", "phase": PHASE_IMPLEMENT, "status": TASK_BLOCKED},
+            {"task_id": "RA:DESIGN", "node_id": "RA", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_BLOCKED},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_BLOCKED},
+        ],
+        "node_states": {"R": NODE_BLOCKED_BY_DEPENDENCY, "RA": NODE_FAILED, "RB": NODE_BLOCKED_BY_DEPENDENCY},
+        "descendants": {"R": ["RA", "RB"]},
+        "dependencies": {"RB": ["RA"]},
+    }
+
+
+def test_release_returns_blocked_dependents_to_pending_after_retry_reset(
+    tmp_path: Path,
+) -> None:
+    """A retried dependency must un-block its dependents (2026-09-20 test1).
+
+    The run passed REQ-1's auto TDD retry yet finished "blocked: REQ-2, ROOT"
+    because propagation is one-way: once marked, BLOCKED tasks were never
+    schedulable again. Releasing after the reset restores both the declared
+    dependent and the waiting parent.
+    """
+    manager = _make_parallel_manager(tmp_path)
+    state = _blocked_state()
+    # The retry reset RA the way _reset_node_from_implement_retry does.
+    state["tasks"][3]["status"] = TASK_PENDING
+    state["node_states"]["RA"] = NODE_DESIGNED
+
+    released = asyncio.run(manager._release_dependency_blocks(state))
+
+    assert set(released) == {"R", "RB"}
+    tasks = {task["task_id"]: task["status"] for task in state["tasks"]}
+    assert tasks["R:IMPLEMENT"] == TASK_PENDING
+    assert tasks["RB:DESIGN"] == TASK_PENDING
+    assert tasks["RB:IMPLEMENT"] == TASK_PENDING
+    # A node whose DESIGN already completed resumes as DESIGNED, not UNSEEN,
+    # so the queue node state stays consistent with its task statuses.
+    assert state["node_states"]["R"] == NODE_DESIGNED
+    assert state["node_states"]["RB"] == NODE_UNSEEN
+
+
+def test_release_is_transitive_through_blocked_intermediaries(tmp_path: Path) -> None:
+    """BLOCKED propagates transitively, so releasing must iterate to a fixpoint.
+
+    RA failed -> RB blocked (declared) -> RC blocked through RB. Resetting RA
+    alone must release both RB and RC regardless of dict iteration order.
+    """
+    manager = _make_parallel_manager(tmp_path)
+    state = {
+        "tasks": [
+            {"task_id": "RA:DESIGN", "node_id": "RA", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_BLOCKED},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_BLOCKED},
+            {"task_id": "RC:DESIGN", "node_id": "RC", "phase": PHASE_DESIGN, "status": TASK_BLOCKED},
+            {"task_id": "RC:IMPLEMENT", "node_id": "RC", "phase": PHASE_IMPLEMENT, "status": TASK_BLOCKED},
+        ],
+        "node_states": {"RA": NODE_DESIGNED, "RB": NODE_BLOCKED_BY_DEPENDENCY, "RC": NODE_BLOCKED_BY_DEPENDENCY},
+        "dependencies": {"RB": ["RA"], "RC": ["RB"]},
+    }
+
+    released = asyncio.run(manager._release_dependency_blocks(state))
+
+    assert set(released) == {"RB", "RC"}
+    assert all(
+        task["status"] == TASK_PENDING
+        for task in state["tasks"]
+        if task["node_id"] in {"RB", "RC"}
+    )
+
+
+def test_release_keeps_nodes_blocked_behind_still_failed_prerequisites(
+    tmp_path: Path,
+) -> None:
+    """Releasing one failed node must not release its still-failed siblings.
+
+    RD stays failed, so RE (its declared dependent) keeps its BLOCKED state
+    even though RA was reset and RB was released.
+    """
+    manager = _make_parallel_manager(tmp_path)
+    state = {
+        "tasks": [
+            {"task_id": "RA:DESIGN", "node_id": "RA", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_BLOCKED},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_BLOCKED},
+            {"task_id": "RD:DESIGN", "node_id": "RD", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RD:IMPLEMENT", "node_id": "RD", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+            {"task_id": "RE:DESIGN", "node_id": "RE", "phase": PHASE_DESIGN, "status": TASK_BLOCKED},
+            {"task_id": "RE:IMPLEMENT", "node_id": "RE", "phase": PHASE_IMPLEMENT, "status": TASK_BLOCKED},
+        ],
+        "node_states": {
+            "RA": NODE_DESIGNED,
+            "RB": NODE_BLOCKED_BY_DEPENDENCY,
+            "RD": NODE_FAILED,
+            "RE": NODE_BLOCKED_BY_DEPENDENCY,
+        },
+        "dependencies": {"RB": ["RA"], "RE": ["RD"]},
+    }
+
+    released = asyncio.run(manager._release_dependency_blocks(state))
+
+    assert released == ["RB"]
+    tasks = {task["task_id"]: task["status"] for task in state["tasks"]}
+    assert tasks["RE:DESIGN"] == TASK_BLOCKED
+    assert tasks["RE:IMPLEMENT"] == TASK_BLOCKED
+    assert state["node_states"]["RE"] == NODE_BLOCKED_BY_DEPENDENCY
+
+
+def test_release_holds_nested_ancestor_until_every_failed_descendant_is_reset(
+    tmp_path: Path,
+) -> None:
+    """A blocked ancestor waits on ALL failed descendants, not just the deepest.
+
+    Ancestor blocking propagates through ``descendants`` (R waits for RA and
+    RA1's IMPLEMENTs), and release checks the same map through the same
+    ``_failed_prerequisite_ids`` helper, so the two are mirror images: while
+    any failed descendant remains — here the middle layer RA after only the
+    innermost RA1 was retried — the ancestor keeps its BLOCKED state, and it
+    is released only once every failed descendant under it has been reset.
+    """
+    manager = _make_parallel_manager(tmp_path)
+    state = {
+        "tasks": [
+            {"task_id": "R:DESIGN", "node_id": "R", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "R:IMPLEMENT", "node_id": "R", "phase": PHASE_IMPLEMENT, "status": TASK_BLOCKED},
+            {"task_id": "RA:DESIGN", "node_id": "RA", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+            {"task_id": "RA1:DESIGN", "node_id": "RA1", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA1:IMPLEMENT", "node_id": "RA1", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+        ],
+        "node_states": {
+            "R": NODE_BLOCKED_BY_DEPENDENCY,
+            "RA": NODE_FAILED,
+            "RA1": NODE_FAILED,
+        },
+        "descendants": {"R": ["RA", "RA1"], "RA": ["RA1"]},
+        "dependencies": {},
+    }
+
+    # Only the innermost failed descendant is retried; the middle layer RA is
+    # still failed, so the ancestor must stay blocked.
+    state["tasks"][5]["status"] = TASK_PENDING
+    state["node_states"]["RA1"] = NODE_DESIGNED
+    released = asyncio.run(manager._release_dependency_blocks(state))
+    assert released == [], "R stays blocked while the middle descendant RA is still failed"
+    assert state["tasks"][1]["status"] == TASK_BLOCKED
+    assert state["node_states"]["R"] == NODE_BLOCKED_BY_DEPENDENCY
+
+    # Resetting the middle layer too releases the ancestor.
+    state["tasks"][3]["status"] = TASK_PENDING
+    state["node_states"]["RA"] = NODE_DESIGNED
+    released = asyncio.run(manager._release_dependency_blocks(state))
+    assert released == ["R"]
+    assert state["tasks"][1]["status"] == TASK_PENDING
+    assert state["node_states"]["R"] == NODE_DESIGNED
+
+
+def test_released_block_is_reblocked_when_the_retry_fails_again(
+    tmp_path: Path,
+) -> None:
+    """Releasing must be safe to undo: propagation re-blocks on the next pick.
+
+    The drain runs propagation before every task pick, so a retried node that
+    fails again re-blocks its dependents exactly as the first failure did.
+    """
+    manager = _make_parallel_manager(tmp_path)
+    state = {
+        "tasks": [
+            {"task_id": "RA:DESIGN", "node_id": "RA", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_PENDING},
+            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
+        ],
+        "node_states": {"RA": NODE_DESIGNED, "RB": NODE_UNSEEN},
+        "dependencies": {"RB": ["RA"]},
+    }
+    asyncio.run(manager._release_dependency_blocks(state))
+
+    # The retry fails again.
+    state["tasks"][1]["status"] = TASK_FAILED
+    state["node_states"]["RA"] = NODE_FAILED
+    asyncio.run(manager._propagate_dependency_blocks(state))
+
+    tasks = {task["task_id"]: task["status"] for task in state["tasks"]}
+    assert tasks["RB:DESIGN"] == TASK_BLOCKED
+    assert tasks["RB:IMPLEMENT"] == TASK_BLOCKED
+    assert state["node_states"]["RB"] == NODE_BLOCKED_BY_DEPENDENCY
+
+
+def test_auto_tdd_retry_releases_blocked_dependents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-run auto retry path must release blocks it un-fails.
+
+    This is the integration path from the 2026-09-20 test1 run: the first
+    drain failed RA and blocked RB/R; the auto TDD retry scanned
+    runner-events for RA's test/failed, reset it, and the second drain must
+    now see RB/R as schedulable instead of finishing "blocked".
+    """
+    manager = _make_parallel_manager(tmp_path)
+    state = _blocked_state()
+    # The fake runtime has no paths object; point the retry scan at a real
+    # events file under the workspace so _prepare_auto_tdd_retry can read it.
+    events_path = Path(manager.workspace_path) / ".arc" / "runner-events.jsonl"
+    manager.runtime.paths = SimpleNamespace(runner_events_path=events_path)
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    events_path.write_text(
+        json.dumps(
+            {
+                "type": "requirement_state",
+                "node_id": "RA",
+                "phase": "test",
+                "status": "failed",
+                "message": "Unit: sessionService failed",
+                "timestamp": "2026-09-20 06:19:38",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    retried = asyncio.run(manager._prepare_auto_tdd_retry(state))
+
+    assert retried == ["RA"]
+    tasks = {task["task_id"]: task["status"] for task in state["tasks"]}
+    assert tasks["R:IMPLEMENT"] == TASK_PENDING, "the waiting parent is schedulable again"
+    assert tasks["RB:DESIGN"] == TASK_PENDING, "the declared dependent is schedulable again"
+    assert tasks["RB:IMPLEMENT"] == TASK_PENDING
+    assert state["node_states"]["R"] == NODE_DESIGNED
+    assert state["node_states"]["RB"] == NODE_UNSEEN
 
 
 def test_subtree_tasks_share_one_worktree_directory(

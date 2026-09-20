@@ -12,6 +12,7 @@ the node session updates all run for real — no tokens, no npm.
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -1429,6 +1430,28 @@ def test_install_tool_reaches_agent_without_shell() -> None:
     assert "not configured" in result
 
 
+def test_install_tool_converts_handler_crash_into_failed_install() -> None:
+    """A handler exception must not escape into the agent graph.
+
+    Observed on the 2026-09-20 test1 run: ``install_dependencies`` raised
+    ``FileNotFoundError: [WinError 2]`` (bare ``npm`` is unspawnable through
+    ``create_subprocess_exec`` on Windows), the exception killed the whole
+    IMPLEMENT task, and the stream-fallback replay crashed on it again. The
+    tool layer now converts any handler crash into an ordinary failed install
+    so the agent can fall back to a standard-library implementation.
+    """
+
+    class ExplodingHandler:
+        async def install_package(self, package: str, target: str = "backend") -> str:
+            raise FileNotFoundError(2, "系统找不到指定的文件。", "npm")
+
+    tool = build_install_dependencies_tool(app_handler=ExplodingHandler(), node_id="REQ-X")
+    result = asyncio.run(tool(package="bcrypt", target="backend"))
+    assert result.startswith("Exit Code: 1")
+    assert "FileNotFoundError" in result
+    assert "fall back" in result.lower()
+
+
 def test_install_command_uses_argv_list() -> None:
     """The install command must bypass the shell (review round-1 hardening).
 
@@ -1450,3 +1473,64 @@ def test_install_command_uses_argv_list() -> None:
     install_source = inspect.getsource(web_mod.WebAppType.install_package)
     assert '"npm",' in install_source
     assert 'name,' in install_source
+
+
+def test_exec_argv_resolves_program_through_pathext() -> None:
+    """``create_subprocess_exec`` cannot spawn bare ``npm`` on Windows.
+
+    ``CreateProcess`` does not apply ``PATHEXT`` resolution, so the argv-list
+    npm install crashed with ``FileNotFoundError: [WinError 2]`` on Windows
+    (the real file is ``npm.cmd``). The list path must resolve the program
+    with ``shutil.which`` first - on Windows that finds ``npm.cmd``, on POSIX
+    it returns the same absolute path, so both platforms spawn it directly.
+    """
+
+    import inspect
+
+    from app_type_handler import web as web_mod
+
+    source = inspect.getsource(web_mod._run_npm_command)
+    assert "_resolve_executable" in source, "the exec path must resolve the program first"
+
+    # Resolution mirrors a shell: whatever which() finds, it stays on PATH.
+    assert web_mod._resolve_executable("definitely-not-a-real-program-xyz") == (
+        "definitely-not-a-real-program-xyz"
+    ), "an unresolvable name is passed through for the OS error to surface"
+    resolved = web_mod._resolve_executable("npm")
+    if sys.platform == "win32":
+        assert resolved.lower().endswith((".cmd", ".exe", ".bat", ".ps1")) or resolved == "npm"
+    else:
+        assert resolved == "npm" or Path(resolved).is_absolute()
+
+
+def test_install_package_converts_spawn_failure_into_failed_install(
+    tmp_path, monkeypatch
+) -> None:
+    """An unspawnable npm must fail the install, not crash the IMPLEMENT task.
+
+    Belt to the tool-layer suspenders: even if resolution misses (a PATH-less
+    sandbox, a renamed binary), ``install_package`` returns an ``Exit Code: 1``
+    body the agent can recover from instead of raising.
+    """
+
+    from app_type_handler import web as web_mod
+    from app_type_handler.web import WebAppType
+
+    async def exploding_run(command, target_dir, timeout=None):
+        raise FileNotFoundError(2, "系统找不到指定的文件。", "npm")
+
+    async def noop_log(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(web_mod, "_run_npm_command", exploding_run)
+
+    handler = WebAppType.__new__(WebAppType)
+    handler.workspace_path = str(tmp_path)
+    handler.log_cb = noop_log
+    (tmp_path / "backend").mkdir()
+
+    result = asyncio.run(handler.install_package("bcrypt", "backend"))
+
+    assert result.startswith("Exit Code: 1")
+    assert "could not run" in result
+    assert "FileNotFoundError" in result
