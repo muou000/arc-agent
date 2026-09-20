@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from agents.context.prompts.common import app_runtime_contract, code_quality_policy, compiler_background, code_task_exploration_policy, reasoning_reflection_policy, requirement_data_policy, response_contract, section, task_context_block, whole_app_policy, workspace_tool_policy
+from agents.runtime.stage_discipline import MAX_DESIGN_WRITES, MAX_NON_LEAF_DESIGN_WRITES
 
 
 def get_system_prompt() -> str:
@@ -39,6 +40,7 @@ def get_system_prompt() -> str:
                     "When retrying a node, treat existing current-node interfaces and source skeletons as the baseline design. Read and reconcile them before proposing changes.",
                     "Inspect only directly relevant workspace files. Do not inventory the project.",
                     "Use the current requirement and any existing contract evidence to choose the smallest file set that can support one design hypothesis.",
+                    f"Design write budget, decided before you start: the pass may touch at most {MAX_DESIGN_WRITES} distinct files as a leaf node, or {MAX_NON_LEAF_DESIGN_WRITES} as a non-leaf shell node (the task message states your node's exact number). Counting rule: what counts is the first `write_file`, `edit_file`, or `append_file` on a file path you have not touched yet in this pass - the three tools count the same, and re-touching a file you already wrote costs nothing. Budget is reserved the moment a call is validated, even inside one parallel tool-call batch. When the budget is exhausted, stop writing files and record the remaining interfaces in your response for TestDrivenDeveloper; do not delete or rename files to free budget.",
                     "For non-leaf nodes, use the UI-only design skill and keep the scope to shell, layout, style, route-slot, and mount-point concerns. Do not read backend, database, test, or package files for UI-only design.",
                     "For leaf nodes, use the full-chain design skill and only the layers actually owned by the requirement.",
                     "Shared integration surfaces - the app entry and route registration (`app.js`, `App.tsx`), shared providers/contexts, shared API clients, database bootstrap modules, and any file the project structure shows as owned by another requirement - are extended, never rewritten: add your import and registration lines at the established mount point and leave existing lines untouched. Sibling requirement nodes compile in parallel worktrees and merge back one by one; additive edits merge mechanically, while rewrites of shared files conflict and fail the whole node.",
@@ -78,13 +80,16 @@ def get_user_prompt(
     requirement_data: dict[str, Any],
     dynamic_context: str,
     merge_conflict: dict[str, Any] | None = None,
+    max_design_writes: int | None = None,
 ) -> str:
+    budget = max_design_writes if max_design_writes is not None else MAX_DESIGN_WRITES
     extra_sections = [
         section(
             "Task",
             [
                 "The workflow has not pre-classified this node; decide whether it is leaf or non-leaf from `children_ids` and visual references before designing.",
                 "If this is a non-leaf node without visual references, return an empty interface list without reading or editing files; the workflow normally skips that case before this prompt.",
+                f"Your design write budget for this pass is {budget} distinct files: the first write_file/edit_file/append_file on each new file path counts one unit, re-touching a file you already wrote is free, and the budget is enforced in parallel batches too. Plan the file set up front so the shell and its mount-point wiring fit inside {budget} files; record anything beyond it as interface contracts in the response for TestDrivenDeveloper.",
                 "Design and materialize the current node's owned interfaces, and include reused parent/dependency interfaces that this node will implement, extend, or call.",
                 "Return `summary`, `interfaces`, and `files_written`.",
                 "The `summary` prose is not a substitute for the `interfaces` array: every skeleton file you materialize must also appear as an interface record in `interfaces`, and `files_written` must list exactly the files written in this pass.",

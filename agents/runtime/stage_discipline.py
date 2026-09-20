@@ -18,7 +18,19 @@ _VALIDATION_TOOLS = frozenset({"run_build", "run_tests"})
 # Marker prefix of results produced by _blocked(); tool-usage observability
 # uses it to tell blocked round-trips apart from tool errors.
 BLOCKED_RESULT_PREFIX = "Error: ARC stage discipline:"
-_MAX_DESIGN_WRITES = 8
+# DESIGN write budget: distinct file paths whose first successful touch
+# (write_file/edit_file/append_file all count the same) a pass may
+# materialize. The budget counts *paths*, not call count: rewriting or
+# appending to a path already touched never consumes budget again. A leaf
+# pass owns ~7 new modules plus small additive wiring edits on shared
+# surfaces (run6: 7 owned + 5 shared = 12 legal paths), so its ceiling is 12.
+# A non-leaf shell pass composes many small presentational files around its
+# mount points (arc-output4 ROOT materialized 12 in one legal batch), so its
+# ceiling is 16.
+_MAX_DESIGN_WRITES = 12
+MAX_DESIGN_WRITES = _MAX_DESIGN_WRITES
+_MAX_NON_LEAF_DESIGN_WRITES = 16
+MAX_NON_LEAF_DESIGN_WRITES = _MAX_NON_LEAF_DESIGN_WRITES
 _MAX_SKELETON_LINES = 160
 MAX_SKELETON_LINES = _MAX_SKELETON_LINES
 MAX_APPEND_LINES = 80
@@ -114,6 +126,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         test_manifest_lock: TestManifestLock | None = None,
         pending_contract_registry: Any | None = None,
         template_shared_surfaces: frozenset[str] | None = None,
+        max_design_writes: int | None = None,
     ) -> None:
         self._stage = stage
         self._file_claim_gate = file_claim_gate
@@ -131,12 +144,22 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # and is deliberately not unlocked by validation failures — a failing
         # test never makes destroying runtime wiring the right repair.
         self._template_shared_surfaces = template_shared_surfaces or frozenset()
+        # DESIGN write budget for this pass (interface_design only). Leaf
+        # nodes default to 8; a non-leaf shell pass may raise it (see
+        # ``InterfaceDesigner._max_design_writes``).
+        self._max_design_writes = max_design_writes if max_design_writes is not None else _MAX_DESIGN_WRITES
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._repeated_read_counts: dict[str, int] = {}
         self._written_paths: set[str] = set()
         self._failed_paths: set[str] = set()
         self._validation_failed = False
-        self._design_write_count = 0
+        # Paths that consumed budget at validation time. The agent emits file
+        # tools in parallel batches, so counting only on success lets a whole
+        # batch (arc-output4 ROOT: 12 writes in one tool-call burst) observe
+        # the same stale count and overshoot the cap. Reserving at validation
+        # and releasing on failure keeps the cap exact without punishing a
+        # batch that respects it.
+        self._design_write_reservations: set[str] = set()
         self._append_counts: dict[str, int] = {}
         self._rewrite_counts: dict[str, int] = {}
         self._write_block_counts: dict[str, int] | None = {} if stage == "interface_design" else None
@@ -217,6 +240,44 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             "the file as a reused interface in your response."
         )
 
+    def _reserve_design_write(self, path: str) -> str | None:
+        """Consume one unit of the DESIGN write budget for ``path``.
+
+        Returns the block message when the budget is exhausted. The budget
+        counts distinct paths (write_file, edit_file, and append_file all
+        count a path's first touch the same); re-touching a path already
+        reserved costs nothing. Reserving at validation time is what makes a
+        parallel tool-call batch respect the cap: counting only on success
+        let every call in the batch observe the same stale count and overshoot
+        (arc-output4 ROOT: 12 writes in one burst, cap 8). A later failure on
+        the path releases the reservation, so an errored attempt does not
+        burn budget either.
+
+        Invariant for future tool additions: exactly two call sites reserve —
+        ``_validate_append`` (append_file) and the interface_design branch of
+        ``_validate_write`` (write_file/edit_file). Any tool added to
+        ``_FILE_WRITE_TOOLS`` or ``_ADDITIVE_FILE_WRITE_TOOLS`` routes through
+        those validators and is therefore reserved automatically; a new write
+        tool that bypasses them must call this helper at the same position in
+        the check order — after per-write content checks, before the file
+        claim gate, so a content-rejected write never burns budget and a
+        claim-rejected one already holds its unit.
+        """
+
+        if path in self._design_write_reservations:
+            return None
+        if len(self._design_write_reservations) >= self._max_design_writes:
+            used = len(self._design_write_reservations)
+            return (
+                f"Design write budget blocked: this pass may touch at most {self._max_design_writes} "
+                f"distinct files (first write_file/edit_file/append_file on a path each count once; "
+                f"re-touching a file you already wrote costs nothing). {used} file(s) are already "
+                "reserved. Record the remaining interfaces in your response instead of writing "
+                "more files - TestDrivenDeveloper owns the implementation work."
+            )
+        self._design_write_reservations.add(path)
+        return None
+
     def _validate_append(self, args: dict[str, Any]) -> str | None:
         """Validate the DESIGN-only additive continuation tool.
 
@@ -230,11 +291,6 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         path = _discipline_path(args)
         if not path:
             return "append_file requires a workspace file_path."
-        if path not in self._written_paths and self._design_write_count >= _MAX_DESIGN_WRITES:
-            return (
-                f"InterfaceDesigner may materialize at most {_MAX_DESIGN_WRITES} small skeleton files. "
-                "Record remaining interfaces in the response for TDD."
-            )
         count = self._append_counts.get(path, 0)
         if count >= MAX_APPENDS_PER_FILE:
             return (
@@ -252,6 +308,8 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 f"append_file accepts at most {MAX_APPEND_LINES} lines per chunk; received {line_count}. "
                 "Split the next cohesive skeleton section into another append."
             )
+        if budget_block := self._reserve_design_write(path):
+            return budget_block
         if self._file_claim_gate is not None:
             blocked = self._file_claim_gate.check_and_claim(path)
             if blocked:
@@ -403,11 +461,6 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             if blocked:
                 return blocked
         if self._stage == "interface_design":
-            if path not in self._written_paths and self._design_write_count >= _MAX_DESIGN_WRITES:
-                return (
-                    f"InterfaceDesigner may materialize at most {_MAX_DESIGN_WRITES} small skeleton files. "
-                    "Record remaining interfaces in the response for TDD."
-                )
             content = str(args.get("content", args.get("new_string", "")) or "")
             if violation := self._validate_design_content(content):
                 return violation
@@ -416,6 +469,8 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                     f"InterfaceDesigner may only materialize small skeletons (at most {_MAX_SKELETON_LINES} lines per write). "
                     "Record the complete business contract for TDD instead of implementing it now."
                 )
+            if budget_block := self._reserve_design_write(path):
+                return budget_block
         if self._file_claim_gate is not None:
             # Cross-node ownership of new files (parallel worktrees): claim
             # the path for this node or reject a sibling's claimed path. The
@@ -475,6 +530,13 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if _tool_result_failed(result):
             if path:
                 self._failed_paths.add(path)
+                # A failed write consumed budget at validation time; release
+                # the reservation so a retry after the error is not charged
+                # twice for the same path. A path that already materialized
+                # successfully keeps its reservation — its failed *retry*
+                # must not re-free the slot it already occupies.
+                if self._stage == "interface_design" and path not in self._written_paths:
+                    self._design_write_reservations.discard(path)
             return
         if name == "delete" and path:
             # The file is gone, so its write lock, read ranges, repeat-read
@@ -510,8 +572,6 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             self._read_ranges.setdefault(path, []).append((offset, offset + limit))
             self._cache_read_summary(request, path, offset, limit, result)
         if (name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS) and path:
-            if path not in self._written_paths and self._stage == "interface_design":
-                self._design_write_count += 1
             self._written_paths.add(path)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)

@@ -3,7 +3,10 @@
 The middleware guards every tool call of the three stage agents:
 
 - ``test_generation`` may only write test assets and must not run validation.
-- ``interface_design`` may materialize at most 8 small skeleton files.
+- ``interface_design`` may touch at most 12 distinct files in a pass (leaf
+  default; the middleware accepts a higher tiered ceiling for non-leaf shell
+  passes), counted per path across write_file/edit_file/append_file and
+  reserved at validation time so parallel batches respect the cap.
 - every stage blocks repeated writes/re-reads until a file-operation or
   validation failure unlocks the path again; in ``test_generation`` a
   successful delete also releases the path, so delete-then-rewrite works
@@ -586,31 +589,135 @@ def test_run_tests_exit_code_zero_does_not_unlock() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_interface_design_blocks_more_than_eight_skeleton_writes() -> None:
-    middleware = make("interface_design")
-    for index in range(8):
+def test_interface_design_blocks_beyond_the_leaf_skeleton_write_budget() -> None:
+    middleware = make("interface_design")  # default = leaf ceiling (12)
+    for index in range(12):
         result = run(
             middleware,
             make_request("write_file", {"file_path": f"/workspace/src/mod_{index}.py", "content": "class A:\n"}, call_id=f"c{index}"),
         )
         assert result.content == "ok", f"write {index} should pass"
-    ninth = run(
+    thirteenth = run(
         middleware,
-        make_request("write_file", {"file_path": "/workspace/src/mod_new.py", "content": "class B:\n"}, call_id="c9"),
+        make_request("write_file", {"file_path": "/workspace/src/mod_new.py", "content": "class B:\n"}, call_id="c13"),
     )
-    assert ninth.status == "error" and "at most 8 small skeleton files" in ninth.content
-    ninth_append = run(
+    assert thirteenth.status == "error" and "at most 12" in thirteenth.content and "distinct files" in thirteenth.content
+    thirteenth_append = run(
         middleware,
-        make_request("append_file", {"file_path": "/workspace/src/mod_new.py", "content": "class B:\n"}, call_id="a9"),
+        make_request("append_file", {"file_path": "/workspace/src/mod_new.py", "content": "class B:\n"}, call_id="a13"),
     )
-    assert ninth_append.status == "error" and "at most 8 small skeleton files" in ninth_append.content
+    assert thirteenth_append.status == "error" and "at most 12" in thirteenth_append.content
     # Rewriting an already-written path is governed by the repeated-write rule,
     # not the skeleton budget.
     rewrite = run(
         middleware,
-        make_request("write_file", {"file_path": "/workspace/src/mod_0.py", "content": "class A2:\n"}, call_id="c10"),
+        make_request("write_file", {"file_path": "/workspace/src/mod_0.py", "content": "class A2:\n"}, call_id="c14"),
     )
     assert rewrite.status == "error" and "Repeated write blocked" in rewrite.content
+
+
+def test_interface_design_write_budget_reserves_across_a_parallel_batch() -> None:
+    """A parallel tool-call burst must not overshoot the cap (arc-output4 ROOT).
+
+    Twelve write_file calls arrive before any of them completes; counting
+    only on success let every validation read the same stale count and the
+    whole burst through. Reservation at validation time makes the batch
+    respect the cap exactly.
+    """
+
+    middleware = StageDisciplineMiddleware(stage="interface_design", max_design_writes=8)
+    batch = [
+        make_request("write_file", {"file_path": f"/workspace/src/part_{index}.py", "content": "x = 1\n"}, call_id=f"b{index}")
+        for index in range(12)
+    ]
+    # Simulate the runtime interleaving: every call is validated before any
+    # result is recorded (wrap_tool_call on a batch of concurrent handlers).
+    for request in batch[:8]:
+        assert middleware._validate_tool_call(request) is None
+    for request in batch[:8]:
+        run(middleware, request)
+    blocked_validation = middleware._validate_tool_call(batch[8])
+    assert blocked_validation is not None and "at most 8" in blocked_validation
+    ninth = run(middleware, batch[8])
+    assert ninth.status == "error" and "at most 8" in ninth.content
+
+
+def test_interface_design_write_budget_counts_edit_and_write_paths_the_same() -> None:
+    """The budget counts distinct paths; edit_file's first touch costs one unit."""
+
+    middleware = StageDisciplineMiddleware(stage="interface_design", max_design_writes=2)
+    first = run(middleware, make_request("write_file", {"file_path": "/workspace/src/a.py", "content": "a\n"}, call_id="c1"))
+    assert first.content == "ok"
+    # First touch of a second path via edit_file consumes the remaining unit.
+    second = run(middleware, make_request("edit_file", {"file_path": "/workspace/src/b.py", "old_string": "x", "new_string": "y"}, call_id="c2"))
+    assert second.content == "ok"
+    third = run(middleware, make_request("write_file", {"file_path": "/workspace/src/c.py", "content": "c\n"}, call_id="c3"))
+    assert third.status == "error" and "at most 2" in third.content
+    # Re-touching a path already touched costs nothing: appending to a.py is
+    # budget-free (the per-file append cap is a separate rule).
+    append_same = run(middleware, make_request("append_file", {"file_path": "/workspace/src/a.py", "content": "more\n"}, call_id="c4"))
+    assert append_same.content == "ok"
+
+
+def test_interface_design_write_budget_reserves_every_write_tool_in_one_batch() -> None:
+    """Invariant pin: a mixed parallel batch of write/edit/append first-touches
+    each reserves one unit, whatever tool carries it (see the call-site
+    invariant in ``_reserve_design_write``'s docstring)."""
+
+    middleware = StageDisciplineMiddleware(stage="interface_design", max_design_writes=2)
+    batch = [
+        make_request("write_file", {"file_path": "/workspace/src/one.py", "content": "1\n"}, call_id="m1"),
+        make_request("edit_file", {"file_path": "/workspace/src/two.py", "old_string": "x", "new_string": "y"}, call_id="m2"),
+        make_request("append_file", {"file_path": "/workspace/src/three.py", "content": "3\n"}, call_id="m3"),
+    ]
+    # Validate all three before recording any result (parallel-batch shape).
+    validations = [middleware._validate_tool_call(request) for request in batch]
+    assert validations[0] is None and validations[1] is None
+    assert validations[2] is not None and "at most 2" in validations[2]
+
+
+def test_interface_design_write_budget_failure_releases_the_reservation() -> None:
+    """An errored write refunds its unit; a failed retry of a materialized
+    path does not (its slot is already occupied)."""
+
+    def failing_tool(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="Error: no such file", name=request.tool_call["name"], tool_call_id=request.tool_call["id"])
+
+    middleware = StageDisciplineMiddleware(stage="interface_design", max_design_writes=1)
+    blocked_first = run(middleware, make_request("write_file", {"file_path": "/workspace/src/gone.py", "content": "x\n"}, call_id="c1"), handler=failing_tool)
+    assert "Error: no such file" in blocked_first.content
+    # The failed write freed the only budget unit, so a different path may use it.
+    retry = run(middleware, make_request("write_file", {"file_path": "/workspace/src/other.py", "content": "y\n"}, call_id="c2"))
+    assert retry.content == "ok"
+
+    # A path that already materialized keeps its reservation even when a later
+    # unlocked retry of it fails: the unlock (via the first failure) lets the
+    # retry through to the handler, but the slot it occupies is not re-freed.
+    middleware2 = StageDisciplineMiddleware(stage="interface_design", max_design_writes=1)
+    ok_write = run(middleware2, make_request("write_file", {"file_path": "/workspace/src/ok.py", "content": "v1\n"}, call_id="c1"))
+    assert ok_write.content == "ok"
+    middleware2._failed_paths.add("/workspace/src/ok.py")  # a file-op failure unlocks a rewrite
+    failed_rewrite = run(middleware2, make_request("write_file", {"file_path": "/workspace/src/ok.py", "content": "v2\n"}, call_id="c2"), handler=failing_tool)
+    assert "Error: no such file" in failed_rewrite.content
+    other = run(middleware2, make_request("write_file", {"file_path": "/workspace/src/zz.py", "content": "z\n"}, call_id="c3"))
+    assert other.status == "error" and "at most 1" in other.content
+
+
+def test_interface_design_non_leaf_budget_can_be_raised() -> None:
+    """A non-leaf shell pass (16-file ceiling) admits the arc-output4 ROOT shape."""
+
+    middleware = StageDisciplineMiddleware(stage="interface_design", max_design_writes=16)
+    for index in range(16):
+        result = run(
+            middleware,
+            make_request("write_file", {"file_path": f"/workspace/src/shell_{index}.tsx", "content": "export {}\n"}, call_id=f"s{index}"),
+        )
+        assert result.content == "ok", f"write {index} should pass"
+    seventeenth = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/src/extra.tsx", "content": "export {}\n"}, call_id="s16"),
+    )
+    assert seventeenth.status == "error" and "at most 16" in seventeenth.content
 
 
 def test_interface_design_blocks_large_files() -> None:

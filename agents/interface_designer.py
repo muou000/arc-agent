@@ -25,6 +25,7 @@ from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent, salvage_json_objects
+from agents.runtime.stage_discipline import MAX_DESIGN_WRITES, MAX_NON_LEAF_DESIGN_WRITES
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
 from agents.tools.traceability import build_traceability_tools
 
@@ -132,6 +133,29 @@ class InterfaceDesigner:
         # isolated per-node worktree: sessions and caches stay in the main
         # workspace while the agent's filesystem root is the worktree.
         self.context_workspace_root = context_workspace_root
+        # Write budget tier pinned by ``run()`` for the pass it is executing.
+        # The repair flows rebuild agents mid-pass and read this instead of
+        # re-deriving from anything, so every rebuild within one ``run`` shares
+        # the tier the first agent was built with. ``None`` outside a run.
+        self._current_max_design_writes: int | None = None
+
+    @staticmethod
+    def _max_design_writes(requirement_data: dict[str, Any]) -> int:
+        """Tiered DESIGN write budget for this pass.
+
+        The ceiling counts distinct file paths (see ``_reserve_design_write``).
+        A leaf pass owns ~7 new modules plus small additive wiring edits on
+        shared surfaces (run6: 7 owned + 5 shared = 12 legal paths). A
+        non-leaf shell pass composes many small presentational files around
+        its mount points — arc-output4's ROOT legally materialized 12 in one
+        parallel batch — so it gets a higher ceiling sized with headroom over
+        that observation. Leaf-ness reads ``children_ids`` from the
+        traceability record the caller passes in, the same source the
+        workflow's non-leaf skip gate uses.
+        """
+
+        is_non_leaf = bool(requirement_data.get("children_ids"))
+        return MAX_NON_LEAF_DESIGN_WRITES if is_non_leaf else MAX_DESIGN_WRITES
 
     async def run(
         self,
@@ -170,6 +194,12 @@ class InterfaceDesigner:
             workspace_root=workspace_root,
             interface_ids_by_file=self._registered_interfaces_by_file(),
         )
+        # Pin the tier once per run: the repair flows below rebuild agents and
+        # read this pin, so every rebuild within this pass shares the tier the
+        # first agent was built with (no re-derivation, no agent-attribute
+        # probing).
+        max_design_writes = self._max_design_writes(requirement_data)
+        self._current_max_design_writes = max_design_writes
         agent = self._build_agent(
             node_id=node_id,
             workspace_root=workspace_root,
@@ -177,12 +207,14 @@ class InterfaceDesigner:
             required_skill_names=required_skill_names,
             response_format=InterfaceDesignResponse,
             pending_contract_registry=pending_registry,
+            max_design_writes=max_design_writes,
         )
         message = get_user_prompt(
             node_id=node_id,
             requirement_data=requirement_data,
             dynamic_context=context_text,
             merge_conflict=self._load_merge_conflict_context(node_id),
+            max_design_writes=max_design_writes,
         )
         await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking interface design.", node_id=node_id)
@@ -267,15 +299,17 @@ class InterfaceDesigner:
         required_skill_names: list[str],
         response_format: Any,
         pending_contract_registry: PendingContractRegistry | None = None,
+        max_design_writes: int | None = None,
     ) -> Any:
         """Build the InterfaceDesigner deep-agent with a given response format.
 
         The skills source is attached unconditionally: the runtime skills
-        section lists the whole catalog and this stage agent picks what to
-        read; ``required_skill_names`` only adds the safety-floor activation
-        policy on top. ``app_type`` selects the template shared surfaces that
-        stage discipline protects from whole-file rewrites (see
-        ``AppTypeHandler.template_shared_surfaces``).
+        section lists the whole catalog and this stage agent picks what it
+        needs to read; ``required_skill_names`` only adds the safety-floor
+        activation policy on top. ``app_type`` selects the template shared
+        surfaces that stage discipline protects from whole-file rewrites (see
+        ``AppTypeHandler.template_shared_surfaces``). ``max_design_writes``
+        tiers the DESIGN write budget (leaf vs non-leaf shell pass).
         """
 
         return build_stage_agent(
@@ -295,6 +329,7 @@ class InterfaceDesigner:
             claims_workspace_root=self.context_workspace_root or workspace_root,
             pending_contract_registry=pending_contract_registry,
             app_type=app_type,
+            max_design_writes=max_design_writes,
         )
 
     async def _repair_empty_interfaces(
@@ -346,6 +381,7 @@ class InterfaceDesigner:
                 required_skill_names=required_skill_names,
                 min_items=len(skeletons),
                 pending_contract_registry=pending_contract_registry,
+                max_design_writes=self._current_max_design_writes,
             )
             merged = await self._fill_skeletons(
                 fill_agent,
@@ -426,6 +462,7 @@ class InterfaceDesigner:
             required_skill_names=required_skill_names,
             min_items=1,
             pending_contract_registry=pending_contract_registry,
+            max_design_writes=self._current_max_design_writes,
         )
         try:
             payload = await ainvoke_stage_agent(
@@ -585,6 +622,7 @@ class InterfaceDesigner:
         required_skill_names: list[str] | None,
         min_items: int,
         pending_contract_registry: PendingContractRegistry | None = None,
+        max_design_writes: int | None = None,
     ) -> Any:
         """Rebuild the agent with a minItems-constrained schema when possible.
 
@@ -608,6 +646,7 @@ class InterfaceDesigner:
                 required_skill_names=required_skill_names,
                 response_format=constrained,
                 pending_contract_registry=pending_contract_registry,
+                max_design_writes=max_design_writes,
             )
         except Exception:
             return agent
