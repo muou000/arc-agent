@@ -90,6 +90,7 @@ def get_user_prompt(
     test_type: str,
     node_tests: list[dict],
     previous_failure_summary: str = "",
+    merge_conflict: dict[str, Any] | None = None,
 ) -> str:
     ordered_layers: list[dict[str, object]] = []
     for layer in ("Unit", "Integration", "E2E"):
@@ -114,6 +115,20 @@ def get_user_prompt(
     ])
     if previous_failure_summary.strip():
         sections.append(f"### Latest Failure Evidence\n{previous_failure_summary.strip()}")
+    conflict_paths = [str(path) for path in (merge_conflict or {}).get("paths", []) if str(path).strip()]
+    if conflict_paths:
+        sections.append(
+            section(
+                "Merge Conflict Retry",
+                [
+                    "This IMPLEMENT pass is a one-shot retry after the previous pass conflicted with a parallel sibling requirement node during merge.",
+                    f"The sibling now owns these file paths (they are already merged into the workspace you see): {', '.join(conflict_paths)}.",
+                    "Do not create, rewrite, or reorganize those files. The sibling's landed behavior there is the baseline this node must work with; read it before implementing.",
+                    "Place this node's owned behavior in node-owned file paths - new cohesive modules named after this requirement's own domain - and wire them from the shared surfaces with small additive edits.",
+                    "If the requirement genuinely needs the sibling-owned surface to change, extend it additively (an import, a registration line at the established mount point) instead of rewriting it, and reconcile any behavior gap inside this node's own modules.",
+                ],
+            )
+        )
     sections.append(
         section(
             "Task",

@@ -67,3 +67,37 @@ def test_harness_skill_strictmode_section_pinned() -> None:
     assert "## StrictMode and exact-call-count assertions" in skill
     assert "double-invokes" in skill
     assert "zero-width" in skill
+
+
+def test_prompt_omits_merge_conflict_guidance_by_default() -> None:
+    prompt = _prompt()
+    assert "Merge Conflict Retry" not in prompt
+
+
+def test_prompt_renders_merge_conflict_retry_guidance() -> None:
+    """The one-shot IMPLEMENT conflict retry injects the sibling-owned paths
+    and the steer-away contract into the TDD user prompt."""
+    prompt = get_user_prompt(
+        node_id="REQ-1",
+        dynamic_context="ctx",
+        test_files=["tests/a.test.js"],
+        test_type="Unit",
+        node_tests=[],
+        merge_conflict={"paths": ["shared.js", "glue/app.js"], "phase": "implement"},
+    )
+    assert "Merge Conflict Retry" in prompt
+    assert "one-shot retry" in prompt
+    assert "shared.js, glue/app.js" in prompt
+    assert "Do not create, rewrite, or reorganize those files" in prompt
+    assert "node-owned file paths" in prompt
+    # Blank-string paths are dropped rather than rendered as empty entries.
+    prompt_sparse = get_user_prompt(
+        node_id="REQ-1",
+        dynamic_context="ctx",
+        test_files=["tests/a.test.js"],
+        test_type="Unit",
+        node_tests=[],
+        merge_conflict={"paths": ["", "shared.js"], "phase": "implement"},
+    )
+    assert "shared.js" in prompt_sparse
+    assert ", ," not in prompt_sparse
