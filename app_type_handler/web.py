@@ -191,17 +191,40 @@ class _StageTimer:
         return "\n\n=== Stage Timing ===\n" + " | ".join(parts) + "\n"
 
 
+def _resolve_executable(program: str) -> str:
+    """Resolve ``program`` to a real file ``create_subprocess_exec`` can spawn.
+
+    ``CreateProcess`` (unlike a shell) does not apply ``PATHEXT`` resolution,
+    so the bare name ``npm`` cannot be spawned on Windows where the real file
+    is ``npm.cmd``; without this the install crashes the whole IMPLEMENT task
+    with ``FileNotFoundError: [WinError 2]`` (observed on the 2026-09-20
+    test1 run). Resolution stays on PATH exactly like a shell would. An
+    unresolvable name is passed through unchanged so the OS error names the
+    program.
+    """
+    resolved = shutil.which(program)
+    return resolved or program
+
+
 async def _run_npm_command(
     command: str | list[str],
     target_dir: str,
     timeout: float = NPM_INSTALL_TIMEOUT_SECONDS,
 ) -> tuple[int, str, str]:
+    # Callers must treat an OSError from this helper (unspawnable program,
+    # missing platform tool) as an ordinary failed command: catch it and
+    # surface an exit-code-1 style result rather than letting it escape into
+    # the agent graph. Every call site guards this way (run_npm_install's
+    # attempt loop, install_package's spawn guard, the dom-peer patch below);
+    # a new call site must do the same or an environment surprise will crash
+    # the running IMPLEMENT task instead of failing one command.
     # A list command bypasses the shell entirely (no quoting/injection
     # surface); a string command keeps the historical shell behavior for
     # the flag-carrying install lines built from module constants.
     if isinstance(command, list):
         process = await asyncio.create_subprocess_exec(
-            *command,
+            _resolve_executable(command[0]),
+            *command[1:],
             cwd=target_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -2051,12 +2074,19 @@ class WebAppType(AppTypeHandler):
             "Installing missing @testing-library/dom peer (required by "
             "@testing-library/react 16, not declared by the provided template)...",
         )
-        returncode, _stdout, stderr = await _run_npm_command(
-            "npm install --no-save --no-package-lock "
-            f'{LEGACY_PEER_DEPS_FLAG} "@testing-library/dom@^10.4.0"',
-            frontend_dir,
-            NPM_INSTALL_TIMEOUT_SECONDS,
-        )
+        # Spawn-level failures (unspawnable npm, PATH-less sandbox) degrade to
+        # the same warning as a nonzero install: the peer stays missing, which
+        # the E2E gates report, instead of an exception escaping into the
+        # workspace-verification path that calls this.
+        try:
+            returncode, _stdout, stderr = await _run_npm_command(
+                "npm install --no-save --no-package-lock "
+                f'{LEGACY_PEER_DEPS_FLAG} "@testing-library/dom@^10.4.0"',
+                frontend_dir,
+                NPM_INSTALL_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            returncode, stderr = 1, f"{type(exc).__name__}: {exc}"
         if returncode != 0:
             await self._log(
                 "System",
@@ -2213,18 +2243,37 @@ class WebAppType(AppTypeHandler):
         # LEGACY_PEER_DEPS_FLAG is a single-token npm flag; split() keeps the
         # argv form honest if it ever grows, and a multi-token value would be
         # a breaking change to audit at its definition, not at each use site.
-        returncode, _stdout, stderr = await _run_npm_command(
-            [
-                "npm",
-                "install",
-                "--no-save",
-                "--no-package-lock",
-                *LEGACY_PEER_DEPS_FLAG.split(),
-                name,
-            ],
-            target_dir,
-            NPM_INSTALL_TIMEOUT_SECONDS,
-        )
+        # The subprocess itself is guarded: an unspawnable npm (or any other
+        # platform-level surprise) must surface as an ordinary failed install
+        # the agent can recover from, never as an exception that crashes the
+        # whole IMPLEMENT task (observed: WinError 2 killed REQ-1 and blocked
+        # REQ-2/ROOT on the 2026-09-20 test1 run).
+        try:
+            returncode, _stdout, stderr = await _run_npm_command(
+                [
+                    "npm",
+                    "install",
+                    "--no-save",
+                    "--no-package-lock",
+                    *LEGACY_PEER_DEPS_FLAG.split(),
+                    name,
+                ],
+                target_dir,
+                NPM_INSTALL_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            await self._log(
+                "System",
+                f"npm install of '{name}' into {label}/ could not run: {type(exc).__name__}: {exc}",
+                "warning",
+            )
+            return (
+                "Exit Code: 1\n"
+                "STDERR:\n"
+                f"npm install of '{name}' into {label}/ could not run: "
+                f"{type(exc).__name__}: {exc}\n"
+                "Fall back to a standard-library or local implementation.\n"
+            )
         if returncode != 0:
             await self._log(
                 "System",

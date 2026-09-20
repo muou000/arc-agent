@@ -70,7 +70,29 @@ def build_install_dependencies_tool(
                 "STDERR:\n"
                 "Package installation is not configured for this app handler.\n"
             )
-        return await install(package, target)
+        # A handler exception must not escape into the agent graph: an
+        # environment-level surprise (unspawnable package manager, missing
+        # platform tool) is an ordinary failed install the agent can recover
+        # from, while an escaping exception kills the whole IMPLEMENT task
+        # (observed: WinError 2 from npm on Windows crashed REQ-1's task and
+        # blocked REQ-2/ROOT on the 2026-09-20 test1 run).
+        try:
+            return await install(package, target)
+        except Exception as exc:
+            await _emit_log(
+                log_cb,
+                "Compiler",
+                f"Package installation crashed: {type(exc).__name__}: {exc}",
+                status="error",
+                node_id=node_id,
+            )
+            return (
+                "Exit Code: 1\n"
+                "STDERR:\n"
+                f"Package installation crashed: {type(exc).__name__}: {exc}\n"
+                "Treat the package as unavailable and fall back to a "
+                "standard-library or local implementation, then re-run run_tests.\n"
+            )
 
     return install_dependencies
 
