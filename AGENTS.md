@@ -147,3 +147,17 @@ python arc_main.py doctor
 - 测试命令、slow 门禁或运行时前置条件变化。
 
 根目录 `AGENTS.md` 应保持为维护 arc-agent 的短规则索引；生成应用的详细设计、测试和实现规则应继续留在运行时 prompt、middleware 和 skills 中。
+
+## Agent skills
+
+### Issue 跟踪
+
+issue 以 GitHub Issues 形式跟踪（`muou000/arc-agent`，用 `gh` CLI 读写）。见 `docs/agents/issue-tracker.md`。
+
+### Triage 标签
+
+使用五个规范角色的默认标签字符串（`needs-triage` / `needs-info` / `ready-for-agent` / `ready-for-human` / `wontfix`）。见 `docs/agents/triage-labels.md`。
+
+### 领域文档
+
+单上下文布局：根目录一个 `CONTEXT.md` + `docs/adr/`（均由 `/domain-modeling` 惰性创建）。见 `docs/agents/domain.md`。
