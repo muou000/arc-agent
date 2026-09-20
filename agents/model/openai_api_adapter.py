@@ -44,6 +44,15 @@ _DEFAULT_CONNECT_TIMEOUT = 15.0
 # ~30s of dead waiting per stalled attempt. 0 disables the watchdog.
 _DEFAULT_STREAM_CHUNK_TIMEOUT = 90.0
 _CHUNK_TIMEOUT_ENV = "ARC_MODEL_STREAM_CHUNK_TIMEOUT"
+# Whether streamed chat.completions requests ask the endpoint to return usage
+# (stream_options.include_usage). Without it every streamed call reports no
+# usage and ARC falls back to tiktoken estimation, whose cache_read is 0 by
+# definition — arc-output4's whole run was billed as zero-cache because of
+# this. The flag also gates a compatibility escape hatch: a gateway that
+# 400-rejects stream_options would otherwise mark the endpoint
+# streaming-unsupported and silently lose the stream transport's
+# idle-timeout protection, so keep it possible to turn the option off.
+_STREAM_USAGE_ENV = "ARC_MODEL_STREAM_USAGE"
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
 _REACHABILITY_PROBE_TIMEOUT = 5.0
 # A dead endpoint is re-probed up to this many times per real attempt before
@@ -555,7 +564,11 @@ def build_openai_chat_model(
     kwargs: dict[str, Any] = {
         "model": config.model_name,
         "disable_streaming": True,
-        "stream_usage": False,
+        # Chat-completions streaming only sends stream_options.include_usage
+        # (the real token counts incl. cache hits in the final SSE chunk) when
+        # this is on; the Responses streaming path ignores it, and the
+        # non-streaming paths never read it, so it is safe for every mode.
+        "stream_usage": resolve_stream_usage(),
         "use_responses_api": config.api_mode == "responses",
         "output_version": "responses/v1" if config.api_mode == "responses" else "v0",
         "arc_api_mode": config.api_mode,
@@ -599,6 +612,20 @@ def resolve_model_request_timeout() -> httpx.Timeout:
     request_timeout = _env_float("ARC_MODEL_TIMEOUT", _DEFAULT_REQUEST_TIMEOUT)
     connect_timeout = _env_float("ARC_MODEL_CONNECT_TIMEOUT", _DEFAULT_CONNECT_TIMEOUT)
     return httpx.Timeout(request_timeout, connect=min(connect_timeout, request_timeout))
+
+
+def resolve_stream_usage() -> bool:
+    """Whether streamed requests ask the provider for usage (env-tunable).
+
+    Defaults to on: ``stream_options.include_usage`` is what makes the final
+    SSE chunk carry the real token counts (including cache hits), turning
+    llm_usage events from tiktoken estimates (cache_read=0 by construction)
+    into reported values. ``ARC_MODEL_STREAM_USAGE=0/false/no/off`` restores
+    the pre-fix behaviour for gateways that reject the option.
+    """
+
+    raw = os.environ.get(_STREAM_USAGE_ENV, "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 def resolve_stream_chunk_timeout() -> float | None:

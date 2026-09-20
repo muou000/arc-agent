@@ -116,6 +116,12 @@ ARC_MODEL_STREAM_CHUNK_TIMEOUT=90      # 流式响应相邻 SSE chunk 的最大�
                                        # 的 120s）：流中途静默卡死（TCP 存活但零字节）在该时限内被发现并按
                                        # 连接类失败换传输方式重试，而不是等到 600s 读超时或把整个 agent
                                        # 会话回退重放；设 0 关闭该看门狗
+ARC_MODEL_STREAM_USAGE=1               # 流式 chat.completions 请求是否携带 stream_options.include_usage（默认
+                                       # 开）：开启后末个 SSE chunk 携带端点真实 usage（含缓存命中），llm_usage
+                                       # 事件从 tiktoken 估算（cache_read 按定义为 0）转为 reported 口径；
+                                       # 某网关 4xx 拒绝该选项时设 0/false/no/off 恢复旧行为（端点会整体回退
+                                       # 纯非流式——非流式响应本身自带 usage，计费不受影响，只失去流式对网关
+                                       # 空闲切断的防护）
 ARC_VISUAL_PRECOMPUTE=1                # 编译前并发预分析需求参考图（设 0/false/no/off 关闭）
 ARC_VISUAL_PRECOMPUTE_CONCURRENCY=4    # 参考图预分析的并发调用数
 ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_format）开关：auto（默认，对自定义

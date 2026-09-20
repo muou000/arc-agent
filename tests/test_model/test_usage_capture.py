@@ -13,8 +13,8 @@ import json
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import AIMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 from agents.model import openai_api_adapter as adapter
 from agents.model import usage_capture
@@ -38,6 +38,10 @@ def _reset_usage_state():
 
 def _chat_result(message: AIMessage, llm_output: dict | None = None) -> ChatResult:
     return ChatResult(generations=[ChatGeneration(message=message)], llm_output=llm_output or {})
+
+
+async def _instant_asleep(seconds: float) -> None:
+    return None
 
 
 def _record_to_dict(record: LLMUsageRecord) -> dict:
@@ -295,6 +299,62 @@ class TestAdapterIntegration:
         assert records[0].api_mode == "chat_completions"
         assert records[0].node_id == "REQ-9"
         assert records[0].input_tokens == 10
+
+    def test_streamed_generate_reports_provider_usage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The zero-cache billing blind spot, end to end (arc-output4): with
+        stream_usage on, the streamed transport's final chunk carries the
+        provider's usage; the llm_usage record must be reported (not
+        estimated), keep the cache-hit share, and bill it at the cache rate.
+
+        The fake _astream yields what langchain-openai produces from a
+        ``stream_options.include_usage`` stream: generation chunks merged with
+        a trailing usage-only chunk into one AIMessage carrying usage_metadata.
+        """
+
+        records: list[LLMUsageRecord] = []
+        set_llm_usage_sink(records.append)
+        monkeypatch.delenv("ARC_MODEL_STREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("ARC_MODEL_STREAM_USAGE", raising=False)
+        monkeypatch.setattr(adapter, "_asleep", _instant_asleep)
+
+        async def fake_astream(self, messages, stop=None, run_manager=None, **kwargs):
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="hi",
+                    usage_metadata={
+                        "input_tokens": 64000,
+                        "output_tokens": 210,
+                        "total_tokens": 64210,
+                        "input_token_details": {"cache_read": 60000},
+                    },
+                )
+            )
+
+        monkeypatch.setattr(adapter.ChatOpenAI, "_astream", fake_astream)
+
+        async def run() -> None:
+            model = adapter.ARCChatOpenAI(
+                model="MiniMax-M3",
+                api_key="test-key",
+                arc_api_mode="chat_completions",
+                arc_model_name="MiniMax-M3",
+            )
+            await model._agenerate([{"role": "user", "content": "hi"}])
+
+        asyncio.run(run())
+        assert len(records) == 1
+        record = records[0]
+        # The provider answered with usage: no estimation, cache share kept.
+        assert record.source == "reported"
+        assert record.transport == "streamed"
+        assert record.cache_read_tokens == 60000
+        assert record.input_tokens == 4000  # 64000 prompt - 60000 cached
+        # MiniMax-M3 prices cache reads at a fifth of the input rate.
+        assert record.cost is not None
+        assert record.cost["input"] == pytest.approx(4000 / 1e6 * 2.1)
+        assert record.cost["cache_read"] == pytest.approx(60000 / 1e6 * 0.42)
 
     def test_async_generate_reports_latency_telemetry(
         self, monkeypatch: pytest.MonkeyPatch
