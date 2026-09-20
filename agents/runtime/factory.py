@@ -352,6 +352,7 @@ def build_stage_agent(
     test_manifest_lock: Any | None = None,
     pending_contract_registry: Any | None = None,
     app_type: str | None = None,
+    max_design_writes: int | None = None,
 ):
     """Create an agent instance with ARC's first-batch filesystem policy.
 
@@ -370,6 +371,10 @@ def build_stage_agent(
     protects from whole-file rewrites (see
     ``AppTypeHandler.template_shared_surfaces``); ``None``/unknown types
     protect nothing.
+
+    ``max_design_writes`` overrides the interface_design stage's write budget
+    (distinct-file cap; see ``StageDisciplineMiddleware``); other stages
+    ignore it and ``None`` keeps the default leaf ceiling.
     """
 
     _apply_windows_filesystem_path_compat()
@@ -424,6 +429,7 @@ def build_stage_agent(
         test_manifest_lock=test_manifest_lock if stage == "test_generation" else None,
         pending_contract_registry=pending_contract_registry if stage == "interface_design" else None,
         template_shared_surfaces=_template_shared_surfaces(app_type),
+        max_design_writes=max_design_writes if stage == "interface_design" else None,
     )
     permissions = _build_filesystem_permissions(
         root,
