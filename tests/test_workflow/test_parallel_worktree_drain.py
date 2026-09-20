@@ -90,7 +90,9 @@ def _requirement_tree() -> dict[str, Any]:
     }
 
 
-def _make_parallel_manager(tmp_path: Path, max_tasks: int = 2) -> ARCWorkflowManager:
+def _make_parallel_manager(
+    tmp_path: Path, max_tasks: int = 2, node_ids: list[str] | None = None
+) -> ARCWorkflowManager:
     workspace = tmp_path / "workspace"
     # The drain opens real git worktrees, so the workspace needs a repo with
     # the runtime's managed ignore block (worktrees live under .arc/worktrees).
@@ -115,7 +117,7 @@ def _make_parallel_manager(tmp_path: Path, max_tasks: int = 2) -> ARCWorkflowMan
         log_cb=lambda *args, **kwargs: None,
     )
     manager.runtime = SimpleNamespace(
-        traceability=_Traceability(["R", "RA", "RB"]),
+        traceability=_Traceability(node_ids or ["R", "RA", "RB"]),
         events=_Events(),
         git=_Git(),
     )
@@ -1491,3 +1493,135 @@ def test_failed_parent_design_unblocks_children_with_an_audit_log(
         "descendant node(s) (RA, RB) will design against the integration state" in message
         for message in logs
     ), logs
+
+
+# ----------------------------------------------------------------------
+# affinity depth split (ARC_AFFINITY_DEPTH)
+# ----------------------------------------------------------------------
+
+
+def _wide_requirement_tree() -> dict[str, Any]:
+    """simple-keep's pathology: two feature subtrees under one parent. Under
+    the default top-level grouping they serialize in the REQ-2 group's single
+    reusable worktree; under ARC_AFFINITY_DEPTH=2 each drains in parallel."""
+    return {
+        "id": "R",
+        "name": "root",
+        "description": "root",
+        "children": [
+            {
+                "id": "REQ-2",
+                "name": "notes",
+                "description": "notes",
+                "children": [
+                    {
+                        "id": "REQ-2.5",
+                        "name": "archive",
+                        "description": "archive",
+                        "children": [
+                            {"id": "REQ-2.5.1", "name": "archive", "description": "a", "children": []},
+                            {"id": "REQ-2.5.2", "name": "undo", "description": "u", "children": []},
+                        ],
+                    },
+                    {
+                        "id": "REQ-2.7",
+                        "name": "labels",
+                        "description": "labels",
+                        "children": [
+                            {"id": "REQ-2.7.1", "name": "assign", "description": "l", "children": []},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def test_affinity_depth_split_runs_feature_subtrees_in_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lever on real git: ARC_AFFINITY_DEPTH=2 gives sibling feature
+    subtrees under one parent their own groups, so their IMPLEMENT tasks
+    overlap in distinct worktrees with distinct port slots and both merge
+    back into the integration workspace."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    monkeypatch.setenv("ARC_AFFINITY_DEPTH", "2")
+    manager = _make_parallel_manager(
+        tmp_path,
+        node_ids=["R", "REQ-2", "REQ-2.5", "REQ-2.5.1", "REQ-2.5.2", "REQ-2.7", "REQ-2.7.1"],
+    )
+    queue_state = _queue_state(manager, _wide_requirement_tree())
+    for task in queue_state["tasks"]:
+        if task["phase"] == PHASE_DESIGN:
+            task["status"] = TASK_COMPLETED
+
+    active: set[str] = set()
+    seen_worktrees: dict[str, str] = {}
+    seen_ports: dict[str, int | None] = {}
+    overlap = False
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        nonlocal overlap
+        if active:
+            overlap = True
+        active.add(task["task_id"])
+        if ctx is not None:
+            seen_worktrees[task["node_id"]] = ctx.handle.path
+            seen_ports[task["node_id"]] = ctx.web_port
+            Path(ctx.handle.path, f"{task['node_id']}.feature.js").write_text(
+                f"feature {task['node_id']};\n", encoding="utf-8"
+            )
+        # Generous window: the assertion is "must overlap", so a loaded CI
+        # box must not turn a real overlap into a scheduling-looking miss.
+        await asyncio.sleep(0.15)
+        active.discard(task["task_id"])
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert overlap, "feature subtrees under one parent must overlap under depth 2"
+    assert seen_worktrees["REQ-2.5.1"] != seen_worktrees["REQ-2.7.1"], "distinct worktrees"
+    assert seen_ports["REQ-2.5.1"] != seen_ports["REQ-2.7.1"], "distinct port slots"
+    workspace = Path(manager.workspace_path)
+    for node_id in ("REQ-2.5.1", "REQ-2.5.2", "REQ-2.7.1"):
+        assert (workspace / f"{node_id}.feature.js").exists(), f"{node_id} merged back"
+    states = queue_state["node_states"]
+    assert all(states[node] == NODE_PASSED for node in ("R", "REQ-2", "REQ-2.5", "REQ-2.7"))
+
+
+def test_default_depth_keeps_feature_subtrees_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default must not change: without ARC_AFFINITY_DEPTH the whole
+    REQ-2 subtree is one group, so the feature subtrees' IMPLEMENTs stay
+    strictly serial in the group's single reusable worktree."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    monkeypatch.delenv("ARC_AFFINITY_DEPTH", raising=False)
+    manager = _make_parallel_manager(
+        tmp_path,
+        node_ids=["R", "REQ-2", "REQ-2.5", "REQ-2.5.1", "REQ-2.5.2", "REQ-2.7", "REQ-2.7.1"],
+    )
+    queue_state = _queue_state(manager, _wide_requirement_tree())
+    for task in queue_state["tasks"]:
+        if task["phase"] == PHASE_DESIGN:
+            task["status"] = TASK_COMPLETED
+
+    active: set[str] = set()
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        assert active.isdisjoint({task["node_id"]}), (
+            f"overlap under default depth: {active} vs {task['node_id']}"
+        )
+        active.add(task["node_id"])
+        await asyncio.sleep(0.02)
+        active.discard(task["node_id"])
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    states = queue_state["node_states"]
+    assert all(states[node] == NODE_PASSED for node in ("R", "REQ-2", "REQ-2.5", "REQ-2.7"))

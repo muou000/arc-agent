@@ -145,6 +145,187 @@ def test_affinity_map_groups_by_top_level_subtree() -> None:
 
 
 # ----------------------------------------------------------------------
+# affinity depth split (ARC_AFFINITY_DEPTH)
+# ----------------------------------------------------------------------
+
+
+def _wide_tree() -> dict:
+    """simple-keep's pathology in miniature: one wide top-level subtree
+    (REQ-2) whose six feature subtrees are mutually independent but share
+    one group under the default top-level grouping."""
+    return {
+        "id": "R",
+        "children": [
+            {
+                "id": "REQ-2",
+                "children": [
+                    {
+                        "id": "REQ-2.5",
+                        "children": [
+                            {"id": "REQ-2.5.1", "children": []},
+                            {"id": "REQ-2.5.2", "children": []},
+                        ],
+                    },
+                    {
+                        "id": "REQ-2.7",
+                        "children": [
+                            {"id": "REQ-2.7.1", "children": []},
+                            {
+                                "id": "REQ-2.7.6",
+                                "children": [{"id": "REQ-2.7.6.1", "children": []}],
+                            },
+                        ],
+                    },
+                ],
+            },
+            {"id": "REQ-3", "children": []},
+        ],
+    }
+
+
+def test_affinity_depth_two_splits_feature_subtrees() -> None:
+    """The lever for wide trees: sibling feature subtrees under one parent
+    each get their own group so they can drain in parallel, while a feature
+    subtree's own descendants stay together (their design phases race on the
+    same skeleton files)."""
+    assert ARCWorkflowManager._build_affinity_map(_wide_tree(), 2) == {
+        "R": "R",
+        "REQ-2": "REQ-2",
+        "REQ-2.5": "REQ-2.5",
+        "REQ-2.5.1": "REQ-2.5",
+        "REQ-2.5.2": "REQ-2.5",
+        "REQ-2.7": "REQ-2.7",
+        "REQ-2.7.1": "REQ-2.7",
+        "REQ-2.7.6": "REQ-2.7",
+        "REQ-2.7.6.1": "REQ-2.7",
+        "REQ-3": "REQ-3",
+    }
+
+
+def test_affinity_depth_two_splits_simple_keep_shape() -> None:
+    """The motivating case pinned literally: simple-keep's REQ-2 subtree
+    with its six feature subtrees (delete 2.3, update 2.4, archive 2.5,
+    coloring 2.6, labels 2.7, pinned 2.8) - each its own group under
+    depth 2, every descendant staying with its feature subtree."""
+    tree = {
+        "id": "ROOT",
+        "children": [
+            {
+                "id": "REQ-1",
+                "children": [{"id": "REQ-1.1", "children": []}],
+            },
+            {
+                "id": "REQ-2",
+                "children": [
+                    {"id": "REQ-2.3", "children": [{"id": "REQ-2.3.1", "children": []}]},
+                    {"id": "REQ-2.4", "children": []},
+                    {"id": "REQ-2.5", "children": [{"id": "REQ-2.5.1", "children": []}]},
+                    {"id": "REQ-2.6", "children": [{"id": "REQ-2.6.1", "children": []}]},
+                    {
+                        "id": "REQ-2.7",
+                        "children": [
+                            {"id": "REQ-2.7.1", "children": []},
+                            {
+                                "id": "REQ-2.7.6",
+                                "children": [{"id": "REQ-2.7.6.1", "children": []}],
+                            },
+                        ],
+                    },
+                    {"id": "REQ-2.8", "children": [{"id": "REQ-2.8.1", "children": []}]},
+                ],
+            },
+        ],
+    }
+
+    grouped = ARCWorkflowManager._build_affinity_map(tree, 2)
+
+    assert grouped["REQ-2"] == "REQ-2"
+    for feature in ("REQ-2.3", "REQ-2.4", "REQ-2.5", "REQ-2.6", "REQ-2.7", "REQ-2.8"):
+        assert grouped[feature] == feature, f"{feature} heads its own group"
+    assert grouped["REQ-2.3.1"] == "REQ-2.3"
+    assert grouped["REQ-2.5.1"] == "REQ-2.5"
+    assert grouped["REQ-2.6.1"] == "REQ-2.6"
+    assert grouped["REQ-2.7.1"] == "REQ-2.7"
+    assert grouped["REQ-2.7.6"] == "REQ-2.7"
+    assert grouped["REQ-2.7.6.1"] == "REQ-2.7", "depth-4 nodes inherit the depth-2 boundary"
+    assert grouped["REQ-2.8.1"] == "REQ-2.8"
+    assert grouped["REQ-1.1"] == "REQ-1.1", (
+        "the boundary is literal: a depth-2 node heads its own group even under a "
+        "single-child parent - parent/child ordering is enforced by the design and "
+        "implement gates, not by the affinity group"
+    )
+
+
+def test_affinity_depth_beyond_tree_height_splits_every_subtree() -> None:
+    """The depth is a boundary, not a target: every subtree at depth <= N
+    heads its own group, so a depth past the tree's height makes every node
+    its own group - maximum parallelism, no worktree sharing, safety resting
+    entirely on the merge rails. Monotonic and literal, never clamped."""
+    assert ARCWorkflowManager._build_affinity_map(_wide_tree(), 99) == {
+        "R": "R",
+        "REQ-2": "REQ-2",
+        "REQ-2.5": "REQ-2.5",
+        "REQ-2.5.1": "REQ-2.5.1",
+        "REQ-2.5.2": "REQ-2.5.2",
+        "REQ-2.7": "REQ-2.7",
+        "REQ-2.7.1": "REQ-2.7.1",
+        "REQ-2.7.6": "REQ-2.7.6",
+        "REQ-2.7.6.1": "REQ-2.7.6.1",
+        "REQ-3": "REQ-3",
+    }
+
+
+def test_affinity_depth_env_degrades_to_default(monkeypatch) -> None:
+    """ARC_AFFINITY_DEPTH must always yield a usable map: unparsable values
+    and depths below 1 degrade to the default 1 (the grouping every saved
+    queue was built under), never to 0 or an error."""
+    from core.workflow import _affinity_depth
+
+    monkeypatch.delenv("ARC_AFFINITY_DEPTH", raising=False)
+    assert _affinity_depth() == 1
+
+    for raw in ("", "garbage", "0", "-3", "1.5"):
+        monkeypatch.setenv("ARC_AFFINITY_DEPTH", raw)
+        assert _affinity_depth() == 1, raw
+
+    monkeypatch.setenv("ARC_AFFINITY_DEPTH", "2")
+    assert _affinity_depth() == 2
+
+
+def test_queue_build_uses_configured_affinity_depth(tmp_path, monkeypatch) -> None:
+    """The env reaches the queue's durable affinity map: a fresh queue built
+    under ARC_AFFINITY_DEPTH=2 carries the split groups, and a default run
+    keeps the historical top-level map."""
+    import json
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_AFFINITY_DEPTH", "2")
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_path),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *a, **k: None,
+    )
+    queue = manager._load_or_create_processing_queue(_wide_tree())
+
+    assert queue["affinity"]["REQ-2.5.1"] == "REQ-2.5"
+    assert queue["affinity"]["REQ-2.7.6"] == "REQ-2.7"
+
+    # An existing queue's affinity map is the durable contract of a started
+    # run: a resume with a different depth must not regroup in-flight work.
+    queue["affinity"] = {"R": "R", "REQ-2": "REQ-2", "REQ-2.5.1": "REQ-2"}
+    (tmp_path / ".arc").mkdir(exist_ok=True)
+    (tmp_path / ".arc" / "processing_queue.json").write_text(
+        json.dumps(queue), encoding="utf-8"
+    )
+    restored = manager._load_or_create_processing_queue(_wide_tree())
+
+    assert restored["affinity"]["REQ-2.5.1"] == "REQ-2", (
+        "a resumed run keeps the affinity map it started under"
+    )
+
+
+# ----------------------------------------------------------------------
 # declared requirement dependencies
 # ----------------------------------------------------------------------
 
