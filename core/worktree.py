@@ -19,9 +19,8 @@ integration branch under the workflow's merge lock. Sibling nodes touch
 disjoint files in the common case, so merges are clean. Two guards cover the
 overlapping cases: ``core.file_claims`` blocks a stage agent from creating a
 new file a parallel sibling already created (the add/add case no resolver
-can fix), and the workflow re-queues a node's DESIGN and once more its
-IMPLEMENT after a merge conflict
-(``reset_branch_to_integration`` puts the retry back at the merged
+can fix), and the workflow re-queues a node once per phase after a merge
+conflict (``reset_branch_to_integration`` puts the retry back at the merged
 integration HEAD, so the winning sibling's files are visible to it). A
 conflict that survives both guards fails the node with an explicit reason
 and keeps the worktree on disk for inspection and ``--retry``. One narrow
@@ -411,10 +410,9 @@ class NodeWorktreeManager:
         After a merge conflict the node branch holds the losing (conflicting)
         commits. A conflict-aware DESIGN or IMPLEMENT retry re-runs the node
         from the current integration state - which already contains the
-        winning
-        sibling's files - so its branch is reset here and the worktree
-        directory is un-quarantined for reuse. The discarded commits stay
-        reachable through git's reflog for inspection.
+        winning sibling's files - so its branch is reset here and the
+        worktree directory is un-quarantined for reuse. The discarded
+        commits stay reachable through git's reflog for inspection.
         """
 
         self._quarantined.discard(str(Path(handle.path)))

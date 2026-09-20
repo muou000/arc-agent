@@ -158,11 +158,10 @@ ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_for
 # 冲突将该节点标记为失败并保留其 worktree 供排查。
 # 两个补充防线：新文件的跨节点占用注册（写时声明，agent 试图创建兄弟节点已占用的
 # 新文件时直接拒绝并给出改道指引，状态存于 .arc/file_claims.json）；DESIGN 与
-# IMPLEMENT 阶段的
-# 合并冲突不再立即失败——首次冲突将节点重排队一次（DESIGN 重排 DESIGN，IMPLEMENT
-# 只重排 IMPLEMENT，已完成的 DESIGN 产物保留），重试从已合并的 integration
-# HEAD 出发（兄弟文件已在磁盘可见），冲突路径注入 prompt 指引绕行，二次冲突才终判
-# 失败。
+# IMPLEMENT 阶段的合并冲突均不再立即失败——首次冲突将该阶段任务重排一次（DESIGN
+# 冲突重排 DESIGN，IMPLEMENT 冲突只重排 IMPLEMENT、已完成的 DESIGN 产物保留；两
+# 阶段各有一次独立预算），重试从已合并的 integration HEAD 出发（兄弟文件已在磁盘
+# 可见），冲突路径注入 prompt 指引绕行，同阶段二次冲突才终判失败。
 # 设 0/false/no/off 恢复共享工作区的严格串行调度。
 ARC_NODE_WORKTREES=1                   # 每节点隔离 worktree 并行（默认开启；设 0/false/no/off 关闭）
 ARC_MAX_CONCURRENT_TASKS=3             # 同时运行的任务数（仅并行模式生效，默认 3，上限 8）

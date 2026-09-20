@@ -857,32 +857,33 @@ class ARCWorkflowManager:
                     requirement_data,
                 )
                 if not merged:
-                    requeue: Awaitable[bool] | None = None
                     if (
                         merge_conflict
                         and phase == PHASE_DESIGN
-                        and not sessions.load_node_session(node_id).get("merge_conflict_retry_used")
+                        and self._merge_conflict_requeue_available(node_id, PHASE_DESIGN)
                     ):
-                        requeue = self._requeue_design_after_merge_conflict(
+                        if await self._requeue_design_after_merge_conflict(
                             ctx, queue_state, node_id, merge_conflict
-                        )
+                        ):
+                            await self._close_task_workspace(ctx)
+                            return
                     elif (
                         merge_conflict
                         and phase == PHASE_IMPLEMENT
-                        and not sessions.load_node_session(node_id).get("merge_conflict_retry_used")
+                        and self._merge_conflict_requeue_available(node_id, PHASE_IMPLEMENT)
                     ):
-                        requeue = self._requeue_implement_after_merge_conflict(
+                        if await self._requeue_implement_after_merge_conflict(
                             ctx, queue_state, node_id, merge_conflict
-                        )
-                    if requeue is not None and await requeue:
-                        await self._close_task_workspace(ctx)
-                        return
-                    # Requeue declined (already used, no requeue path for the
-                    # phase, or the requeue itself failed): fall through to
-                    # the failure branch. The method tail still closes ctx
-                    # with preserve=True there, so a declined requeue never
-                    # leaks the worktree - it is preserved for --retry
-                    # exactly like any other failed merge.
+                        ):
+                            await self._close_task_workspace(ctx)
+                            return
+                    # Requeue declined (this phase's budget already spent, no
+                    # requeue path for the phase, or the requeue itself
+                    # failed): fall through to the failure branch. The method
+                    # tail still closes ctx with preserve=True there, so a
+                    # declined requeue never leaks the worktree - it is
+                    # preserved for --retry exactly like any other failed
+                    # merge.
                     task_ok = False
 
         if task_ok:
@@ -1116,6 +1117,28 @@ class ARCWorkflowManager:
             node_id,
         )
         return True
+
+    @staticmethod
+    def _merge_conflict_requeue_available(node_id: str, phase: str) -> bool:
+        """Whether this phase still has its one-shot conflict requeue left.
+
+        The budget is per phase: a node whose DESIGN retry already consumed
+        the DESIGN budget keeps a full IMPLEMENT budget (and vice versa), so
+        each phase gets exactly one requeue. The phase key is the recorded
+        ``merge_conflict_context.phase`` - the flag written by a DESIGN
+        requeue does not cost the node its IMPLEMENT requeue. A legacy
+        ``retry_used`` flag with no readable context is treated as spent for
+        safety (it can only come from a pre-phase-keying requeue).
+        """
+
+        session = sessions.load_node_session(node_id)
+        if not session.get("merge_conflict_retry_used"):
+            return True
+        context = session.get("merge_conflict_context")
+        if not isinstance(context, dict):
+            return False
+        recorded_phase = str(context.get("phase") or "").strip().lower()
+        return recorded_phase != str(phase).strip().lower()
 
     async def _requeue_implement_after_merge_conflict(
         self,
