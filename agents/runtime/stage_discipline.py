@@ -418,7 +418,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 f"Read blocked: {path} was already written in this stage; you know its content. "
                 "Continue with the next action instead of re-reading it, and never rewrite the "
                 "file to verify it — the written version stands and a suspected imperfection is "
-                "not evidence."
+                "not evidence. Any retry shape (smaller limit, shifted offset) is blocked too."
             )
         offset = _as_nonnegative_int(args.get("offset"), default=0)
         limit = min(_as_nonnegative_int(args.get("limit"), default=100), _MAX_READ_LIMIT)
@@ -430,7 +430,8 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 return (
                     f"Repeated read blocked: {path} was re-read {_MAX_REPEATED_READS_PER_PATH} time(s) "
                     "in this stage already. Use the earlier results and continue; if the file needs "
-                    "changes, follow the write options instead of probing offsets to bypass the cache."
+                    "changes, follow the write options instead of probing offsets to bypass the cache. "
+                    "A narrower limit or shifted offset is the same blocked read."
                 )
             return None
         return None

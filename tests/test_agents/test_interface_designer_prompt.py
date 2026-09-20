@@ -38,6 +38,21 @@ def test_interface_designer_prompt_states_the_write_budget_counting_rule() -> No
     assert prompt.index(budget_rule) > prompt.index(materialization)
 
 
+def test_interface_designer_prompt_pins_mechanical_read_lock() -> None:
+    """arc-output4 DESIGN wasted 11 rounds on read blocks: the designer wrote
+    skeletons and then read them back "to verify the final state". The rule
+    existed in the shared reflection policy but was buried; pin the
+    stage-level mechanical statement (locked paths + blocked retry shapes).
+    """
+
+    prompt = get_system_prompt()
+
+    assert "Read discipline is enforced mechanically" in prompt
+    assert "every later `read_file` on it is rejected" in prompt
+    assert "including retries with a smaller `limit`, a shifted `offset`" in prompt
+    assert "Never read a file back to verify the final state of your own work" in prompt
+
+
 def test_interface_designer_user_prompt_pins_the_node_budget_number() -> None:
     leaf = get_user_prompt(
         node_id="REQ-LEAF-1",
