@@ -1,0 +1,51 @@
+# arc-agent
+
+arc-agent 是 ARC（Agentic Requirement Compiler）需求编译器的实现仓库：把结构化需求树编译为应用工作区，并维护可审计的链路（节点状态、接口契约、测试 manifest、runner 事件、Git 检查点）。本文件是仓库的领域词汇表。
+
+## Language
+
+### 调度与并行
+
+**亲和组（Affinity Group）**：
+调度器把节点分进共享 worktree 的组，组内任务严格串行。现状按顶层子树划分。
+_避免_：worktree 组、并行组
+
+**冲突域（Conflict Domain）**：
+并行任务可能触碰的共享文件面的集合。亲和组是它的粗粒度代理；本设计将其细化为节点实际写的文件集合。
+_避免_：共享面、耦合面
+
+**门禁流水线化（Gate Pipelining）**：
+把依赖方 DESIGN 的等待条件从“依赖 IMPLEMENT 完成并合并”放宽为“依赖 DESIGN 完成并合并”。
+_避免_：设计提前、依赖放宽
+
+**串行源（Serial Source）**：
+任何把任务强制排队的调度约束。本仓库识别出三个：亲和分组、依赖门禁（DESIGN 等 IMPLEMENT）、并发上限。
+_避免_：串行瓶颈、排队原因
+
+### 依赖与耦合
+
+**声明依赖（Declared Dependency）**：
+requirements 中人写的 `dependencies` 字段。编译器契约：给定输入，不可修改。
+_避免_：显式依赖
+
+**隐藏耦合（Hidden Coupling）**：
+需求文本暗示但未声明的依赖（如需要默认标签存在但只声明了父链）。过度串行会掩盖它们；放松调度会使其暴露。
+_避免_：暗依赖、隐式依赖
+
+**真实耦合（Real Coupling）**：
+接口调用边（call_edges）体现的代码级依赖，与声明依赖独立存在，可能过度或不足。
+_避免_：实际依赖
+
+### 合并与仲裁
+
+**机械消解（Mechanical Resolution）**：
+合并层对“双方纯追加”冲突的自动消解（difflib 插入重放）。对语义重复失明——它正是让 run7 式双方代码共存的机制。
+_避免_：自动合并、additive 消解
+
+**仲裁（Arbitration）**：
+机械层失败时（非追加冲突或合并后健康门禁失败）的 LLM 升级路径：拿三方 diff 与双方契约做裁决。编辑权窄限于冲突文件集，产出必须经健康门禁复验。
+_避免_：merge agent、AI 审查
+
+**文件占位（File Claim）**：
+`core/file_claims.py` 的跨节点新建文件占位，防兄弟节点 add/add 冲突。
+_避免_：文件锁、写锁

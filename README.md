@@ -164,6 +164,8 @@ ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_for
 # 设 0/false/no/off 恢复共享工作区的严格串行调度。
 ARC_NODE_WORKTREES=1                   # 每节点隔离 worktree 并行（默认开启；设 0/false/no/off 关闭）
 ARC_MAX_CONCURRENT_TASKS=3             # 同时运行的任务数（仅并行模式生效，默认 3，上限 8）
+ARC_AFFINITY_DEPTH=1                   # 亲和分组切分深度（默认 1=顶层子树一组；设 2 让宽子树的
+                                       # 特性子树各自成组并行，如 simple-keep 的 REQ-2；组内仍串行）
 ```
 
 运行健康检查验证配置：

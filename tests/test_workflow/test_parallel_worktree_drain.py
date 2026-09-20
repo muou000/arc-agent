@@ -1241,3 +1241,153 @@ def test_failed_parent_design_unblocks_children_with_an_audit_log(
         "descendant node(s) (RA, RB) will design against the integration state" in message
         for message in logs
     ), logs
+
+
+# ----------------------------------------------------------------------
+# affinity depth split (ARC_AFFINITY_DEPTH)
+# ----------------------------------------------------------------------
+
+
+def _wide_requirement_tree() -> dict[str, Any]:
+    """simple-keep's pathology: two feature subtrees under one parent. Under
+    the default top-level grouping they serialize in the REQ-2 group's single
+    reusable worktree; under ARC_AFFINITY_DEPTH=2 each drains in parallel."""
+    return {
+        "id": "R",
+        "name": "root",
+        "description": "root",
+        "children": [
+            {
+                "id": "REQ-2",
+                "name": "notes",
+                "description": "notes",
+                "children": [
+                    {
+                        "id": "REQ-2.5",
+                        "name": "archive",
+                        "description": "archive",
+                        "children": [
+                            {"id": "REQ-2.5.1", "name": "archive", "description": "a", "children": []},
+                            {"id": "REQ-2.5.2", "name": "undo", "description": "u", "children": []},
+                        ],
+                    },
+                    {
+                        "id": "REQ-2.7",
+                        "name": "labels",
+                        "description": "labels",
+                        "children": [
+                            {"id": "REQ-2.7.1", "name": "assign", "description": "l", "children": []},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def test_affinity_depth_split_runs_feature_subtrees_in_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lever on real git: ARC_AFFINITY_DEPTH=2 gives sibling feature
+    subtrees under one parent their own groups, so their IMPLEMENT tasks
+    overlap in distinct worktrees with distinct port slots and both merge
+    back into the integration workspace."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    monkeypatch.setenv("ARC_AFFINITY_DEPTH", "2")
+    manager = _make_parallel_manager(tmp_path)
+    manager.runtime = SimpleNamespace(
+        traceability=_Traceability(["R", "REQ-2", "REQ-2.5", "REQ-2.5.1", "REQ-2.5.2", "REQ-2.7", "REQ-2.7.1"]),
+        events=_Events(),
+        git=_Git(),
+    )
+    queue_state = _queue_state(manager, _wide_requirement_tree())
+    for task in queue_state["tasks"]:
+        if task["phase"] == PHASE_DESIGN:
+            task["status"] = TASK_COMPLETED
+
+    active: set[str] = set()
+    seen_worktrees: dict[str, str] = {}
+    seen_ports: dict[str, int | None] = {}
+    overlap = False
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        nonlocal overlap
+        if active:
+            overlap = True
+        active.add(task["task_id"])
+        if ctx is not None:
+            seen_worktrees[task["node_id"]] = ctx.handle.path
+            seen_ports[task["node_id"]] = ctx.web_port
+            Path(ctx.handle.path, f"{task['node_id']}.feature.js").write_text(
+                f"feature {task['node_id']};\n", encoding="utf-8"
+            )
+        await asyncio.sleep(0.05)
+        active.discard(task["task_id"])
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert overlap, "feature subtrees under one parent must overlap under depth 2"
+    assert seen_worktrees["REQ-2.5.1"] != seen_worktrees["REQ-2.7.1"], "distinct worktrees"
+    assert seen_ports["REQ-2.5.1"] != seen_ports["REQ-2.7.1"], "distinct port slots"
+    workspace = Path(manager.workspace_path)
+    for node_id in ("REQ-2.5.1", "REQ-2.5.2", "REQ-2.7.1"):
+        assert (workspace / f"{node_id}.feature.js").exists(), f"{node_id} merged back"
+    states = queue_state["node_states"]
+    assert all(states[node] == NODE_PASSED for node in ("R", "REQ-2", "REQ-2.5", "REQ-2.7"))
+
+
+def test_default_depth_keeps_feature_subtrees_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default must not change: without ARC_AFFINITY_DEPTH the whole
+    REQ-2 subtree is one group, so the feature subtrees' IMPLEMENTs stay
+    strictly serial in the group's single reusable worktree."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    monkeypatch.delenv("ARC_AFFINITY_DEPTH", raising=False)
+    manager = _make_parallel_manager(tmp_path)
+    manager.runtime = SimpleNamespace(
+        traceability=_Traceability(["R", "REQ-2", "REQ-2.5", "REQ-2.5.1", "REQ-2.5.2", "REQ-2.7", "REQ-2.7.1"]),
+        events=_Events(),
+        git=_Git(),
+    )
+    queue_state = _queue_state(manager, _wide_requirement_tree())
+    for task in queue_state["tasks"]:
+        if task["phase"] == PHASE_DESIGN:
+            task["status"] = TASK_COMPLETED
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        events.append(("start", task["node_id"]))
+        await asyncio.sleep(0.02)
+        events.append(("end", task["node_id"]))
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    for subtree_leaf in ("REQ-2.5.1", "REQ-2.7.1"):
+        starts = [i for i, (kind, node) in enumerate(events) if kind == "start" and node == subtree_leaf]
+        assert starts, f"{subtree_leaf} never ran"
+        start = starts[0]
+        others = [i for i, (kind, node) in enumerate(events) if kind == "end" and i < start]
+        running = set()
+        for i, (kind, node) in enumerate(events[:start]):
+            if kind == "start":
+                running.add(node)
+            else:
+                running.discard(node)
+        assert subtree_leaf not in running
+        # At the moment this leaf starts, no other node from a sibling feature
+        # subtree is mid-flight: everything is serialized in the one group.
+        in_flight = {
+            node
+            for i, (kind, node) in enumerate(events[:start])
+            if kind == "start"
+            and not any(k == "end" and n == node and j > i for j, (k, n) in enumerate(events[:start]))
+        }
+        assert in_flight == set(), f"unexpected overlap under default depth: {in_flight}"

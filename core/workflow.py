@@ -41,10 +41,15 @@ QUEUE_FILENAME = "processing_queue.json"
 # the one shared workspace in strict queue order, because stage agents, git
 # checkpoints (`git add .`) and test runners (one web port, one E2E database)
 # would otherwise interfere with each other. Tasks are scheduled with subtree
-# affinity: consecutive tasks of one top-level subtree reuse one worktree
-# directory and run sequentially inside it, so siblings never race on shared
-# files; different subtrees drain in parallel and a freed slot steals work
-# from another free group. Cross-subtree conflicts that survive (shared glue
+# affinity: consecutive tasks of one subtree reuse one worktree directory and
+# run sequentially inside it, so siblings never race on shared files;
+# different subtrees drain in parallel and a freed slot steals work from
+# another free group. ARC_AFFINITY_DEPTH (default 1) sets the depth at which
+# the grouping splits: a wide top-level subtree's child subtrees each become
+# their own group, trading worktree sharing for parallelism - the sibling
+# skeletons then race only through the merge rails (file claims, additive
+# resolution, health gate), which is where the arbitration of the wider
+# surfaces happens. Cross-subtree conflicts that survive (shared glue
 # files) are resolved mechanically when every side only appended lines,
 # guarded by a backend health check before the merge commit; anything else
 # fails the node with an explicit reason and preserves its worktree for
@@ -90,6 +95,24 @@ def _worktrees_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _affinity_depth() -> int:
+    """Subtree depth at which the affinity grouping splits.
+
+    Depth 1 (the default) keeps the historical top-level-subtree groups.
+    Deeper values split a wide top-level subtree into one group per
+    descendant subtree at that depth, so sibling feature subtrees under a
+    common parent can drain in parallel. Values below 1 and unparsable
+    input degrade to 1: an affinity map must always exist, and the fallback
+    is the behaviour every saved queue was built under.
+    """
+    raw = os.environ.get("ARC_AFFINITY_DEPTH", "").strip()
+    try:
+        depth = int(raw)
+    except ValueError:
+        return 1
+    return max(depth, 1)
+
+
 @dataclass
 class _TaskWorkspace:
     """An in-flight task's isolated resources (worktree mode only)."""
@@ -126,6 +149,9 @@ class ARCWorkflowManager:
         # Per-node worktree parallelism (default on; ARC_NODE_WORKTREES=0
         # restores the shared-workspace serial mode).
         self._parallel_mode = _worktrees_enabled()
+        # Captured once per process like ARC_NODE_WORKTREES: one CLI run, one
+        # grouping; a mid-run flip would put queued tasks in two groups' files.
+        self._affinity_depth = _affinity_depth()
         self._worktree_manager = (
             NodeWorktreeManager(self.workspace_path) if self._parallel_mode else None
         )
@@ -1160,7 +1186,7 @@ class ARCWorkflowManager:
         node_ids = self._collect_node_ids(expected_tasks)
         descendants = self._build_descendants_map(requirement_tree)
         parents = self._build_parents_map(requirement_tree)
-        affinity = self._build_affinity_map(requirement_tree)
+        affinity = self._build_affinity_map(requirement_tree, self._affinity_depth)
         declared = self._build_dependencies_map(requirement_tree)
         dependencies, ancestor_dropped = self._drop_ancestor_dependency_edges(declared, parents)
         dependencies, cycle_dropped = self._break_dependency_cycles(
@@ -1184,6 +1210,10 @@ class ARCWorkflowManager:
             queue_state.setdefault("descendants", descendants)
             # Queues saved before parent-serial DESIGN lack the map.
             queue_state.setdefault("parents", parents)
+            # Queues saved before affinity-depth split lack a finer map; like
+            # the dependencies map, a restored map is the durable contract -
+            # in-flight work was grouped under it, and regrouping mid-run
+            # would put one subtree's tasks in two groups' worktree files.
             queue_state.setdefault("affinity", affinity)
             # Queues saved before dependency gating lack the map. A restored map
             # is the durable contract, but it is not trusted blindly: an edge
@@ -1489,13 +1519,20 @@ class ARCWorkflowManager:
         return parents
 
     @staticmethod
-    def _build_affinity_map(root_node: dict[str, Any]) -> dict[str, str]:
-        """Map every node id to the top-level subtree it belongs to.
+    def _build_affinity_map(root_node: dict[str, Any], max_depth: int = 1) -> dict[str, str]:
+        """Map every node id to the subtree group it shares a worktree with.
 
-        Tasks of one subtree run sequentially in the subtree's reusable
-        worktree, so a parent's and its children's design phases never race on
-        shared skeleton files; different subtrees drain in parallel. The root
-        itself forms its own group.
+        Tasks of one group run sequentially in the group's reusable worktree,
+        so a parent's and its children's design phases never race on shared
+        skeleton files; different groups drain in parallel. The root itself
+        forms its own group.
+
+        ``max_depth`` bounds how deep a top-level subtree stays one group:
+        depth 1 is the historical top-level-subtree grouping; a deeper split
+        gives each descendant subtree at that depth (e.g. feature subtrees
+        under a wide parent) its own group so siblings can drain in parallel.
+        Nodes deeper than ``max_depth`` inherit their ancestor's group, so a
+        group boundary is always a whole subtree, never a node subset.
         """
 
         affinity: dict[str, str] = {}
@@ -1503,20 +1540,24 @@ class ARCWorkflowManager:
         if root_id:
             affinity[root_id] = root_id
 
-        def walk(node: dict[str, Any], group: str) -> None:
+        def walk(node: dict[str, Any], group: str, depth: int) -> None:
             node_id = str(node.get("id", "")).strip()
             if not node_id:
                 return
-            affinity[node_id] = group
+            # A node at depth <= max_depth heads its own group; deeper nodes
+            # inherit the boundary ancestor's group, so a group is always a
+            # whole subtree, never a node subset.
+            node_group = node_id if depth <= max_depth else group
+            affinity[node_id] = node_group
             for child in node.get("children", []) or []:
                 if isinstance(child, dict):
-                    walk(child, group)
+                    walk(child, node_group, depth + 1)
 
         for child in root_node.get("children", []) or []:
             if isinstance(child, dict):
                 child_id = str(child.get("id", "")).strip()
                 if child_id:
-                    walk(child, child_id)
+                    walk(child, child_id, 1)
         return affinity
 
     @staticmethod
