@@ -1,0 +1,42 @@
+name: Package release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（如 v1.0.0）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 打包（git archive 只含 tracked 文件，自动排除 .git；显式排除 arc-bench-test）
+        run: |
+          TAG="${{ inputs.tag }}"
+          git archive --format=zip -o "arc-agent-${TAG}.zip" HEAD -- . ':(exclude)arc-bench-test'
+
+          # 门禁：包内不得出现被排除目录
+          if unzip -l "arc-agent-${TAG}.zip" | grep -q "arc-bench-test/"; then
+            echo "::error::压缩包仍包含 arc-bench-test"
+            exit 1
+          fi
+          unzip -l "arc-agent-${TAG}.zip" | tail -1
+
+      - name: 创建 Release 并上传（tag 已存在时改为覆盖上传附件）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "arc-agent-${TAG}.zip" --clobber
+          else
+            gh release create "${TAG}" "arc-agent-${TAG}.zip" \
+              --title "arc-agent ${TAG}" \
+              --generate-notes
+          fi
