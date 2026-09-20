@@ -20,10 +20,16 @@ def test_system_prompt_pins_read_lock_and_no_probe_retries() -> None:
 
     prompt = get_system_prompt()
 
-    assert "Read discipline is enforced mechanically" in prompt
+    assert "That boundary's read rule is enforced mechanically" in prompt
     assert "every test file you write in this pass is read-locked immediately" in prompt
     assert "retrying with a smaller `limit` (for example `limit: 5`), a shifted `offset`" in prompt
     assert "not to fetch its `first_line`" in prompt
+    # The mechanical statement must read as an enforcement note on the Hard
+    # boundary line directly above it, not as a second, ambiguous rule of
+    # its own (review finding 6f448e98fbf1 on PR #74).
+    assert prompt.index("Hard boundary: write verification assets") < prompt.index(
+        "That boundary's read rule is enforced mechanically"
+    )
 
 
 def test_user_prompt_requires_exact_current_contract_ids() -> None:
