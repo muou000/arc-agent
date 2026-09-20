@@ -247,13 +247,14 @@ class MergeArbiter:
                 workspace_root=self.workspace_path,
             )
             proposed = _extract_path_map(response)
-            record["proposed_paths"] = sorted(proposed)
             if proposed is None:
+                record["proposed_paths"] = []
                 detail = "arbitration model returned no parseable file map"
                 record["outcome"] = "rejected"
                 record["detail"] = detail
                 self._emit(record)
                 return ArbitrationResult(accepted=False, detail=detail)
+            record["proposed_paths"] = sorted(proposed)
             outside = [path for path in proposed if path not in allowed]
             if outside:
                 detail = (
@@ -302,7 +303,11 @@ class MergeArbiter:
     def _emit(self, record: dict[str, Any]) -> None:
         if self.emit_event is None:
             return
-        payload = {"type": "merge_arbitration", "timestamp": _utc_now()}
+        # Same public timestamp helper the runtime's EventClient uses, so the
+        # new event's shape stays consistent with the existing stream.
+        from arcbench_agent_runtime.events import utc_timestamp
+
+        payload = {"type": "merge_arbitration", "timestamp": utc_timestamp()}
         payload.update(record)
         try:
             self.emit_event(payload)
@@ -359,12 +364,6 @@ def _response_text(response: Any) -> str | None:
         if parts:
             return "\n".join(parts)
     return None
-
-
-def _utc_now() -> str:
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc).isoformat()
 
 
 def read_workspace_file(workspace_path: str, path: str) -> str | None:

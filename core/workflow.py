@@ -1090,7 +1090,7 @@ class ARCWorkflowManager:
                 ours_label=self._integration_side_label(node_id),
                 theirs_label=node_id,
                 files=stages,
-                contract_cards=self._arbitration_contract_cards(node_id),
+                contract_cards=self._arbitration_contract_cards(node_id, conflict_paths),
                 gate_failure=gate_failure,
             )
 
@@ -1124,7 +1124,25 @@ class ARCWorkflowManager:
                 )
             return None
 
-        return ArbitrationHooks(collect_input=collect_input, run=run)
+        def on_reverified(gate_result: str | None) -> None:
+            """Persist the post-repair re-verification result (audit trail)."""
+
+            self._emit_merge_arbitration_event(
+                {
+                    "type": "merge_arbitration",
+                    "node_id": node_id,
+                    "phase": phase,
+                    "trigger": TRIGGER_HEALTH_GATE,
+                    "outcome": "reverified-passed" if not gate_result else "reverified-failed",
+                    "detail": gate_result or "",
+                }
+            )
+
+        return ArbitrationHooks(
+            collect_input=collect_input,
+            run=run,
+            on_reverified=on_reverified,
+        )
 
     def _integration_side_label(self, node_id: str) -> str:
         """How the integration side is named in the arbitration prompt.
@@ -1137,14 +1155,17 @@ class ARCWorkflowManager:
 
         return f"integration branch (all merged nodes except {node_id})"
 
-    def _arbitration_contract_cards(self, node_id: str) -> dict[str, Any]:
-        """Both sides' contract cards: the incoming node and every other node.
+    def _arbitration_contract_cards(self, node_id: str, conflict_paths: list[str]) -> dict[str, Any]:
+        """Both sides' contract cards, filtered to the conflicting files.
 
-        Cards are pruned to interface rows (id/type/content/file_path), so
-        even a wide tree's union stays a few kilobytes - far below any whole
-        repository context, which the arbiter must never see.
+        A card belongs in the arbitration input only when its interfaces
+        point at a conflicted path (the incoming node's side) or it is the
+        incoming node itself; unrelated nodes' cards - including siblings
+        that never touched the conflict - are pruned, keeping the context
+        cost gate honest on wide trees.
         """
 
+        conflict_set = set(conflict_paths)
         try:
             others = [
                 str(row.get("req_id") or "").strip()
@@ -1155,7 +1176,21 @@ class ARCWorkflowManager:
             others = []
         node_ids = [req_id for req_id in others if req_id and req_id != node_id]
         node_ids.append(node_id)
-        return collect_contract_cards(self.runtime.traceability, node_ids)
+        cards = collect_contract_cards(self.runtime.traceability, node_ids)
+        # Keep a foreign card only when one of its interfaces lives in a
+        # conflicted file; the incoming node's own card always stays.
+        pruned: dict[str, Any] = {}
+        for card_node_id, card in cards.items():
+            if card_node_id == node_id:
+                pruned[card_node_id] = card
+                continue
+            interfaces = card.get("interfaces") if isinstance(card, dict) else None
+            if any(
+                isinstance(row, dict) and str(row.get("file_path") or "") in conflict_set
+                for row in (interfaces or [])
+            ):
+                pruned[card_node_id] = card
+        return pruned
 
     def _build_arbitration_model(self) -> Any:
         """The arbitration model: the run's configured main model.

@@ -748,3 +748,99 @@ def test_integrate_arbitration_declined_keeps_plain_conflict_error(tmp_path: Pat
     assert not isinstance(excinfo.value, MergeArbitrationError)
     assert model.call_count == 0, "a declined arbitration never reaches the model"
     assert "The worktree is preserved for inspection." in str(excinfo.value)
+
+
+def test_integrate_arbitration_rejects_echoed_conflict_markers(tmp_path: Path) -> None:
+    """An arbiter that echoes git conflict markers back instead of resolving
+    them is rejected; the merge aborts with the plain conflict semantics."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('worktree side wins');\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('integration side wins');\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "sibling rewrite"], repo)
+    echoed = (
+        "<<<<<<< HEAD\nconsole.log('integration side wins');\n"
+        "=======\nconsole.log('worktree side wins');\n>>>>>>>\n"
+    )
+    model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": echoed}))])
+    hooks, _audit = _real_arbitration_hooks(manager, model, _FakeTraceability({}))
+
+    with pytest.raises(MergeConflictError, match="did not resolve") as excinfo:
+        manager.integrate(handle, "REQ-2.1 marker echo", arbiter=hooks)
+
+    assert isinstance(excinfo.value, MergeConflictError)
+    assert model.call_count == 1
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+
+
+def test_integrate_arbitration_reports_reverify_result(tmp_path: Path) -> None:
+    """The post-repair re-verification result is reported through
+    ``on_reverified`` so the audit trail records it."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst a = require('./a');\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst b = require('./b');\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "append b"], repo)
+    model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": "fixed;\n"}))])
+    hooks, _audit = _real_arbitration_hooks(manager, model, _FakeTraceability({}))
+    reverify_results: list[str | None] = []
+    hooks.on_reverified = reverify_results.append
+    gate_calls = {"count": 0}
+
+    def verify() -> str | None:
+        gate_calls["count"] += 1
+        # First probe fails (the mechanical resolution is broken); after the
+        # arbitration repair the tree boots and serves.
+        return "boot failed" if gate_calls["count"] == 1 else None
+
+    committed, _detail = manager.integrate(
+        handle, "REQ-2.1 boot repair", verify=verify, arbiter=hooks
+    )
+
+    assert committed is True
+    assert reverify_results == [None], "the passing re-verification is reported"
+
+
+def test_integrate_arbitration_reports_failed_reverify_result(tmp_path: Path) -> None:
+    """A failing post-repair re-verification is reported (and the merge
+    aborts with MergeArbitrationError)."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst a = require('./a');\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst b = require('./b');\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "append b"], repo)
+    model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": "still broken;\n"}))])
+    hooks, _audit = _real_arbitration_hooks(manager, model, _FakeTraceability({}))
+    reverify_results: list[str | None] = []
+    hooks.on_reverified = reverify_results.append
+
+    with pytest.raises(MergeArbitrationError):
+        manager.integrate(
+            handle, "REQ-2.1 boot repair fails", verify=lambda: "backend unhealthy", arbiter=hooks
+        )
+
+    assert reverify_results == ["backend unhealthy"]

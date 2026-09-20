@@ -66,7 +66,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from core.merge_arbitration import TRIGGER_CONFLICT, TRIGGER_HEALTH_GATE
 
@@ -139,10 +139,14 @@ class _ArbitrationOutcome:
 class ArbitrationHooks:
     """Optional LLM escalation hooks for merge-layer failures (issue #81).
 
-    Both callables run inside the merge lock's worker thread while the merge
-    is mid-flight; they receive the conflict paths and must return a truthy
-    detail string when the escalation should be abandoned (the caller then
-    aborts the merge). ``None`` hooks keep the pre-arbitration behavior.
+    All callables run inside the merge lock's worker thread while the merge
+    is mid-flight. ``collect_input`` returns ``None`` when the escalation is
+    unavailable (budget spent); ``run`` returns a failure-detail string when
+    the escalation should be abandoned (the caller then aborts the merge) and
+    ``None`` when the arbiter rewrote the conflict files in the mid-merge
+    working tree. ``on_reverified`` receives the health gate's re-verification
+    result after a health-gate-triggered repair, so the audit trail can
+    record it. ``None`` hooks keep the pre-arbitration behavior.
     """
 
     collect_input: Callable[[list[str], str], Any] | None = None
@@ -155,6 +159,9 @@ class ArbitrationHooks:
     mid-merge working tree and the caller should re-verify; any string is a
     failure detail that aborts the merge.
     """
+
+    on_reverified: Callable[[str | None], None] | None = None
+    """(gate_result) -> None, called with the post-repair re-verification result."""
 
 
 @dataclass
@@ -423,10 +430,10 @@ class NodeWorktreeManager:
     ) -> "_ArbitrationOutcome":
         """Escalate a non-additive conflict to the LLM arbiter.
 
-        Returns an outcome whose ``failure`` is ``None`` when the arbiter
-        produced conflict files that carry no unresolved markers (the merge
-        state stays mid-merge and the caller proceeds to the health gate);
-        otherwise ``failure`` is a detail that aborts the merge.
+        Returns ``ran(True)`` when the arbiter resolved every conflict file
+        (no unmerged index paths, no literal conflict markers; the merge state
+        stays mid-merge and the caller proceeds to the health gate); a failed
+        outcome carries a ``detail`` that aborts the merge.
         """
 
         if arbiter is None or arbiter.collect_input is None or arbiter.run is None:
@@ -442,11 +449,21 @@ class NodeWorktreeManager:
         failure = arbiter.run(arbitration_input, unmerged, TRIGGER_CONFLICT)
         if failure:
             return _ArbitrationOutcome.ran(False, failure)
+        # The run hook stages what it rewrote; a path it never touched stays
+        # unmerged in the index, and a file that still carries literal git
+        # conflict markers is a hand-off the health gate should not have to
+        # diagnose. Both abort here.
         still_unresolved = self._unresolved_paths()
-        if still_unresolved:
+        marker_tainted = [
+            path
+            for path in unmerged
+            if _carries_conflict_markers(Path(self.main_workspace) / path)
+        ]
+        if still_unresolved or marker_tainted:
+            details = still_unresolved or marker_tainted
             return _ArbitrationOutcome.ran(
                 False,
-                "The arbiter left conflict markers in: " + ", ".join(still_unresolved[:8]) + ".",
+                "The arbiter did not resolve: " + ", ".join(details[:8]) + ".",
             )
         return _ArbitrationOutcome.ran(True, "")
 
@@ -461,9 +478,9 @@ class NodeWorktreeManager:
     ) -> "_ArbitrationOutcome":
         """Escalate a failed post-merge health gate to the LLM arbiter.
 
-        The arbiter may rewrite the resolved files; ``verify`` then re-runs.
-        Returns an outcome whose ``failure`` is ``None`` when the
-        re-verification passes, any string otherwise.
+        The arbiter may rewrite the resolved files; ``verify`` then re-runs
+        (its result reported through ``arbiter.on_reverified`` for the audit
+        trail). Returns ``ran(True)`` when the re-verification passes.
         """
 
         if arbiter is None or arbiter.collect_input is None or arbiter.run is None:
@@ -475,13 +492,18 @@ class NodeWorktreeManager:
         if failure:
             return _ArbitrationOutcome.ran(False, failure)
         if verify is None:
+            if arbiter.on_reverified is not None:
+                arbiter.on_reverified(None)
             return _ArbitrationOutcome.ran(True, "")
         try:
             recheck = verify()
         except Exception as exc:
-            return _ArbitrationOutcome.ran(
-                False, f"re-verification crashed: {type(exc).__name__}: {exc}"
-            )
+            recheck = f"re-verification crashed: {type(exc).__name__}: {exc}"
+        if arbiter.on_reverified is not None:
+            try:
+                arbiter.on_reverified(recheck)
+            except Exception:  # noqa: BLE001 - audit reporting must not break the merge
+                pass
         if recheck:
             return _ArbitrationOutcome.ran(
                 False, f"re-verification still failed after arbitration: {recheck}"
@@ -843,6 +865,35 @@ def _parse_worktree_entries(porcelain_output: str) -> list[tuple[str, str | None
             branch = line[len("branch "):].strip() or None
             entries[-1] = (current_path, branch)
     return entries
+
+
+# Git writes these at line starts in conflicted files. ``=======`` is
+# deliberately absent: it is a legal Markdown setext underline, and a false
+# positive here would burn the node's only arbitration budget.
+_CONFLICT_MARKERS = (
+    "<<<<<<<",
+    ">>>>>>>",
+    "|||||||",
+)
+
+
+def _carries_conflict_markers(path: Path) -> bool:
+    """Whether a file still contains git conflict markers.
+
+    An arbiter that echoes the markers back (instead of resolving them)
+    produces a syntactically staged but semantically broken tree; the health
+    gate would report a confusing boot failure instead of the honest cause.
+    """
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as file:
+            for line in file:
+                stripped = line.rstrip("\r\n")
+                if stripped.startswith(_CONFLICT_MARKERS):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def _collect_insertions(

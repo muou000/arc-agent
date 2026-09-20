@@ -10,7 +10,9 @@ These tests lock the arbitration contract without touching real git:
 - every arbitration leaves a ``merge_arbitration`` audit record.
 
 Real-git end-to-end arbitration (semantic conflict resolution, boot-failure
-repair) lives in ``test_worktree_manager.py``.
+repair) lives in ``test_worktree_manager.py``; the production wiring test at
+the bottom of this file drives ``_integrate_task_workspace`` against real git
+with the workflow's own hook builder (only the model is scripted).
 """
 
 from __future__ import annotations
@@ -449,6 +451,22 @@ def test_arbitration_model_failure_is_reported_not_raised(tmp_path: Path) -> Non
     assert events[-1]["outcome"] == "crashed"
 
 
+def test_arbitration_unparseable_response_is_rejected_not_crashed(tmp_path: Path) -> None:
+    """A non-JSON model response is a *rejected* arbitration, not a crash -
+    the two outcomes mean different things in the audit trail."""
+
+    (tmp_path / "backend").mkdir()
+    model = FauxChatModel(responses=[faux_text("I cannot resolve this conflict.")])
+    arbiter, events = _arbiter_with_model(model, tmp_path)
+
+    result = asyncio_run(arbiter.arbitrate("wt", "main", _sample_input()))
+
+    assert result.accepted is False
+    assert "no parseable file map" in result.detail
+    assert events[-1]["outcome"] == "rejected"
+    assert events[-1]["proposed_paths"] == []
+
+
 def test_arbitration_parses_fenced_json_responses(tmp_path: Path) -> None:
     (tmp_path / "backend").mkdir()
     model = FauxChatModel(
@@ -486,3 +504,152 @@ def asyncio_run(coro: Any) -> Any:
     import asyncio
 
     return asyncio.run(coro)
+
+
+# ----------------------------------------------------------------------
+# production wiring over real git
+# ----------------------------------------------------------------------
+
+
+class _ContractTraceability:
+    """Traceability stub whose registered contracts map onto real interface rows."""
+
+    def __init__(self, interfaces_by_req: dict[str, list[dict[str, Any]]]) -> None:
+        self._interfaces_by_req = interfaces_by_req
+
+    def list_interfaces(self, req_id: str | None = None) -> list[dict[str, Any]]:
+        if req_id is None:
+            return [row for rows in self._interfaces_by_req.values() for row in rows]
+        return list(self._interfaces_by_req.get(req_id, []))
+
+    def get_node_contract(self, req_id: str) -> dict[str, Any] | None:
+        return None
+
+    def list_node_contracts(self) -> list[dict[str, Any]]:
+        return [{"req_id": req_id} for req_id in self._interfaces_by_req]
+
+
+def test_production_hooks_drive_a_semantic_conflict_merge_over_real_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The workflow's own hook builder resolves a real non-additive conflict.
+
+    Everything is production wiring except the model: ARCWorkflowManager,
+    NodeWorktreeManager, ``_integrate_task_workspace``, the node-session
+    budget and the runner-events audit path all run for real against a real
+    git repository.
+    """
+
+    import subprocess
+
+    from core.config import set_workspace_root
+    from core.workflow import ARCWorkflowManager, _TaskWorkspace
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@e.com"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=str(workspace), check=True, capture_output=True)
+    (workspace / ".gitignore").write_text(
+        "# >>> arcbench-agent-runtime >>>\n.arc/*\n!.arc/traceability/\n!.arc/traceability/**\n# <<< arcbench-agent-runtime <<<\n",
+        encoding="utf-8",
+    )
+    (workspace / "backend").mkdir()
+    (workspace / "frontend").mkdir()
+    (workspace / "backend" / "src.js").write_text("console.log('v1');\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(workspace), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(workspace), check=True, capture_output=True)
+
+    monkeypatch.setenv(ARBITRATION_ENV, "1")
+    set_workspace_root(str(workspace))
+    manager = ARCWorkflowManager(
+        workspace_path=str(workspace),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *args, **kwargs: None,
+    )
+    manager.runtime = SimpleNamespace(
+        traceability=_ContractTraceability(
+            {
+                "REQ-2": [
+                    {
+                        "interface_id": "IF-A",
+                        "type": "API",
+                        "content": "GET /a",
+                        "file_path": "backend/src.js",
+                        "req_ids": ["REQ-2"],
+                    }
+                ],
+                "REQ-3": [
+                    {
+                        "interface_id": "IF-B",
+                        "type": "API",
+                        "content": "GET /b",
+                        "file_path": "backend/src.js",
+                        "req_ids": ["REQ-3"],
+                    }
+                ],
+                # A sibling whose contracts live elsewhere: its card must be
+                # pruned out of the arbitration input.
+                "REQ-9": [
+                    {
+                        "interface_id": "IF-Z",
+                        "type": "API",
+                        "content": "GET /z",
+                        "file_path": "backend/other.js",
+                        "req_ids": ["REQ-9"],
+                    }
+                ],
+            }
+        ),
+        paths=SimpleNamespace(runner_events_path=workspace / ".arc" / "runner-events.jsonl"),
+    )
+    resolved_content = "console.log('v1 both sides');\nroute('/a', a);\nroute('/b', b);\n"
+    model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": resolved_content}))])
+    monkeypatch.setattr(manager, "_build_arbitration_model", lambda: model)
+
+    # A non-additive conflict: both sides rewrote the same line differently.
+    handle = manager._worktree_manager.prepare("REQ-3")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('v1 theirs');\nroute('/b', b);\n", encoding="utf-8"
+    )
+    (workspace / "backend" / "src.js").write_text(
+        "console.log('v1 ours');\nroute('/a', a);\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=str(workspace), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "sibling rewrite"], cwd=str(workspace), check=True, capture_output=True
+    )
+    ctx = _TaskWorkspace(
+        node_id="REQ-3",
+        handle=handle,
+        slot=0,
+        web_port=4001,
+        phase_runner=SimpleNamespace(),
+    )
+
+    merged, _detail, conflict_paths = asyncio_run(
+        manager._integrate_task_workspace(
+            ctx, "REQ-3", "IMPLEMENT", {"id": "REQ-3", "name": "req3", "description": "d"}
+        )
+    )
+
+    assert merged is True, "the arbitrated merge lands through the production wiring"
+    assert conflict_paths == []
+    assert (workspace / "backend" / "src.js").read_text(encoding="utf-8") == resolved_content
+    assert not (workspace / ".git" / "MERGE_HEAD").exists()
+    assert model.call_count == 1
+
+    # The prompt carried the three-way contents, both conflicting nodes'
+    # contract cards, and nothing from the unrelated sibling.
+    prompt = str(model.calls[0][0].content)
+    assert "v1 ours" in prompt and "v1 theirs" in prompt and "console.log('v1');" in prompt
+    assert "IF-A" in prompt and "IF-B" in prompt
+    assert "IF-Z" not in prompt, "an unrelated sibling's card must be pruned"
+
+    # The audit record landed in the runner events; the budget in the session.
+    events_text = (workspace / ".arc" / "runner-events.jsonl").read_text(encoding="utf-8")
+    assert '"type": "merge_arbitration"' in events_text
+    assert '"outcome": "applied"' in events_text
+    from core import sessions
+
+    assert sessions.load_node_session("REQ-3").get("merge_arbitration_used") is True
