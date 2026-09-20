@@ -221,6 +221,11 @@ def test_repeated_read_blocked_only_after_the_fresh_reread_budget() -> None:
     assert "Repeated read blocked" in blocked.content
     assert "non-overlapping" not in blocked.content
     assert "offset" in blocked.content
+    # arc-output4 REQ-2: after this block the TestGenerator fired four narrow
+    # `limit: 5` probes at freshly written test files. The message must state
+    # up front that a narrower limit or shifted offset is the same blocked
+    # read, so the retry never looks like an unexplored exit.
+    assert "A narrower limit or shifted offset is the same blocked read." in blocked.content
 
 
 def test_failed_read_unlocks_the_path_beyond_the_read_budget() -> None:
@@ -270,6 +275,10 @@ def test_read_of_written_file_block_points_to_next_action() -> None:
     assert blocked.status == "error"
     assert "Read blocked" in blocked.content
     assert "Continue with the next action" in blocked.content
+    # arc-output4 REQ-1: four seconds after this exact block the agent retried
+    # the same path with limit=5 and was blocked again. The message must name
+    # the retry shapes so the narrow probe does not look like an escape.
+    assert "Any retry shape (smaller limit, shifted offset) is blocked too." in blocked.content
 
 
 # ---------------------------------------------------------------------------
