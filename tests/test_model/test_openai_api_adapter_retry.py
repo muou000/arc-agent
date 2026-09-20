@@ -20,6 +20,8 @@ the current contract:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 
 import httpx
 import pytest
@@ -255,34 +257,65 @@ def test_stream_usage_env_restores_pre_fix_behaviour(
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected"),
+    ("raw", "expected", "warns"),
     [
-        ("", True),  # unset: the fix's default
-        ("1", True),
-        ("true", True),
-        ("yes", True),
-        ("on", True),
-        ("0", False),
-        ("false", False),
-        ("no", False),
-        ("off", False),
-        (" Off ", False),  # surrounding whitespace + case folded
+        ("", True, False),  # unset: the fix's default, not a config mistake
+        ("1", True, False),
+        ("true", True, False),
+        ("yes", True, False),
+        ("on", True, False),
+        ("0", False, False),
+        ("false", False, False),
+        ("no", False, False),
+        ("off", False, False),
+        (" Off ", False, False),  # surrounding whitespace + case folded
         # A typo or unrecognized value must not silently disable the fix
-        # (default-on, same invalid->default convention as _env_int/_env_float;
-        # check_config surfaces the typo as a doctor warning).
-        ("flase", True),
-        ("maybe", True),
+        # (default-on, same invalid->default convention as _env_int/_env_float)
+        # but is logged once, like structured_output_supported's invalid-value
+        # warning; check_config surfaces it as a doctor warning too.
+        ("flase", True, True),
+        ("maybe", True, True),
     ],
 )
-def test_resolve_stream_usage_parse_matrix(raw: str, expected: bool) -> None:
-    from agents.model.openai_api_adapter import resolve_stream_usage
+def test_resolve_stream_usage_parse_matrix(raw: str, expected: bool, warns: bool) -> None:
+    from agents.model import openai_api_adapter as adapter_module
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setenv("ARC_MODEL_STREAM_USAGE", raw)
+    adapter_module._ENV_WARNED.clear()
     try:
-        assert resolve_stream_usage() is expected
+        with caplog_context(adapter_module) as records:
+            assert adapter_module.resolve_stream_usage() is expected
+            # A repeat resolve (every model build) must not re-log the typo.
+            adapter_module.resolve_stream_usage()
+        warning_records = [r for r in records if r.levelno >= logging.WARNING]
+        assert len(warning_records) == (1 if warns else 0)
     finally:
+        adapter_module._ENV_WARNED.clear()
         monkeypatch.undo()
+
+
+@contextlib.contextmanager
+def caplog_context(module):
+    """Capture this module's logger output without pytest's caplog fixture
+    (the parse matrix drives resolve directly, not through a test function
+    that can request it)."""
+
+    class _Capture(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(level=logging.DEBUG)
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    capture = _Capture()
+    module_logger = logging.getLogger(module.__name__)
+    module_logger.addHandler(capture)
+    try:
+        yield capture.records
+    finally:
+        module_logger.removeHandler(capture)
 
 
 def test_responses_mode_streaming_never_sends_stream_options(

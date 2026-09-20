@@ -53,6 +53,9 @@ _CHUNK_TIMEOUT_ENV = "ARC_MODEL_STREAM_CHUNK_TIMEOUT"
 # streaming-unsupported and silently lose the stream transport's
 # idle-timeout protection, so keep it possible to turn the option off.
 _STREAM_USAGE_ENV = "ARC_MODEL_STREAM_USAGE"
+# One-shot dedupe for unrecognized-env-value warnings, keyed by (name, value).
+_ENV_WARNED: set[tuple[str, str]] = set()
+_ENV_WARN_LOCK = threading.Lock()
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
 _REACHABILITY_PROBE_TIMEOUT = 5.0
 # A dead endpoint is re-probed up to this many times per real attempt before
@@ -622,15 +625,35 @@ def resolve_stream_usage() -> bool:
     llm_usage events from tiktoken estimates (cache_read=0 by construction)
     into reported values. ``ARC_MODEL_STREAM_USAGE=0/false/no/off`` restores
     the pre-fix behaviour for gateways that reject the option. Unset or
-    unrecognized values fall back to the default (on): the doctor surfaces
-    the typo, and defaulting on matches ARC_DEBUG_ENABLED-style boolean env
-    handling where a silent value never turns a fix off by accident.
+    unrecognized values fall back to the default (on) — a typo silently
+    disabling the fix would re-open the zero-cache blind spot — but an
+    unrecognized value is logged once (the structured_output_supported
+    convention), and the doctor surfaces it too.
     """
 
     raw = os.environ.get(_STREAM_USAGE_ENV, "").strip().lower()
     if raw in {"0", "false", "no", "off"}:
         return False
+    if raw and raw not in {"1", "true", "yes", "on"}:
+        _warn_unrecognized_env_once(
+            _STREAM_USAGE_ENV, raw, "expected 1/true/yes/on or 0/false/no/off; defaulting to on"
+        )
     return True
+
+
+def _warn_unrecognized_env_once(name: str, value: str, expected: str) -> None:
+    """Log an unrecognized env value once per process (not per call site).
+
+    Resolvers run on every model build; without the dedupe the same typo would
+    re-log for each cached-client rebuild. A warning, not an error: the
+    invalid->default fallback keeps the run alive.
+    """
+
+    with _ENV_WARN_LOCK:
+        if (name, value) in _ENV_WARNED:
+            return
+        _ENV_WARNED.add((name, value))
+    logger.warning("Invalid %s=%r; %s.", name, value, expected)
 
 
 def resolve_stream_chunk_timeout() -> float | None:
