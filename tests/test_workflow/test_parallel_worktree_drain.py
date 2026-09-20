@@ -779,6 +779,55 @@ def test_release_keeps_nodes_blocked_behind_still_failed_prerequisites(
     assert state["node_states"]["RE"] == NODE_BLOCKED_BY_DEPENDENCY
 
 
+def test_release_holds_nested_ancestor_until_every_failed_descendant_is_reset(
+    tmp_path: Path,
+) -> None:
+    """A blocked ancestor waits on ALL failed descendants, not just the deepest.
+
+    Ancestor blocking propagates through ``descendants`` (R waits for RA and
+    RA1's IMPLEMENTs), and release checks the same map through the same
+    ``_failed_prerequisite_ids`` helper, so the two are mirror images: while
+    any failed descendant remains — here the middle layer RA after only the
+    innermost RA1 was retried — the ancestor keeps its BLOCKED state, and it
+    is released only once every failed descendant under it has been reset.
+    """
+    manager = _make_parallel_manager(tmp_path)
+    state = {
+        "tasks": [
+            {"task_id": "R:DESIGN", "node_id": "R", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "R:IMPLEMENT", "node_id": "R", "phase": PHASE_IMPLEMENT, "status": TASK_BLOCKED},
+            {"task_id": "RA:DESIGN", "node_id": "RA", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA:IMPLEMENT", "node_id": "RA", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+            {"task_id": "RA1:DESIGN", "node_id": "RA1", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+            {"task_id": "RA1:IMPLEMENT", "node_id": "RA1", "phase": PHASE_IMPLEMENT, "status": TASK_FAILED},
+        ],
+        "node_states": {
+            "R": NODE_BLOCKED_BY_DEPENDENCY,
+            "RA": NODE_FAILED,
+            "RA1": NODE_FAILED,
+        },
+        "descendants": {"R": ["RA", "RA1"], "RA": ["RA1"]},
+        "dependencies": {},
+    }
+
+    # Only the innermost failed descendant is retried; the middle layer RA is
+    # still failed, so the ancestor must stay blocked.
+    state["tasks"][5]["status"] = TASK_PENDING
+    state["node_states"]["RA1"] = NODE_DESIGNED
+    released = asyncio.run(manager._release_dependency_blocks(state))
+    assert released == [], "R stays blocked while the middle descendant RA is still failed"
+    assert state["tasks"][1]["status"] == TASK_BLOCKED
+    assert state["node_states"]["R"] == NODE_BLOCKED_BY_DEPENDENCY
+
+    # Resetting the middle layer too releases the ancestor.
+    state["tasks"][3]["status"] = TASK_PENDING
+    state["node_states"]["RA"] = NODE_DESIGNED
+    released = asyncio.run(manager._release_dependency_blocks(state))
+    assert released == ["R"]
+    assert state["tasks"][1]["status"] == TASK_PENDING
+    assert state["node_states"]["R"] == NODE_DESIGNED
+
+
 def test_released_block_is_reblocked_when_the_retry_fails_again(
     tmp_path: Path,
 ) -> None:
