@@ -254,6 +254,37 @@ def test_stream_usage_env_restores_pre_fix_behaviour(
         reset_model_cache_for_tests()
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", True),  # unset: the fix's default
+        ("1", True),
+        ("true", True),
+        ("yes", True),
+        ("on", True),
+        ("0", False),
+        ("false", False),
+        ("no", False),
+        ("off", False),
+        (" Off ", False),  # surrounding whitespace + case folded
+        # A typo or unrecognized value must not silently disable the fix
+        # (default-on, same invalid->default convention as _env_int/_env_float;
+        # check_config surfaces the typo as a doctor warning).
+        ("flase", True),
+        ("maybe", True),
+    ],
+)
+def test_resolve_stream_usage_parse_matrix(raw: str, expected: bool) -> None:
+    from agents.model.openai_api_adapter import resolve_stream_usage
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("ARC_MODEL_STREAM_USAGE", raw)
+    try:
+        assert resolve_stream_usage() is expected
+    finally:
+        monkeypatch.undo()
+
+
 def test_responses_mode_streaming_never_sends_stream_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

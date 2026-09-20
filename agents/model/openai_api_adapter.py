@@ -621,11 +621,16 @@ def resolve_stream_usage() -> bool:
     SSE chunk carry the real token counts (including cache hits), turning
     llm_usage events from tiktoken estimates (cache_read=0 by construction)
     into reported values. ``ARC_MODEL_STREAM_USAGE=0/false/no/off`` restores
-    the pre-fix behaviour for gateways that reject the option.
+    the pre-fix behaviour for gateways that reject the option. Unset or
+    unrecognized values fall back to the default (on): the doctor surfaces
+    the typo, and defaulting on matches ARC_DEBUG_ENABLED-style boolean env
+    handling where a silent value never turns a fix off by accident.
     """
 
     raw = os.environ.get(_STREAM_USAGE_ENV, "").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 def resolve_stream_chunk_timeout() -> float | None:

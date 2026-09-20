@@ -11,10 +11,11 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
 from agents.model import openai_api_adapter as adapter
 from agents.model import usage_capture
@@ -42,6 +43,15 @@ def _chat_result(message: AIMessage, llm_output: dict | None = None) -> ChatResu
 
 async def _instant_asleep(seconds: float) -> None:
     return None
+
+
+class _FakeAsyncClient:
+    """Stands in for langchain-openai's ``async_client`` property so the real
+    ``BaseChatOpenAI._astream`` HTTP branch (``async_client.create(**payload)``)
+    runs against a canned stream instead of the network."""
+
+    def __init__(self, create: Any) -> None:
+        self.create = create
 
 
 def _record_to_dict(record: LLMUsageRecord) -> dict:
@@ -308,31 +318,71 @@ class TestAdapterIntegration:
         provider's usage; the llm_usage record must be reported (not
         estimated), keep the cache-hit share, and bill it at the cache rate.
 
-        The fake _astream yields what langchain-openai produces from a
-        ``stream_options.include_usage`` stream: generation chunks merged with
-        a trailing usage-only chunk into one AIMessage carrying usage_metadata.
+        The mocked HTTP boundary serves what a stream_options.include_usage
+        stream actually delivers: content chunks followed by a usage-only
+        final chunk. Everything between the boundary and the usage record is
+        real code — langchain-openai's _astream (request construction,
+        chunk-to-generation conversion, usage extraction) and ARC's
+        _arc_streamed_agenerate / agenerate_from_stream aggregation — so the
+        test pins that the built model really asks for usage and that the
+        reported share survives to the record.
         """
+
+        from openai.types.chat import ChatCompletionChunk
+
+        def _chunk(**overrides: dict) -> ChatCompletionChunk:
+            payload: dict = {
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "MiniMax-M3",
+                "choices": [],
+            }
+            payload.update(overrides)
+            return ChatCompletionChunk.model_validate(payload)
+
+        content_chunk = _chunk(
+            choices=[{"index": 0, "delta": {"role": "assistant", "content": "hi"}}]
+        )
+        usage_chunk = _chunk(
+            usage={
+                "prompt_tokens": 64000,
+                "completion_tokens": 210,
+                "total_tokens": 64210,
+                "prompt_tokens_details": {"cached_tokens": 60000},
+            }
+        )
+
+        class _FakeStream:
+            def __init__(self, items: list) -> None:
+                self._items = iter(items)
+
+            async def __aenter__(self) -> "_FakeStream":
+                return self
+
+            async def __aexit__(self, *exc_info: object) -> bool:
+                return False
+
+            def __aiter__(self) -> "_FakeStream":
+                return self
+
+            async def __anext__(self) -> ChatCompletionChunk:
+                try:
+                    return next(self._items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        captured_request: dict = {}
+
+        async def fake_create(**kwargs: dict) -> _FakeStream:
+            captured_request.update(kwargs)
+            return _FakeStream([content_chunk, usage_chunk])
 
         records: list[LLMUsageRecord] = []
         set_llm_usage_sink(records.append)
         monkeypatch.delenv("ARC_MODEL_STREAM_TRANSPORT", raising=False)
         monkeypatch.delenv("ARC_MODEL_STREAM_USAGE", raising=False)
         monkeypatch.setattr(adapter, "_asleep", _instant_asleep)
-
-        async def fake_astream(self, messages, stop=None, run_manager=None, **kwargs):
-            yield ChatGenerationChunk(
-                message=AIMessageChunk(
-                    content="hi",
-                    usage_metadata={
-                        "input_tokens": 64000,
-                        "output_tokens": 210,
-                        "total_tokens": 64210,
-                        "input_token_details": {"cache_read": 60000},
-                    },
-                )
-            )
-
-        monkeypatch.setattr(adapter.ChatOpenAI, "_astream", fake_astream)
 
         async def run() -> None:
             model = adapter.ARCChatOpenAI(
@@ -341,9 +391,15 @@ class TestAdapterIntegration:
                 arc_api_mode="chat_completions",
                 arc_model_name="MiniMax-M3",
             )
+            # Instance-level stand-in for the SDK client: the real _astream's
+            # plain branch resolves async_client on the instance first.
+            model.async_client = _FakeAsyncClient(fake_create)
             await model._agenerate([{"role": "user", "content": "hi"}])
 
         asyncio.run(run())
+        # The real request path asked the endpoint for usage.
+        assert captured_request["stream"] is True
+        assert captured_request["stream_options"] == {"include_usage": True}
         assert len(records) == 1
         record = records[0]
         # The provider answered with usage: no estimation, cache share kept.
