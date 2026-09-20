@@ -191,6 +191,19 @@ class _StageTimer:
         return "\n\n=== Stage Timing ===\n" + " | ".join(parts) + "\n"
 
 
+def _resolve_executable(program: str) -> str:
+    """Resolve ``program`` to a real file ``create_subprocess_exec`` can spawn.
+
+    ``CreateProcess`` (unlike a shell) does not apply ``PATHEXT`` resolution,
+    so the bare name ``npm`` cannot be spawned on Windows where the real file
+    is ``npm.cmd``; without this the install crashes the whole IMPLEMENT task
+    with ``FileNotFoundError: [WinError 2]`` (observed on the 2026-09-20
+    test1 run). Resolution stays on PATH exactly like a shell would.
+    """
+    resolved = shutil.which(program)
+    return resolved or program
+
+
 async def _run_npm_command(
     command: str | list[str],
     target_dir: str,
@@ -201,7 +214,8 @@ async def _run_npm_command(
     # the flag-carrying install lines built from module constants.
     if isinstance(command, list):
         process = await asyncio.create_subprocess_exec(
-            *command,
+            _resolve_executable(command[0]),
+            *command[1:],
             cwd=target_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -2213,18 +2227,37 @@ class WebAppType(AppTypeHandler):
         # LEGACY_PEER_DEPS_FLAG is a single-token npm flag; split() keeps the
         # argv form honest if it ever grows, and a multi-token value would be
         # a breaking change to audit at its definition, not at each use site.
-        returncode, _stdout, stderr = await _run_npm_command(
-            [
-                "npm",
-                "install",
-                "--no-save",
-                "--no-package-lock",
-                *LEGACY_PEER_DEPS_FLAG.split(),
-                name,
-            ],
-            target_dir,
-            NPM_INSTALL_TIMEOUT_SECONDS,
-        )
+        # The subprocess itself is guarded: an unspawnable npm (or any other
+        # platform-level surprise) must surface as an ordinary failed install
+        # the agent can recover from, never as an exception that crashes the
+        # whole IMPLEMENT task (observed: WinError 2 killed REQ-1 and blocked
+        # REQ-2/ROOT on the 2026-09-20 test1 run).
+        try:
+            returncode, _stdout, stderr = await _run_npm_command(
+                [
+                    "npm",
+                    "install",
+                    "--no-save",
+                    "--no-package-lock",
+                    *LEGACY_PEER_DEPS_FLAG.split(),
+                    name,
+                ],
+                target_dir,
+                NPM_INSTALL_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            await self._log(
+                "System",
+                f"npm install of '{name}' into {label}/ could not run: {type(exc).__name__}: {exc}",
+                "warning",
+            )
+            return (
+                "Exit Code: 1\n"
+                "STDERR:\n"
+                f"npm install of '{name}' into {label}/ could not run: "
+                f"{type(exc).__name__}: {exc}\n"
+                "Fall back to a standard-library or local implementation.\n"
+            )
         if returncode != 0:
             await self._log(
                 "System",
