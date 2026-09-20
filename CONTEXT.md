@@ -7,7 +7,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）需求编译器的实现仓�
 ### 调度与并行
 
 **亲和组（Affinity Group）**：
-调度器把节点分进共享 worktree 的组，组内任务严格串行。现状按顶层子树划分。
+调度器把节点分进共享 worktree 的组，组内任务严格串行。默认按顶层子树划分；`ARC_AFFINITY_DEPTH` 配置切分深度，让宽子树的特性子树各自成组。
 _避免_：worktree 组、并行组
 
 **冲突域（Conflict Domain）**：

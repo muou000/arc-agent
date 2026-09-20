@@ -47,9 +47,8 @@ QUEUE_FILENAME = "processing_queue.json"
 # another free group. ARC_AFFINITY_DEPTH (default 1) sets the depth at which
 # the grouping splits: a wide top-level subtree's child subtrees each become
 # their own group, trading worktree sharing for parallelism - the sibling
-# skeletons then race only through the merge rails (file claims, additive
-# resolution, health gate), which is where the arbitration of the wider
-# surfaces happens. Cross-subtree conflicts that survive (shared glue
+# skeletons then meet only through the merge rails (file claims, additive
+# resolution, health gate). Cross-subtree conflicts that survive (shared glue
 # files) are resolved mechanically when every side only appended lines,
 # guarded by a backend health check before the merge commit; anything else
 # fails the node with an explicit reason and preserves its worktree for
@@ -104,6 +103,10 @@ def _affinity_depth() -> int:
     common parent can drain in parallel. Values below 1 and unparsable
     input degrade to 1: an affinity map must always exist, and the fallback
     is the behaviour every saved queue was built under.
+
+    Unlike ARC_MAX_CONCURRENT_TASKS there is deliberately no upper clamp:
+    a depth past the tree's height is the sanctioned every-subtree-its-own-
+    group mode (no worktree sharing), monotonic and literal.
     """
     raw = os.environ.get("ARC_AFFINITY_DEPTH", "").strip()
     try:
@@ -558,8 +561,9 @@ class ARCWorkflowManager:
     ) -> dict[str, Any] | None:
         """Pick the next runnable task honouring subtree affinity.
 
-        Tasks group by their top-level requirement ancestor, and each group
-        owns one reusable worktree, so at most one task per group may run at
+        Tasks group by their affinity-group subtree (top-level by default;
+        ARC_AFFINITY_DEPTH splits deeper), and each group owns one reusable
+        worktree, so at most one task per group may run at
         once. A freed slot prefers the free group with the most pending work
         (longest-remaining first), counted together with the pending work of
         the other groups that depend on it: a small hub subtree that many
@@ -864,8 +868,9 @@ class ARCWorkflowManager:
     async def _open_task_workspace(self, task: dict[str, Any], queue_state: dict[str, Any]) -> _TaskWorkspace:
         """Create the task's isolated worktree, port slot and phase runner.
 
-        The worktree directory is keyed by the task's top-level subtree
-        (affinity group) so consecutive tasks of one subtree reuse it;
+        The worktree directory is keyed by the task's affinity-group subtree
+        (top-level by default; ARC_AFFINITY_DEPTH splits deeper) so
+        consecutive tasks of one group reuse it;
         ``prepare`` falls back to a node-keyed directory when the group
         directory is dirty or quarantined.
         """
@@ -1519,7 +1524,7 @@ class ARCWorkflowManager:
         return parents
 
     @staticmethod
-    def _build_affinity_map(root_node: dict[str, Any], max_depth: int = 1) -> dict[str, str]:
+    def _build_affinity_map(root_node: dict[str, Any], split_depth: int = 1) -> dict[str, str]:
         """Map every node id to the subtree group it shares a worktree with.
 
         Tasks of one group run sequentially in the group's reusable worktree,
@@ -1527,11 +1532,11 @@ class ARCWorkflowManager:
         skeleton files; different groups drain in parallel. The root itself
         forms its own group.
 
-        ``max_depth`` bounds how deep a top-level subtree stays one group:
+        ``split_depth`` bounds how deep a top-level subtree stays one group:
         depth 1 is the historical top-level-subtree grouping; a deeper split
         gives each descendant subtree at that depth (e.g. feature subtrees
         under a wide parent) its own group so siblings can drain in parallel.
-        Nodes deeper than ``max_depth`` inherit their ancestor's group, so a
+        Nodes deeper than ``split_depth`` inherit their ancestor's group, so a
         group boundary is always a whole subtree, never a node subset.
         """
 
@@ -1544,10 +1549,10 @@ class ARCWorkflowManager:
             node_id = str(node.get("id", "")).strip()
             if not node_id:
                 return
-            # A node at depth <= max_depth heads its own group; deeper nodes
+            # A node at depth <= split_depth heads its own group; deeper nodes
             # inherit the boundary ancestor's group, so a group is always a
             # whole subtree, never a node subset.
-            node_group = node_id if depth <= max_depth else group
+            node_group = node_id if depth <= split_depth else group
             affinity[node_id] = node_group
             for child in node.get("children", []) or []:
                 if isinstance(child, dict):

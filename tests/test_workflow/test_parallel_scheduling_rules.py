@@ -202,6 +202,60 @@ def test_affinity_depth_two_splits_feature_subtrees() -> None:
     }
 
 
+def test_affinity_depth_two_splits_simple_keep_shape() -> None:
+    """The motivating case pinned literally: simple-keep's REQ-2 subtree
+    with its six feature subtrees (delete 2.3, update 2.4, archive 2.5,
+    coloring 2.6, labels 2.7, pinned 2.8) - each its own group under
+    depth 2, every descendant staying with its feature subtree."""
+    tree = {
+        "id": "ROOT",
+        "children": [
+            {
+                "id": "REQ-1",
+                "children": [{"id": "REQ-1.1", "children": []}],
+            },
+            {
+                "id": "REQ-2",
+                "children": [
+                    {"id": "REQ-2.3", "children": [{"id": "REQ-2.3.1", "children": []}]},
+                    {"id": "REQ-2.4", "children": []},
+                    {"id": "REQ-2.5", "children": [{"id": "REQ-2.5.1", "children": []}]},
+                    {"id": "REQ-2.6", "children": [{"id": "REQ-2.6.1", "children": []}]},
+                    {
+                        "id": "REQ-2.7",
+                        "children": [
+                            {"id": "REQ-2.7.1", "children": []},
+                            {
+                                "id": "REQ-2.7.6",
+                                "children": [{"id": "REQ-2.7.6.1", "children": []}],
+                            },
+                        ],
+                    },
+                    {"id": "REQ-2.8", "children": [{"id": "REQ-2.8.1", "children": []}]},
+                ],
+            },
+        ],
+    }
+
+    grouped = ARCWorkflowManager._build_affinity_map(tree, 2)
+
+    assert grouped["REQ-2"] == "REQ-2"
+    for feature in ("REQ-2.3", "REQ-2.4", "REQ-2.5", "REQ-2.6", "REQ-2.7", "REQ-2.8"):
+        assert grouped[feature] == feature, f"{feature} heads its own group"
+    assert grouped["REQ-2.3.1"] == "REQ-2.3"
+    assert grouped["REQ-2.5.1"] == "REQ-2.5"
+    assert grouped["REQ-2.6.1"] == "REQ-2.6"
+    assert grouped["REQ-2.7.1"] == "REQ-2.7"
+    assert grouped["REQ-2.7.6"] == "REQ-2.7"
+    assert grouped["REQ-2.7.6.1"] == "REQ-2.7", "depth-4 nodes inherit the depth-2 boundary"
+    assert grouped["REQ-2.8.1"] == "REQ-2.8"
+    assert grouped["REQ-1.1"] == "REQ-1.1", (
+        "the boundary is literal: a depth-2 node heads its own group even under a "
+        "single-child parent - parent/child ordering is enforced by the design and "
+        "implement gates, not by the affinity group"
+    )
+
+
 def test_affinity_depth_beyond_tree_height_splits_every_subtree() -> None:
     """The depth is a boundary, not a target: every subtree at depth <= N
     heads its own group, so a depth past the tree's height makes every node
