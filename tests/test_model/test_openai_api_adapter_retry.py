@@ -20,9 +20,12 @@ the current contract:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 
 import httpx
 import pytest
+from langchain_core.messages import HumanMessage
 from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
 from agents.model import openai_api_adapter as adapter
@@ -196,6 +199,152 @@ def test_build_openai_chat_model_sets_timeout_and_disables_sdk_retries(
         assert client.timeout is not None
         assert client.timeout.read == 120.0
         assert client.max_retries == 0
+    finally:
+        reset_model_cache_for_tests()
+
+
+def test_built_model_streams_with_usage_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The zero-cache billing blind spot: streamed chat.completions requests
+    must ask for usage (stream_options.include_usage) or every call falls to
+    tiktoken estimation whose cache_read is 0 by definition (arc-output4 was
+    fully billed as zero-cache because of this)."""
+
+    from agents.model.openai_api_adapter import build_openai_chat_model, reset_model_cache_for_tests
+
+    monkeypatch.delenv("ARC_MODEL_STREAM_USAGE", raising=False)
+    reset_model_cache_for_tests()
+    try:
+        model = build_openai_chat_model(
+            "test-model",
+            api_mode="chat_completions",
+            base_url="https://model.test/v1",
+            api_key="test-key",
+        )
+        assert model.stream_usage is True
+        payload = model._get_request_payload(
+            [HumanMessage("hi")], stream=True, stream_options={"include_usage": True}
+        )
+        assert payload["stream_options"] == {"include_usage": True}
+    finally:
+        reset_model_cache_for_tests()
+
+
+def test_stream_usage_env_restores_pre_fix_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ARC_MODEL_STREAM_USAGE=0 is the escape hatch for gateways that reject
+    stream_options with a 4xx (which would otherwise mark the endpoint
+    streaming-unsupported and lose the stream transport's idle-timeout
+    protection)."""
+
+    from agents.model.openai_api_adapter import build_openai_chat_model, reset_model_cache_for_tests
+
+    monkeypatch.setenv("ARC_MODEL_STREAM_USAGE", "0")
+    reset_model_cache_for_tests()
+    try:
+        model = build_openai_chat_model(
+            "test-model",
+            api_mode="chat_completions",
+            base_url="https://model.test/v1",
+            api_key="test-key",
+        )
+        assert model.stream_usage is False
+        assert model._should_stream_usage() is False
+    finally:
+        reset_model_cache_for_tests()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    [
+        ("", True, False),  # unset: the fix's default, not a config mistake
+        ("1", True, False),
+        ("true", True, False),
+        ("yes", True, False),
+        ("on", True, False),
+        ("0", False, False),
+        ("false", False, False),
+        ("no", False, False),
+        ("off", False, False),
+        (" Off ", False, False),  # surrounding whitespace + case folded
+        # A typo or unrecognized value must not silently disable the fix
+        # (default-on, same invalid->default convention as _env_int/_env_float)
+        # but is logged once, like structured_output_supported's invalid-value
+        # warning; check_config surfaces it as a doctor warning too.
+        ("flase", True, True),
+        ("maybe", True, True),
+    ],
+)
+def test_resolve_stream_usage_parse_matrix(raw: str, expected: bool, warns: bool) -> None:
+    from agents.model import openai_api_adapter as adapter_module
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("ARC_MODEL_STREAM_USAGE", raw)
+    adapter_module._ENV_WARNED.clear()
+    try:
+        with caplog_context(adapter_module) as records:
+            assert adapter_module.resolve_stream_usage() is expected
+            # A repeat resolve (every model build) must not re-log the typo.
+            adapter_module.resolve_stream_usage()
+        warning_records = [r for r in records if r.levelno >= logging.WARNING]
+        assert len(warning_records) == (1 if warns else 0)
+    finally:
+        adapter_module._ENV_WARNED.clear()
+        monkeypatch.undo()
+
+
+@contextlib.contextmanager
+def caplog_context(module):
+    """Capture this module's logger output without pytest's caplog fixture
+    (the parse matrix drives resolve directly, not through a test function
+    that can request it)."""
+
+    class _Capture(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(level=logging.DEBUG)
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    capture = _Capture()
+    module_logger = logging.getLogger(module.__name__)
+    module_logger.addHandler(capture)
+    try:
+        yield capture.records
+    finally:
+        module_logger.removeHandler(capture)
+
+
+def test_responses_mode_streaming_never_sends_stream_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Responses streaming path builds its payload from _astream_responses
+    (which never reads stream_usage), and _construct_responses_api_payload does
+    not strip unknown keys — so instance-level stream_usage must not leak a
+    chat.completions-only option into a responses request."""
+
+    from agents.model.openai_api_adapter import build_openai_chat_model, reset_model_cache_for_tests
+
+    monkeypatch.delenv("ARC_MODEL_STREAM_USAGE", raising=False)
+    reset_model_cache_for_tests()
+    try:
+        model = build_openai_chat_model(
+            "test-model",
+            api_mode="responses",
+            base_url="https://model.test/v1",
+            api_key="test-key",
+        )
+        assert model.stream_usage is True
+        # The chat.completions branch of _should_stream_usage stays on...
+        assert model._should_stream_usage() is True
+        # ...but the payload the responses streaming path would send carries
+        # no stream_options: _astream_responses builds from kwargs directly.
+        payload = model._get_request_payload([HumanMessage("hi")], stream=True)
+        assert "input" in payload and "messages" not in payload
+        assert "stream_options" not in payload
     finally:
         reset_model_cache_for_tests()
 

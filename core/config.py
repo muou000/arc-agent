@@ -201,6 +201,13 @@ def check_config() -> dict[str, Any]:
             "(expected stream, retry, or 0/false/no/off)"
         )
 
+    stream_usage = os.environ.get("ARC_MODEL_STREAM_USAGE", "").strip().lower()
+    if stream_usage and stream_usage not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        warnings.append(
+            f"ARC_MODEL_STREAM_USAGE has unexpected value: {stream_usage} "
+            "(expected 1/true/yes/on or 0/false/no/off)"
+        )
+
     # Check .env file presence
     env_file = get_project_env_path()
     if not env_file.exists():
