@@ -650,6 +650,23 @@ def test_interface_design_write_budget_counts_edit_and_write_paths_the_same() ->
     assert append_same.content == "ok"
 
 
+def test_interface_design_write_budget_reserves_every_write_tool_in_one_batch() -> None:
+    """Invariant pin: a mixed parallel batch of write/edit/append first-touches
+    each reserves one unit, whatever tool carries it (see the call-site
+    invariant in ``_reserve_design_write``'s docstring)."""
+
+    middleware = StageDisciplineMiddleware(stage="interface_design", max_design_writes=2)
+    batch = [
+        make_request("write_file", {"file_path": "/workspace/src/one.py", "content": "1\n"}, call_id="m1"),
+        make_request("edit_file", {"file_path": "/workspace/src/two.py", "old_string": "x", "new_string": "y"}, call_id="m2"),
+        make_request("append_file", {"file_path": "/workspace/src/three.py", "content": "3\n"}, call_id="m3"),
+    ]
+    # Validate all three before recording any result (parallel-batch shape).
+    validations = [middleware._validate_tool_call(request) for request in batch]
+    assert validations[0] is None and validations[1] is None
+    assert validations[2] is not None and "at most 2" in validations[2]
+
+
 def test_interface_design_write_budget_failure_releases_the_reservation() -> None:
     """An errored write refunds its unit; a failed retry of a materialized
     path does not (its slot is already occupied)."""

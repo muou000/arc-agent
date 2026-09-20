@@ -252,6 +252,16 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         (arc-output4 ROOT: 12 writes in one burst, cap 8). A later failure on
         the path releases the reservation, so an errored attempt does not
         burn budget either.
+
+        Invariant for future tool additions: exactly two call sites reserve —
+        ``_validate_append`` (append_file) and the interface_design branch of
+        ``_validate_write`` (write_file/edit_file). Any tool added to
+        ``_FILE_WRITE_TOOLS`` or ``_ADDITIVE_FILE_WRITE_TOOLS`` routes through
+        those validators and is therefore reserved automatically; a new write
+        tool that bypasses them must call this helper at the same position in
+        the check order — after per-write content checks, before the file
+        claim gate, so a content-rejected write never burns budget and a
+        claim-rejected one already holds its unit.
         """
 
         if path in self._design_write_reservations:

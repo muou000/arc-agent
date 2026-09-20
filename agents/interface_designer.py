@@ -133,6 +133,11 @@ class InterfaceDesigner:
         # isolated per-node worktree: sessions and caches stay in the main
         # workspace while the agent's filesystem root is the worktree.
         self.context_workspace_root = context_workspace_root
+        # Write budget tier pinned by ``run()`` for the pass it is executing.
+        # The repair flows rebuild agents mid-pass and read this instead of
+        # re-deriving from anything, so every rebuild within one ``run`` shares
+        # the tier the first agent was built with. ``None`` outside a run.
+        self._current_max_design_writes: int | None = None
 
     @staticmethod
     def _max_design_writes(requirement_data: dict[str, Any]) -> int:
@@ -189,6 +194,12 @@ class InterfaceDesigner:
             workspace_root=workspace_root,
             interface_ids_by_file=self._registered_interfaces_by_file(),
         )
+        # Pin the tier once per run: the repair flows below rebuild agents and
+        # read this pin, so every rebuild within this pass shares the tier the
+        # first agent was built with (no re-derivation, no agent-attribute
+        # probing).
+        max_design_writes = self._max_design_writes(requirement_data)
+        self._current_max_design_writes = max_design_writes
         agent = self._build_agent(
             node_id=node_id,
             workspace_root=workspace_root,
@@ -196,14 +207,14 @@ class InterfaceDesigner:
             required_skill_names=required_skill_names,
             response_format=InterfaceDesignResponse,
             pending_contract_registry=pending_registry,
-            max_design_writes=self._max_design_writes(requirement_data),
+            max_design_writes=max_design_writes,
         )
         message = get_user_prompt(
             node_id=node_id,
             requirement_data=requirement_data,
             dynamic_context=context_text,
             merge_conflict=self._load_merge_conflict_context(node_id),
-            max_design_writes=self._max_design_writes(requirement_data),
+            max_design_writes=max_design_writes,
         )
         await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking interface design.", node_id=node_id)
@@ -370,7 +381,7 @@ class InterfaceDesigner:
                 required_skill_names=required_skill_names,
                 min_items=len(skeletons),
                 pending_contract_registry=pending_contract_registry,
-                max_design_writes=self._max_design_writes_for_agent(agent),
+                max_design_writes=self._current_max_design_writes,
             )
             merged = await self._fill_skeletons(
                 fill_agent,
@@ -451,7 +462,7 @@ class InterfaceDesigner:
             required_skill_names=required_skill_names,
             min_items=1,
             pending_contract_registry=pending_contract_registry,
-            max_design_writes=self._max_design_writes_for_agent(agent),
+            max_design_writes=self._current_max_design_writes,
         )
         try:
             payload = await ainvoke_stage_agent(
@@ -600,20 +611,6 @@ class InterfaceDesigner:
                 rows,
             ]
         )
-
-    @staticmethod
-    def _max_design_writes_for_agent(agent: Any) -> int | None:
-        """Inherit the write budget of the agent being repaired.
-
-        The rebuilt repair agent gets a fresh discipline; without this it
-        would fall back to the leaf ceiling even on a non-leaf pass whose
-        budgeted writes already happened.
-        """
-
-        discipline = getattr(agent, "arc_stage_discipline", None)
-        if discipline is None:
-            return None
-        return getattr(discipline, "_max_design_writes", None)
 
     def _constrained_repair_agent(
         self,
