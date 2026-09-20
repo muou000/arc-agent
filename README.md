@@ -161,11 +161,18 @@ ARC_STRUCTURED_OUTPUT=auto             # 结构化输出（pydantic response_for
 # 合并冲突不再立即失败——首次冲突将节点重排队一次，重试从已合并的 integration
 # HEAD 出发（兄弟文件已在磁盘可见），冲突路径注入 prompt 指引绕行，二次冲突才终判
 # 失败。IMPLEMENT 阶段冲突维持立即失败语义。
+# 语义冲突仲裁（ARC_MERGE_ARBITRATION=1 开启，默认关闭；关闭时行为与不开启
+# 完全一致）：非追加冲突与合并后健康门禁失败不再直接终判，先交主模型仲裁一次——
+# 输入只含冲突文件的三方内容与双方接口契约卡（上下文裁剪是唯一成本闸门），仲裁
+# 仅可改写冲突文件集内的文件，产物必须复验通过健康门禁才算合并成功；每节点预算
+# 恰好一次（两触发点共享），二次触发直接走既有重排/终判路径；仲裁输入/输出/复验
+# 结果以 merge_arbitration 事件写入 .arc/runner-events.jsonl 留痕。
 # 设 0/false/no/off 恢复共享工作区的严格串行调度。
 ARC_NODE_WORKTREES=1                   # 每节点隔离 worktree 并行（默认开启；设 0/false/no/off 关闭）
 ARC_MAX_CONCURRENT_TASKS=3             # 同时运行的任务数（仅并行模式生效，默认 3，上限 8）
 ARC_AFFINITY_DEPTH=1                   # 亲和分组切分深度（默认 1=顶层子树一组；设 2 让宽子树的
                                        # 特性子树各自成组并行，如 simple-keep 的 REQ-2；组内仍串行）
+ARC_MERGE_ARBITRATION=0                # 合并层语义冲突 LLM 仲裁（默认关闭；设 1/true 启用）
 ```
 
 运行健康检查验证配置：

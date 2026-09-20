@@ -21,10 +21,28 @@ from core.commits import build_commit_message
 from core.config import load_project_env, set_app_type, set_web_port, set_workspace_root
 from core.files import load_requirements, read_json_file, validate_requirement_tree, write_json_file
 from core.logging import append_debug_log, write_terminal_log
+from core.merge_arbitration import (
+    ArbitrationInput,
+    MergeArbiter,
+    TRIGGER_CONFLICT,
+    TRIGGER_HEALTH_GATE,
+    arbitration_enabled,
+    collect_contract_cards,
+    merge_arbitration_budget_key,
+    read_conflict_stages,
+    read_workspace_file,
+)
 from core.path_safety import validate_clean_target
 from core.tdd_retry import build_tdd_reprompt, scan_test_failures
 from core.visual_analysis import precompute_visual_references, visual_precompute_enabled
-from core.worktree import MergeConflictError, NodeWorktreeManager, WorktreeError, WorktreeHandle
+from core.worktree import (
+    ArbitrationHooks,
+    MergeArbitrationError,
+    MergeConflictError,
+    NodeWorktreeManager,
+    WorktreeError,
+    WorktreeHandle,
+)
 
 
 load_project_env()
@@ -1005,6 +1023,7 @@ class ARCWorkflowManager:
 
         commit_message = build_commit_message(node_id, phase, requirement_data)
         verify = self._build_merge_health_gate() if self.app_type == "web" else None
+        arbiter = self._build_merge_arbitration_hooks(ctx, node_id, phase)
         async with self._merge_lock:
             try:
                 committed, detail = await asyncio.to_thread(
@@ -1012,6 +1031,7 @@ class ARCWorkflowManager:
                     ctx.handle,
                     commit_message,
                     verify=verify,
+                    arbiter=arbiter,
                 )
             except MergeConflictError as exc:
                 await self._log("Compiler", str(exc), "error", node_id)
@@ -1023,6 +1043,146 @@ class ARCWorkflowManager:
             await self._log("Compiler", "No file changes detected for this checkpoint.", node_id=node_id)
         await self._log("Compiler", f"Integrated {node_id}: {detail}.", node_id=node_id)
         return True, detail, []
+
+    def _build_merge_arbitration_hooks(
+        self,
+        ctx: _TaskWorkspace,
+        node_id: str,
+        phase: str,
+    ) -> ArbitrationHooks | None:
+        """LLM escalation hooks for this task's merge (issue #81).
+
+        Gated by ``ARC_MERGE_ARBITRATION`` (default off): with the gate closed
+        the hooks are ``None`` and ``integrate`` behaves exactly like main.
+        The budget is one arbitration per node, stored in the node session and
+        marked spent *before* the model call so a crashed arbitration cannot
+        buy a second attempt. Both hooks run inside the merge worker thread;
+        the model call itself is executed synchronously through the arbiter's
+        ``arbitrate`` (the stage adapters' model classes expose sync-less
+        async only, so the hooks wrap the coroutine with ``asyncio.run`` on
+        the worker thread, the same pattern the health gate uses).
+        """
+
+        if not arbitration_enabled():
+            return None
+
+        def collect_input(
+            conflict_paths: list[str],
+            trigger: str,
+            gate_failure: str = "",
+        ) -> ArbitrationInput | None:
+            if sessions.load_node_session(node_id).get(merge_arbitration_budget_key()):
+                return None
+            git = self._worktree_manager._git
+            stages = read_conflict_stages(
+                lambda args: git(args, cwd=self.workspace_path, check=False),
+                conflict_paths,
+            )
+            if trigger == TRIGGER_HEALTH_GATE:
+                # The mechanical resolution already staged the files, so the
+                # merge index holds no conflict stages: the arbiter sees the
+                # currently resolved content it must repair, plus whatever
+                # stages the index still exposes.
+                for path, entry in stages.items():
+                    entry["resolved"] = read_workspace_file(self.workspace_path, path)
+            return ArbitrationInput(
+                trigger=trigger,
+                ours_label=self._integration_side_label(node_id),
+                theirs_label=node_id,
+                files=stages,
+                contract_cards=self._arbitration_contract_cards(node_id),
+                gate_failure=gate_failure,
+            )
+
+        def run(
+            arbitration_input: ArbitrationInput,
+            conflict_paths: list[str],
+            trigger: str,
+        ) -> str | None:
+            if sessions.load_node_session(node_id).get(merge_arbitration_budget_key()):
+                return "The node's single arbitration budget is already spent."
+            sessions.merge_node_session(node_id, {merge_arbitration_budget_key(): True})
+            arbiter = MergeArbiter(
+                model=self._build_arbitration_model(),
+                workspace_path=self.workspace_path,
+                emit_event=self._emit_merge_arbitration_event,
+            )
+            result = asyncio.run(
+                arbiter.arbitrate(
+                    ctx.handle.path,
+                    self._integration_side_label(node_id),
+                    arbitration_input,
+                    node_id=node_id,
+                    phase=phase,
+                )
+            )
+            if not result.accepted:
+                return result.detail
+            for path in result.applied:
+                self._worktree_manager._git(
+                    ["add", "--", path], cwd=self.workspace_path, check=False
+                )
+            return None
+
+        return ArbitrationHooks(collect_input=collect_input, run=run)
+
+    def _integration_side_label(self, node_id: str) -> str:
+        """How the integration side is named in the arbitration prompt.
+
+        The integration branch holds every already-merged sibling, so it is
+        presented as one side ("integration branch") rather than attributed to
+        a single node; git cannot cheaply say which sibling authored the
+        ``ours`` stage of a conflicted file.
+        """
+
+        return f"integration branch (all merged nodes except {node_id})"
+
+    def _arbitration_contract_cards(self, node_id: str) -> dict[str, Any]:
+        """Both sides' contract cards: the incoming node and every other node.
+
+        Cards are pruned to interface rows (id/type/content/file_path), so
+        even a wide tree's union stays a few kilobytes - far below any whole
+        repository context, which the arbiter must never see.
+        """
+
+        try:
+            others = [
+                str(row.get("req_id") or "").strip()
+                for row in self.runtime.traceability.list_node_contracts()
+                if isinstance(row, dict)
+            ]
+        except Exception:
+            others = []
+        node_ids = [req_id for req_id in others if req_id and req_id != node_id]
+        node_ids.append(node_id)
+        return collect_contract_cards(self.runtime.traceability, node_ids)
+
+    def _build_arbitration_model(self) -> Any:
+        """The arbitration model: the run's configured main model.
+
+        Issue #81 pins arbitration to the main model (no cheaper arbiter).
+        The model instance is built per arbitration so a test-provided fake
+        monkeypatched into the adapter layer is always honored.
+        """
+
+        from agents.model.factory import create_arc_chat_model
+
+        model_name = os.environ.get("MODEL", "openai:gpt-5.4")
+        return create_arc_chat_model(model_name)
+
+    def _emit_merge_arbitration_event(self, payload: dict[str, Any]) -> None:
+        """Persist one audit record as a runner event (best effort)."""
+
+        try:
+            from arcbench_agent_runtime.jsonio import append_jsonl
+
+            append_jsonl(self.runtime.paths.runner_events_path, payload)
+        except Exception as exc:  # noqa: BLE001 - audit must never break the merge
+            append_debug_log(
+                "MergeArbiter",
+                f"merge arbitration audit emit failed: {type(exc).__name__}: {exc}",
+                workspace_root=self.workspace_path,
+            )
 
     async def _requeue_design_after_merge_conflict(
         self,

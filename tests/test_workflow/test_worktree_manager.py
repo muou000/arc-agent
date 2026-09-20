@@ -8,19 +8,26 @@ node_modules. They lock the contract the parallel drain relies on.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from core.worktree import (
+    ArbitrationHooks,
+    MergeArbitrationError,
     MergeConflictError,
     MergeVerificationError,
     NodeWorktreeManager,
     WorktreeError,
 )
+from tests.helpers.faux import FauxChatModel, faux_text
 
 
 def _git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
@@ -411,3 +418,333 @@ def test_integrate_does_not_union_new_file_conflicts(tmp_path: Path) -> None:
         manager.integrate(handle, "REQ-2.1 add/add")
 
     assert not (repo / ".git" / "MERGE_HEAD").exists()
+
+
+# ----------------------------------------------------------------------
+# LLM merge arbitration (issue #81)
+# ----------------------------------------------------------------------
+
+
+def _real_arbitration_hooks(
+    manager: NodeWorktreeManager,
+    model: FauxChatModel,
+    traceability: Any,
+    *,
+    budget_spent: bool = False,
+) -> tuple[ArbitrationHooks, dict[str, Any]]:
+    """Production-shaped hooks: real index reads via the manager's git, real
+    contract-card collection, one shared budget flag."""
+
+    from core.merge_arbitration import (
+        ArbitrationInput,
+        MergeArbiter,
+        TRIGGER_HEALTH_GATE,
+        collect_contract_cards,
+        read_conflict_stages,
+        read_workspace_file,
+    )
+
+    state = {"budget_spent": budget_spent}
+    events: list[dict[str, Any]] = []
+
+    def collect_input(conflict_paths: list[str], trigger: str, gate_failure: str = "") -> Any:
+        if state["budget_spent"]:
+            return None
+        stages = read_conflict_stages(
+            lambda args: manager._git(args, cwd=manager.main_workspace, check=False),
+            conflict_paths,
+        )
+        if trigger == TRIGGER_HEALTH_GATE:
+            # Mirror the workflow's collect hook: the mechanical resolution
+            # already staged the files, so the arbiter repairs the resolved
+            # content from the working tree.
+            for path, entry in stages.items():
+                entry["resolved"] = read_workspace_file(manager.main_workspace, path)
+        return ArbitrationInput(
+            trigger=trigger,
+            ours_label="REQ-2",
+            theirs_label="REQ-3",
+            files=stages,
+            contract_cards=collect_contract_cards(traceability, ["REQ-2", "REQ-3"]),
+            gate_failure=gate_failure,
+        )
+
+    def run(arbitration_input: Any, conflict_paths: list[str], trigger: str) -> str | None:
+        state["budget_spent"] = True
+        arbiter = MergeArbiter(
+            model=model,
+            workspace_path=manager.main_workspace,
+            emit_event=events.append,
+        )
+        result = asyncio.run(
+            arbiter.arbitrate("worktree", "master", arbitration_input, node_id="REQ-3")
+        )
+        if not result.accepted:
+            return result.detail
+        for path in result.applied:
+            manager._git(["add", "--", path], cwd=manager.main_workspace, check=False)
+        return None
+
+    hooks = ArbitrationHooks(collect_input=collect_input, run=run)
+    return hooks, {"state": state, "events": events}
+
+
+class _FakeTraceability:
+    """Minimal traceability surface for contract-card collection."""
+
+    def __init__(self, interfaces_by_req: dict[str, list[dict[str, Any]]]) -> None:
+        self._interfaces_by_req = interfaces_by_req
+
+    def list_interfaces(self, req_id: str | None = None) -> list[dict[str, Any]]:
+        if req_id is None:
+            return [row for rows in self._interfaces_by_req.values() for row in rows]
+        return list(self._interfaces_by_req.get(req_id, []))
+
+    def get_node_contract(self, req_id: str) -> dict[str, Any] | None:
+        return None
+
+
+def test_integrate_arbitration_resolves_semantic_conflict(tmp_path: Path) -> None:
+    """Two nodes write different implementations of the same lines (a
+    non-additive conflict). With arbitration enabled the arbiter's merged
+    version lands, the health gate passes, and the merge commit completes."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    # Non-additive: the worktree *rewrites* the base line, integration rewrote
+    # it differently - no side only appends, so the mechanical resolver
+    # refuses and arbitration is the only path to a merge.
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('integration side wins routes');\nroute('/a', a);\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('worktree side wins routes');\nroute('/b', b);\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "sibling rewrite"], repo)
+    resolved_content = (
+        "console.log('both sides win routes');\nroute('/a', a);\nroute('/b', b);\n"
+    )
+    model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": resolved_content}))])
+    traceability = _FakeTraceability(
+        {
+            "REQ-2": [{"interface_id": "IF-A", "type": "API", "content": "GET /a", "file_path": "backend/src.js"}],
+            "REQ-3": [{"interface_id": "IF-B", "type": "API", "content": "GET /b", "file_path": "backend/src.js"}],
+        }
+    )
+    hooks, audit = _real_arbitration_hooks(manager, model, traceability)
+
+    committed, detail = manager.integrate(
+        handle,
+        "REQ-2.1 semantic conflict",
+        verify=lambda: None,
+        arbiter=hooks,
+    )
+
+    assert committed is True
+    assert (repo / "backend" / "src.js").read_text(encoding="utf-8") == resolved_content
+    assert "LLM arbitration" in detail
+    assert not (repo / ".git" / "MERGE_HEAD").exists(), "the merge commit completes"
+    # The arbitration prompt saw the three-way contents and both cards.
+    prompt = str(model.calls[0][0].content)
+    assert "route('/a', a)" in prompt and "route('/b', b)" in prompt
+    assert "IF-A" in prompt and "IF-B" in prompt
+    # Audit trail: one applied arbitration record.
+    applied = [event for event in audit["events"] if event["outcome"] == "applied"]
+    assert len(applied) == 1
+    assert applied[0]["trigger"] == "conflict"
+
+
+def test_integrate_arbitration_health_gate_repairs_boot_failure(tmp_path: Path) -> None:
+    """An additively resolved merge whose health gate fails (backend will not
+    boot) is repaired by the arbiter and re-verifies green before landing."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst a = require('./a');\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst b = require('./b');\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "append b"], repo)
+
+    gate_state = {"calls": 0}
+
+    def verify() -> str | None:
+        gate_state["calls"] += 1
+        # First probe: the mechanical resolution is broken (e.g. duplicate
+        # route mounts). After arbitration the tree boots and serves.
+        if gate_state["calls"] == 1:
+            return "backend runtime failed to start on the merged workspace"
+        return None
+
+    fixed_content = (
+        "console.log('v1');\nconst a = require('./a');\nconst b = require('./b');\n"
+    )
+    model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": fixed_content}))])
+    hooks, audit = _real_arbitration_hooks(manager, model, _FakeTraceability({}))
+
+    committed, detail = manager.integrate(
+        handle, "REQ-2.1 boot repair", verify=verify, arbiter=hooks
+    )
+
+    assert committed is True
+    assert (repo / "backend" / "src.js").read_text(encoding="utf-8") == fixed_content
+    assert gate_state["calls"] == 2, "the gate re-verified after the repair"
+    assert "health gate passed after LLM arbitration repair" in detail
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    applied = [event for event in audit["events"] if event["outcome"] == "applied"]
+    assert len(applied) == 1
+    assert applied[0]["trigger"] == "health-gate"
+
+
+def test_integrate_arbitration_budget_is_one_call_per_node(tmp_path: Path) -> None:
+    """The second arbitration trigger for the same node never calls the model:
+    it goes straight to the existing failure path."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('integration side wins');\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('worktree side wins');\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "sibling rewrite"], repo)
+    model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": "resolved;\n"}))])
+    hooks, audit = _real_arbitration_hooks(manager, model, _FakeTraceability({}))
+
+    committed, _detail = manager.integrate(
+        handle, "REQ-2.1 first conflict", arbiter=hooks
+    )
+    assert committed is True
+
+    # A second conflicting merge for the same node's budget: the collect hook
+    # declines (budget spent) and integrate must fail with the plain
+    # MergeConflictError, exactly like the pre-arbitration behavior.
+    handle2 = manager.prepare("REQ-3.1")
+    (Path(handle2.path) / "backend" / "src.js").write_text(
+        "console.log('another rewrite');\n",
+        encoding="utf-8",
+    )
+    manager.commit(handle2, "another rewrite")
+    (repo / "backend" / "src.js").write_text(
+        "console.log('resolved;\nchanged again');\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "rewrite again"], repo)
+
+    with pytest.raises(MergeConflictError) as excinfo:
+        manager.integrate(handle2, "REQ-3.1 second conflict", arbiter=hooks)
+
+    assert not isinstance(excinfo.value, MergeArbitrationError)
+    assert model.call_count == 1, "the model is called exactly once across both triggers"
+    assert audit["state"]["budget_spent"] is True
+
+
+def test_integrate_arbitration_failure_aborts_and_preserves_worktree(tmp_path: Path) -> None:
+    """An arbitration whose output still fails the health gate aborts the
+    merge, preserves the worktree, and raises MergeArbitrationError."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    # Additive conflict (both sides only append): the mechanical resolution
+    # runs, the gate fails, and arbitration's repair must also fail the gate.
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst a = require('./a');\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('v1');\nconst b = require('./b');\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "append b"], repo)
+    model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": "still broken;\n"}))])
+    hooks, _audit = _real_arbitration_hooks(manager, model, _FakeTraceability({}))
+
+    with pytest.raises(MergeArbitrationError, match="post-merge verification"):
+        manager.integrate(
+            handle,
+            "REQ-2.1 arbitration fails gate",
+            verify=lambda: "backend unhealthy",
+            arbiter=hooks,
+        )
+
+    assert (repo / "backend" / "src.js").read_text(encoding="utf-8") == (
+        "console.log('v1');\nconst b = require('./b');\n"
+    ), "the aborted merge restores the integration workspace"
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    assert manager._is_registered(Path(handle.path)), "the worktree stays for inspection"
+
+
+def test_integrate_conflict_arbitration_spends_the_only_budget(tmp_path: Path) -> None:
+    """Trigger 1 (conflict arbitration) and trigger 2 (health-gate repair)
+    share one budget: a conflict resolved by arbitration has no budget left
+    when the health gate then fails, so the plain MergeVerificationError
+    aborts the merge."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('worktree side wins');\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('integration side wins');\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "sibling rewrite"], repo)
+    model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": "arbitrated;\n"}))])
+    hooks, audit = _real_arbitration_hooks(manager, model, _FakeTraceability({}))
+
+    with pytest.raises(MergeVerificationError, match="post-merge verification"):
+        manager.integrate(
+            handle,
+            "REQ-2.1 conflict then gate failure",
+            verify=lambda: "backend unhealthy",
+            arbiter=hooks,
+        )
+
+    assert model.call_count == 1, "only the conflict arbitration consumed a model call"
+    assert audit["state"]["budget_spent"] is True
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    assert manager._is_registered(Path(handle.path)), "the worktree stays for inspection"
+
+
+def test_integrate_arbitration_declined_keeps_plain_conflict_error(tmp_path: Path) -> None:
+    """When the hooks decline (budget spent) on a conflict, the raised error
+    is the plain MergeConflictError — the pre-arbitration behavior."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "src.js").write_text(
+        "console.log('worktree side wins');\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "src.js").write_text(
+        "console.log('integration side wins');\n",
+        encoding="utf-8",
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "sibling rewrite"], repo)
+    model = FauxChatModel(responses=[])
+    hooks, _audit = _real_arbitration_hooks(manager, model, _FakeTraceability({}), budget_spent=True)
+
+    with pytest.raises(MergeConflictError) as excinfo:
+        manager.integrate(handle, "REQ-2.1 declined", arbiter=hooks)
+
+    assert not isinstance(excinfo.value, MergeArbitrationError)
+    assert model.call_count == 0, "a declined arbitration never reaches the model"
+    assert "The worktree is preserved for inspection." in str(excinfo.value)
