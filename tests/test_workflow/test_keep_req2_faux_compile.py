@@ -341,20 +341,19 @@ def test_keep_req2_faux_compile_end_to_end(
     keep_req2_runtime,
 ) -> None:
     # Parallel worktree mode with the depth-2 split is the code path under
-    # test; ARC_MAX_CONCURRENT_TASKS=1 keeps the drain serial. At >=2 a real
-    # product race fires (a group worktree's `git checkout -B ... master` in
-    # `prepare` runs concurrently with another group's `git merge` on the
-    # integration branch; the checkout's `check=False` swallows the contended
-    # write, the index ends up holding files the disk never materialized, and
-    # the task's `git add -A .` stages their deletion — a later sibling's
-    # merge then hits a modify/delete conflict and fails the node). Reproduced
-    # deterministically enough on this fixture (2/3 runs fail at 2 slots, 3/3
-    # at 3); the race is product work tracked separately, so this test drains
-    # serially — the scheduler, affinity grouping, worktrees, merges and all
-    # stage loops still execute the real parallel-mode code paths.
+    # test, drained at 2 real slots: that is the minimum that opens issue
+    # #91's window (a group worktree's `git checkout -B ... master` in
+    # `prepare` running concurrently with another group's `git merge` on the
+    # integration branch). Before the fix the checkout's `check=False`
+    # swallowed the contended write, the index held files the disk never
+    # materialized, the task's `git add -A .` staged their deletion, and a
+    # later sibling's merge hit a modify/delete conflict (2/3 runs failed at
+    # 2 slots, 3/3 at 3). The manager's integration gate now excludes
+    # prepare/reset from integrate, so 2 slots is also a regression pin; the
+    # deterministic gate-contract tests live in test_worktree_manager.py.
     monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     monkeypatch.setenv("ARC_AFFINITY_DEPTH", "2")
-    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
     monkeypatch.setenv("ARC_AUTO_TDD_RETRY", "0")
     monkeypatch.setenv("ARC_VISUAL_PRECOMPUTE", "0")
     # No arbitration in this run: the faux scripts never drift their anchors,
@@ -471,8 +470,8 @@ def test_keep_req2_pipeline_mode_starts_dependent_design_before_dependency_imple
     dependency's landing IMPLEMENT.
 
     Why the assertion watches scheduling decisions, not wall-clock start
-    order: the serial drain (``ARC_MAX_CONCURRENT_TASKS=1``, kept serial
-    because the product race of #91 fires at >=2 real slots) picks tasks in
+    order: the serial drain (``ARC_MAX_CONCURRENT_TASKS=1``, kept serial so
+    the flat queue order stays deterministic) picks tasks in
     flat queue order, and every dependency pair inside the fixture shares the
     REQ-2 affinity subtree - so even when the dependent's DESIGN is runnable
     first, the flat order may start the dependency's IMPLEMENT before it. The
