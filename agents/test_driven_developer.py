@@ -20,6 +20,7 @@ from agents.tools.test_manifest import normalize_manifest_path
 from agents.tools.test_failure_digest import (
     build_failure_digest,
     extract_build_note,
+    extract_served_verdict,
     format_failure_digest,
 )
 from agents.tools.traceability import build_traceability_tools
@@ -361,6 +362,7 @@ class TestDrivenDeveloper:
             fingerprint=failure_fingerprint(result),
             environment_failure=classify_test_failure(result),
             build=extract_build_note(result),
+            served=extract_served_verdict(result),
         )
         lines = [line for line in (result or "").splitlines() if line.strip()]
         excerpt = "\n".join(lines[-40:])

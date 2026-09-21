@@ -18,6 +18,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from app_type_handler.web import SERVED_VERDICT_FINGERPRINT_CHARS
+
 #: Cap on the excerpt lines kept per failed test in the digest text.
 _PER_TEST_EXCERPT_LINES = 8
 #: Cap on retained raw-output files per node before the oldest are pruned.
@@ -99,6 +101,18 @@ _BUILD_REBUILT_LINE = re.compile(
     r"Built `frontend/dist` from the current sources(?: \(fingerprint ([0-9a-f]+)\))?"
 )
 _BUILD_FAILED_MARKER = "Frontend build failed before E2E startup."
+
+# Serving verdict emitted by the web handler next to the build verdict
+# (``_frontend_serving_verdict``). It is the agent-facing statement of what the
+# backend's SPA fallback can stat *at result time* — the 2026-09-20 arc-output1
+# run had the builder reporting Built/Reused while every request-time stat
+# failed, and no output reconciled the two views. The fingerprint group accepts
+# any hex length and echoes it verbatim: the handler's truncation
+# (``SERVED_VERDICT_FINGERPRINT_CHARS``, imported above) is a display choice,
+# and the round-trip test below locks the two ends against drift.
+_SERVED_VERDICT_LINE = re.compile(
+    r"Served index\.html: (.+?) \((present(?:, fingerprint ([0-9a-f]+|unavailable))?|absent)\)"
+)
 
 
 def _strip_ansi(text: str) -> str:
@@ -291,6 +305,27 @@ def extract_build_note(test_output: str) -> str:
     return ""
 
 
+def extract_served_verdict(test_output: str) -> str:
+    """Return the served-artifact verdict carried by a run output, else ``""``.
+
+    Mirrors ``extract_build_note`` for the handler's ``Served index.html:``
+    line: presence plus (when present) the dist content fingerprint. The
+    digest note phrasing deliberately differs from the handler's line so a
+    rendered digest block re-extracted from a combined result can never
+    re-match (same contract as the build notes).
+    """
+
+    match = _SERVED_VERDICT_LINE.search(_strip_ansi(test_output or ""))
+    if not match:
+        return ""
+    path, fingerprint = match.group(1).strip(), match.group(3)
+    if match.group(2) == "absent":
+        return f"frontend/dist/index.html absent at result time (checked {path})"
+    if fingerprint:
+        return f"frontend/dist/index.html present at result time (fingerprint {fingerprint}) at {path}"
+    return f"frontend/dist/index.html present at result time at {path}"
+
+
 def format_failure_digest(
     digest: dict[str, Any],
     *,
@@ -299,6 +334,7 @@ def format_failure_digest(
     fingerprint: str = "",
     environment_failure: str = "",
     build: str = "",
+    served: str = "",
 ) -> str:
     """Render a digest dict into the handoff text block for the next session."""
 
@@ -313,6 +349,8 @@ def format_failure_digest(
         blocks.append(f"- environment_failure: {environment_failure}")
     if build:
         blocks.append(f"- build: {build}")
+    if served:
+        blocks.append(f"- served_artifact: {served}")
     if failed_tests:
         blocks.append(f"- failed tests ({len(failed_tests)}):")
         for item in failed_tests:

@@ -17,6 +17,7 @@ from agents.tools.test_contract_check import (
 from agents.tools.test_failure_digest import (
     build_failure_digest,
     extract_build_note,
+    extract_served_verdict,
     format_failure_digest,
     persist_run_output,
 )
@@ -1120,6 +1121,7 @@ class WorkflowPhaseRunner:
                         fingerprint=failure_fingerprint(output),
                         environment_failure=classify_test_failure(output),
                         build=extract_build_note(output),
+                        served=extract_served_verdict(output),
                     )
                     + "\n"
                 )

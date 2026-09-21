@@ -1149,7 +1149,7 @@ def _record_frontend_fingerprint(frontend_path: str, fingerprint: str, dist_fing
         return
 
 
-async def _build_frontend_dist(workspace_path: str) -> tuple[bool, str]:
+async def _build_frontend_dist(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
     frontend_path = os.path.join(workspace_path, "frontend")
     dist_index_path = Path(frontend_path) / "dist" / "index.html"
     fingerprint = _frontend_source_fingerprint(frontend_path)
@@ -1159,8 +1159,12 @@ async def _build_frontend_dist(workspace_path: str) -> tuple[bool, str]:
     # Every E2E attempt rebuilt the frontend from scratch (~tens of seconds),
     # even when the previous attempt already produced a valid `dist` for the
     # same sources. Reuse it only when both sides of the cache are unchanged.
+    # `force_rebuild` bypasses the cache for the SPA-static-host recovery: the
+    # backend failed to stat an artifact the cache still vouches for, so the
+    # record is exactly what must not be trusted this once.
     if (
-        fingerprint is not None
+        not force_rebuild
+        and fingerprint is not None
         and dist_fingerprint is not None
         and recorded_build == (fingerprint, dist_fingerprint)
     ):
@@ -1201,6 +1205,73 @@ async def _build_frontend_dist(workspace_path: str) -> tuple[bool, str]:
         frontend_build_output
         + "\nFrontend build did not produce `frontend/dist/index.html`, so backend hosting cannot start.\n",
     )
+
+
+# The verdict line's authoritative state is checked on disk at render time, not
+# captured at build time: the 2026-09-20 arc-output1 run died precisely because
+# the builder said "Built/Reused" while the backend's request-time stat failed.
+# Re-checking at result-assembly time reports what the backend can serve NOW,
+# and the digest-side regex parses this exact line shape.
+_SERVED_VERDICT_PREFIX = "Served index.html: "
+# Truncation shared by the verdict line and the digest-side regex that parses
+# it (agents/tools/test_failure_digest.py imports this constant): the two ends
+# must never drift, or the digest stops recognizing the handler's own line.
+SERVED_VERDICT_FINGERPRINT_CHARS = 12
+
+
+def _frontend_serving_verdict(workspace_path: str) -> str:
+    """Deterministic one-line statement of the SPA shell the backend serves.
+
+    ``dist/`` is read-denied for agents (generated output), so the run result
+    is the only channel that can align the agent's view of the static host
+    with the backend's. The line names the absolute path the template's SPA
+    fallback resolves, whether ``index.html`` is on disk right now, and the
+    dist content fingerprint the build cache would reuse.
+    """
+
+    dist_root = Path(workspace_path) / "frontend" / "dist"
+    dist_index_path = dist_root / "index.html"
+    fingerprint = _frontend_dist_fingerprint(os.path.join(workspace_path, "frontend"))
+    if not dist_index_path.is_file():
+        state = "absent"
+        detail = ""
+    else:
+        state = "present"
+        # Mirror the fingerprint truncation the build verdicts already use so
+        # the two lines cross-reference without a full hash. The digest-side
+        # regex accepts any hex length and echoes it, so this truncation is a
+        # display choice, not a parse contract.
+        detail = (
+            f", fingerprint {(fingerprint or '')[:SERVED_VERDICT_FINGERPRINT_CHARS] or 'unavailable'}"
+        )
+    return f"{_SERVED_VERDICT_PREFIX}{dist_index_path} ({state}{detail})"
+
+
+# Failure signature of a dead SPA static host (the 2026-09-20 arc-output1 run):
+# the backend's SPA fallback called sendFile, `send` re-stats the file per
+# request, and the stat failed although the build cache vouched for the
+# artifact — `NotFoundError: Not Found` raised from send's internals with a
+# `sendfile` frame from Express on the stack. The generated fallback handler's
+# own function/file names drift between agent edits, so the anchors are the
+# stable library frames plus the sendFile call. Every anchor is line-anchored
+# and consecutive anchors may be separated by at most two NON-EMPTY lines of
+# the same stack block (a blank line separates Playwright error blocks, so the
+# pattern cannot splice frames from two different stacks in one output).
+_SPA_STATIC_HOST_FAILURE = re.compile(
+    r"NotFoundError:\s*Not Found[^\r\n]*\r?\n"
+    r"(?:[^\r\n]+[^\r\n]*\r?\n){0,2}?"
+    r"[^\r\n]*at\s+(?:createHttpError|SendStream\.pipe)\b[^\r\n]*\r?\n"
+    r"(?:[^\r\n]+[^\r\n]*\r?\n){0,2}?"
+    r"[^\r\n]*at\s+sendfile\b[^\r\n]*\r?\n"
+    r"(?:[^\r\n]+[^\r\n]*\r?\n){0,2}?"
+    r"[^\r\n]*at\s+\S*sendFile\b[^\r\n]*"
+)
+
+
+def _is_spa_static_host_failure(output: str) -> bool:
+    """True when a failed E2E output carries the dead-static-host signature."""
+
+    return bool(_SPA_STATIC_HOST_FAILURE.search(output or ""))
 
 
 async def _prepare_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -> tuple[bool, str]:
@@ -1642,6 +1713,11 @@ class WebAppType(AppTypeHandler):
         # Strictly per instance: parallel worktree tasks build one handler per
         # task, and a task must never observe another task's live runtime.
         self._e2e_runtime_session: _E2EBackendSession | None = None
+        # One-shot budget for the SPA static-host self-heal (dead `send`
+        # NotFoundError in a sendFile frame): a second occurrence of the same
+        # signature means the rebuild did not cure it, and the failure must go
+        # to the agent instead of looping system-side.
+        self._spa_static_host_recovery_used: bool = False
 
     @classmethod
     def prerequisite_commands(cls) -> list[str]:
@@ -2344,7 +2420,8 @@ class WebAppType(AppTypeHandler):
                 return _prepend_test_execution_header(
                     execution,
                     "Frontend build failed before E2E startup.\n\n"
-                    f"=== Frontend Build ===\n{frontend_build_output}",
+                    f"=== Frontend Build ===\n{frontend_build_output}\n\n"
+                    f"{_frontend_serving_verdict(self.workspace_path)}",
                 )
 
             database_ready, database_prepare_output = await _prepare_e2e_database(
@@ -2356,6 +2433,7 @@ class WebAppType(AppTypeHandler):
                     execution,
                     "E2E database preparation failed before backend startup.\n\n"
                     f"=== Frontend Build ===\n{frontend_build_output}\n\n"
+                    f"{_frontend_serving_verdict(self.workspace_path)}\n\n"
                     f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
                     f"=== Database Prepare ===\n{database_prepare_output}",
                 )
@@ -2371,6 +2449,7 @@ class WebAppType(AppTypeHandler):
                     execution,
                     "Failed to start backend server for E2E testing.\n\n"
                     f"=== Frontend Build ===\n{frontend_build_output}\n\n"
+                    f"{_frontend_serving_verdict(self.workspace_path)}\n\n"
                     f"=== Database Prepare ===\n{database_prepare_output}\n\n"
                     f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
                     f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
@@ -2387,6 +2466,7 @@ class WebAppType(AppTypeHandler):
             if normalized_type == "e2e":
                 result_body = (
                     f"=== Frontend Build ===\n{frontend_build_output}\n\n"
+                    f"{_frontend_serving_verdict(self.workspace_path)}\n\n"
                     f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n"
                     f"DB Label: {e2e_runtime_env.get('ARC_E2E_DB_LABEL', 'unknown')}\n\n"
                     f"=== Database Prepare ===\n{database_prepare_output}\n\n"
@@ -2563,16 +2643,121 @@ class WebAppType(AppTypeHandler):
             return _prepend_group_execution_header(execution, body)
 
         stage_timer = _StageTimer()
-        build_ok, frontend_build_output = await stage_timer.measure(
-            "frontend_build", _build_frontend_dist(self.workspace_path)
-        )
-        if not build_ok:
-            return _prepend_group_execution_header(
+
+        try:
+            body, backend_cleanup_note = await self._run_e2e_group_attempt(
                 execution,
-                "Frontend build failed before E2E startup.\n\n"
-                f"=== Frontend Build ===\n{frontend_build_output}"
-                + stage_timer.render(),
+                stage_timer,
+                resolved_port,
+                force_rebuild=False,
+                prior_cleanup_note="",
             )
+        except Exception as exc:
+            return (
+                f"Failed to start grouped E2E execution: {str(exc)}"
+                + stage_timer.render()
+            )
+
+        # Self-heal the dead static host once (the 2026-09-20 arc-output1 run
+        # burned 22 agent minutes on this failure): the backend could not stat
+        # an artifact the build cache vouched for, so distrust the cache and
+        # the live runtime this once — force a rebuild, restart the backend,
+        # rerun the batch. The retried body leads; the failed attempt survives
+        # as a superseded appendix for the failure evidence.
+        if (
+            _extract_exit_code(body) != 0
+            and not self._spa_static_host_recovery_used
+            and _is_spa_static_host_failure(body)
+        ):
+            self._spa_static_host_recovery_used = True
+            await self._log(
+                "System",
+                "E2E failure matches the SPA static-host signature (send NotFoundError in sendFile); "
+                "forcing one frontend rebuild + backend restart retry.",
+            )
+            recovery_note = await self._terminate_e2e_session("SPA static-host recovery cleanup")
+            try:
+                retried_body, _ = await self._run_e2e_group_attempt(
+                    execution,
+                    stage_timer,
+                    resolved_port,
+                    force_rebuild=True,
+                    prior_cleanup_note=recovery_note or backend_cleanup_note,
+                )
+            except Exception as exc:
+                retried_body = (
+                    f"Failed to retry grouped E2E execution after SPA static-host recovery: {str(exc)}"
+                    + stage_timer.render()
+                )
+            # Same self-check the non-recovery path applies below, on the
+            # retried attempt alone: a retried pass whose cleanup failed is
+            # still a failure for the agent.
+            if "Backend runtime cleanup failed:" in retried_body and "Exit Code: 0" in retried_body:
+                retried_body = retried_body.replace("Exit Code: 0", "Exit Code: 1", 1)
+            # The retried attempt leads so exit-code parsing and the agent both
+            # read the retried verdict first; the failed attempt survives as an
+            # appendix for the failure evidence (the NotFoundError stack).
+            first_attempt_exit = _extract_exit_code(body)
+            appendix = body
+            if first_attempt_exit is not None:
+                appendix = appendix.replace(
+                    f"Exit Code: {first_attempt_exit}",
+                    f"Exit Code (superseded by the recovery retry): {first_attempt_exit}",
+                    1,
+                )
+            body = (
+                f"{retried_body.rstrip()}\n\n"
+                f"=== SPA Static-Host Recovery Retry ===\n"
+                "The first attempt of this batch failed with the dead static-host signature "
+                "(the backend could not stat `frontend/dist/index.html` at request time "
+                "even though the build cache vouched for it). The system forced one "
+                "frontend rebuild and backend restart, then re-ran the batch; the result "
+                "above is the retried attempt.\n\n"
+                "First attempt (superseded, kept for the failure evidence):\n\n"
+                f"{appendix}"
+            )
+
+        if "Backend runtime cleanup failed:" in body and "Exit Code: 0" in body:
+            body = body.replace("Exit Code: 0", "Exit Code: 1", 1)
+        return _prepend_group_execution_header(execution, body)
+
+    async def _run_e2e_group_attempt(
+        self,
+        execution: dict[str, str],
+        stage_timer: _StageTimer,
+        resolved_port: int,
+        *,
+        force_rebuild: bool,
+        prior_cleanup_note: str,
+    ) -> tuple[str, str]:
+        """Run one grouped E2E attempt end to end and return its result body.
+
+        ``run_test_group`` calls this once, and a second time with
+        ``force_rebuild=True`` when the first attempt died on the SPA
+        static-host signature (see the recovery block there). The runtime env
+        is rebuilt per attempt so each carries its own database label.
+
+        Returns ``(body, backend_cleanup_note)``; the note lets the recovery
+        re-run carry the teardown evidence of the attempt before it.
+        """
+
+        build_ok, frontend_build_output = await stage_timer.measure(
+            "frontend_build",
+            _build_frontend_dist(self.workspace_path, force_rebuild=force_rebuild),
+        )
+        # Failure bodies check the verdict here (post-build, pre-Playwright);
+        # the success body re-checks after Playwright — see the comment there.
+        served_verdict = _frontend_serving_verdict(self.workspace_path)
+        if not build_ok:
+            failure_body = (
+                "Exit Code: 1\n\n"
+                "Frontend build failed before E2E startup.\n\n"
+                f"=== Frontend Build ===\n{frontend_build_output}\n\n{served_verdict}"
+                + stage_timer.render()
+            )
+            if prior_cleanup_note:
+                failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{prior_cleanup_note}"
+            return failure_body, prior_cleanup_note
 
         e2e_runtime_env = _build_e2e_runtime_env(
             self.workspace_path,
@@ -2580,11 +2765,10 @@ class WebAppType(AppTypeHandler):
             web_port=resolved_port,
         )
 
-        backend_process = None
         backend_start_command = ""
         backend_startup_detail = ""
         backend_instance_fingerprint = ""
-        backend_cleanup_note = ""
+        backend_cleanup_note = prior_cleanup_note
         database_prepare_output = ""
         reused_runtime = False
         # Off the event loop: hashing a large backend tree is pure blocking I/O
@@ -2593,150 +2777,147 @@ class WebAppType(AppTypeHandler):
             _backend_source_fingerprint,
             os.path.join(self.workspace_path, "backend"),
         )
-        try:
-            reused_session = await stage_timer.measure(
-                "backend_runtime",
-                self._try_reuse_e2e_backend_session(
-                    e2e_runtime_env,
-                    resolved_port,
-                    backend_fingerprint,
-                ),
+        reused_session = await stage_timer.measure(
+            "backend_runtime",
+            self._try_reuse_e2e_backend_session(
+                e2e_runtime_env,
+                resolved_port,
+                backend_fingerprint,
+            ),
+        )
+        if reused_session is not None:
+            reset_ok, reset_output = await stage_timer.measure(
+                "database_prepare", self._reset_live_e2e_database(e2e_runtime_env)
             )
-            if reused_session is not None:
-                reset_ok, reset_output = await stage_timer.measure(
-                    "database_prepare", self._reset_live_e2e_database(e2e_runtime_env)
-                )
-                database_prepare_output = reset_output
-                if reset_ok:
-                    reused_runtime = True
-                    backend_process = reused_session.process
-                    backend_start_command = reused_session.start_command
-                    backend_startup_detail = reused_session.startup_detail
-                    backend_instance_fingerprint = reused_session.instance_fingerprint
-                else:
-                    # The fresh start below overwrites database_prepare_output,
-                    # so carry the reset failure reason in the cleanup note:
-                    # both failure bodies and the deferred-cleanup section
-                    # surface it there.
-                    backend_cleanup_note = (
-                        "Live E2E runtime reset was not possible; fell back to a fresh start: "
-                        f"{reset_output}"
-                    )
-
-            if not reused_runtime:
-                stale_note = await self._terminate_e2e_session("Stale E2E runtime cleanup")
-                if stale_note:
-                    backend_cleanup_note = (
-                        f"{backend_cleanup_note}\n{stale_note}" if backend_cleanup_note else stale_note
-                    )
-                database_ready, database_prepare_output = await stage_timer.measure(
-                    "database_prepare",
-                    _prepare_e2e_database(self.workspace_path, e2e_runtime_env),
-                )
-                if not database_ready:
-                    failure_body = (
-                        "E2E database preparation failed before backend startup.\n\n"
-                        f"=== Frontend Build ===\n{frontend_build_output}\n\n"
-                        f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
-                        f"=== Database Prepare ===\n{database_prepare_output}"
-                        + stage_timer.render()
-                    )
-                    if backend_cleanup_note:
-                        failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
-                    return _prepend_group_execution_header(execution, failure_body)
-
-                (
-                    backend_process,
-                    backend_start_command,
-                    backend_startup_detail,
-                    backend_instance_fingerprint,
-                ) = await stage_timer.measure(
-                    "backend_runtime",
-                    _start_backend_runtime(
-                        self.workspace_path, e2e_runtime_env, web_port=resolved_port
-                    ),
-                )
-                if backend_process is None:
-                    failure_body = (
-                        "Exit Code: 1\n\n"
-                        f"=== Frontend Build ===\n{frontend_build_output}\n\n"
-                        f"=== Database Prepare ===\n{database_prepare_output}\n\n"
-                        f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
-                        f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
-                        f"STDERR:\n{backend_startup_detail or 'No startup detail recorded.'}\n"
-                        + stage_timer.render()
-                    )
-                    if backend_cleanup_note:
-                        failure_body += f"\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
-                    return _prepend_group_execution_header(execution, failure_body)
-                self._e2e_runtime_session = _E2EBackendSession(
-                    process=backend_process,
-                    port=resolved_port,
-                    db_path=e2e_runtime_env.get("ARC_E2E_DB_PATH", ""),
-                    fingerprint=backend_fingerprint or "",
-                    start_command=backend_start_command,
-                    startup_detail=backend_startup_detail,
-                    instance_fingerprint=backend_instance_fingerprint,
-                )
-
-            playwright_command = "npx playwright test"
-            if execution.get("resolved_targets"):
-                playwright_command += " " + " ".join(execution["resolved_targets"])
-            playwright_result = await stage_timer.measure(
-                "playwright",
-                _execute_web_test_command(
-                    playwright_command,
-                    cwd=execution["working_directory"],
-                    timeout=120.0,
-                    extra_env=e2e_runtime_env,
-                    web_port=resolved_port,
-                ),
-            )
-            playwright_exit_code = _extract_exit_code(playwright_result)
-            if playwright_exit_code is None:
-                playwright_exit_code = 1
-            if reused_runtime:
-                backend_runtime_section = (
-                    "Reused the live backend runtime from an earlier E2E attempt in this TDD session "
-                    "(backend sources, port and E2E database unchanged).\n"
-                    f"Command: {backend_start_command}\n"
-                    f"Port: {resolved_port}\n\n"
-                    f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}"
-                )
+            database_prepare_output = reset_output
+            if reset_ok:
+                reused_runtime = True
+                backend_start_command = reused_session.start_command
+                backend_startup_detail = reused_session.startup_detail
+                backend_instance_fingerprint = reused_session.instance_fingerprint
             else:
-                backend_runtime_section = (
-                    f"Command: {backend_start_command}\n"
-                    f"Port: {resolved_port}\n\n"
-                    f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}"
+                # The fresh start below overwrites database_prepare_output,
+                # so carry the reset failure reason in the cleanup note:
+                # both failure bodies and the deferred-cleanup section
+                # surface it there.
+                backend_cleanup_note = (
+                    f"{backend_cleanup_note}\n" if backend_cleanup_note else ""
+                ) + (
+                    "Live E2E runtime reset was not possible; fell back to a fresh start: "
+                    f"{reset_output}"
                 )
-            deferred_cleanup = (
-                "Deferred: the backend runtime stays alive for subsequent E2E attempts of this "
-                "session and is shut down when the node's IMPLEMENT phase finishes."
+
+        if not reused_runtime:
+            stale_note = await self._terminate_e2e_session("Stale E2E runtime cleanup")
+            if stale_note:
+                backend_cleanup_note = (
+                    f"{backend_cleanup_note}\n{stale_note}" if backend_cleanup_note else stale_note
+                )
+            database_ready, database_prepare_output = await stage_timer.measure(
+                "database_prepare",
+                _prepare_e2e_database(self.workspace_path, e2e_runtime_env),
             )
-            cleanup_section = deferred_cleanup
-            if backend_cleanup_note:
-                cleanup_section = f"Previous runtime cleanup: {backend_cleanup_note}\n{deferred_cleanup}"
-            body = (
-                f"Exit Code: {playwright_exit_code}\n\n"
-                f"=== Frontend Build ===\n{frontend_build_output}\n\n"
-                f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n"
-                f"DB Label: {e2e_runtime_env.get('ARC_E2E_DB_LABEL', 'unknown')}\n\n"
-                f"=== Database Prepare ===\n{database_prepare_output}\n\n"
-                f"=== Backend Runtime ===\n{backend_runtime_section}\n\n"
-                f"=== Backend Instance Fingerprint ===\n{backend_instance_fingerprint or 'No backend instance fingerprint recorded.'}\n\n"
-                f"{playwright_result}\n\n"
-                f"=== Backend Runtime Cleanup ===\n{cleanup_section}"
-                + stage_timer.render()
+            if not database_ready:
+                failure_body = (
+                    "Exit Code: 1\n\n"
+                    "E2E database preparation failed before backend startup.\n\n"
+                    f"=== Frontend Build ===\n{frontend_build_output}\n\n{served_verdict}\n\n"
+                    f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
+                    f"=== Database Prepare ===\n{database_prepare_output}"
+                    + stage_timer.render()
+                )
+                if backend_cleanup_note:
+                    failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
+                return failure_body, backend_cleanup_note
+
+            (
+                backend_process,
+                backend_start_command,
+                backend_startup_detail,
+                backend_instance_fingerprint,
+            ) = await stage_timer.measure(
+                "backend_runtime",
+                _start_backend_runtime(
+                    self.workspace_path, e2e_runtime_env, web_port=resolved_port
+                ),
             )
-        except Exception as exc:
-            return (
-                f"Failed to start grouped E2E execution: {str(exc)}"
-                + stage_timer.render()
+            if backend_process is None:
+                failure_body = (
+                    "Exit Code: 1\n\n"
+                    f"=== Frontend Build ===\n{frontend_build_output}\n\n{served_verdict}\n\n"
+                    f"=== Database Prepare ===\n{database_prepare_output}\n\n"
+                    f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
+                    f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
+                    f"STDERR:\n{backend_startup_detail or 'No startup detail recorded.'}\n"
+                    + stage_timer.render()
+                )
+                if backend_cleanup_note:
+                    failure_body += f"\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
+                return failure_body, backend_cleanup_note
+            self._e2e_runtime_session = _E2EBackendSession(
+                process=backend_process,
+                port=resolved_port,
+                db_path=e2e_runtime_env.get("ARC_E2E_DB_PATH", ""),
+                fingerprint=backend_fingerprint or "",
+                start_command=backend_start_command,
+                startup_detail=backend_startup_detail,
+                instance_fingerprint=backend_instance_fingerprint,
             )
 
-        if "Backend runtime cleanup failed:" in body and "Exit Code: 0" in body:
-            body = body.replace("Exit Code: 0", "Exit Code: 1", 1)
-        return _prepend_group_execution_header(execution, body)
+        playwright_command = "npx playwright test"
+        if execution.get("resolved_targets"):
+            playwright_command += " " + " ".join(execution["resolved_targets"])
+        playwright_result = await stage_timer.measure(
+            "playwright",
+            _execute_web_test_command(
+                playwright_command,
+                cwd=execution["working_directory"],
+                timeout=120.0,
+                extra_env=e2e_runtime_env,
+                web_port=resolved_port,
+            ),
+        )
+        playwright_exit_code = _extract_exit_code(playwright_result)
+        if playwright_exit_code is None:
+            playwright_exit_code = 1
+        if reused_runtime:
+            backend_runtime_section = (
+                "Reused the live backend runtime from an earlier E2E attempt in this TDD session "
+                "(backend sources, port and E2E database unchanged).\n"
+                f"Command: {backend_start_command}\n"
+                f"Port: {resolved_port}\n\n"
+                f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}"
+            )
+        else:
+            backend_runtime_section = (
+                f"Command: {backend_start_command}\n"
+                f"Port: {resolved_port}\n\n"
+                f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}"
+            )
+        deferred_cleanup = (
+            "Deferred: the backend runtime stays alive for subsequent E2E attempts of this "
+            "session and is shut down when the node's IMPLEMENT phase finishes."
+        )
+        cleanup_section = deferred_cleanup
+        if backend_cleanup_note:
+            cleanup_section = f"Previous runtime cleanup: {backend_cleanup_note}\n{deferred_cleanup}"
+        body = (
+            f"Exit Code: {playwright_exit_code}\n\n"
+            # Checked here — after Playwright ran — not right after the build:
+            # the verdict's job is to expose the artifact-vanished-after-build
+            # race, which a pre-Playwright snapshot cannot see.
+            f"=== Frontend Build ===\n{frontend_build_output}\n\n"
+            f"{_frontend_serving_verdict(self.workspace_path)}\n\n"
+            f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n"
+            f"DB Label: {e2e_runtime_env.get('ARC_E2E_DB_LABEL', 'unknown')}\n\n"
+            f"=== Database Prepare ===\n{database_prepare_output}\n\n"
+            f"=== Backend Runtime ===\n{backend_runtime_section}\n\n"
+            f"=== Backend Instance Fingerprint ===\n{backend_instance_fingerprint or 'No backend instance fingerprint recorded.'}\n\n"
+            f"{playwright_result}\n\n"
+            f"=== Backend Runtime Cleanup ===\n{cleanup_section}"
+            + stage_timer.render()
+        )
+        return body, backend_cleanup_note
 
     @classmethod
     def build_stack_block(

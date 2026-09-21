@@ -93,7 +93,7 @@ def _make_session(db_path: str, fingerprint: str, port: int = 4321) -> web_handl
 
 
 def _patch_fresh_start(monkeypatch, recorder: _CommandRecorder, start_calls: list[str]) -> None:
-    async def _fake_build(workspace_path: str) -> tuple[bool, str]:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
         return True, "build ok"
 
     async def _fake_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, str]:
