@@ -1432,7 +1432,7 @@ async def _start_backend_runtime(
     (``_arc_output_tails``); the caller owns that object for the runtime's
     whole lifetime and must clean it up through ``_terminate_process`` -
     the single teardown path that releases the port and awaits the drains.
-    Every current call site (probe_backend_health, run_test_file,
+    Every current call site (probe_backend_health,
     run_test_group's session) funnels there; a new call site bypassing it
     would leave the drains pending on a dead process.
     """
@@ -1925,30 +1925,6 @@ class WebAppType(AppTypeHandler):
                 f"Copied {copied} requirement asset(s) into frontend/public/assets.",
             )
 
-    @classmethod
-    def template_contract_violations(cls, template_dir: str) -> list[str]:
-        """Report template files that would fail the post-template port gate.
-
-        Runs at template-selection time (see ``AppTypeHandler._select_template``)
-        so a usable but stale external template is swapped for the bundled one
-        instead of scaffolding a workspace that initialization then aborts on.
-        """
-
-        violations: list[str] = []
-        for relative_path, marker in PORT_TEMPLATE_CONTRACT:
-            file_path = os.path.join(template_dir, *relative_path.split("/"))
-            if not os.path.exists(file_path):
-                continue
-            try:
-                with open(file_path, "r", encoding="utf-8") as file:
-                    content = file.read()
-            except OSError:
-                violations.append(relative_path)
-                continue
-            if marker not in content:
-                violations.append(relative_path)
-        return violations
-
     async def post_template_setup(self) -> bool:
         """Assert the scaffolded runtime files resolve the web port from the environment.
 
@@ -2386,7 +2362,6 @@ class WebAppType(AppTypeHandler):
     async def run_test_file(self, test_type: str, file_path: str, web_port: int | None = None) -> str:
         resolved_port = int(web_port) if web_port is not None else get_web_port()
         await self._log("System", f"System test execution ({test_type}): {file_path}")
-        normalized_type = test_type.lower()
         validation_error = self.validate_test_path(test_type, file_path)
         if validation_error:
             return f"Exit Code: 1\nSTDERR:\n{validation_error}\n"
@@ -2394,103 +2369,12 @@ class WebAppType(AppTypeHandler):
             execution = _build_web_test_execution(test_type, file_path, self.workspace_path, web_port=resolved_port)
         except ValueError as exc:
             return str(exc)
-        backend_process = None
-        frontend_build_output = ""
-        database_prepare_output = ""
-        backend_start_command = ""
-        backend_startup_detail = ""
-        backend_instance_fingerprint = ""
-        backend_cleanup_note = ""
-        e2e_runtime_env: dict[str, str] = {}
-        result_body = ""
 
-        if normalized_type == "e2e":
-            # Single-file runs get their own target set and therefore their own
-            # E2E database, so they never ride the session runtime. Clear any
-            # live session first so the fresh start below cannot collide with a
-            # port the session still holds.
-            await self._terminate_e2e_session("Single-file E2E pre-start cleanup")
-            e2e_runtime_env = _build_e2e_runtime_env(
-                self.workspace_path,
-                [execution.get("resolved_test_file", "")],
-                web_port=resolved_port,
-            )
-            build_ok, frontend_build_output = await _build_frontend_dist(self.workspace_path)
-            if not build_ok:
-                return _prepend_test_execution_header(
-                    execution,
-                    "Frontend build failed before E2E startup.\n\n"
-                    f"=== Frontend Build ===\n{frontend_build_output}\n\n"
-                    f"{_frontend_serving_verdict(self.workspace_path)}",
-                )
-
-            database_ready, database_prepare_output = await _prepare_e2e_database(
-                self.workspace_path,
-                e2e_runtime_env,
-            )
-            if not database_ready:
-                return _prepend_test_execution_header(
-                    execution,
-                    "E2E database preparation failed before backend startup.\n\n"
-                    f"=== Frontend Build ===\n{frontend_build_output}\n\n"
-                    f"{_frontend_serving_verdict(self.workspace_path)}\n\n"
-                    f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
-                    f"=== Database Prepare ===\n{database_prepare_output}",
-                )
-
-            (
-                backend_process,
-                backend_start_command,
-                backend_startup_detail,
-                backend_instance_fingerprint,
-            ) = await _start_backend_runtime(self.workspace_path, e2e_runtime_env, web_port=resolved_port)
-            if backend_process is None:
-                return _prepend_test_execution_header(
-                    execution,
-                    "Failed to start backend server for E2E testing.\n\n"
-                    f"=== Frontend Build ===\n{frontend_build_output}\n\n"
-                    f"{_frontend_serving_verdict(self.workspace_path)}\n\n"
-                    f"=== Database Prepare ===\n{database_prepare_output}\n\n"
-                    f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
-                    f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
-                    f"=== Backend Runtime Error ===\n{backend_startup_detail or 'No startup detail recorded.'}\n",
-                )
-
-        try:
-            result_body = await _execute_web_test_command(
-                execution["command"],
-                cwd=execution["working_directory"],
-                extra_env=e2e_runtime_env if normalized_type == "e2e" else None,
-                web_port=resolved_port,
-            )
-            if normalized_type == "e2e":
-                result_body = (
-                    f"=== Frontend Build ===\n{frontend_build_output}\n\n"
-                    f"{_frontend_serving_verdict(self.workspace_path)}\n\n"
-                    f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n"
-                    f"DB Label: {e2e_runtime_env.get('ARC_E2E_DB_LABEL', 'unknown')}\n\n"
-                    f"=== Database Prepare ===\n{database_prepare_output}\n\n"
-                    f"=== Backend Runtime ===\nCommand: {backend_start_command}\n"
-                    f"Port: {resolved_port}\n"
-                    f"Startup Cleanup: {backend_startup_detail or 'No startup cleanup note recorded.'}\n\n"
-                    f"=== Backend Instance Fingerprint ===\n{backend_instance_fingerprint or 'No backend instance fingerprint recorded.'}\n\n"
-                    f"{result_body}"
-                )
-        finally:
-            if normalized_type == "e2e":
-                try:
-                    backend_cleanup_note = await _terminate_process(backend_process, port=resolved_port)
-                except Exception as cleanup_exc:
-                    backend_cleanup_note = f"Backend runtime cleanup failed: {cleanup_exc}"
-
-        if normalized_type == "e2e":
-            result_body = (
-                f"{result_body}\n\n"
-                f"=== Backend Runtime Cleanup ===\n{backend_cleanup_note or 'No cleanup note recorded.'}"
-            )
-            if "Backend runtime cleanup failed:" in backend_cleanup_note and "Exit Code: 0" in result_body:
-                result_body = result_body.replace("Exit Code: 0", "Exit Code: 1", 1)
-
+        result_body = await _execute_web_test_command(
+            execution["command"],
+            cwd=execution["working_directory"],
+            web_port=resolved_port,
+        )
         return _prepend_test_execution_header(execution, result_body)
 
     async def _try_reuse_e2e_backend_session(
