@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -23,7 +26,7 @@ from core.path_compat import normalize_windows_extended_prefix_text
 from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 from core.visual_analysis import analyze_and_attach_visual_references
 from app_type_handler.test_results import classify_test_failure, failure_fingerprint, parse_test_results
-from agents.tools.test_manifest import normalize_coverage_scope
+from agents.tools.test_manifest import is_test_file_path, normalize_coverage_scope
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -431,11 +434,89 @@ class WorkflowPhaseRunner:
             await self.app_handler.shutdown_e2e_runtime()
         if final_ok:
             self._mark_interfaces_implemented(interfaces)
+            await self._sweep_undeclared_test_files(node_id, tests)
         self._update_node_session(
             node_id,
             {"phase_status": {"implement": "completed" if final_ok else "failed"}},
         )
         return final_ok
+
+    async def _sweep_undeclared_test_files(self, node_id: str, tests: list[dict[str, Any]]) -> None:
+        """Move undeclared test files out of the delivery tree before the checkpoint.
+
+        The simple-ticketing arc-output1 run showed why the IMPLEMENT
+        checkpoint needs this sweep in addition to the discipline's
+        budgeted delete: a TDD agent that could not delete its render-probe
+        diagnostics (``frontend/tests/diag.test.tsx``,
+        ``RegisterPage.diag.test.tsx``, ``backend/test-express-wildcard.js``)
+        left them in the tree, and the ``git add -A`` checkpoint shipped them
+        into the delivery commit. The discipline now allows the agent to
+        clean them up itself; this sweep is the mechanical backstop for the
+        files it still leaves behind.
+
+        An undeclared test file is one that lives under a test directory or
+        carries a test name, is untracked in git (so an edit to a *registered*
+        test file, or a pre-existing sibling test the manifest never owned,
+        never matches), and is not in the current node's test manifest. On
+        match the file is moved under ``.arc/diagnostics/<node>/`` — ignored
+        by the managed gitignore, kept for inspection — instead of deleted.
+        Movement failures (locks, permission errors) log a warning and leave
+        the file in place: a dirty delivery commit is recoverable, a crashed
+        IMPLEMENT phase is not.
+        """
+
+        try:
+            candidates = collect_undeclared_test_files(
+                self.workspace_path,
+                declared_paths=collect_test_files(tests),
+            )
+            if not candidates:
+                return
+            safe_node = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(node_id or "").strip()) or "node"
+            diagnostics_dir = Path(self.workspace_path) / ".arc" / "diagnostics" / safe_node
+            moved: list[str] = []
+            move_error: Exception | None = None
+            for relative in candidates:
+                source = Path(self.workspace_path) / relative
+                target = diagnostics_dir / relative
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(source), str(target))
+                    moved.append(relative)
+                except OSError as exc:
+                    # Record the partial sweep and keep the remaining files in
+                    # place; a dirty delivery commit is recoverable, a crash
+                    # here must not fail the phase.
+                    move_error = exc
+                    break
+            if moved:
+                self._update_node_session(node_id, {"swept_diagnostic_files": sorted(moved)})
+                await self._log(
+                    "TestDrivenDeveloper",
+                    (
+                        f"Moved {len(moved)} undeclared test file(s) out of the delivery tree for "
+                        f"{node_id}: {', '.join(moved)}. They are preserved under "
+                        "`.arc/diagnostics/` (ignored by checkpoints) for inspection."
+                        + (
+                            f" (Stopped after a move failure: {move_error}; any remaining "
+                            "diagnostic files will stay in the test tree.)"
+                            if move_error is not None
+                            else ""
+                        )
+                    ),
+                    status="warning",
+                    node_id=node_id,
+                )
+        except Exception as exc:
+            await self._log(
+                "TestDrivenDeveloper",
+                (
+                    f"Undeclared-test-file sweep failed for {node_id} ({type(exc).__name__}: {exc}); "
+                    "the checkpoint will include any diagnostic files left in the test tree."
+                ),
+                status="warning",
+                node_id=node_id,
+            )
 
     async def _check_test_contract_satisfiability(
         self,
@@ -1877,6 +1958,106 @@ def collect_test_files(tests: list[dict[str, Any]]) -> list[str]:
         if file_path and file_path not in seen:
             seen.append(file_path)
     return seen
+
+
+#: Workspace subtrees an undeclared-test sweep never enters: ignored runtime
+#: state, dependency installs, and generated build output never belong to a
+#: delivery commit decision in the first place.
+_SWEEP_SKIPPED_PARTS = frozenset({".arc", ".git", "node_modules", "dist", "dist-ssr", "build", "coverage", ".vite"})
+
+
+def _is_test_like_relative_path(path: str) -> bool:
+    """Whether a workspace-relative path looks like a test file.
+
+    The manifest predicate (``is_test_file_path``) governs what a TestGenerator
+    may declare; the sweep deliberately accepts more, because it protects the
+    delivery commit, not the declaration channel: an IMPLEMENT-stage probe
+    with a bare ``test-*`` name (``backend/test-express-wildcard.js``) dodges
+    the manifest's stricter naming and must not sail into the delivery commit
+    on that technicality.
+    """
+
+    if is_test_file_path(path):
+        return True
+    name = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    return stem == "test" or stem.startswith("test-") or stem.endswith("-test")
+
+
+def _load_untracked_paths(workspace_root: str) -> set[str]:
+    """Git-untracked paths of ``workspace_root`` (repo-relative, POSIX style).
+
+    ``--exclude-standard`` keeps ignored state (``.arc``, ``node_modules``,
+    lockfiles) out of the candidate set, so the sweep only ever considers
+    files git would actually stage. Failures return an empty set: the sweep
+    is a best-effort backstop, not a gate, and a git hiccup must not fail
+    the IMPLEMENT phase. The raw ``subprocess.run`` (rather than the runtime
+    SDK's ``GitClient.run``) is deliberate: the client hardcodes its own
+    ``project_dir`` as cwd and cannot target a task worktree, which is
+    exactly where the parallel-mode sweep must run.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(workspace_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if completed.returncode != 0:
+        return set()
+    return {
+        line.replace("\\", "/").strip()
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    }
+
+
+def collect_undeclared_test_files(
+    workspace_root: str,
+    *,
+    declared_paths: list[str] | set[str],
+) -> list[str]:
+    """Untracked test-named files under ``workspace_root`` outside the manifest.
+
+    This is the IMPLEMENT checkpoint's backstop against agent-authored
+    diagnostic files leaking into the delivery commit (issue #89): the file
+    set is the intersection of
+
+    - untracked paths in git (so tracked/committed files never match), and
+    - test-named paths the node's test manifest does not declare.
+
+    The git-untracked filter is what keeps the sweep surgical: a *modified*
+    registered test file, a pre-existing sibling test from an earlier node,
+    and files another node's manifest owns are all committed state and stay
+    untouched. Only genuinely new, unregistered test-shaped files — the
+    diagnostics an agent wrote to localize a failure — are collected.
+
+    Returns workspace-relative POSIX-style paths, sorted.
+    """
+
+    root = Path(workspace_root).expanduser().resolve()
+    declared = {
+        normalize_workspace_relative_path(path, str(root))
+        for path in declared_paths
+        if str(path or "").strip()
+    }
+    matches: list[str] = []
+    for path in sorted(_load_untracked_paths(str(root))):
+        parts = path.split("/")
+        if any(part in _SWEEP_SKIPPED_PARTS for part in parts[:-1]):
+            continue
+        if path in declared or normalize_workspace_relative_path(path, str(root)) in declared:
+            continue
+        if _is_test_like_relative_path(path):
+            matches.append(path)
+    return sorted(matches)
 
 
 #: Environment-failure reasons that name a concrete npm package. These are

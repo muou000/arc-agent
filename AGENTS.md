@@ -59,7 +59,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 
 - 保持节点的设计、实施、成功、失败、恢复和重试状态可互相解释。
 - `--resume` 应复用现有输出工作区和追溯产物；`--retry-failed` 与 `--retry` 只能在续跑语义下使用。
-- 默认启用每节点 worktree 并行调度（设置 `ARC_NODE_WORKTREES=0/false/no/off` 可恢复共享工作区的严格串行调度）。并行下任务按子树亲和调度，切分深度由 `ARC_AFFINITY_DEPTH` 控制（默认 1=顶层子树一组；设 2 起宽子树的深层子树各自成组）：同一子树的任务在共享的 worktree 目录中顺序执行，不同子树并行（独立端口槽位和 E2E 数据库，默认并发 `ARC_MAX_CONCURRENT_TASKS=3`、上限 8），任务结束合并回主工作区；父子 DESIGN 串行——子节点的 DESIGN 等到父节点 DESIGN 完成并合并后才调度（失败的父节点不阻塞子节点），使子节点从包含父壳层的 integration HEAD 出发做增量编辑；需求树声明的 `dependencies` 对 DESIGN 和 IMPLEMENT 都做门禁——依赖节点的 DESIGN/IMPLEMENT 等到其依赖节点的 IMPLEMENT 结束（完成即已合并）后才开始，依赖方从依赖节点已落地的接口做增量设计而不是并行重复实现共享面；依赖 IMPLEMENT 失败时依赖方（声明依赖它的节点和等待其后代的祖先）被显式标记 `BLOCKED_BY_DEPENDENCY` 而非静默 PENDING，重试重置救活依赖节点后由释放逻辑（`_release_dependency_blocks`）对称解除；无法调度的依赖边（成环——含仅通过父子规则闭合的环、祖先与后代互指、外来队列引用未知节点）在队列构建/恢复时丢弃并告警；跨子树共享 glue 文件的纯追加冲突由合并层机械消解并受合并后健康检查门禁约束，其余冲突将该节点标记为失败并保留其 worktree。修改该模式时必须同步维护 `core/worktree.py` 的复用/隔离区/合并/冲突语义、`_next_affinity_task` 的分组规则、端口槽位分配和 `_task_dependencies_met` 的顺序规则，并配套真实 git 的回归测试。
+- 默认启用每节点 worktree 并行调度（设置 `ARC_NODE_WORKTREES=0/false/no/off` 可恢复共享工作区的严格串行调度）。并行下任务按子树亲和调度，切分深度由 `ARC_AFFINITY_DEPTH` 控制（默认 1=顶层子树一组；设 2 起宽子树的深层子树各自成组）：同一子树的任务在共享的 worktree 目录中顺序执行，不同子树并行（独立端口槽位和 E2E 数据库，默认并发 `ARC_MAX_CONCURRENT_TASKS=3`、上限 8），任务结束合并回主工作区；父子 DESIGN 串行——子节点的 DESIGN 等到父节点 DESIGN 完成并合并后才调度（失败的父节点不阻塞子节点），使子节点从包含父壳层的 integration HEAD 出发做增量编辑；需求树声明的 `dependencies` 对 DESIGN 和 IMPLEMENT 都做门禁——依赖节点的 DESIGN/IMPLEMENT 等到其依赖节点的 IMPLEMENT 结束（完成即已合并）后才开始，依赖方从依赖节点已落地的接口做增量设计而不是并行重复实现共享面；依赖 IMPLEMENT 失败时依赖方（声明依赖它的节点和等待其后代的祖先）被显式标记 `BLOCKED_BY_DEPENDENCY` 而非静默 PENDING，重试重置救活依赖节点后由释放逻辑（`_release_dependency_blocks`）对称解除；无法调度的依赖边（成环——含仅通过父子规则闭合的环、祖先与后代互指、外来队列引用未知节点）在队列构建/恢复时丢弃并告警；跨子树共享 glue 文件的纯追加冲突由合并层机械消解并受合并后健康检查门禁约束；语义冲突仲裁（`ARC_MERGE_ARBITRATION`，默认关闭）在两个触发点把非追加冲突和健康门禁失败升级给主模型仲裁一次——输入只含冲突文件三方内容与双方契约卡、编辑仅限冲突文件集、产物须过健康门禁复验、每节点预算一次（触发点共享）并留痕 runner 事件，关闭时行为不变；仲裁失败或未启用的其余冲突按阶段各重排一次（DESIGN 冲突重排 DESIGN，IMPLEMENT 冲突只重排 IMPLEMENT、已完成的 DESIGN 产物保留，两阶段预算独立；重排上下文注入冲突路径供 prompt 绕行指引），同阶段二次冲突终判失败并保留其 worktree。修改该模式时必须同步维护 `core/worktree.py` 的复用/隔离区/合并/冲突语义、`_next_affinity_task` 的分组规则、端口槽位分配和 `_task_dependencies_met` 的顺序规则，并配套真实 git 的回归测试。
 - 修改 post-run TDD retry 时，保持 `.arc/runner-events.jsonl` 的扫描字段、去重顺序和失败上下文传递一致。
 
 ### Runtime SDK 和追溯数据
@@ -85,7 +85,7 @@ arc-agent 是 ARC（Agentic Requirement Compiler）及 ARC-Bench agent 的实现
 
 ### A/B 评测
 
-- `core/evals.py` 的五指标口径（pass rate、tokens、cache hit rate、latency、est. cost）、`runs.jsonl` / `report.json` 字段和报告版式是评测工作流契约；修改时同步 `tests/test_evals/` 与 README 的「A/B 评测」一节。
+- `core/evals.py` 的五指标口径（pass rate、tokens、cache hit rate、latency、est. cost）、`runs.jsonl` / `report.json` 字段和报告版式是评测工作流契约；修改时同步 `tests/test_evals/` 与 `docs/evals.md`（README 只保留命令示例与指路）。
 - 评测通过子进程调用 compile（缺省 runner 为仓库 `arc_main.py` 的 `compile` 入口；`--runner-script` 注入的通用脚本只接收 `<requirement> -o <workspace> -t <type> --port <port> [arm 参数]` 纯运行参数），只读取运行工作区的 `.arc/` 产物（runner 事件、队列）聚合指标；不要为取指标绕过 runtime SDK 直接改写工作区。测试一律使用注入的 runner（如 `tests/test_evals/fake_eval_runner.py`），不得消耗真实模型调用。报告默认写入 `records/evals/`，属于新增运行证据，不要改动已有评测目录。
 
 ## 测试和验证
@@ -139,11 +139,11 @@ python arc_main.py doctor
 
 ## 文档同步
 
-以下变化需要同步检查 README、测试说明和本文件是否仍准确：
+面向使用者的文档分两层：README 只保留简介、快速开始和指路链接；环境变量细节的权威位置是 `docs/configuration.md`，评测与用量观测细节的权威位置是 `docs/evals.md`。以下变化需要同步检查对应文档、测试说明和本文件是否仍准确：
 
-- CLI 参数、环境变量或安装方式变化；
+- CLI 参数、环境变量或安装方式变化（同步 `docs/configuration.md`）；
 - 目录布局、模板来源或 app-type 支持范围变化；
-- 事件、追溯表、队列、测试 manifest 或输出产物变化；
+- 事件、追溯表、队列、测试 manifest 或输出产物变化（涉及用量/评测指标时同步 `docs/evals.md`）；
 - 测试命令、slow 门禁或运行时前置条件变化。
 
 根目录 `AGENTS.md` 应保持为维护 arc-agent 的短规则索引；生成应用的详细设计、测试和实现规则应继续留在运行时 prompt、middleware 和 skills 中。

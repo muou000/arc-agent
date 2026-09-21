@@ -21,10 +21,28 @@ from core.commits import build_commit_message
 from core.config import load_project_env, set_app_type, set_web_port, set_workspace_root
 from core.files import load_requirements, read_json_file, validate_requirement_tree, write_json_file
 from core.logging import append_debug_log, write_terminal_log
+from core.merge_arbitration import (
+    ArbitrationInput,
+    MergeArbiter,
+    TRIGGER_CONFLICT,
+    TRIGGER_HEALTH_GATE,
+    arbitration_enabled,
+    collect_contract_cards,
+    merge_arbitration_budget_key,
+    read_conflict_stages,
+    read_workspace_file,
+)
 from core.path_safety import validate_clean_target
 from core.tdd_retry import build_tdd_reprompt, scan_test_failures
 from core.visual_analysis import precompute_visual_references, visual_precompute_enabled
-from core.worktree import MergeConflictError, NodeWorktreeManager, WorktreeError, WorktreeHandle
+from core.worktree import (
+    ArbitrationHooks,
+    MergeArbitrationError,
+    MergeConflictError,
+    NodeWorktreeManager,
+    WorktreeError,
+    WorktreeHandle,
+)
 
 
 load_project_env()
@@ -845,10 +863,11 @@ class ARCWorkflowManager:
                 # Commit the worktree and merge its branch back; a merge
                 # conflict fails the node even when its phase succeeded,
                 # because the work never reached the integration workspace.
-                # One narrow exception: the first DESIGN conflict re-queues
-                # the node once with the conflicting paths as guidance, so a
-                # parallel sibling that won the file does not cost the whole
-                # node.
+                # One narrow exception per phase: the first DESIGN conflict
+                # re-queues the node's DESIGN once, and the first IMPLEMENT
+                # conflict re-queues the node's IMPLEMENT once - both with
+                # the conflicting paths as guidance, so a parallel sibling
+                # that won the file does not cost the whole node.
                 merged, _detail, merge_conflict = await self._integrate_task_workspace(
                     ctx,
                     node_id,
@@ -859,20 +878,30 @@ class ARCWorkflowManager:
                     if (
                         merge_conflict
                         and phase == PHASE_DESIGN
-                        and not sessions.load_node_session(node_id).get("merge_conflict_retry_used")
+                        and self._merge_conflict_requeue_available(node_id, PHASE_DESIGN)
                     ):
-                        requeued = await self._requeue_design_after_merge_conflict(
+                        if await self._requeue_design_after_merge_conflict(
                             ctx, queue_state, node_id, merge_conflict
-                        )
-                        if requeued:
+                        ):
                             await self._close_task_workspace(ctx)
                             return
-                    # Requeue declined (already used, not a DESIGN conflict,
-                    # or the requeue itself failed): fall through to the
-                    # failure branch. The method tail still closes ctx with
-                    # preserve=True there, so a declined requeue never leaks
-                    # the worktree - it is preserved for --retry exactly like
-                    # any other failed merge.
+                    elif (
+                        merge_conflict
+                        and phase == PHASE_IMPLEMENT
+                        and self._merge_conflict_requeue_available(node_id, PHASE_IMPLEMENT)
+                    ):
+                        if await self._requeue_implement_after_merge_conflict(
+                            ctx, queue_state, node_id, merge_conflict
+                        ):
+                            await self._close_task_workspace(ctx)
+                            return
+                    # Requeue declined (this phase's budget already spent, no
+                    # requeue path for the phase, or the requeue itself
+                    # failed): fall through to the failure branch. The method
+                    # tail still closes ctx with preserve=True there, so a
+                    # declined requeue never leaks the worktree - it is
+                    # preserved for --retry exactly like any other failed
+                    # merge.
                     task_ok = False
 
         if task_ok:
@@ -1005,6 +1034,7 @@ class ARCWorkflowManager:
 
         commit_message = build_commit_message(node_id, phase, requirement_data)
         verify = self._build_merge_health_gate() if self.app_type == "web" else None
+        arbiter = self._build_merge_arbitration_hooks(ctx, node_id, phase)
         async with self._merge_lock:
             try:
                 committed, detail = await asyncio.to_thread(
@@ -1012,6 +1042,7 @@ class ARCWorkflowManager:
                     ctx.handle,
                     commit_message,
                     verify=verify,
+                    arbiter=arbiter,
                 )
             except MergeConflictError as exc:
                 await self._log("Compiler", str(exc), "error", node_id)
@@ -1023,6 +1054,181 @@ class ARCWorkflowManager:
             await self._log("Compiler", "No file changes detected for this checkpoint.", node_id=node_id)
         await self._log("Compiler", f"Integrated {node_id}: {detail}.", node_id=node_id)
         return True, detail, []
+
+    def _build_merge_arbitration_hooks(
+        self,
+        ctx: _TaskWorkspace,
+        node_id: str,
+        phase: str,
+    ) -> ArbitrationHooks | None:
+        """LLM escalation hooks for this task's merge (issue #81).
+
+        Gated by ``ARC_MERGE_ARBITRATION`` (default off): with the gate closed
+        the hooks are ``None`` and ``integrate`` behaves exactly like main.
+        The budget is one arbitration per node, stored in the node session and
+        marked spent *before* the model call so a crashed arbitration cannot
+        buy a second attempt. Both hooks run inside the merge worker thread;
+        the model call itself is executed synchronously through the arbiter's
+        ``arbitrate`` (the stage adapters' model classes expose sync-less
+        async only, so the hooks wrap the coroutine with ``asyncio.run`` on
+        the worker thread, the same pattern the health gate uses).
+        """
+
+        if not arbitration_enabled():
+            return None
+
+        def collect_input(
+            conflict_paths: list[str],
+            trigger: str,
+            gate_failure: str = "",
+        ) -> ArbitrationInput | None:
+            if sessions.load_node_session(node_id).get(merge_arbitration_budget_key()):
+                return None
+            git = self._worktree_manager._git
+            stages = read_conflict_stages(
+                lambda args: git(args, cwd=self.workspace_path, check=False),
+                conflict_paths,
+            )
+            if trigger == TRIGGER_HEALTH_GATE:
+                # The mechanical resolution already staged the files, so the
+                # merge index holds no conflict stages: the arbiter sees the
+                # currently resolved content it must repair, plus whatever
+                # stages the index still exposes.
+                for path, entry in stages.items():
+                    entry["resolved"] = read_workspace_file(self.workspace_path, path)
+            return ArbitrationInput(
+                trigger=trigger,
+                ours_label=self._integration_side_label(node_id),
+                theirs_label=node_id,
+                files=stages,
+                contract_cards=self._arbitration_contract_cards(node_id, conflict_paths),
+                gate_failure=gate_failure,
+            )
+
+        def run(
+            arbitration_input: ArbitrationInput,
+            conflict_paths: list[str],
+            trigger: str,
+        ) -> str | None:
+            if sessions.load_node_session(node_id).get(merge_arbitration_budget_key()):
+                return "The node's single arbitration budget is already spent."
+            sessions.merge_node_session(node_id, {merge_arbitration_budget_key(): True})
+            arbiter = MergeArbiter(
+                model=self._build_arbitration_model(),
+                workspace_path=self.workspace_path,
+                emit_event=self._emit_merge_arbitration_event,
+            )
+            result = asyncio.run(
+                arbiter.arbitrate(
+                    ctx.handle.path,
+                    self._integration_side_label(node_id),
+                    arbitration_input,
+                    node_id=node_id,
+                    phase=phase,
+                )
+            )
+            if not result.accepted:
+                return result.detail
+            for path in result.applied:
+                self._worktree_manager._git(
+                    ["add", "--", path], cwd=self.workspace_path, check=False
+                )
+            return None
+
+        def on_reverified(gate_result: str | None) -> None:
+            """Persist the post-repair re-verification result (audit trail)."""
+
+            self._emit_merge_arbitration_event(
+                {
+                    "type": "merge_arbitration",
+                    "node_id": node_id,
+                    "phase": phase,
+                    "trigger": TRIGGER_HEALTH_GATE,
+                    "outcome": "reverified-passed" if not gate_result else "reverified-failed",
+                    "detail": gate_result or "",
+                }
+            )
+
+        return ArbitrationHooks(
+            collect_input=collect_input,
+            run=run,
+            on_reverified=on_reverified,
+        )
+
+    def _integration_side_label(self, node_id: str) -> str:
+        """How the integration side is named in the arbitration prompt.
+
+        The integration branch holds every already-merged sibling, so it is
+        presented as one side ("integration branch") rather than attributed to
+        a single node; git cannot cheaply say which sibling authored the
+        ``ours`` stage of a conflicted file.
+        """
+
+        return f"integration branch (all merged nodes except {node_id})"
+
+    def _arbitration_contract_cards(self, node_id: str, conflict_paths: list[str]) -> dict[str, Any]:
+        """Both sides' contract cards, filtered to the conflicting files.
+
+        A card belongs in the arbitration input only when its interfaces
+        point at a conflicted path (the incoming node's side) or it is the
+        incoming node itself; unrelated nodes' cards - including siblings
+        that never touched the conflict - are pruned, keeping the context
+        cost gate honest on wide trees.
+        """
+
+        conflict_set = set(conflict_paths)
+        try:
+            others = [
+                str(row.get("req_id") or "").strip()
+                for row in self.runtime.traceability.list_node_contracts()
+                if isinstance(row, dict)
+            ]
+        except Exception:
+            others = []
+        node_ids = [req_id for req_id in others if req_id and req_id != node_id]
+        node_ids.append(node_id)
+        cards = collect_contract_cards(self.runtime.traceability, node_ids)
+        # Keep a foreign card only when one of its interfaces lives in a
+        # conflicted file; the incoming node's own card always stays.
+        pruned: dict[str, Any] = {}
+        for card_node_id, card in cards.items():
+            if card_node_id == node_id:
+                pruned[card_node_id] = card
+                continue
+            interfaces = card.get("interfaces") if isinstance(card, dict) else None
+            if any(
+                isinstance(row, dict) and str(row.get("file_path") or "") in conflict_set
+                for row in (interfaces or [])
+            ):
+                pruned[card_node_id] = card
+        return pruned
+
+    def _build_arbitration_model(self) -> Any:
+        """The arbitration model: the run's configured main model.
+
+        Issue #81 pins arbitration to the main model (no cheaper arbiter).
+        The model instance is built per arbitration so a test-provided fake
+        monkeypatched into the adapter layer is always honored.
+        """
+
+        from agents.model.factory import create_arc_chat_model
+
+        model_name = os.environ.get("MODEL", "openai:gpt-5.4")
+        return create_arc_chat_model(model_name)
+
+    def _emit_merge_arbitration_event(self, payload: dict[str, Any]) -> None:
+        """Persist one audit record as a runner event (best effort)."""
+
+        try:
+            from arcbench_agent_runtime.jsonio import append_jsonl
+
+            append_jsonl(self.runtime.paths.runner_events_path, payload)
+        except Exception as exc:  # noqa: BLE001 - audit must never break the merge
+            append_debug_log(
+                "MergeArbiter",
+                f"merge arbitration audit emit failed: {type(exc).__name__}: {exc}",
+                workspace_root=self.workspace_path,
+            )
 
     async def _requeue_design_after_merge_conflict(
         self,
@@ -1101,6 +1307,126 @@ class ARCWorkflowManager:
             "Merge conflict on: "
             + ", ".join(conflict_paths[:8])
             + f". Re-queued {node_id} DESIGN once; the retry starts from the merged integration "
+            "state and must avoid the sibling-owned paths.",
+            "warning",
+            node_id,
+        )
+        return True
+
+    @staticmethod
+    def _merge_conflict_requeue_available(node_id: str, phase: str) -> bool:
+        """Whether this phase still has its one-shot conflict requeue left.
+
+        The budget is per phase: a node whose DESIGN retry already consumed
+        the DESIGN budget keeps a full IMPLEMENT budget (and vice versa), so
+        each phase gets exactly one requeue. The phase key is the recorded
+        ``merge_conflict_context.phase`` - the flag written by a DESIGN
+        requeue does not cost the node its IMPLEMENT requeue. A legacy
+        ``retry_used`` flag with no readable context is treated as spent for
+        safety (it can only come from a pre-phase-keying requeue).
+        """
+
+        session = sessions.load_node_session(node_id)
+        if not session.get("merge_conflict_retry_used"):
+            return True
+        context = session.get("merge_conflict_context")
+        if not isinstance(context, dict):
+            return False
+        recorded_phase = str(context.get("phase") or "").strip().lower()
+        return recorded_phase != str(phase).strip().lower()
+
+    async def _requeue_implement_after_merge_conflict(
+        self,
+        ctx: _TaskWorkspace,
+        queue_state: dict[str, Any],
+        node_id: str,
+        conflict_paths: list[str],
+    ) -> bool:
+        """Re-queue a node's IMPLEMENT once after a merge conflict.
+
+        The DESIGN-side counterpart of
+        ``_requeue_design_after_merge_conflict``: the conflicting files stay
+        owned by the winning sibling (its branch is already merged), so the
+        node's branch is reset to the current integration HEAD - the retry
+        sees the sibling's files on disk and implements around them. DESIGN
+        artifacts are NOT cleared: the design already merged cleanly and is
+        part of the integration HEAD the retry starts from. The conflicting
+        paths are stored in the node session for the TDD prompt; a second
+        conflict fails the node as before.
+
+        Every decline path leaves the task workspace exactly as a regular
+        conflict failure left it: quarantined, branch intact, preserved for
+        ``--retry``. The queue is validated *before* the branch reset so a
+        decline never discards the node's conflicted commits.
+        """
+
+        design_task = None
+        implement_task = None
+        for task in queue_state["tasks"]:
+            if task["node_id"] != node_id:
+                continue
+            if task["phase"] == PHASE_DESIGN:
+                design_task = task
+            elif task["phase"] == PHASE_IMPLEMENT:
+                implement_task = task
+        if design_task is None or implement_task is None:
+            await self._log(
+                "Compiler",
+                f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete.",
+                "error",
+                node_id,
+            )
+            return False
+        # The requeue is implement-only by construction (the caller saw an
+        # IMPLEMENT conflict), so the DESIGN task must have settled; guard
+        # against an unexpected queue shape instead of resetting a completed
+        # DESIGN and re-running its agent for nothing.
+        if design_task["status"] != TASK_COMPLETED:
+            await self._log(
+                "Compiler",
+                f"Re-queueing {node_id} after its merge conflict failed: its DESIGN task is not completed.",
+                "error",
+                node_id,
+            )
+            return False
+
+        try:
+            await asyncio.to_thread(self._worktree_manager.reset_branch_to_integration, ctx.handle)
+        except WorktreeError as exc:
+            await self._log(
+                "Compiler",
+                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead: {exc}",
+                "error",
+                node_id,
+            )
+            return False
+
+        implement_task["status"] = TASK_PENDING
+        self.runtime.traceability.reset_test_pass_statuses_for_requirement(node_id)
+        self._set_node_state(queue_state["node_states"], node_id, NODE_DESIGNED)
+        sessions.merge_node_session(
+            node_id,
+            {
+                "phase_status": {"implement": "pending"},
+                "resume_context": {},
+                "result_state": "",
+                # The workspace now contains the winning sibling's files; the
+                # DESIGN baseline states are stale for this pass, so
+                # IMPLEMENT must re-baseline from scratch (same as a manual
+                # implement retry).
+                "design_baseline": {},
+                "recent_failure_summary": "",
+                "merge_conflict_context": {"paths": list(conflict_paths), "phase": "implement"},
+                "merge_conflict_retry_used": True,
+            },
+        )
+        context_pipeline.cache.invalidate_db_layers(node_id)
+        self._save_processing_queue(queue_state)
+        await self._log(
+            "Compiler",
+            "Merge conflict on: "
+            + ", ".join(conflict_paths[:8])
+            + f". Re-queued {node_id} IMPLEMENT once; the retry starts from the merged integration "
             "state and must avoid the sibling-owned paths.",
             "warning",
             node_id,
@@ -1979,6 +2305,12 @@ class ARCWorkflowManager:
                 # implementation; the DESIGN baseline states are stale for
                 # this pass, so IMPLEMENT must re-baseline from scratch.
                 "design_baseline": {},
+                # A manual retry is a fresh IMPLEMENT pass: restore the
+                # one-shot conflict retry budget and drop stale conflict
+                # paths so the prompt is not misdirected (same contract as
+                # the DESIGN-side reset; None replaces the dict wholesale).
+                "merge_conflict_context": None,
+                "merge_conflict_retry_used": False,
             },
         )
         context_pipeline.cache.invalidate_db_layers(node_id)

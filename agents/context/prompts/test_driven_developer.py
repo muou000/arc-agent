@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from agents.context.prompts.common import app_runtime_contract, code_quality_policy, compiler_background, code_task_exploration_policy, reasoning_reflection_policy, requirement_data_policy, section, whole_app_policy, workspace_tool_policy
 
@@ -31,6 +32,7 @@ def get_system_prompt() -> str:
                     "When the requirement or tests involve login, registration, logout, session, authenticated state, current user, account state, or auth-sensitive navigation, use the auth-session-consistency skill and implement the global auth/session path rather than a local-only state patch.",
                     "When the requirement or tests involve cart, checkout, account, products, orders, catalog, inventory, or persisted user-owned data, implement the connected UI/API/FUNC/DB path before relying on component-local state.",
                     "When the requirement or GIVEN steps require pre-existing records, implement those records in the normal database, migration, seed, bootstrap, or persistent-runtime path before repairing selectors or weakening tests. Preserve their ownership, visibility, permissions, status, and relationships.",
+                    "If you create a temporary diagnostic test file to localize a failure (e.g. a render probe like `diag.test.tsx`), delete it with the `delete` tool once it has served its purpose: files you wrote this session and left in the test tree would otherwise ship with the delivery commit. Diagnostics are not allowed to linger; the checkpoint keeps only the declared test manifest and product files.",
                 ],
             ),
             section(
@@ -90,6 +92,7 @@ def get_user_prompt(
     test_type: str,
     node_tests: list[dict],
     previous_failure_summary: str = "",
+    merge_conflict: dict[str, Any] | None = None,
 ) -> str:
     ordered_layers: list[dict[str, object]] = []
     for layer in ("Unit", "Integration", "E2E"):
@@ -114,6 +117,20 @@ def get_user_prompt(
     ])
     if previous_failure_summary.strip():
         sections.append(f"### Latest Failure Evidence\n{previous_failure_summary.strip()}")
+    conflict_paths = [str(path) for path in (merge_conflict or {}).get("paths", []) if str(path).strip()]
+    if conflict_paths:
+        sections.append(
+            section(
+                "Merge Conflict Retry",
+                [
+                    "This IMPLEMENT pass is a one-shot retry after the previous pass conflicted with a parallel sibling requirement node during merge.",
+                    f"The sibling now owns these file paths (they are already merged into the workspace you see): {', '.join(conflict_paths)}.",
+                    "Do not create, rewrite, or reorganize those files. The sibling's landed behavior there is the baseline this node must work with; read it before implementing.",
+                    "Place this node's owned behavior in node-owned file paths - new cohesive modules named after this requirement's own domain - and wire them from the shared surfaces with small additive edits.",
+                    "If the requirement genuinely needs the sibling-owned surface to change, extend it additively (an import, a registration line at the established mount point) instead of rewriting it, and reconcile any behavior gap inside this node's own modules.",
+                ],
+            )
+        )
     sections.append(
         section(
             "Task",
