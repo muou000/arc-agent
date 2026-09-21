@@ -6,7 +6,7 @@ import asyncio
 
 from app_type_handler.android import AndroidAppType
 from app_type_handler.cli import CliAppType
-from app_type_handler.web import WebAppType, _build_web_test_execution
+from app_type_handler.web import WebAppType, _build_web_group_execution, _build_web_test_execution
 
 
 def _handler(handler_type):
@@ -22,14 +22,27 @@ def test_web_rejects_traversal_and_shell_syntax() -> None:
 
 
 def test_web_execution_builder_rejects_an_unsafe_target() -> None:
-    unsafe_path = "backend/test-e2e/home.js & whoami &.js"
+    unsafe_path = "frontend/tests/home.test.ts & whoami &.test.ts"
 
     try:
-        _build_web_test_execution("e2e", unsafe_path, "workspace")
+        _build_web_test_execution("unit", unsafe_path, "workspace")
     except ValueError as exc:
         assert "test path" in str(exc).lower()
     else:
         raise AssertionError("unsafe web test path was accepted by the execution builder")
+
+
+def test_web_group_builder_rejects_an_unsafe_e2e_target() -> None:
+    """E2E targets enter through the group builder; it must reject them too."""
+
+    unsafe_path = "backend/test-e2e/home.js & whoami &.js"
+
+    try:
+        _build_web_group_execution("e2e", [unsafe_path], "workspace")
+    except ValueError as exc:
+        assert "test path" in str(exc).lower()
+    else:
+        raise AssertionError("unsafe e2e target was accepted by the group execution builder")
 
 
 def test_cli_rejects_traversal() -> None:
