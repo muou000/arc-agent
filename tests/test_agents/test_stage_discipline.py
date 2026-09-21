@@ -534,6 +534,85 @@ def test_read_block_after_write_warns_against_rewrite_verification() -> None:
 
 
 # ---------------------------------------------------------------------------
+# implementation stage: budgeted delete of session-created test files (#89)
+# ---------------------------------------------------------------------------
+
+
+def test_implementation_delete_of_session_created_test_asset_is_allowed() -> None:
+    """Issue #89 exact sequence: a TDD agent writes render-probe diagnostics
+    (``diag.test.tsx``) to localize a failure and must be able to clean them
+    up — the blanket delete ban shipped them into the delivery commit via the
+    ``git add -A`` checkpoint."""
+
+    middleware = make("implementation")
+    path = "/workspace/frontend/tests/diag.test.tsx"
+
+    written = run(middleware, make_request("write_file", {"file_path": path, "content": "probe\n"}, call_id="c1"))
+    assert written.content == "ok"
+
+    deleted = run(middleware, make_request("delete", {"file_path": path}, call_id="c2"))
+    assert not isinstance(deleted, ToolMessage) or deleted.status != "error"
+
+
+def test_implementation_delete_still_blocked_for_files_not_written_this_session() -> None:
+    """The release is ownership-scoped: a registered manifest test the node
+    must keep satisfying, a product file, and a test path never written here
+    all stay blocked — IMPLEMENT may only remove what it created itself."""
+
+    middleware = make("implementation")
+    # A manifest test that existed before this session: never written here,
+    # so the delete is refused even though it is a test asset.
+    registered = run(
+        middleware,
+        make_request("delete", {"file_path": "/workspace/frontend/tests/authApiClient.test.ts"}, call_id="c1"),
+    )
+    assert isinstance(registered, ToolMessage) and registered.status == "error"
+    assert "disabled in ARC's staged file workflow" in registered.content
+
+    product = run(middleware, make_request("delete", {"file_path": "/workspace/frontend/src/App.jsx"}, call_id="c2"))
+    assert isinstance(product, ToolMessage) and product.status == "error"
+
+    # A written *product* file is still not deletable: only test assets the
+    # session created are on the channel.
+    written_product = "/workspace/frontend/src/newComponent.jsx"
+    assert run(middleware, make_request("write_file", {"file_path": written_product, "content": "x\n"}, call_id="c3")).content == "ok"
+    blocked = run(middleware, make_request("delete", {"file_path": written_product}, call_id="c4"))
+    assert isinstance(blocked, ToolMessage) and blocked.status == "error"
+    assert "disabled in ARC's staged file workflow" in blocked.content
+
+
+def test_implementation_delete_rewrite_budget_blocks_third_cycle() -> None:
+    """The same two-cycle budget as test_generation caps the channel: an
+    agent that keeps delete-rewriting its probe file gets refused on the
+    third delete and the last written version stands."""
+
+    middleware = make("implementation")
+    path = "/workspace/frontend/tests/diag.test.tsx"
+    for cycle in range(2):
+        assert run(middleware, make_request("write_file", {"file_path": path, "content": f"v{cycle}\n"}, call_id=f"w{cycle}")).content == "ok"
+        deleted = run(middleware, make_request("delete", {"file_path": path}, call_id=f"d{cycle}"))
+        assert not isinstance(deleted, ToolMessage) or deleted.status != "error"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "final\n"}, call_id="w-final")).content == "ok"
+
+    blocked = run(middleware, make_request("delete", {"file_path": path}, call_id="d-3rd"))
+    assert blocked.status == "error"
+    assert "Rewrite budget blocked" in blocked.content
+
+
+def test_implementation_delete_then_rewrite_releases_write_lock() -> None:
+    """A successful delete releases the write lock (same release semantics
+    as test_generation), so the diagnostic file can be recreated if needed."""
+
+    middleware = make("implementation")
+    path = "/workspace/frontend/tests/RegisterPage.diag.test.tsx"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1")).content == "ok"
+    deleted = run(middleware, make_request("delete", {"file_path": path}, call_id="c2"))
+    assert not isinstance(deleted, ToolMessage) or deleted.status != "error"
+    rewritten = run(middleware, make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c3"))
+    assert rewritten.content == "ok"
+
+
+# ---------------------------------------------------------------------------
 # implementation stage: write lock and unlock semantics
 # ---------------------------------------------------------------------------
 

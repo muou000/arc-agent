@@ -44,13 +44,14 @@ _MAX_READ_LIMIT = 200
 # A small per-path budget serves the legitimate case and still caps the loop.
 _MAX_REPEATED_READS_PER_PATH = 2
 # Successful delete-then-rewrite cycles allowed per test-file path in one
-# test_generation pass. The delete release exists so a legitimate fix does not
-# wait for an accidental failure to unlock; the 2026-09-19 arc-output3 run
-# showed its unbounded edge: a TestGenerator that *believed* its writes had
-# been truncated (they had not — no truncation error ever occurred) re-ran the
-# delete+write cycle 5-7 times per file, ~10M input tokens, until the step
-# budget crashed the whole DESIGN task. Counting cycles on the delete keeps
-# the last written version on disk when the cap trips.
+# test_generation or implementation pass. The delete release exists so a
+# legitimate fix does not wait for an accidental failure to unlock; the
+# 2026-09-19 arc-output3 run showed its unbounded edge: a TestGenerator that
+# *believed* its writes had been truncated (they had not — no truncation error
+# ever occurred) re-ran the delete+write cycle 5-7 times per file, ~10M input
+# tokens, until the step budget crashed the whole DESIGN task. Counting
+# cycles on the delete keeps the last written version on disk when the cap
+# trips.
 _MAX_DELETE_REWRITES_PER_PATH = 2
 _DESIGN_MUTATION_PATTERNS = (
     re.compile(r"\b(?:INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.IGNORECASE),
@@ -195,6 +196,13 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 manifest_block = self._validate_test_manifest_path(args, operation="delete")
                 if manifest_block:
                     return manifest_block
+                return self._validate_delete_rewrite_budget(args)
+            if self._stage == "implementation" and self._is_session_created_test_asset(args):
+                # IMPLEMENT may clean up diagnostic test files it created
+                # itself this pass (render probes, framework-behavior
+                # scratch files). Registered manifest tests and product
+                # files are not on this channel: they were not written
+                # here, so the path-ownership check below rejects them.
                 return self._validate_delete_rewrite_budget(args)
             return f"`{name}` is disabled in ARC's staged file workflow."
         if self._stage == "test_generation" and name in _VALIDATION_TOOLS:
@@ -360,6 +368,23 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             "coverage on a second path is not permitted; rework the content of a "
             "declared file instead."
         )
+
+    def _is_session_created_test_asset(self, args: dict[str, Any]) -> bool:
+        """Whether IMPLEMENT's delete target is a test file this pass wrote.
+
+        The simple-ticketing arc-output1 run showed the gap a blanket delete
+        ban leaves: a TDD agent that wrote render-probe diagnostics under
+        ``frontend/tests/`` could not clean them up, and the ``git add -A``
+        checkpoint shipped them into the delivery commit (``diag.test.tsx``,
+        ``RegisterPage.diag.test.tsx``). Restricting the release to paths in
+        ``_written_paths`` keeps every pre-existing surface off the channel:
+        a registered manifest test the node must keep satisfying, sibling
+        tests merged from another branch, and product files all fail this
+        check, so the only deletable file is one this session created.
+        """
+
+        path = _discipline_path(args)
+        return bool(path) and path in self._written_paths and _is_test_asset(path)
 
     def _validate_delete_rewrite_budget(self, args: dict[str, Any]) -> str | None:
         """Cap the delete-then-rewrite escape per test-file path.
