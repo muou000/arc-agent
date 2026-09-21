@@ -30,7 +30,6 @@ from core.merge_arbitration import (
     arbitration_enabled,
     collect_contract_cards,
     merge_arbitration_budget_key,
-    read_conflict_stages,
     read_workspace_file,
 )
 from core.path_safety import validate_clean_target
@@ -43,6 +42,8 @@ from core.worktree import (
     NodeWorktreeManager,
     WorktreeError,
     WorktreeHandle,
+    WorktreeOutcome,
+    WorktreeTaskResult,
 )
 
 
@@ -906,7 +907,9 @@ class ARCWorkflowManager:
                         if await self._requeue_design_after_merge_conflict(
                             ctx, queue_state, node_id, merge_conflict
                         ):
-                            await self._close_task_workspace(ctx)
+                            # The requeue settled the worktree through the
+                            # manager (reset + reuse-or-remove) and released
+                            # the task's claims and port slot.
                             return
                     elif (
                         merge_conflict
@@ -916,15 +919,13 @@ class ARCWorkflowManager:
                         if await self._requeue_implement_after_merge_conflict(
                             ctx, queue_state, node_id, merge_conflict
                         ):
-                            await self._close_task_workspace(ctx)
                             return
                     # Requeue declined (this phase's budget already spent, no
                     # requeue path for the phase, or the requeue itself
                     # failed): fall through to the failure branch. The method
-                    # tail still closes ctx with preserve=True there, so a
-                    # declined requeue never leaks the worktree - it is
-                    # preserved for --retry exactly like any other failed
-                    # merge.
+                    # tail still settles ctx as FAILED there, so a declined
+                    # requeue never leaks the worktree - it is preserved for
+                    # --retry exactly like any other failed merge.
                     task_ok = False
 
         if task_ok:
@@ -977,7 +978,9 @@ class ARCWorkflowManager:
             await self._log("Compiler", f"{phase} failed for node {node_id}.", "error", node_id)
 
         if ctx is not None:
-            await self._close_task_workspace(ctx, preserve=not merged)
+            await self._settle_task_workspace(
+                ctx, WorktreeTaskResult.MERGED if merged else WorktreeTaskResult.FAILED
+            )
 
     async def _open_task_workspace(self, task: dict[str, Any], queue_state: dict[str, Any]) -> _TaskWorkspace:
         """Create the task's isolated worktree, port slot and phase runner.
@@ -1253,10 +1256,7 @@ class ARCWorkflowManager:
         )
         if not result.accepted:
             return False
-        for path in result.applied:
-            self._worktree_manager._git(
-                ["add", "--", path], cwd=self.workspace_path, check=False
-            )
+        self._worktree_manager.stage_paths(result.applied)
         remaining = detect_contract_drift(
             self.runtime.traceability.list_interfaces(req_id=node_id),
             workspace_root=self.workspace_path,
@@ -1265,20 +1265,16 @@ class ARCWorkflowManager:
             return False
         # An accepted arbitration whose rewrite is byte-identical to what is
         # already on disk (the anchors were somehow already honored) leaves
-        # nothing to commit: that is a successful repair, not a failure, so a
-        # "nothing to commit" outcome counts as repaired.
-        commit = self._worktree_manager._git(
-            [
-                "commit",
-                "-m",
-                f"contract drift arbitration: restore registered anchors of {node_id}",
-            ],
-            cwd=self.workspace_path,
-            check=False,
-        )
-        if commit.returncode == 0:
-            return True
-        return "nothing to commit" in (commit.stdout + commit.stderr).lower()
+        # nothing to commit: that is a successful repair, not a failure, so
+        # "nothing to commit" (commit_integration returning False) counts as
+        # repaired. A real commit failure is not.
+        try:
+            self._worktree_manager.commit_integration(
+                f"contract drift arbitration: restore registered anchors of {node_id}"
+            )
+        except WorktreeError:
+            return False
+        return True
 
     async def _emit_contract_drift_event(self, payload: dict[str, Any]) -> None:
         """Persist one contract-drift audit record (best effort)."""
@@ -1326,11 +1322,7 @@ class ARCWorkflowManager:
         ) -> ArbitrationInput | None:
             if sessions.load_node_session(node_id).get(merge_arbitration_budget_key()):
                 return None
-            git = self._worktree_manager._git
-            stages = read_conflict_stages(
-                lambda args: git(args, cwd=self.workspace_path, check=False),
-                conflict_paths,
-            )
+            stages = self._worktree_manager.read_conflict_stages(conflict_paths)
             if trigger == TRIGGER_HEALTH_GATE:
                 # The mechanical resolution already staged the files, so the
                 # merge index holds no conflict stages: the arbiter sees the
@@ -1371,10 +1363,7 @@ class ARCWorkflowManager:
             )
             if not result.accepted:
                 return result.detail
-            for path in result.applied:
-                self._worktree_manager._git(
-                    ["add", "--", path], cwd=self.workspace_path, check=False
-                )
+            self._worktree_manager.stage_paths(result.applied)
             return None
 
         def on_reverified(gate_result: str | None) -> None:
@@ -1482,16 +1471,19 @@ class ARCWorkflowManager:
         """Re-queue a node's DESIGN once after a merge conflict.
 
         The conflicting files stay owned by the winning sibling (its branch
-        is already merged), so the node's branch is reset to the current
-        integration HEAD - the retry sees the sibling's files on disk and
-        designs around them. The conflicting paths are stored in the node
-        session for the DESIGN prompt; a second conflict (or an IMPLEMENT
-        conflict) fails the node as before.
+        is already merged), so the node's retry must run from the current
+        integration state - which already contains the winning sibling's
+        files. The manager owns the retry reset: ``settle`` with
+        ``RESET_FOR_RETRY`` resets the node's branch to the integration HEAD,
+        un-quarantines the worktree directory, and reuses or removes the
+        directory per its reusability. The conflicting paths are stored in
+        the node session for the DESIGN prompt; a second conflict (or an
+        IMPLEMENT conflict) fails the node as before.
 
         Every decline path leaves the task workspace exactly as a regular
         conflict failure left it: quarantined, branch intact, preserved for
-        ``--retry``. The queue is validated *before* the branch reset so a
-        decline never discards the node's conflicted commits.
+        ``--retry``. The queue is validated *before* the reset so a decline
+        never discards the node's conflicted commits.
         """
 
         design_task = None
@@ -1512,12 +1504,14 @@ class ARCWorkflowManager:
             )
             return False
 
-        try:
-            await asyncio.to_thread(self._worktree_manager.reset_branch_to_integration, ctx.handle)
-        except WorktreeError as exc:
+        # The manager's reset-and-settle runs before the queue is mutated: a
+        # failed reset leaves the worktree untouched, the requeue declines,
+        # and the node fails with its conflicted commits intact.
+        settled = await self._settle_task_workspace(ctx, WorktreeTaskResult.RESET_FOR_RETRY)
+        if settled is None:
             await self._log(
                 "Compiler",
-                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead: {exc}",
+                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead.",
                 "error",
                 node_id,
             )
@@ -1589,17 +1583,19 @@ class ARCWorkflowManager:
         The DESIGN-side counterpart of
         ``_requeue_design_after_merge_conflict``: the conflicting files stay
         owned by the winning sibling (its branch is already merged), so the
-        node's branch is reset to the current integration HEAD - the retry
-        sees the sibling's files on disk and implements around them. DESIGN
-        artifacts are NOT cleared: the design already merged cleanly and is
-        part of the integration HEAD the retry starts from. The conflicting
-        paths are stored in the node session for the TDD prompt; a second
-        conflict fails the node as before.
+        node's retry must run from the current integration state - the
+        manager's ``settle`` with ``RESET_FOR_RETRY`` resets the node's
+        branch to the integration HEAD, un-quarantines the worktree
+        directory, and reuses or removes the directory per its reusability.
+        DESIGN artifacts are NOT cleared: the design already merged cleanly
+        and is part of the integration HEAD the retry starts from. The
+        conflicting paths are stored in the node session for the TDD prompt;
+        a second conflict fails the node as before.
 
         Every decline path leaves the task workspace exactly as a regular
         conflict failure left it: quarantined, branch intact, preserved for
-        ``--retry``. The queue is validated *before* the branch reset so a
-        decline never discards the node's conflicted commits.
+        ``--retry``. The queue is validated *before* the reset so a decline
+        never discards the node's conflicted commits.
         """
 
         design_task = None
@@ -1632,12 +1628,14 @@ class ARCWorkflowManager:
             )
             return False
 
-        try:
-            await asyncio.to_thread(self._worktree_manager.reset_branch_to_integration, ctx.handle)
-        except WorktreeError as exc:
+        # The manager's reset-and-settle runs before the queue is mutated: a
+        # failed reset leaves the worktree untouched, the requeue declines,
+        # and the node fails with its conflicted commits intact.
+        settled = await self._settle_task_workspace(ctx, WorktreeTaskResult.RESET_FOR_RETRY)
+        if settled is None:
             await self._log(
                 "Compiler",
-                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead: {exc}",
+                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead.",
                 "error",
                 node_id,
             )
@@ -1697,15 +1695,22 @@ class ARCWorkflowManager:
 
         return verify
 
-    async def _close_task_workspace(self, ctx: _TaskWorkspace, *, preserve: bool = False) -> None:
+    async def _settle_task_workspace(
+        self, ctx: _TaskWorkspace, result: WorktreeTaskResult
+    ) -> WorktreeOutcome | None:
+        """Settle the task's worktree through the manager's lifecycle decision.
+
+        The scheduler reports the task's result (``WorktreeTaskResult``); the
+        manager returns the one outcome (preserve / reuse / delete). Returns
+        ``None`` when the manager could not settle the worktree (logged as a
+        warning). Scheduler-owned resources - the node's file claims and the
+        port slot - are always released here; the worktree itself is entirely
+        the manager's.
+        """
+
         try:
-            # Reusable (subtree) worktrees always survive their task: the next
-            # task of the subtree reuses the directory, and the end-of-drain
-            # cleanup removes it once the run no longer needs it.
-            await asyncio.to_thread(
-                self._worktree_manager.discard,
-                ctx.handle,
-                preserve=preserve or ctx.handle.reusable,
+            outcome = await asyncio.to_thread(
+                self._worktree_manager.settle, ctx.handle, result=result
             )
         except Exception as exc:
             await self._log(
@@ -1714,12 +1719,14 @@ class ARCWorkflowManager:
                 "warning",
                 ctx.node_id,
             )
+            return None
         finally:
             # Release the node's new-file claims: after a successful merge the
             # files are tracked in git (claims are moot), and after a terminal
             # failure the paths must be free for other nodes.
             get_file_claim_registry(self.workspace_path).release_node(ctx.node_id)
             self._release_port_slot(ctx.slot)
+        return outcome
 
     def _acquire_port_slot(self, node_id: str) -> int:
         for slot in range(self._port_slot_count):
