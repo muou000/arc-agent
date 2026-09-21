@@ -31,6 +31,7 @@ def get_system_prompt() -> str:
                     "When the requirement or tests involve login, registration, logout, session, authenticated state, current user, account state, or auth-sensitive navigation, use the auth-session-consistency skill and implement the global auth/session path rather than a local-only state patch.",
                     "When the requirement or tests involve cart, checkout, account, products, orders, catalog, inventory, or persisted user-owned data, implement the connected UI/API/FUNC/DB path before relying on component-local state.",
                     "When the requirement or GIVEN steps require pre-existing records, implement those records in the normal database, migration, seed, bootstrap, or persistent-runtime path before repairing selectors or weakening tests. Preserve their ownership, visibility, permissions, status, and relationships.",
+                    "If you create a temporary diagnostic test file to localize a failure (e.g. a render probe like `diag.test.tsx`), delete it with the `delete` tool once it has served its purpose: files you wrote this session and left in the test tree would otherwise ship with the delivery commit. Diagnostics are not allowed to linger; the checkpoint keeps only the declared test manifest and product files.",
                 ],
             ),
             section(
