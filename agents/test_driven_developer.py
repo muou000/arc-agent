@@ -9,6 +9,7 @@ from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
 from agents.runtime.capabilities import normalize_manifest_path
+from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_install_dependencies_tool
@@ -24,18 +25,6 @@ from core.test_types import canonical_test_type
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
-
-
-def _is_trackable_failure_fingerprint(fingerprint: str) -> bool:
-    """Whether a failed result's fingerprint carries a real error key line.
-
-    ``failure_fingerprint`` pairs the exit code with the first error-bearing
-    line; layer/budget gate rejections render as ``<exit>|`` with nothing
-    after the pipe. Only error-bearing failures may extend the stall-hint
-    chain — a gate rejection is not a test failure the agent "repaired".
-    """
-
-    return bool(fingerprint.partition("|")[2].strip())
 
 
 class TestDrivenDeveloper:
@@ -71,12 +60,11 @@ class TestDrivenDeveloper:
         self._test_budget_exhausted = False
         self._current_test_files: list[str] = []
         self._current_test_type = ""
-        # Per-run test-edit stall chain: last failure's fingerprint per test
-        # type plus the write-event position at that failure, so the next
-        # same-fingerprint failure can ask "what was edited in between?".
-        self._stage_build: Any = None
-        self._last_failure_fingerprints: dict[str, str] = {}
-        self._write_event_marks: dict[str, int] = {}
+        # Per-run test-edit stall chain: per test layer, the last failure's
+        # fingerprint plus the write-event position at that failure, so the
+        # next same-fingerprint failure can ask "what was edited in between?".
+        self._stage_build: StageAgentBuild | None = None
+        self._stall_chains: dict[str, tuple[str, int]] = {}
 
     async def run(
         self,
@@ -99,8 +87,7 @@ class TestDrivenDeveloper:
         self._last_modified_files = []
         self._test_budget_exhausted = False
         self._stage_build = None
-        self._last_failure_fingerprints = {}
-        self._write_event_marks = {}
+        self._stall_chains = {}
         self._current_test_files = [str(path or "").strip() for path in test_files if str(path or "").strip()]
         self._current_test_type = test_type
         current_node_tests = [item for item in (node_tests or []) if isinstance(item, dict)]
@@ -205,19 +192,21 @@ class TestDrivenDeveloper:
                 if run_tests_executor is None
                 else await run_tests_executor(requested_type, requested_files or None)
             )
-            # The stall hint keys on the PREVIOUS failure's chain state, so it
-            # is read before _note_run_outcome advances it. core.phases asks
-            # for the same hint mid-executor (its in-session digest is
-            # composed there, before this closure sees the result) and both
-            # surfaces render the identical text for one failure. The chain
-            # key is the canonical layer name: the executor canonicalizes the
-            # requested type, and the two lookups must land on one key.
+            # One call computes the stall hint from the PRE-advance chain and
+            # then advances it, so the ordering contract ("hint first, then
+            # chain update") cannot drift apart. The chain key is the
+            # canonical layer name, which always matches the key core.phases
+            # uses for its in-session digest lookup: bare run_tests calls
+            # resolve to _current_test_type (the layer this run() serves),
+            # aliases never carry a runnable type through this closure (the
+            # file-resolution gate rejects them first), and after an in-session
+            # layer advance the stale layer name is rejected by the executor
+            # before any run - so only agreed-upon keys ever enter the chain.
             chain_type = canonical_test_type(requested_type) or requested_type
-            stall_hint = self.test_edit_stall_hint(chain_type, result.fingerprint)
+            stall_hint = self._advance_stall_chain(chain_type, result)
             self._last_run_tests_result = result.output
             self._last_run_tests_exit_code = result.exit_code
             self._record_failure_state(result, test_edit_hint=stall_hint)
-            self._note_run_outcome(chain_type, result)
             return result.output
 
         if self.app_handler is None:
@@ -327,21 +316,18 @@ class TestDrivenDeveloper:
         fingerprint for *test_type* and everything edited since that previous
         failure is a test file (manifest-declared or test-shaped). Read by
         ``core.phases`` while composing the in-session digest — at which point
-        the chain state below is still the previous failure's — and by the
-        ``run_tests`` closure for the cross-session digest, so one failure
-        renders the identical hint on both surfaces.
+        the chain state below is still the previous failure's — so one failure
+        renders the identical hint on the in-session and cross-session
+        surfaces.
         """
 
-        previous = self._last_failure_fingerprints.get(test_type, "")
-        if not previous or previous != fingerprint:
-            return ""
-        mark = self._write_event_marks.get(test_type)
-        if mark is None:
+        chain = self._stall_chains.get(test_type)
+        if not chain or chain[0] != fingerprint:
             return ""
         return build_test_edit_stall_hint(
             fingerprint=fingerprint,
-            previous_fingerprint=previous,
-            edited_paths=self._stage_write_events()[mark:],
+            previous_fingerprint=chain[0],
+            edited_paths=self._stage_write_events()[chain[1] :],
             manifest_test_files=self._current_test_files,
         )
 
@@ -349,24 +335,25 @@ class TestDrivenDeveloper:
         build = self._stage_build
         return build.write_events() if build is not None else []
 
-    def _note_run_outcome(self, test_type: str, result: TestRunResult) -> None:
-        """Advance the per-layer fingerprint/write chain after one run_tests call.
+    def _advance_stall_chain(self, test_type: str, result: TestRunResult) -> str:
+        """Compute the stall hint for this result, then advance the chain.
 
+        The hint must reflect the chain state BEFORE this failure is recorded
+        (it compares against the previous failure), so both happen here in
+        that order and the ``run_tests`` closure cannot get them reversed.
         Only real failures extend the chain: layer/budget gate rejections
-        render as ``<exit>|`` with no error key line, and letting them in
-        would break (or fabricate) the consecutive-repeat condition the stall
-        hint keys on. A passing run clears the chain — the next
-        same-fingerprint failure starts a fresh one.
+        carry no error key line (``has_error_fingerprint``) and would
+        otherwise break - or fabricate - the consecutive-repeat condition. A
+        passing run clears the chain: the next same-fingerprint failure
+        starts a fresh one.
         """
 
+        stall_hint = self.test_edit_stall_hint(test_type, result.fingerprint)
         if result.passed_run:
-            self._last_failure_fingerprints.pop(test_type, None)
-            self._write_event_marks.pop(test_type, None)
-            return
-        if not _is_trackable_failure_fingerprint(result.fingerprint):
-            return
-        self._last_failure_fingerprints[test_type] = result.fingerprint
-        self._write_event_marks[test_type] = len(self._stage_write_events())
+            self._stall_chains.pop(test_type, None)
+        elif result.has_error_fingerprint:
+            self._stall_chains[test_type] = (result.fingerprint, len(self._stage_write_events()))
+        return stall_hint
 
     @staticmethod
     def _load_merge_conflict_context(node_id: str) -> dict[str, Any] | None:
