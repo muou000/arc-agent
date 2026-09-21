@@ -1682,7 +1682,7 @@ def test_test_generator_salvages_step_budget_when_all_declared_files_written(
     ``test_agent_step_budget.py``.
     """
 
-    import agents.test_generator as test_generator_module
+    import agents.runtime.stage_session as stage_session_module
     from langgraph.errors import GraphRecursionError
 
     node_id = "REQ-STEP-BUDGET-1"
@@ -1722,13 +1722,13 @@ def test_test_generator_salvages_step_budget_when_all_declared_files_written(
         ]
     )
 
-    real_ainvoke = test_generator_module.ainvoke_stage_agent
+    real_ainvoke = stage_session_module.ainvoke_stage_agent
 
     async def crash_after_full_session(agent, **kwargs):
         await real_ainvoke(agent, **kwargs)
         raise GraphRecursionError("Recursion limit of 300 reached without hitting a stop condition.")
 
-    monkeypatch.setattr(test_generator_module, "ainvoke_stage_agent", crash_after_full_session)
+    monkeypatch.setattr(stage_session_module, "ainvoke_stage_agent", crash_after_full_session)
 
     logs: list[str] = []
 
@@ -1772,7 +1772,7 @@ def test_step_budget_salvage_declines_when_a_declared_file_is_missing(tmp_projec
             ),
         }
     )
-    agent = _stub_agent_with_written_paths(["/workspace/backend/tests/unit/a.test.js"])
+    built = _stub_build_with_written_paths(["/workspace/backend/tests/unit/a.test.js"])
 
     import asyncio as _asyncio
     from langgraph.errors import GraphRecursionError
@@ -1781,7 +1781,7 @@ def test_step_budget_salvage_declines_when_a_declared_file_is_missing(tmp_projec
         generator._salvage_step_budget(
             node_id="REQ-SALVAGE-1",
             manifest_lock=manifest_lock,
-            agent=agent,
+            built=built,
             exc=GraphRecursionError("Recursion limit of 300 reached"),
         )
     )
@@ -1790,7 +1790,7 @@ def test_step_budget_salvage_declines_when_a_declared_file_is_missing(tmp_projec
 
 def test_step_budget_salvage_declines_without_a_locked_manifest(tmp_project_dir: Path) -> None:
     generator = _salvage_probe_generator(tmp_project_dir)
-    agent = _stub_agent_with_written_paths(["/workspace/backend/tests/unit/a.test.js"])
+    built = _stub_build_with_written_paths(["/workspace/backend/tests/unit/a.test.js"])
 
     import asyncio as _asyncio
     from langgraph.errors import GraphRecursionError
@@ -1799,7 +1799,7 @@ def test_step_budget_salvage_declines_without_a_locked_manifest(tmp_project_dir:
         generator._salvage_step_budget(
             node_id="REQ-SALVAGE-1",
             manifest_lock=TestManifestLock(),
-            agent=agent,
+            built=built,
             exc=GraphRecursionError("Recursion limit of 300 reached"),
         )
     )
@@ -1823,7 +1823,7 @@ def test_step_budget_salvage_declines_without_materialized_paths(tmp_project_dir
         generator._salvage_step_budget(
             node_id="REQ-SALVAGE-1",
             manifest_lock=manifest_lock,
-            agent=_stub_agent_with_written_paths([]),
+            built=_stub_build_with_written_paths([]),
             exc=GraphRecursionError("Recursion limit of 300 reached"),
         )
     )
@@ -1856,7 +1856,7 @@ def test_step_budget_salvage_rows_flow_through_the_normal_reconciliation(tmp_pro
         generator._salvage_step_budget(
             node_id=node_id,
             manifest_lock=manifest_lock,
-            agent=_stub_agent_with_written_paths(written),
+            built=_stub_build_with_written_paths(written),
             exc=GraphRecursionError("Recursion limit of 300 reached"),
         )
     )
@@ -1869,7 +1869,7 @@ def test_step_budget_salvage_rows_flow_through_the_normal_reconciliation(tmp_pro
             tests=tests,
             raw_payload=payload,
             manifest_lock=manifest_lock,
-            agent=_stub_agent_with_written_paths(written),
+            built=_stub_build_with_written_paths(written),
         )
     )
     assert reconciled is not None and len(reconciled) == 1
@@ -1888,11 +1888,14 @@ def _salvage_probe_generator(tmp_project_dir: Path) -> TestGenerator:
     )
 
 
-def _stub_agent_with_written_paths(paths: list[str]):
+def _stub_build_with_written_paths(paths: list[str]):
     from types import SimpleNamespace
 
-    return SimpleNamespace(
-        arc_stage_discipline=SimpleNamespace(materialized_paths=lambda: list(paths))
+    from agents.runtime.factory import StageAgentBuild
+
+    return StageAgentBuild(
+        agent=SimpleNamespace(),
+        stage_discipline=SimpleNamespace(materialized_paths=lambda: list(paths)),
     )
 
 

@@ -64,14 +64,14 @@ def run_twice(workspace: Path, model: FauxChatModel, *, response_format: object 
 
     async def scenario() -> tuple[dict, dict]:
         first = await ainvoke_stage_agent(
-            build_probe(workspace, model, response_format=response_format),
+            build_probe(workspace, model, response_format=response_format).agent,
             message="first invocation",
             context=context,
             thread_id="REQ-REUSE-1:probe",
             label="probe",
         )
         second = await ainvoke_stage_agent(
-            build_probe(workspace, model, response_format=response_format),
+            build_probe(workspace, model, response_format=response_format).agent,
             message="second invocation",
             context=context,
             thread_id="REQ-REUSE-1:probe",

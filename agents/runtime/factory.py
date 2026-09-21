@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -45,6 +45,41 @@ _UNSET: Any = object()
 
 # Provider keys whose ARC harness profile has already been registered.
 _REGISTERED_HARNESS_PROFILES: set[str] = set()
+
+StageKind = Literal["interface_design", "test_generation", "implementation"]
+
+
+@dataclass(frozen=True)
+class StageAgentBuild:
+    """Declared result of ``build_stage_agent``.
+
+    The stage discipline used to ride on the built agent as an undeclared
+    ``arc_stage_discipline`` attribute that every stage adapter recovered with
+    ``getattr``; it is now a declared field of this result, and the
+    materialized-paths query it carries is a method here — the "files this
+    session actually wrote" ground truth that repair and reconciliation flows
+    key on.
+    """
+
+    agent: Any
+    stage_discipline: StageDisciplineMiddleware | None
+
+    def materialized_paths(self) -> list[str]:
+        """Paths the discipline observed this session materialize.
+
+        Empty when the build carries no discipline (e.g. a stub in tests).
+        Never raises: every caller treats the result as evidence for repair
+        and reconciliation decisions, and a discipline failure must not sink
+        the pass.
+        """
+
+        if self.stage_discipline is None:
+            return []
+        try:
+            return list(self.stage_discipline.materialized_paths())
+        except Exception:
+            return []
+
 
 class OpenAIGlobSchema(BaseModel):
     """OpenAI-compatible schema for the glob tool.
@@ -337,7 +372,7 @@ class DisableToolsMiddleware(AgentMiddleware[Any, Any, Any]):
 def build_stage_agent(
     *,
     name: str,
-    stage: Literal["interface_design", "test_generation", "implementation"],
+    stage: StageKind,
     model: str | object,
     system_prompt: str,
     response_format: object | None,
@@ -353,8 +388,11 @@ def build_stage_agent(
     pending_contract_registry: Any | None = None,
     app_type: str | None = None,
     max_design_writes: int | None = None,
-):
+) -> StageAgentBuild:
     """Create an agent instance with ARC's first-batch filesystem policy.
+
+    Returns the declared :class:`StageAgentBuild`: the invokable deep agent
+    plus the stage discipline wired into it.
 
     ``checkpointer`` defaults to the process-wide shared saver so that rebuilding
     an agent for the same ``thread_id`` resumes the previous conversation rather
@@ -463,10 +501,7 @@ def build_stage_agent(
         response_format=_resolve_response_format(response_format, model=model),
         checkpointer=resolved_checkpointer,
     )
-    # Surface run-local discipline state (e.g. materialized write paths) to
-    # the stage adapter that owns this agent.
-    agent.arc_stage_discipline = stage_discipline
-    return agent
+    return StageAgentBuild(agent=agent, stage_discipline=stage_discipline)
 
 
 def _apply_unambiguous_read_file_format() -> None:

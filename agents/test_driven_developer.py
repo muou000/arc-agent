@@ -3,16 +3,12 @@ from __future__ import annotations
 import inspect
 import json
 import os
-from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
-from agents.runtime.checkpointer import get_project_thread_namespace
-from agents.runtime.contracts import AgentRuntimeContext
-from agents.runtime.factory import build_stage_agent
-from agents.runtime.runners import ainvoke_stage_agent
+from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_install_dependencies_tool
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
@@ -51,7 +47,7 @@ class TestDrivenDeveloper:
         context_workspace_root: str | None = None,
     ) -> None:
         self.log_cb = log_cb
-        self.model = model or os.environ.get("MODEL", "openai:gpt-5.4")
+        self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
         self.workspace_root = workspace_root
         self.requirement_path = requirement_path or ""
         self.app_type = app_type
@@ -91,13 +87,19 @@ class TestDrivenDeveloper:
         self._current_test_files = [str(path or "").strip() for path in test_files if str(path or "").strip()]
         self._current_test_type = test_type
         current_node_tests = [item for item in (node_tests or []) if isinstance(item, dict)]
-        workspace_root = str(Path(
-            self.workspace_root
-            or context_pipeline.config.workspace_dir
-            or os.environ.get("ARC_WORKSPACE_ROOT")
-            or os.getcwd()
-        ).expanduser().resolve())
-        app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
+        session = StageSession(
+            agent_name=self.agent_name,
+            node_id=node_id,
+            phase="IMPLEMENT",
+            model=self.model,
+            log_cb=self.log_cb,
+            workspace_root=self.workspace_root,
+            requirement_path=self.requirement_path,
+            app_type=self.app_type,
+            context_workspace_root=self.context_workspace_root,
+            thread_suffix=self._current_test_type or "batch",
+            test_type=self._current_test_type,
+        )
 
         def normalize_requested_path(value: Any) -> str:
             path = str(value or "").strip().replace("\\", "/")
@@ -107,19 +109,11 @@ class TestDrivenDeveloper:
                 return ""
             return path.lstrip("./")
 
-        context_pipeline.configure(
-            workspace_dir=self.context_workspace_root or workspace_root,
-            app_type=app_type,
-        )
-        static_context, dynamic_context = context_pipeline.build_agent_context_split(
-            node_id=node_id,
-            agent_type=self.agent_name,
+        context_text = session.build_context(
             preloaded_source=preloaded_source,
             target_test_files=self._current_test_files,
-            map_workspace_dir=workspace_root,
         )
         interface_contract = context_pipeline.get_interface_contract_context(node_id)
-        context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
         required_skill_names = implementation_skills(
             interface_contract=interface_contract,
             previous_failure_summary=previous_failure_summary,
@@ -219,22 +213,15 @@ class TestDrivenDeveloper:
             )
 
         traceability_tools = build_traceability_tools(node_id=node_id, log_cb=self.log_cb)
-        agent = build_stage_agent(
+        built = session.build_agent(
             name="test_driven_developer",
             stage="implementation",
-            model=self.model,
             system_prompt="\n\n".join(
                 [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=None,
-            workspace_root=workspace_root,
-            writable_roots=[workspace_root],
-            skills=[SKILLS_SOURCE],
-            memory=[],
             tools=[run_tests, run_build, install_dependencies, *traceability_tools],
-            node_id=node_id,
-            claims_workspace_root=self.context_workspace_root or workspace_root,
-            app_type=app_type,
+            skills=[SKILLS_SOURCE],
         )
         message = get_user_prompt(
             node_id=node_id,
@@ -248,31 +235,15 @@ class TestDrivenDeveloper:
         )
         await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking TDD implementation.", node_id=node_id)
-        payload = await ainvoke_stage_agent(
-            agent,
-            message=message,
-            context=AgentRuntimeContext(
-                node_id=node_id,
-                phase="IMPLEMENT",
-                app_type=app_type,
-                workspace_root=workspace_root,
-                requirement_path=self.requirement_path,
-                test_type=self._current_test_type,
-            ),
-            thread_id=f"{get_project_thread_namespace()}:{node_id}:IMPLEMENT:TestDrivenDeveloper:{self._current_test_type or 'batch'}",
-            label=self.agent_name,
-            log_cb=self.log_cb,
-        )
+        payload = await session.invoke(built, message=message)
         final_text = self._payload_to_final_text(payload)
         # Capture the session's writes (discipline ground truth, virtual
         # /workspace/ paths) for the cross-session diff hint. Deleted-after-
         # write paths are excluded by the discipline itself.
-        discipline = getattr(agent, "arc_stage_discipline", None)
-        if discipline is not None:
-            self._last_modified_files = [
-                normalize_manifest_path(path)
-                for path in discipline.materialized_paths()
-            ]
+        self._last_modified_files = [
+            normalize_manifest_path(path)
+            for path in built.materialized_paths()
+        ]
         if self._test_budget_exhausted and stop_on_test_budget_exhausted:
             return "BUDGET_EXHAUSTED"
         if "IMPLEMENTED" in final_text.upper() and self._last_run_tests_exit_code != 0:

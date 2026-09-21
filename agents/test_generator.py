@@ -3,7 +3,6 @@ from __future__ import annotations
 import inspect
 import json
 import os
-from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field
@@ -13,10 +12,8 @@ from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_generator import get_system_prompt, get_user_prompt
 from agents.results import normalize_test_manifest_payload
-from agents.runtime.checkpointer import get_project_thread_namespace
-from agents.runtime.contracts import AgentRuntimeContext
-from agents.runtime.factory import build_stage_agent
-from agents.runtime.runners import ainvoke_stage_agent
+from agents.runtime.factory import StageAgentBuild
+from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.skills.selection import SKILLS_SOURCE, test_generation_skills
 from agents.tools.test_manifest import (
     DeclaredTestFile,
@@ -69,7 +66,7 @@ class TestGenerator:
         context_workspace_root: str | None = None,
     ) -> None:
         self.log_cb = log_cb
-        self.model = model or os.environ.get("MODEL", "openai:gpt-5.4")
+        self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
         self.workspace_root = workspace_root
         self.requirement_path = requirement_path or ""
         self.app_type = app_type
@@ -84,41 +81,30 @@ class TestGenerator:
         *,
         preloaded_source: str | None = None,
     ) -> tuple[list[dict[str, Any]] | None, str]:
-        workspace_root = str(Path(
-            self.workspace_root
-            or context_pipeline.config.workspace_dir
-            or os.environ.get("ARC_WORKSPACE_ROOT")
-            or os.getcwd()
-        ).expanduser().resolve())
-        app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
-        required_skill_names = test_generation_skills(requirement_data)
-        context_pipeline.configure(
-            workspace_dir=self.context_workspace_root or workspace_root,
-            app_type=app_type,
-        )
-        static_context, dynamic_context = context_pipeline.build_agent_context_split(
+        session = StageSession(
+            agent_name=self.agent_name,
             node_id=node_id,
-            agent_type=self.agent_name,
-            preloaded_source=preloaded_source,
-            map_workspace_dir=workspace_root,
+            phase="DESIGN",
+            model=self.model,
+            log_cb=self.log_cb,
+            workspace_root=self.workspace_root,
+            requirement_path=self.requirement_path,
+            app_type=self.app_type,
+            context_workspace_root=self.context_workspace_root,
         )
+        required_skill_names = test_generation_skills(requirement_data)
+        context_text = session.build_context(preloaded_source=preloaded_source)
         interface_contract = context_pipeline.get_interface_contract_context(node_id)
-        context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
         current_interfaces = self._current_node_interfaces(node_id)
         current_interface_ids = self._current_interface_ids(node_id, current_interfaces)
         manifest_lock = TestManifestLock()
-        agent = build_stage_agent(
+        built = session.build_agent(
             name="test_generator",
             stage="test_generation",
-            model=self.model,
             system_prompt="\n\n".join(
                 [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=TestGenerationResponse,
-            workspace_root=workspace_root,
-            writable_roots=[workspace_root],
-            skills=[SKILLS_SOURCE],
-            memory=[],
             tools=[
                 *build_traceability_tools(
                     node_id=node_id,
@@ -128,16 +114,14 @@ class TestGenerator:
                 build_declare_test_manifest_tool(
                     node_id=node_id,
                     manifest_lock=manifest_lock,
-                    validate_test_path=self._make_path_validator(app_type, workspace_root),
+                    validate_test_path=self._make_path_validator(session.app_type, session.workspace_root),
                     log_cb=self.log_cb,
                     current_interface_ids=current_interface_ids,
                     require_interface_coverage=bool(current_interface_ids),
                 ),
             ],
-            node_id=node_id,
-            claims_workspace_root=self.context_workspace_root or workspace_root,
+            skills=[SKILLS_SOURCE],
             test_manifest_lock=manifest_lock,
-            app_type=app_type,
         )
 
         message = get_user_prompt(
@@ -149,23 +133,10 @@ class TestGenerator:
         await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking test generation.", node_id=node_id)
         try:
-            raw_payload = await ainvoke_stage_agent(
-                agent,
-                message=message,
-                context=AgentRuntimeContext(
-                    node_id=node_id,
-                    phase="DESIGN",
-                    app_type=app_type,
-                    workspace_root=workspace_root,
-                    requirement_path=self.requirement_path,
-                ),
-                thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:TestGenerator",
-                label=self.agent_name,
-                log_cb=self.log_cb,
-            )
+            raw_payload = await session.invoke(built, message=message)
         except GraphRecursionError as exc:
             raw_payload = await self._salvage_step_budget(
-                node_id=node_id, manifest_lock=manifest_lock, agent=agent, exc=exc
+                node_id=node_id, manifest_lock=manifest_lock, built=built, exc=exc
             )
             if raw_payload is None:
                 raise
@@ -175,7 +146,7 @@ class TestGenerator:
             tests=tests,
             raw_payload=raw_payload,
             manifest_lock=manifest_lock,
-            agent=agent,
+            built=built,
         )
         if tests is None:
             return None, output_text
@@ -187,7 +158,7 @@ class TestGenerator:
         *,
         node_id: str,
         manifest_lock: TestManifestLock,
-        agent: Any,
+        built: StageAgentBuild,
         exc: GraphRecursionError,
     ) -> dict[str, Any] | None:
         """Complete a first pass whose step budget ran out with all work done.
@@ -205,8 +176,7 @@ class TestGenerator:
         a silent quality cut, not a rescue.
         """
 
-        discipline = getattr(agent, "arc_stage_discipline", None)
-        written_paths = discipline.materialized_paths() if discipline is not None else []
+        written_paths = built.materialized_paths()
         if not manifest_lock.locked or not written_paths:
             return None
         written = {normalize_manifest_path(path) for path in written_paths}
@@ -248,7 +218,7 @@ class TestGenerator:
         tests: list[dict[str, Any]],
         raw_payload: dict[str, Any] | None,
         manifest_lock: TestManifestLock,
-        agent: Any,
+        built: StageAgentBuild,
     ) -> tuple[list[dict[str, Any]] | None, str]:
         """Reconcile the returned manifest with the declaration and the disk.
 
@@ -263,8 +233,7 @@ class TestGenerator:
         if not manifest_lock.locked:
             return tests, json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
 
-        discipline = getattr(agent, "arc_stage_discipline", None)
-        written_paths = discipline.materialized_paths() if discipline is not None else []
+        written_paths = built.materialized_paths()
         result = reconcile_declared_manifest(
             manifest_items=tests,
             manifest_lock=manifest_lock,
@@ -345,13 +314,17 @@ class TestGenerator:
         passes now verifies nothing about the node's own behavior and would be
         silently waved through by the tautology fast path at IMPLEMENT time.
         """
-        workspace_root = str(Path(
-            self.workspace_root
-            or context_pipeline.config.workspace_dir
-            or os.environ.get("ARC_WORKSPACE_ROOT")
-            or os.getcwd()
-        ).expanduser().resolve())
-        app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
+        session = StageSession(
+            agent_name=self.agent_name,
+            node_id=node_id,
+            phase="DESIGN",
+            model=self.model,
+            log_cb=self.log_cb,
+            workspace_root=self.workspace_root,
+            requirement_path=self.requirement_path,
+            app_type=self.app_type,
+            context_workspace_root=self.context_workspace_root,
+        )
         current_interfaces = self._current_node_interfaces(node_id)
         current_interface_ids = self._current_interface_ids(node_id, current_interfaces)
         # Pre-seed the manifest lock with the previous manifest's paths: a
@@ -371,16 +344,11 @@ class TestGenerator:
                 if (path := str(item.get("file_path", "") or "").strip())
             }
         )
-        agent = build_stage_agent(
+        built = session.build_agent(
             name="test_generator",
             stage="test_generation",
-            model=self.model,
             system_prompt=get_system_prompt(),
             response_format=TestGenerationResponse,
-            workspace_root=workspace_root,
-            writable_roots=[workspace_root],
-            skills=[],
-            memory=[],
             tools=[
                 *build_traceability_tools(
                     node_id=node_id,
@@ -390,16 +358,14 @@ class TestGenerator:
                 build_declare_test_manifest_tool(
                     node_id=node_id,
                     manifest_lock=manifest_lock,
-                    validate_test_path=self._make_path_validator(app_type, workspace_root),
+                    validate_test_path=self._make_path_validator(session.app_type, session.workspace_root),
                     log_cb=self.log_cb,
                     current_interface_ids=current_interface_ids,
                     require_interface_coverage=bool(current_interface_ids),
                 ),
             ],
-            node_id=node_id,
-            claims_workspace_root=self.context_workspace_root or workspace_root,
+            skills=[],
             test_manifest_lock=manifest_lock,
-            app_type=app_type,
         )
         message = self._green_rejection_message(
             node_id=node_id,
@@ -412,20 +378,7 @@ class TestGenerator:
             status="warning",
             node_id=node_id,
         )
-        raw_payload = await ainvoke_stage_agent(
-            agent,
-            message=message,
-            context=AgentRuntimeContext(
-                node_id=node_id,
-                phase="DESIGN",
-                app_type=app_type,
-                workspace_root=workspace_root,
-                requirement_path=self.requirement_path,
-            ),
-            thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:TestGenerator",
-            label=self.agent_name,
-            log_cb=self.log_cb,
-        )
+        raw_payload = await session.invoke(built, message=message)
         tests = normalize_test_manifest_payload(raw_payload)
         output_text = json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
         await self._log(f"Green baseline rework returned {len(tests)} test artifact(s).", node_id=node_id)

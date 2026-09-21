@@ -77,7 +77,7 @@ def test_interface_design_agent_exposes_append_file(tmp_path: Path) -> None:
             faux_text("DONE"),
         ]
     )
-    agent = build_stage_agent(
+    built = build_stage_agent(
         name="append-test-designer",
         stage="interface_design",
         model=model,
@@ -92,7 +92,7 @@ def test_interface_design_agent_exposes_append_file(tmp_path: Path) -> None:
 
     payload = asyncio.run(
         ainvoke_stage_agent(
-            agent,
+            built.agent,
             message="materialize the page skeleton",
             context=AgentRuntimeContext(
                 node_id="REQ-APPEND",
