@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, create_model
 
 from agents.model.factory import create_arc_chat_model, split_model_name
 from agents.model.openai_api_adapter import structured_output_supported
+from agents.runtime.capabilities import DISABLED_BUILTIN_TOOLS, capability_for
 from agents.runtime.checkpointer import get_checkpointer
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.filesystem_adapters import (
@@ -33,7 +34,6 @@ if TYPE_CHECKING:
 
 WORKSPACE_PREFIX = "/workspace"
 SKILLS_PREFIX = "/skills"
-DISABLED_BUILTIN_TOOLS = frozenset({"execute", "write_todos"})
 
 # Sentinel so callers can explicitly pass ``checkpointer=None`` (cold start)
 # while omitting the argument still resolves the process-wide shared saver.
@@ -430,8 +430,15 @@ def build_stage_agent(
             skills_root,
         ),
     )
-    stage_tools = list(tools or [])
-    if stage == "interface_design":
+    # Mount-time capability filter: the same table the middleware enforces
+    # at call time keeps a stage from ever seeing a tool it may not call
+    # (e.g. validation tools in test_generation, append_file outside DESIGN).
+    stage_tools = [
+        tool
+        for tool in (tools or [])
+        if capability_for(stage, _tool_name(tool) or "").allowed
+    ]
+    if capability_for(stage, "append_file").allowed:
         stage_tools.append(build_append_file_tool(workspace_root=str(root), permissions=permissions))
 
     agent = create_deep_agent(
