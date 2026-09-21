@@ -16,10 +16,53 @@ from agents.context.pipeline import context_pipeline
 from core import sessions
 from core.file_claims import get_file_claim_registry
 from core.phases import WorkflowPhaseRunner
+from core.queue_state import (
+    NODE_BLOCKED_BY_DEPENDENCY,
+    NODE_CONVERGED,
+    NODE_CONVERGED_WITH_FAILED_CHILDREN,
+    NODE_DESIGNED,
+    NODE_DESIGNING,
+    NODE_FAILED,
+    NODE_IMPLEMENTING,
+    NODE_PASSED,
+    NODE_UNSEEN,
+    PHASE_DESIGN,
+    PHASE_IMPLEMENT,
+    QUEUE_FILENAME,
+    TASK_BLOCKED,
+    TASK_COMPLETED,
+    TASK_FAILED,
+    TASK_PENDING,
+    TASK_RUNNING,
+    ResetPlan,
+    apply_retry_plan,
+    begin_task,
+    break_dependency_cycles,
+    build_affinity_map,
+    build_dependencies_map,
+    build_descendants_map,
+    build_parents_map,
+    complete_task,
+    drop_ancestor_dependency_edges,
+    drop_unschedulable_dependencies,
+    fail_task,
+    has_phase_tasks,
+    design_status_of,
+    implement_status_of,
+    load_or_create_queue,
+    node_state,
+    propagate_dependency_blocks,
+    recover_interrupted,
+    release_dependency_blocks,
+    reset_node_for_retry,
+    save_queue,
+    structural_precedence_edges,
+    task_status,
+)
 from core.service import configure_runtime
 from core.commits import build_commit_message
 from core.config import load_project_env, set_app_type, set_web_port, set_workspace_root
-from core.files import load_requirements, read_json_file, validate_requirement_tree, write_json_file
+from core.files import load_requirements, validate_requirement_tree
 from core.logging import append_debug_log, write_terminal_log
 from core.contract_drift import ContractDrift, detect_contract_drift
 from core.merge_arbitration import (
@@ -86,25 +129,6 @@ QUEUE_FILENAME = "processing_queue.json"
 DEFAULT_MAX_CONCURRENT_TASKS = 1
 PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS = 3
 MAX_PARALLEL_TASKS = 8
-
-PHASE_DESIGN = "DESIGN"
-PHASE_IMPLEMENT = "IMPLEMENT"
-
-TASK_PENDING = "PENDING"
-TASK_RUNNING = "RUNNING"
-TASK_COMPLETED = "COMPLETED"
-TASK_FAILED = "FAILED"
-TASK_BLOCKED = "BLOCKED"
-
-NODE_UNSEEN = "UNSEEN"
-NODE_DESIGNING = "DESIGNING"
-NODE_DESIGNED = "DESIGNED"
-NODE_IMPLEMENTING = "IMPLEMENTING"
-NODE_PASSED = "PASSED"
-NODE_CONVERGED = "CONVERGED"
-NODE_CONVERGED_WITH_FAILED_CHILDREN = "CONVERGED_WITH_FAILED_CHILDREN"
-NODE_FAILED = "FAILED"
-NODE_BLOCKED_BY_DEPENDENCY = "BLOCKED_BY_DEPENDENCY"
 
 
 def _worktrees_enabled() -> bool:
@@ -627,7 +651,7 @@ class ARCWorkflowManager:
 
         pending_weight: dict[str, int] = {}
         for other in queue_state["tasks"]:
-            if other["status"] != TASK_PENDING:
+            if task_status(queue_state, other) != TASK_PENDING:
                 continue
             node_id = str(other.get("node_id", ""))
             if node_id in busy_nodes:
@@ -646,7 +670,7 @@ class ARCWorkflowManager:
         best_task: dict[str, Any] | None = None
         best_weight = -1
         for task in queue_state["tasks"]:
-            if task["status"] != TASK_PENDING:
+            if task_status(queue_state, task) != TASK_PENDING:
                 continue
             node_id = str(task.get("node_id", ""))
             if node_id in busy_nodes:
@@ -698,46 +722,12 @@ class ARCWorkflowManager:
         A failed prerequisite must not be treated as a satisfied scheduling
         edge. Independent nodes continue draining, while direct and
         transitive dependents become explicit ``BLOCKED`` tasks instead of
-        remaining ambiguous ``PENDING`` work at the end of the run.
-
-        Only never-started ``PENDING`` work is marked, and a node with a
-        ``RUNNING`` task is skipped until that task ends: rewriting the
-        status of work that is already executing cannot stop it and would
-        only corrupt the record. The invariant still holds at drain end,
-        where nothing runs and every dependent of a failure is marked.
+        remaining ambiguous ``PENDING`` work at the end of the run. The
+        state math lives in ``core.queue_state``; this wrapper persists and
+        logs the changes.
         """
 
-        changed: list[tuple[str, list[str]]] = []
-        while True:
-            progress = False
-            for node_id in list(queue_state.get("node_states", {})):
-                blocked_by = self._failed_prerequisite_ids(queue_state, node_id)
-                if not blocked_by:
-                    continue
-                node_tasks = [
-                    task
-                    for task in queue_state.get("tasks", [])
-                    if str(task.get("node_id", "")) == node_id
-                ]
-                if any(task.get("status") == TASK_RUNNING for task in node_tasks):
-                    continue
-                pending_tasks = [
-                    task for task in node_tasks if task.get("status") == TASK_PENDING
-                ]
-                if not pending_tasks:
-                    continue
-                for task in pending_tasks:
-                    task["status"] = TASK_BLOCKED
-                self._set_node_state(
-                    queue_state["node_states"],
-                    node_id,
-                    NODE_BLOCKED_BY_DEPENDENCY,
-                )
-                changed.append((node_id, blocked_by))
-                progress = True
-            if not progress:
-                break
-
+        changed = propagate_dependency_blocks(queue_state, on_state_change=self._upsert_node_state)
         if not changed:
             return
         self._save_processing_queue(queue_state)
@@ -753,21 +743,6 @@ class ARCWorkflowManager:
                 node_id,
             )
 
-    @staticmethod
-    def _failed_prerequisite_ids(queue_state: dict[str, Any], node_id: str) -> list[str]:
-        """Return failed declared dependencies and failed child work."""
-
-        failed: list[str] = []
-        for dependency_id in (queue_state.get("dependencies") or {}).get(node_id, []):
-            dependency_state = ARCWorkflowManager._implement_status(queue_state, dependency_id)
-            if dependency_state in {TASK_FAILED, TASK_BLOCKED}:
-                failed.append(str(dependency_id))
-        for descendant_id in (queue_state.get("descendants") or {}).get(node_id, []):
-            descendant_state = ARCWorkflowManager._implement_status(queue_state, descendant_id)
-            if descendant_state in {TASK_FAILED, TASK_BLOCKED}:
-                failed.append(str(descendant_id))
-        return failed
-
     async def _release_dependency_blocks(self, queue_state: dict[str, Any]) -> list[str]:
         """Return ``BLOCKED`` nodes to schedulable state after a retry reset.
 
@@ -779,39 +754,10 @@ class ARCWorkflowManager:
         this asymmetry. This mirror runs after every retry reset: a node whose
         failed prerequisites were all reset goes back to PENDING, and the
         drain's per-pick propagation re-blocks anything whose prerequisites
-        fail again, so releasing is never unsafe. Like propagation, releasing
-        iterates to a fixpoint because BLOCKED is transitive (A fails -> B
-        blocked -> C blocked through B).
+        fail again, so releasing is never unsafe. The fixpoint walk lives in
+        ``core.queue_state``; this wrapper persists and logs the releases.
         """
-        released: list[str] = []
-        while True:
-            progress = False
-            for node_id in list(queue_state.get("node_states", {})):
-                if (
-                    str(queue_state["node_states"].get(node_id, "")).strip().upper()
-                    != NODE_BLOCKED_BY_DEPENDENCY
-                ):
-                    continue
-                if self._failed_prerequisite_ids(queue_state, node_id):
-                    continue
-                design_completed = any(
-                    task.get("phase") == PHASE_DESIGN
-                    and str(task.get("node_id", "")) == node_id
-                    and task.get("status") == TASK_COMPLETED
-                    for task in queue_state.get("tasks", [])
-                )
-                for task in queue_state.get("tasks", []):
-                    if str(task.get("node_id", "")) == node_id and task.get("status") == TASK_BLOCKED:
-                        task["status"] = TASK_PENDING
-                self._set_node_state(
-                    queue_state["node_states"],
-                    node_id,
-                    NODE_DESIGNED if design_completed else NODE_UNSEEN,
-                )
-                released.append(node_id)
-                progress = True
-            if not progress:
-                break
+        released = release_dependency_blocks(queue_state, on_state_change=self._upsert_node_state)
         if released:
             self._save_processing_queue(queue_state)
         for node_id in released:
@@ -825,12 +771,18 @@ class ARCWorkflowManager:
             )
         return released
 
+    def _upsert_node_state(self, node_id: str, state: str) -> None:
+        """Keep the traceability ``node_states`` table current on every write."""
+
+        if self.runtime is not None:
+            self.runtime.traceability.upsert_node_state(node_id, state)
+
     def _begin_task(self, task: dict[str, Any], queue_state: dict[str, Any]) -> None:
-        node_id = task["node_id"]
-        phase = task["phase"]
-        task["status"] = TASK_RUNNING
-        self._mark_task_running(queue_state["node_states"], node_id, phase)
-        queue_state["last_task_id"] = task["task_id"]
+        begin_task(queue_state, task, on_state_change=self._upsert_node_state)
+        if task["phase"] == PHASE_DESIGN:
+            self.runtime.events.mark_design_started(task["node_id"])
+        else:
+            self.runtime.events.mark_implementation_started(task["node_id"])
         self._save_processing_queue(queue_state)
 
     async def _execute_task(self, task: dict[str, Any], queue_state: dict[str, Any]) -> None:
@@ -928,10 +880,8 @@ class ARCWorkflowManager:
                     task_ok = False
 
         if task_ok:
-            task["status"] = TASK_COMPLETED
             sessions.merge_node_session(node_id, {"resume_context": {}})
-            new_state = self._resolve_completed_node_state(node_id, phase)
-            self._set_node_state(queue_state["node_states"], node_id, new_state)
+            complete_task(queue_state, node_id, phase, on_state_change=self._upsert_node_state)
             self._save_processing_queue(queue_state)
             if phase == PHASE_DESIGN:
                 self.runtime.events.mark_design_done(node_id)
@@ -942,9 +892,7 @@ class ARCWorkflowManager:
                 await self._commit_phase_checkpoint(node_id, phase, requirement_data)
             await self._log("Compiler", f"{phase} completed for node {node_id}.", node_id=node_id)
         else:
-            task["status"] = TASK_FAILED
-            self._set_node_state(queue_state["node_states"], node_id, NODE_FAILED)
-            self._mark_remaining_node_tasks_failed(queue_state, node_id)
+            fail_task(queue_state, node_id, on_state_change=self._upsert_node_state)
             self._save_processing_queue(queue_state)
             if phase == PHASE_DESIGN:
                 self.runtime.events.mark_design_failed(node_id)
@@ -1472,6 +1420,18 @@ class ARCWorkflowManager:
                 workspace_root=self.workspace_path,
             )
 
+    def _apply_reset_side_effects(self, node_id: str, plan: ResetPlan) -> None:
+        """Apply a reset's runtime effects (the plan comes from queue_state)."""
+
+        if plan.clear_design_artifacts:
+            self.runtime.traceability.clear_node_design_artifacts(node_id)
+        if plan.reset_test_pass:
+            self.runtime.traceability.reset_test_pass_statuses_for_requirement(node_id)
+        if plan.invalidate_file_layers:
+            context_pipeline.cache.invalidate_file_layers(node_id)
+        if plan.invalidate_db_layers:
+            context_pipeline.cache.invalidate_db_layers(node_id)
+
     async def _requeue_design_after_merge_conflict(
         self,
         ctx: _TaskWorkspace,
@@ -1494,16 +1454,7 @@ class ARCWorkflowManager:
         decline never discards the node's conflicted commits.
         """
 
-        design_task = None
-        implement_task = None
-        for task in queue_state["tasks"]:
-            if task["node_id"] != node_id:
-                continue
-            if task["phase"] == PHASE_DESIGN:
-                design_task = task
-            elif task["phase"] == PHASE_IMPLEMENT:
-                implement_task = task
-        if design_task is None or implement_task is None:
+        if not has_phase_tasks(queue_state, node_id):
             await self._log(
                 "Compiler",
                 f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete.",
@@ -1523,26 +1474,23 @@ class ARCWorkflowManager:
             )
             return False
 
-        design_task["status"] = TASK_PENDING
-        implement_task["status"] = TASK_PENDING
-        self.runtime.traceability.clear_node_design_artifacts(node_id)
-        self.runtime.traceability.reset_test_pass_statuses_for_requirement(node_id)
-        self._set_node_state(queue_state["node_states"], node_id, NODE_UNSEEN)
-        sessions.merge_node_session(
-            node_id,
-            {
-                "interfaces": [],
-                "materialized_files": [],
-                "test_artifacts": [],
-                "phase_status": {"design": "pending", "test": "pending", "implement": "pending"},
-                "resume_context": {},
-                "result_state": "",
-                "merge_conflict_context": {"paths": list(conflict_paths), "phase": "design"},
-                "merge_conflict_retry_used": True,
-            },
-        )
-        context_pipeline.cache.invalidate_file_layers(node_id)
-        context_pipeline.cache.invalidate_db_layers(node_id)
+        try:
+            plan = reset_node_for_retry(
+                queue_state,
+                node_id,
+                phase=PHASE_DESIGN,
+                conflict_paths=conflict_paths,
+                on_state_change=self._upsert_node_state,
+            )
+        except ValueError:
+            await self._log(
+                "Compiler",
+                f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete.",
+                "error",
+                node_id,
+            )
+            return False
+        self._apply_reset_side_effects(node_id, plan)
         self._save_processing_queue(queue_state)
         await self._log(
             "Compiler",
@@ -1602,16 +1550,7 @@ class ARCWorkflowManager:
         decline never discards the node's conflicted commits.
         """
 
-        design_task = None
-        implement_task = None
-        for task in queue_state["tasks"]:
-            if task["node_id"] != node_id:
-                continue
-            if task["phase"] == PHASE_DESIGN:
-                design_task = task
-            elif task["phase"] == PHASE_IMPLEMENT:
-                implement_task = task
-        if design_task is None or implement_task is None:
+        if not has_phase_tasks(queue_state, node_id):
             await self._log(
                 "Compiler",
                 f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete.",
@@ -1623,7 +1562,7 @@ class ARCWorkflowManager:
         # IMPLEMENT conflict), so the DESIGN task must have settled; guard
         # against an unexpected queue shape instead of resetting a completed
         # DESIGN and re-running its agent for nothing.
-        if design_task["status"] != TASK_COMPLETED:
+        if design_status_of(queue_state, node_id) != TASK_COMPLETED:
             await self._log(
                 "Compiler",
                 f"Re-queueing {node_id} after its merge conflict failed: its DESIGN task is not completed.",
@@ -1643,26 +1582,23 @@ class ARCWorkflowManager:
             )
             return False
 
-        implement_task["status"] = TASK_PENDING
-        self.runtime.traceability.reset_test_pass_statuses_for_requirement(node_id)
-        self._set_node_state(queue_state["node_states"], node_id, NODE_DESIGNED)
-        sessions.merge_node_session(
-            node_id,
-            {
-                "phase_status": {"implement": "pending"},
-                "resume_context": {},
-                "result_state": "",
-                # The workspace now contains the winning sibling's files; the
-                # DESIGN baseline states are stale for this pass, so
-                # IMPLEMENT must re-baseline from scratch (same as a manual
-                # implement retry).
-                "design_baseline": {},
-                "recent_failure_summary": "",
-                "merge_conflict_context": {"paths": list(conflict_paths), "phase": "implement"},
-                "merge_conflict_retry_used": True,
-            },
-        )
-        context_pipeline.cache.invalidate_db_layers(node_id)
+        try:
+            plan = reset_node_for_retry(
+                queue_state,
+                node_id,
+                phase=PHASE_IMPLEMENT,
+                conflict_paths=conflict_paths,
+                on_state_change=self._upsert_node_state,
+            )
+        except ValueError:
+            await self._log(
+                "Compiler",
+                f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete.",
+                "error",
+                node_id,
+            )
+            return False
+        self._apply_reset_side_effects(node_id, plan)
         self._save_processing_queue(queue_state)
         await self._log(
             "Compiler",
@@ -1766,7 +1702,7 @@ class ARCWorkflowManager:
         eligible = [
             (node_id, message)
             for node_id, message in failures
-            if str(queue_state.get("node_states", {}).get(node_id, "") or "").strip().upper() == NODE_FAILED
+            if node_state(queue_state, node_id) == NODE_FAILED
         ]
         if not eligible:
             return []
@@ -1774,9 +1710,12 @@ class ARCWorkflowManager:
         retry_node_ids: list[str] = []
         for node_id, _message in eligible:
             try:
-                self._reset_node_for_retry(queue_state, node_id)
+                plan = reset_node_for_retry(
+                    queue_state, node_id, on_state_change=self._upsert_node_state
+                )
             except ValueError:
                 continue
+            self._apply_reset_side_effects(node_id, plan)
             retry_node_ids.append(node_id)
         if not retry_node_ids:
             return []
@@ -1820,486 +1759,82 @@ class ARCWorkflowManager:
         *,
         require_compatible_existing_queue: bool = False,
     ) -> dict[str, Any]:
-        os.makedirs(self.arc_dir, exist_ok=True)
-        root_id = str(requirement_tree.get("id", ""))
-        expected_tasks = self._build_processing_tasks(requirement_tree)
-        expected_task_ids = [task["task_id"] for task in expected_tasks]
-        node_ids = self._collect_node_ids(expected_tasks)
-        descendants = self._build_descendants_map(requirement_tree)
-        parents = self._build_parents_map(requirement_tree)
-        affinity = self._build_affinity_map(requirement_tree, self._affinity_depth)
-        declared = self._build_dependencies_map(requirement_tree)
-        dependencies, ancestor_dropped = self._drop_ancestor_dependency_edges(declared, parents)
-        dependencies, cycle_dropped = self._break_dependency_cycles(
-            dependencies,
-            self._structural_precedence_edges(parents, node_ids),
+        """Load (and migrate) or create the queue; see core.queue_state."""
+
+        return load_or_create_queue(
+            self.queue_path,
+            requirement_tree,
+            affinity_depth=self._affinity_depth,
+            require_compatible_existing_queue=require_compatible_existing_queue,
         )
-        dropped_dependency_edges = [
-            (dependent_id, dependency_id, "ancestor-descendant")
-            for dependent_id, dependency_id in ancestor_dropped
-        ] + [
-            (dependent_id, dependency_id, "cycle")
-            for dependent_id, dependency_id in cycle_dropped
-        ]
-        existing_queue = read_json_file(self.queue_path)
-        if self._is_compatible_queue(existing_queue, root_id, expected_task_ids):
-            queue_state = existing_queue
-            queue_state.setdefault("node_states", {})
-            for node_id in node_ids:
-                queue_state["node_states"].setdefault(node_id, NODE_UNSEEN)
-            # Queues saved before per-node worktree parallelism lack the map.
-            queue_state.setdefault("descendants", descendants)
-            # Queues saved before parent-serial DESIGN lack the map.
-            queue_state.setdefault("parents", parents)
-            # Queues saved before affinity-depth split lack a finer map; like
-            # the dependencies map, a restored map is the durable contract -
-            # in-flight work was grouped under it, and regrouping mid-run
-            # would put one subtree's tasks in two groups' worktree files.
-            queue_state.setdefault("affinity", affinity)
-            # Queues saved before dependency gating lack the map. A restored map
-            # is the durable contract, but it is not trusted blindly: an edge
-            # that references a node this queue cannot schedule (a hand-edited
-            # or foreign queue file) would block its dependent's IMPLEMENT
-            # forever, and a foreign cycle would stall the drain; both are
-            # dropped and reported instead.
-            if "dependencies" in queue_state:
-                restored, unschedulable = self._drop_unschedulable_dependencies(
-                    queue_state["dependencies"], queue_state
-                )
-                structural = self._structural_precedence_edges(parents, node_ids)
-                restored, restored_ancestors = self._drop_ancestor_dependency_edges(restored, parents)
-                restored, restored_cycles = self._break_dependency_cycles(restored, structural)
-                queue_state["dependencies"] = restored
-                queue_state["dropped_dependency_edges"] = list(unschedulable) + [
-                    (dependent_id, dependency_id, "ancestor-descendant")
-                    for dependent_id, dependency_id in restored_ancestors
-                ] + [
-                    (dependent_id, dependency_id, "cycle")
-                    for dependent_id, dependency_id in restored_cycles
-                ]
-            else:
-                queue_state.setdefault("dependencies", dependencies)
-                queue_state["dropped_dependency_edges"] = dropped_dependency_edges
-            self._apply_saved_states_to_tasks(queue_state)
-            return queue_state
-        if require_compatible_existing_queue:
-            raise ValueError(
-                "Resume or retry requested, but the existing processing queue is missing or "
-                "incompatible with the current requirement tree."
-            )
-        queue_state = {
-            "root_id": root_id,
-            "tasks": expected_tasks,
-            "node_states": {node_id: NODE_UNSEEN for node_id in node_ids},
-            "descendants": descendants,
-            "parents": parents,
-            "affinity": affinity,
-            "dependencies": dependencies,
-            "dropped_dependency_edges": dropped_dependency_edges,
-            "last_task_id": None,
-        }
-        self._apply_saved_states_to_tasks(queue_state)
-        return queue_state
 
     @staticmethod
     def _drop_unschedulable_dependencies(
         dependencies: Any,
         queue_state: dict[str, Any],
     ) -> tuple[dict[str, list[str]], list[tuple[str, str, str]]]:
-        """Drop dependency edges this queue cannot schedule, with a reason.
+        """Delegate kept for the scheduling-rule tests; see core.queue_state."""
 
-        The IMPLEMENT gate blocks on an edge whose dependency has no IMPLEMENT
-        task at all (matching the unknown-parent rule), so such an edge would
-        leave the dependent PENDING forever. Edges are therefore validated
-        against the queue's own task set: both endpoints must have an IMPLEMENT
-        task here. The map is rebuilt rather than reused so a malformed value
-        (null, wrong types, unknown ids) can only ever degrade to "no
-        dependencies", never to a stalled drain.
-        """
+        return drop_unschedulable_dependencies(dependencies, queue_state)
 
-        implement_nodes = {
-            str(task.get("node_id", ""))
-            for task in queue_state.get("tasks", [])
-            if task.get("phase") == PHASE_IMPLEMENT
-        }
-        if not isinstance(dependencies, dict):
-            return {}, []
-        kept: dict[str, list[str]] = {}
-        dropped: list[tuple[str, str, str]] = []
-        for dependent_id, dependency_ids in dependencies.items():
-            dependent_id = str(dependent_id)
-            if dependent_id not in implement_nodes:
-                dropped.append((dependent_id, "", "no-implement-task"))
-                continue
-            if not isinstance(dependency_ids, list):
-                dropped.append((dependent_id, "", "malformed-edges"))
-                continue
-            for dependency_id in dependency_ids:
-                dependency_id = str(dependency_id)
-                if dependency_id not in implement_nodes:
-                    dropped.append((dependent_id, dependency_id, "no-implement-task"))
-                    continue
-                kept.setdefault(dependent_id, []).append(dependency_id)
-        return kept, dropped
+    # Queue-shape builders and validators delegate to core.queue_state;
+    # the delegates exist for the scheduling-rule tests and read naturally
+    # on the manager.
 
     @staticmethod
     def _build_dependencies_map(root_node: dict[str, Any]) -> dict[str, list[str]]:
-        """Map every node id to the requirements it declares as dependencies.
-
-        The declared ``dependencies`` list is authored data (ARC-Bench trees
-        use it to model runtime prerequisites: a login node depends on the
-        registration node that creates the account its scenarios use). Only
-        edges that can participate in scheduling survive: ids must exist in
-        this tree and self-references are dropped, so a malformed edge can
-        never stall the drain on a node that is not in the queue.
-        """
-
-        declared_by_node: dict[str, list[str]] = {}
-
-        def collect(node: dict[str, Any]) -> None:
-            node_id = str(node.get("id") or "").strip()
-            if node_id:
-                declared = node.get("dependencies")
-                values = [
-                    str(item or "").strip()
-                    for item in (declared if isinstance(declared, list) else [])
-                ]
-                declared_by_node[node_id] = [value for value in values if value]
-            for child in node.get("children", []) or []:
-                if isinstance(child, dict):
-                    collect(child)
-
-        collect(root_node)
-        dependencies: dict[str, list[str]] = {}
-        for node_id, declared in declared_by_node.items():
-            kept = [
-                dependency_id
-                for dependency_id in declared
-                if dependency_id != node_id and dependency_id in declared_by_node
-            ]
-            kept = list(dict.fromkeys(kept))
-            if kept:
-                dependencies[node_id] = kept
-        return dependencies
+        return build_dependencies_map(root_node)
 
     @staticmethod
     def _structural_precedence_edges(
         parents: dict[str, str],
         node_ids: list[str],
     ) -> dict[str, set[str]]:
-        """The ordering the queue already enforces, as phase-vertex edges.
-
-        Vertices are ``D:<node>`` and ``I:<node>`` (a node's DESIGN and
-        IMPLEMENT tasks). The queue always runs a node's DESIGN before its
-        IMPLEMENT, a child's DESIGN after its parent's DESIGN, and a parent's
-        IMPLEMENT after its descendants' IMPLEMENTs; those rules are edges
-        here so declared dependencies can be checked against them.
-        """
-
-        edges: dict[str, set[str]] = {}
-        for node_id in node_ids:
-            edges.setdefault(f"D:{node_id}", set()).add(f"I:{node_id}")
-        for child_id, parent_id in parents.items():
-            edges.setdefault(f"D:{parent_id}", set()).add(f"D:{child_id}")
-            edges.setdefault(f"I:{child_id}", set()).add(f"I:{parent_id}")
-        return edges
+        return structural_precedence_edges(parents, node_ids)
 
     @staticmethod
     def _drop_ancestor_dependency_edges(
         dependencies: dict[str, list[str]],
         parents: dict[str, str],
     ) -> tuple[dict[str, list[str]], list[tuple[str, str]]]:
-        """Drop declared edges between an ancestor and its own descendant.
-
-        The parent-child rules already sequence such a pair (the child's
-        DESIGN waits for the ancestor's DESIGN, the ancestor's IMPLEMENT
-        waits for the descendant's), and the dependency gate adds the
-        reverse wait, so either direction of the edge makes the pair wait on
-        itself and deadlocks the drain. The edge schedules nothing beyond
-        those rules, so it is dropped here with its own reason instead of
-        surfacing as an anonymous cycle later.
-
-        The ancestry is derived here from ``parents`` (immediate parent per
-        node, the shape _build_parents_map guarantees) rather than accepted
-        as a precomputed descendants map: walking the parent chain per node
-        cannot misclassify a grandparent<->grandchild edge even if a future
-        map shape changes, so the classification is structural instead of a
-        convention callers must uphold.
-        """
-
-        def has_ancestor(node_id: str, candidate_id: str) -> bool:
-            parent_id = str((parents or {}).get(node_id, "") or "")
-            while parent_id:
-                if parent_id == candidate_id:
-                    return True
-                parent_id = str((parents or {}).get(parent_id, "") or "")
-            return False
-
-        kept: dict[str, list[str]] = {}
-        dropped: list[tuple[str, str]] = []
-        for dependent_id, dependency_ids in dependencies.items():
-            for dependency_id in dependency_ids:
-                if has_ancestor(dependent_id, dependency_id) or has_ancestor(dependency_id, dependent_id):
-                    dropped.append((dependent_id, dependency_id))
-                    continue
-                kept.setdefault(dependent_id, []).append(dependency_id)
-        return kept, dropped
+        return drop_ancestor_dependency_edges(dependencies, parents)
 
     @staticmethod
     def _break_dependency_cycles(
         dependencies: dict[str, list[str]],
         structural_edges: dict[str, set[str]] | None = None,
     ) -> tuple[dict[str, list[str]], list[tuple[str, str]]]:
-        """Drop dependency edges that close a cycle, keeping an acyclic graph.
-
-        The gate blocks a node's DESIGN and IMPLEMENT until its dependencies'
-        IMPLEMENTs end, so a cycle would leave every node in it permanently
-        unrunnable and the drain would end with PENDING tasks instead of a
-        reported failure. A declared edge means "the dependency's IMPLEMENT
-        precedes the dependent's DESIGN" (``I:<dependency>`` before
-        ``D:<dependent>``); ``structural_edges`` (from
-        _structural_precedence_edges) adds the precedence the queue enforces
-        on its own, so an edge that closes a cycle *through those rules* -
-        e.g. a node depending on a sibling that depends on one of its
-        children - is caught too, not just pure declared cycles. Without
-        structural edges the check degenerates to the historical node-level
-        graph over the declared edges alone.
-
-        Edges are visited one at a time in map order (which follows the tree
-        walk) and an edge is dropped when its target can already reach its
-        source through the edges accepted so far. Both properties that matter
-        hold at every visit, including forward edges whose cycle is only
-        completed by later edges: (1) a dropped edge always closes a cycle in
-        the original graph, because the accepted edges are a subset of it, and
-        (2) every cycle loses an edge, because its last edge in visit order
-        finds all its other edges accepted. The structural edges are acyclic
-        by construction (design vertices precede implement vertices, ancestors
-        design first, descendants implement first), so every cycle contains a
-        declared edge and the pass above is enough. Without ``structural_edges``
-        the pass still seeds each map node's inherent ``D:N -> I:N`` edge, which
-        makes the phase graph equivalent to the historical node-level graph: a
-        phase cycle must alternate declared ``I:dep -> D:dependent`` edges with
-        ``D:N -> I:N`` edges, so the two cycle notions coincide. Which edge of
-        a cycle is dropped follows the tree order and is reported to the
-        caller; the result is therefore deterministic for a given tree, never
-        partially applied.
-        """
-
-        adjacency: dict[str, set[str]] = {}
-        for source, targets in (structural_edges or {}).items():
-            adjacency.setdefault(source, set()).update(targets)
-        if structural_edges is None:
-            # Degenerate mode (no tree context): seed only the inherent
-            # design-before-implement edges so declared cycles still close.
-            for node_id in {str(key) for key in dependencies} | {
-                str(value)
-                for values in dependencies.values()
-                for value in values
-            }:
-                adjacency.setdefault(f"D:{node_id}", set()).add(f"I:{node_id}")
-
-        def reaches(start: str, goal: str, seen: set[str]) -> bool:
-            if start == goal:
-                return True
-            if start in seen:
-                return False
-            seen.add(start)
-            for next_id in adjacency.get(start, ()):
-                if reaches(next_id, goal, seen):
-                    return True
-            return False
-
-        kept: dict[str, list[str]] = {}
-        dropped: list[tuple[str, str]] = []
-        for dependent_id, dependency_ids in dependencies.items():
-            for dependency_id in dependency_ids:
-                source, target = f"I:{dependency_id}", f"D:{dependent_id}"
-                if reaches(target, source, set()):
-                    dropped.append((dependent_id, dependency_id))
-                    continue
-                kept.setdefault(dependent_id, []).append(dependency_id)
-                adjacency.setdefault(source, set()).add(target)
-        return kept, dropped
+        return break_dependency_cycles(dependencies, structural_edges)
 
     @staticmethod
     def _build_descendants_map(root_node: dict[str, Any]) -> dict[str, list[str]]:
-        """Map every node id to all of its transitive child ids."""
-
-        descendants: dict[str, list[str]] = {}
-
-        def walk(node: dict[str, Any], ancestors: list[str]) -> None:
-            node_id = str(node.get("id", "")).strip()
-            if not node_id:
-                return
-            for ancestor in ancestors:
-                descendants.setdefault(ancestor, []).append(node_id)
-            for child in node.get("children", []) or []:
-                if isinstance(child, dict):
-                    walk(child, [*ancestors, node_id])
-
-        walk(root_node, [])
-        return descendants
+        return build_descendants_map(root_node)
 
     @staticmethod
     def _build_parents_map(root_node: dict[str, Any]) -> dict[str, str]:
-        """Map every node id to its immediate parent id (the root has none)."""
-
-        parents: dict[str, str] = {}
-
-        def walk(node: dict[str, Any], parent_id: str) -> None:
-            node_id = str(node.get("id", "")).strip()
-            if not node_id:
-                return
-            if parent_id:
-                parents[node_id] = parent_id
-            for child in node.get("children", []) or []:
-                if isinstance(child, dict):
-                    walk(child, node_id)
-
-        walk(root_node, "")
-        return parents
+        return build_parents_map(root_node)
 
     @staticmethod
     def _build_affinity_map(root_node: dict[str, Any], split_depth: int = 1) -> dict[str, str]:
-        """Map every node id to the subtree group it shares a worktree with.
-
-        Tasks of one group run sequentially in the group's reusable worktree,
-        so a parent's and its children's design phases never race on shared
-        skeleton files; different groups drain in parallel. The root itself
-        forms its own group.
-
-        ``split_depth`` bounds how deep a top-level subtree stays one group:
-        depth 1 is the historical top-level-subtree grouping; a deeper split
-        gives each descendant subtree at that depth (e.g. feature subtrees
-        under a wide parent) its own group so siblings can drain in parallel.
-        Nodes deeper than ``split_depth`` inherit their ancestor's group, so a
-        group boundary is always a whole subtree, never a node subset.
-        """
-
-        affinity: dict[str, str] = {}
-        root_id = str(root_node.get("id", "")).strip()
-        if root_id:
-            affinity[root_id] = root_id
-
-        def walk(node: dict[str, Any], group: str, depth: int) -> None:
-            node_id = str(node.get("id", "")).strip()
-            if not node_id:
-                return
-            # A node at depth <= split_depth heads its own group; deeper nodes
-            # inherit the boundary ancestor's group, so a group is always a
-            # whole subtree, never a node subset.
-            node_group = node_id if depth <= split_depth else group
-            affinity[node_id] = node_group
-            for child in node.get("children", []) or []:
-                if isinstance(child, dict):
-                    walk(child, node_group, depth + 1)
-
-        for child in root_node.get("children", []) or []:
-            if isinstance(child, dict):
-                child_id = str(child.get("id", "")).strip()
-                if child_id:
-                    walk(child, child_id, 1)
-        return affinity
+        return build_affinity_map(root_node, split_depth)
 
     @staticmethod
     def _task_affinity(node_id: str, queue_state: dict[str, Any]) -> str:
         affinity = queue_state.get("affinity") or {}
         return str(affinity.get(node_id, node_id))
 
-    def _build_processing_tasks(self, root_node: dict[str, Any]) -> list[dict[str, Any]]:
-        tasks: list[dict[str, Any]] = []
-
-        def walk(node: dict[str, Any]) -> None:
-            node_id = str(node.get("id", "")).strip()
-            if not node_id:
-                return
-            tasks.append(self._make_task(node_id, PHASE_DESIGN, len(tasks)))
-            for child in node.get("children", []) or []:
-                if isinstance(child, dict):
-                    walk(child)
-            tasks.append(self._make_task(node_id, PHASE_IMPLEMENT, len(tasks)))
-
-        walk(root_node)
-        return tasks
-
-    def _make_task(self, node_id: str, phase: str, order: int) -> dict[str, Any]:
-        return {
-            "task_id": f"{node_id}:{phase}",
-            "node_id": node_id,
-            "phase": phase,
-            "order": order,
-            "status": TASK_PENDING,
-        }
-
-    @staticmethod
-    def _collect_node_ids(tasks: list[dict[str, Any]]) -> list[str]:
-        seen: list[str] = []
-        for task in tasks:
-            node_id = task["node_id"]
-            if node_id not in seen:
-                seen.append(node_id)
-        return seen
-
-    @staticmethod
-    def _is_compatible_queue(queue_state: dict[str, Any] | None, root_id: str, expected_task_ids: list[str]) -> bool:
-        if not queue_state or queue_state.get("root_id") != root_id:
-            return False
-        return [task.get("task_id") for task in queue_state.get("tasks", [])] == expected_task_ids
-
-    @staticmethod
-    def _apply_saved_states_to_tasks(queue_state: dict[str, Any]) -> None:
-        for task in queue_state["tasks"]:
-            node_state = queue_state["node_states"].get(task["node_id"], NODE_UNSEEN)
-            if node_state in {NODE_PASSED, NODE_CONVERGED, NODE_CONVERGED_WITH_FAILED_CHILDREN} or (
-                node_state == NODE_DESIGNED and task["phase"] == PHASE_DESIGN
-            ):
-                task["status"] = TASK_COMPLETED
-            elif node_state == NODE_FAILED:
-                task["status"] = TASK_FAILED
-            elif node_state == NODE_BLOCKED_BY_DEPENDENCY:
-                task["status"] = TASK_BLOCKED
-
     def _recover_interrupted_queue(self, queue_state: dict[str, Any]) -> list[dict[str, str]]:
-        recovered: list[dict[str, str]] = []
         git_status = ""
         if self.runtime is not None:
             try:
                 git_status = self.runtime.git.status_porcelain().strip()
             except Exception:
                 git_status = ""
-        for task in queue_state["tasks"]:
-            if task["status"] == TASK_RUNNING:
-                node_id = str(task.get("node_id", "") or "").strip()
-                phase = str(task.get("phase", "") or "").strip()
-                previous_state = str(queue_state.get("node_states", {}).get(node_id, NODE_UNSEEN) or NODE_UNSEEN)
-                task["status"] = TASK_PENDING
-                fallback_state = NODE_DESIGNED if phase == PHASE_IMPLEMENT else NODE_UNSEEN
-                if node_id:
-                    queue_state["node_states"][node_id] = fallback_state
-                    if self.runtime is not None:
-                        self.runtime.traceability.upsert_node_state(node_id, fallback_state)
-                    sessions.merge_node_session(
-                        node_id,
-                        {
-                            "resume_context": {
-                                "interrupted": True,
-                                "task_id": str(task.get("task_id", "") or "").strip(),
-                                "phase": phase,
-                                "previous_node_state": previous_state,
-                                "recovered_node_state": fallback_state,
-                                "git_status": git_status.splitlines()[:80],
-                                "instruction": (
-                                    "This node is resuming after an interrupted agent stage. "
-                                    "Preserve useful existing source, test, and traceability artifacts; inspect the listed dirty files "
-                                    "and current-node records before regenerating or overwriting work."
-                                ),
-                            },
-                            "phase_status": {phase.lower(): "interrupted"} if phase else {},
-                        },
-                    )
-                recovered.append({"node_id": node_id, "phase": phase, "task_id": str(task.get("task_id", ""))})
-        queue_state["recovered_interrupted_tasks"] = recovered
-        return recovered
+        return recover_interrupted(
+            queue_state,
+            git_status.splitlines(),
+            on_state_change=self._upsert_node_state,
+        )
 
     @staticmethod
     def _next_runnable_task(
@@ -2319,7 +1854,7 @@ class ARCWorkflowManager:
 
         busy_nodes = {str(task.get("node_id", "")) for task in in_flight}
         for task in queue_state["tasks"]:
-            if task["status"] != TASK_PENDING:
+            if task_status(queue_state, task) != TASK_PENDING:
                 continue
             if str(task.get("node_id", "")) in busy_nodes:
                 continue
@@ -2365,11 +1900,7 @@ class ARCWorkflowManager:
         if phase == PHASE_DESIGN:
             parent_id = str((queue_state.get("parents") or {}).get(node_id, "") or "")
             if parent_id:
-                parent_design_status: str | None = None
-                for other in queue_state["tasks"]:
-                    if other["phase"] == PHASE_DESIGN and other["node_id"] == parent_id:
-                        parent_design_status = str(other.get("status", ""))
-                        break
+                parent_design_status = design_status_of(queue_state, parent_id)
                 # A parents entry without a matching DESIGN task means the
                 # queue is inconsistent with its own map (tasks are built
                 # from the same tree, so this should be unreachable): block
@@ -2380,11 +1911,9 @@ class ARCWorkflowManager:
                 queue_state, node_id, phase=PHASE_DESIGN
             )
         if phase == PHASE_IMPLEMENT:
-            for other in queue_state["tasks"]:
-                if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
-                    if other["status"] != TASK_COMPLETED:
-                        return False
-                    break
+            own_design_status = design_status_of(queue_state, node_id)
+            if own_design_status is not None and own_design_status != TASK_COMPLETED:
+                return False
             if not ARCWorkflowManager._declared_dependencies_satisfied(queue_state, node_id):
                 return False
             descendants = set(queue_state.get("descendants", {}).get(node_id, []))
@@ -2395,7 +1924,7 @@ class ARCWorkflowManager:
                 for other in queue_state["tasks"]
                 if other["phase"] == PHASE_IMPLEMENT and other["node_id"] in descendants
             ]
-            return all(other["status"] == TASK_COMPLETED for other in descendant_tasks)
+            return all(task_status(queue_state, other) == TASK_COMPLETED for other in descendant_tasks)
         return True
 
     @staticmethod
@@ -2429,36 +1958,12 @@ class ARCWorkflowManager:
         pipelined = phase == PHASE_DESIGN and _design_pipelining_enabled()
         for dependency_id in (queue_state.get("dependencies") or {}).get(node_id, []):
             if pipelined:
-                dependency_status = ARCWorkflowManager._design_status(queue_state, dependency_id)
+                dependency_status = design_status_of(queue_state, dependency_id)
             else:
-                dependency_status = ARCWorkflowManager._implement_status(queue_state, dependency_id)
+                dependency_status = implement_status_of(queue_state, dependency_id)
             if dependency_status != TASK_COMPLETED:
                 return False
         return True
-
-    @staticmethod
-    def _design_status(queue_state: dict[str, Any], node_id: str) -> str | None:
-        """Status of a node's DESIGN task, or None when the queue has none."""
-
-        for other in queue_state["tasks"]:
-            if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
-                return str(other.get("status", ""))
-        return None
-
-    @staticmethod
-    def _implement_status(queue_state: dict[str, Any], node_id: str) -> str | None:
-        """Status of a node's IMPLEMENT task, or None when the queue has none."""
-
-        for other in queue_state["tasks"]:
-            if other["phase"] == PHASE_IMPLEMENT and other["node_id"] == node_id:
-                return str(other.get("status", ""))
-        return None
-
-    @staticmethod
-    def _mark_remaining_node_tasks_failed(queue_state: dict[str, Any], node_id: str) -> None:
-        for task in queue_state["tasks"]:
-            if task["node_id"] == node_id and task["status"] in {TASK_PENDING, TASK_RUNNING}:
-                task["status"] = TASK_FAILED
 
     def _apply_retry_plan(
         self,
@@ -2467,155 +1972,23 @@ class ARCWorkflowManager:
         retry_failed: bool = False,
         retry_node_ids: list[str] | None = None,
     ) -> list[str]:
-        requested_ids: list[str] = []
-        if retry_failed:
-            requested_ids = [
-                node_id
-                for node_id, state in queue_state.get("node_states", {}).items()
-                if str(state or "").strip().upper() in {NODE_FAILED, NODE_BLOCKED_BY_DEPENDENCY}
-            ]
-        elif retry_node_ids:
-            requested_ids = [str(node_id).strip() for node_id in retry_node_ids if str(node_id).strip()]
+        """Reset the requested nodes; returns the node ids queued for retry.
 
-        requested_ids = list(dict.fromkeys(requested_ids))
-        if not requested_ids:
-            return []
+        The reset payloads and the retry-kind choice live in
+        ``core.queue_state.reset_node_for_retry`` (issue #106: one
+        implementation); this wrapper applies the runtime side effects the
+        plans carry.
+        """
 
-        known_ids = set(queue_state.get("node_states", {}).keys())
-        unknown_ids = [node_id for node_id in requested_ids if node_id not in known_ids]
-        if unknown_ids:
-            raise ValueError(f"Retry requested for unknown node id(s): {', '.join(unknown_ids)}")
-
-        for node_id in requested_ids:
-            self._reset_node_for_retry(queue_state, node_id)
-
-        queue_state["last_task_id"] = None
-        queue_state["retry_plan"] = {"requested_node_ids": requested_ids, "retry_failed": bool(retry_failed)}
-        return requested_ids
-
-    def _reset_node_for_retry(self, queue_state: dict[str, Any], node_id: str) -> str:
-        design_task = None
-        implement_task = None
-        for task in queue_state["tasks"]:
-            if task["node_id"] != node_id:
-                continue
-            if task["phase"] == PHASE_DESIGN:
-                design_task = task
-            elif task["phase"] == PHASE_IMPLEMENT:
-                implement_task = task
-        if design_task is None or implement_task is None:
-            raise ValueError(f"Retry requested for node {node_id}, but its queue tasks are incomplete.")
-
-        design_status = str(design_task.get("status") or "").strip().upper()
-        implement_status = str(implement_task.get("status") or "").strip().upper()
-        design_failed = design_status == TASK_FAILED
-        implement_failed = implement_status in {TASK_FAILED, TASK_BLOCKED}
-
-        if design_failed or design_status != TASK_COMPLETED:
-            self._reset_node_from_design_retry(queue_state, node_id, design_task, implement_task)
-            return "design"
-
-        if implement_failed:
-            self._reset_node_from_implement_retry(queue_state, node_id, design_task, implement_task)
-            return "implement"
-
-        self._reset_node_for_full_retry(queue_state, node_id, design_task, implement_task)
-        return "design"
-
-    def _reset_node_from_design_retry(
-        self,
-        queue_state: dict[str, Any],
-        node_id: str,
-        design_task: dict[str, Any],
-        implement_task: dict[str, Any],
-    ) -> None:
-        design_task["status"] = TASK_PENDING
-        implement_task["status"] = TASK_PENDING
-        self.runtime.traceability.clear_node_design_artifacts(node_id)
-        self.runtime.traceability.reset_test_pass_statuses_for_requirement(node_id)
-        self._set_node_state(queue_state["node_states"], node_id, NODE_UNSEEN)
-        sessions.merge_node_session(
-            node_id,
-            {
-                "interfaces": [],
-                "materialized_files": [],
-                "test_artifacts": [],
-                "recent_failure_summary": "",
-                "phase_status": {"design": "pending", "test": "pending", "implement": "pending"},
-                "resume_context": {},
-                "result_state": "",
-                # Fresh DESIGN pass: the baseline gate will rebuild the
-                # per-file states from the new manifest.
-                "design_baseline": {},
-                # A manual retry is a fresh DESIGN pass: restore the node's
-                # one-shot conflict retry budget and drop stale conflict
-                # paths so the prompt is not misdirected (None replaces the
-                # dict wholesale; deep-merge would keep a {} patch intact).
-                "merge_conflict_context": None,
-                "merge_conflict_retry_used": False,
-            },
+        resets = apply_retry_plan(
+            queue_state,
+            retry_failed=retry_failed,
+            retry_node_ids=retry_node_ids,
+            on_state_change=self._upsert_node_state,
         )
-        context_pipeline.cache.invalidate_file_layers(node_id)
-        context_pipeline.cache.invalidate_db_layers(node_id)
-
-    def _reset_node_from_implement_retry(
-        self,
-        queue_state: dict[str, Any],
-        node_id: str,
-        design_task: dict[str, Any],
-        implement_task: dict[str, Any],
-    ) -> None:
-        design_task["status"] = TASK_COMPLETED
-        implement_task["status"] = TASK_PENDING
-        self.runtime.traceability.reset_test_pass_statuses_for_requirement(node_id)
-        self._set_node_state(queue_state["node_states"], node_id, NODE_DESIGNED)
-        sessions.merge_node_session(
-            node_id,
-            {
-                "phase_status": {"implement": "pending"},
-                "resume_context": {},
-                "result_state": "",
-                # The workspace now contains the node's own landed
-                # implementation; the DESIGN baseline states are stale for
-                # this pass, so IMPLEMENT must re-baseline from scratch.
-                "design_baseline": {},
-                # A manual retry is a fresh IMPLEMENT pass: restore the
-                # one-shot conflict retry budget and drop stale conflict
-                # paths so the prompt is not misdirected (same contract as
-                # the DESIGN-side reset; None replaces the dict wholesale).
-                "merge_conflict_context": None,
-                "merge_conflict_retry_used": False,
-            },
-        )
-        context_pipeline.cache.invalidate_db_layers(node_id)
-
-    def _reset_node_for_full_retry(
-        self,
-        queue_state: dict[str, Any],
-        node_id: str,
-        design_task: dict[str, Any],
-        implement_task: dict[str, Any],
-    ) -> None:
-        design_task["status"] = TASK_PENDING
-        implement_task["status"] = TASK_PENDING
-        self._set_node_state(queue_state["node_states"], node_id, NODE_UNSEEN)
-        sessions.merge_node_session(
-            node_id,
-            {
-                "phase_status": {"design": "pending", "test": "pending", "implement": "pending"},
-                "resume_context": {},
-                "result_state": "",
-                "recent_failure_summary": "",
-                # Fresh DESIGN pass: the baseline gate will rebuild the
-                # per-file states from the new manifest.
-                "design_baseline": {},
-                # Fresh DESIGN pass: restore the conflict-retry budget and
-                # drop stale conflict paths (see _reset_node_from_design_retry).
-                "merge_conflict_context": None,
-                "merge_conflict_retry_used": False,
-            },
-        )
-        context_pipeline.cache.invalidate_db_layers(node_id)
+        for node_id, plan in resets:
+            self._apply_reset_side_effects(node_id, plan)
+        return [node_id for node_id, _plan in resets]
 
     async def _run_task(self, task: dict[str, Any], ctx: "_TaskWorkspace | None" = None) -> bool:
         node_id = task["node_id"]
@@ -2635,33 +2008,10 @@ class ARCWorkflowManager:
         if not committed:
             await self._log("Compiler", "No file changes detected for this checkpoint.", node_id=node_id)
 
-    def _resolve_completed_node_state(self, node_id: str, phase: str) -> str:
-        if phase == PHASE_DESIGN:
-            return NODE_DESIGNED
-        session = read_json_file(os.path.join(self.arc_dir, "node_sessions", f"{node_id}.json")) or {}
-        result_state = str(session.get("result_state", "")).strip().upper()
-        if result_state == NODE_CONVERGED_WITH_FAILED_CHILDREN:
-            return NODE_CONVERGED_WITH_FAILED_CHILDREN
-        if result_state == NODE_CONVERGED:
-            return NODE_CONVERGED
-        return NODE_PASSED
-
-    def _set_node_state(self, node_states: dict[str, str], node_id: str, state: str) -> None:
-        node_states[node_id] = state
-        self.runtime.traceability.upsert_node_state(node_id, state)
-
     def _sync_queue_node_states(self, queue_state: dict[str, Any]) -> None:
         for node_id, state in queue_state.get("node_states", {}).items():
             normalized_state = str(state or NODE_UNSEEN).strip().upper() or NODE_UNSEEN
             self.runtime.traceability.upsert_node_state(node_id, normalized_state)
-
-    def _mark_task_running(self, node_states: dict[str, str], node_id: str, phase: str) -> None:
-        if phase == PHASE_DESIGN:
-            self._set_node_state(node_states, node_id, NODE_DESIGNING)
-            self.runtime.events.mark_design_started(node_id)
-            return
-        self._set_node_state(node_states, node_id, NODE_IMPLEMENTING)
-        self.runtime.events.mark_implementation_started(node_id)
 
     @staticmethod
     def _build_compile_result(queue_state: dict[str, Any]) -> dict[str, Any]:
@@ -2673,12 +2023,14 @@ class ARCWorkflowManager:
             for node_id, state in queue_state["node_states"].items()
             if state == NODE_BLOCKED_BY_DEPENDENCY
         )
-        completed_tasks = [task["task_id"] for task in queue_state["tasks"] if task["status"] == TASK_COMPLETED]
-        all_completed = all(task["status"] == TASK_COMPLETED for task in queue_state["tasks"])
+        completed_tasks = [
+            task["task_id"] for task in queue_state["tasks"] if task_status(queue_state, task) == TASK_COMPLETED
+        ]
+        all_completed = all(task_status(queue_state, task) == TASK_COMPLETED for task in queue_state["tasks"])
         pending_tasks = [
             task["task_id"]
             for task in queue_state["tasks"]
-            if task["status"] not in {TASK_COMPLETED, TASK_FAILED, TASK_BLOCKED}
+            if task_status(queue_state, task) not in {TASK_COMPLETED, TASK_FAILED, TASK_BLOCKED}
         ]
         accepted = all_completed and not failed_nodes and not blocked_nodes
         return {
@@ -2692,7 +2044,7 @@ class ARCWorkflowManager:
         }
 
     def _save_processing_queue(self, queue_state: dict[str, Any]) -> None:
-        write_json_file(self.queue_path, queue_state)
+        save_queue(queue_state, self.queue_path)
 
     async def _log(
         self,
