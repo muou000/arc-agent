@@ -38,6 +38,19 @@ def patched_bootstrap(tmp_path_factory: pytest.TempPathFactory) -> str:
     return (workspace / "backend" / "src" / "database" / "init_db.js").read_text(encoding="utf-8")
 
 
+@pytest.fixture(scope="module")
+def patched_harness(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """``test_harness.js`` exactly as a generated workspace receives it."""
+
+    workspace = tmp_path_factory.mktemp("patched-harness-") / "workspace"
+    shutil.copytree(TEMPLATE_ROOT, workspace)
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+    assert all(outcome.status in {APPLIED, ALREADY_APPLIED} for outcome in outcomes), outcomes
+    return (workspace / "backend" / "src" / "database" / "test_harness.js").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_init_db_never_returns_a_bare_init_promise(patched_bootstrap: str) -> None:
     """Returning the init promise hands callers a Promise<void>, not a handle."""
 
@@ -76,3 +89,34 @@ def test_genuine_init_failures_surface_instead_of_burning_retries(patched_bootst
     """
 
     assert "if (initPromise === promise) {" in patched_bootstrap
+
+
+def test_harness_opens_sqlite_only_inside_a_per_harness_scope_dir(patched_harness: str) -> None:
+    """A concurrent cleanup must not be able to remove the directory a queued
+    sqlite open is still materializing its file in.
+
+    Harness cleanup removes its root directory when it is empty, and every
+    harness used to write into that one shared ``.arc-test-db`` root - so one
+    worker's cleanup could delete the directory between another worker's mkdir
+    and its queued (asynchronous) sqlite open, failing the open with
+    SQLITE_CANTOPEN {errno: 14}. Seen 2026-09-21 as a vitest unhandled error in
+    a Unit run that cost three flaky retry rounds to self-heal. Nesting each
+    harness's database in its own scope directory makes every removal
+    self-owned: nobody deletes a directory another worker is still using.
+    """
+
+    assert "const scopeDir = path.join(rootDir," in patched_harness
+    assert "rootDir: scopeDir" in patched_harness
+
+
+def test_harness_reset_recreates_the_temp_dir_before_reopening(patched_harness: str) -> None:
+    """reset() drives a fresh initializeDatabase() long after setup() ran.
+
+    setup() mkdirs the root before opening sqlite; reset() reopens without
+    that guarantee of its own. Re-creating the directory before the reopen is
+    the harness-side mkdir -p guard: the reopen must never assume the directory
+    setup() made still exists.
+    """
+
+    assert patched_harness.count("fs.mkdirSync(rootDir, { recursive: true });") == 2
+    assert "Re-create the root directory before reopening sqlite" in patched_harness
