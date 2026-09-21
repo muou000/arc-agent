@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
+from .test_results import TestRunResult, parse_test_run
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_ID_BY_APP_TYPE = {
     "web": "web-react-express",
@@ -236,47 +238,45 @@ class AppTypeHandler(ABC):
         )
 
     @abstractmethod
-    async def run_test_file(self, test_type: str, file_path: str) -> str:
+    async def run_test_file(self, test_type: str, file_path: str) -> TestRunResult:
         """Run one concrete test file through the system-side test executor."""
         raise NotImplementedError
 
-    async def run_test_group(self, test_type: str, file_paths: list[str]) -> str:
+    async def run_test_group(self, test_type: str, file_paths: list[str]) -> TestRunResult:
         """Run a batch of test files through the system-side test executor.
 
         App types can override this with a real grouped runner. The default
         implementation preserves compatibility by running files one by one.
         """
         if not file_paths:
-            return (
-                "Exit Code: 1\n"
-                "STDERR:\n"
-                f"No test files were configured for the current {test_type} batch.\n"
+            return TestRunResult(
+                exit_code=1,
+                output=(
+                    "Exit Code: 1\n"
+                    "STDERR:\n"
+                    f"No test files were configured for the current {test_type} batch.\n"
+                ),
             )
 
         outputs: list[str] = []
         exit_codes: list[int] = []
         for file_path in file_paths:
-            output = await self.run_test_file(test_type, file_path)
-            outputs.append(f"=== Test File: {file_path} ===\n{output}")
-            exit_code = -1
-            for line in output.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("Exit Code:"):
-                    try:
-                        exit_code = int(stripped.split("Exit Code:", 1)[1].strip())
-                    except ValueError:
-                        exit_code = -1
-                    break
-            exit_codes.append(exit_code)
+            result = await self.run_test_file(test_type, file_path)
+            outputs.append(f"=== Test File: {file_path} ===\n{result.output}")
+            exit_codes.append(result.exit_code)
 
-        batch_exit_code = 0 if exit_codes and all(code == 0 for code in exit_codes) else 1
+        # The first failing file's own code wins so the reported cause matches
+        # the earliest failure in execution order (same rule the single-parser
+        # fallback applies to nested command transcripts).
+        batch_exit_code = next((code for code in exit_codes if code != 0), 0)
         header = [
             f"Exit Code: {batch_exit_code}",
             f"Batch Test Type: {test_type}",
             "Batch Test Files:",
         ]
         header.extend(f"- {file_path}" for file_path in file_paths)
-        return f"{chr(10).join(header)}\n\n" + "\n\n".join(outputs)
+        body = f"{chr(10).join(header)}\n\n" + "\n\n".join(outputs)
+        return parse_test_run(body, exit_code=batch_exit_code)
 
     def validate_test_path(self, test_type: str, file_path: str) -> str | None:
         """Return an error message when a generated test path is invalid."""

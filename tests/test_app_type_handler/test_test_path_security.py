@@ -56,5 +56,6 @@ def test_android_rejects_unsafe_test_file_before_gradle(monkeypatch) -> None:
         )
     )
 
-    assert "Exit Code: 1" in result
+    assert "Exit Code: 1" in result.output
+    assert result.exit_code == 1
     assert called is False

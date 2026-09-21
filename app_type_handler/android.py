@@ -10,6 +10,7 @@ from core.processes import finalize_subprocess
 
 from .base import AppTypeHandler
 from .path_validation import normalize_safe_relative_path
+from .test_results import TestRunResult, parse_test_run
 
 
 def _android_file_to_test_class(file_path: str) -> str:
@@ -204,16 +205,16 @@ class AndroidAppType(AppTypeHandler):
             "Use Java/Kotlin test filenames supported by the Android app handler.",
         ]
 
-    async def run_test_file(self, test_type: str, file_path: str) -> str:
+    async def run_test_file(self, test_type: str, file_path: str) -> TestRunResult:
         await self._log("System", f"System test execution ({test_type}): {file_path}")
         validation_error = _android_test_path_error(test_type, file_path)
         if validation_error:
-            return f"Exit Code: 1\nSTDERR:\n{validation_error}\n"
-        return await _run_android_gradle_test(self.workspace_path, file_path)
+            return parse_test_run(f"Exit Code: 1\nSTDERR:\n{validation_error}\n")
+        return parse_test_run(await _run_android_gradle_test(self.workspace_path, file_path))
 
-    async def run_test_group(self, test_type: str, file_paths: list[str]) -> str:
+    async def run_test_group(self, test_type: str, file_paths: list[str]) -> TestRunResult:
         if not file_paths:
-            return (
+            return parse_test_run(
                 "Exit Code: 1\n"
                 "STDERR:\n"
                 f"No test files were configured for the current {test_type} batch.\n"

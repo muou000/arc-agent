@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -284,7 +285,7 @@ def test_verify_workspace_passes_when_the_frontend_builds(tmp_path, monkeypatch)
     handler = _make_handler(workspace)
 
     async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
-        return "Exit Code: 0\nSTDOUT:\nbuilt\n"
+        return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nbuilt\n")
 
     monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
 
@@ -297,7 +298,7 @@ def test_verify_workspace_fails_when_the_frontend_build_fails(tmp_path, monkeypa
     handler = _make_handler(workspace)
 
     async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
-        return "Exit Code: 1\nSTDERR:\n'vite' is not recognized\n"
+        return web_handler._CommandResult(exit_code=1, text="Exit Code: 1\nSTDERR:\n'vite' is not recognized\n")
 
     monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
 
@@ -330,7 +331,7 @@ def test_verify_workspace_installs_playwright_browsers(tmp_path, monkeypatch) ->
 
     async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
         commands.append(command)
-        return "Exit Code: 0\nSTDOUT:\nok\n"
+        return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nok\n")
 
     monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
 
@@ -345,8 +346,11 @@ def test_verify_workspace_aborts_when_browsers_cannot_be_installed(tmp_path, mon
 
     async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
         if "e2e:install-browsers" in command:
-            return "Exit Code: 1\nSTDERR:\nnpm error Missing script: \"e2e:install-browsers\"\n"
-        return "Exit Code: 0\nSTDOUT:\nbuilt\n"
+            return web_handler._CommandResult(
+                exit_code=1,
+                text='Exit Code: 1\nSTDERR:\nnpm error Missing script: "e2e:install-browsers"\n',
+            )
+        return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nbuilt\n")
 
     monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
 
@@ -360,7 +364,7 @@ def test_verify_workspace_skips_the_browser_gate_without_a_backend(tmp_path, mon
 
     async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
         assert command == "npm run build"
-        return "Exit Code: 0\nSTDOUT:\nbuilt\n"
+        return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nbuilt\n")
 
     monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
 
@@ -377,7 +381,7 @@ def test_verify_workspace_skips_the_browser_gate_when_opted_out(tmp_path, monkey
 
     async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
         commands.append(command)
-        return "Exit Code: 0\nSTDOUT:\nbuilt\n"
+        return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nbuilt\n")
 
     monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
     monkeypatch.setenv("ARC_SKIP_BROWSER_INSTALL", "1")
@@ -401,7 +405,7 @@ def test_verify_workspace_falls_back_to_npx_without_an_install_script(tmp_path, 
 
     async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
         commands.append(command)
-        return "Exit Code: 0\nSTDOUT:\nok\n"
+        return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nok\n")
 
     monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
 
@@ -426,7 +430,7 @@ def test_verify_workspace_uses_the_install_script_when_declared(tmp_path, monkey
 
     async def fake_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None):
         commands.append(command)
-        return "Exit Code: 0\nSTDOUT:\nok\n"
+        return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nok\n")
 
     monkeypatch.setattr(web_handler, "_execute_web_test_command", fake_command)
 
@@ -541,15 +545,40 @@ def test_e2e_runtime_env_points_playwright_at_the_workspace_port(tmp_path) -> No
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("Exit Code: 0\nSTDOUT:\nok\n", 0),
-        ("Exit Code: 1\nSTDERR:\nboom\n", 1),
-        ("no exit code here", None),
-    ],
+    ("code", "expected"),
+    [(0, 0), (3, 3)],
 )
-def test_extract_exit_code(raw: str, expected) -> None:
-    assert web_handler._extract_exit_code(raw) == expected
+def test_execute_web_test_command_surfaces_structural_exit_codes(code: int, expected: int, tmp_path) -> None:
+    """The command runner carries the exit code structurally, not only in text."""
+
+    result = asyncio.run(
+        web_handler._execute_web_test_command(
+            f'"{sys.executable}" -c "raise SystemExit({code})"',
+            cwd=str(tmp_path),
+        )
+    )
+
+    assert result.exit_code == expected
+    assert f"Exit Code: {expected}" in result.text
+
+
+def test_execute_web_test_command_reports_spawn_failure_without_a_code(tmp_path, monkeypatch) -> None:
+    """A command that never spawns (OSError) carries no exit code at all."""
+
+    async def refuse_to_spawn(*_args, **_kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(web_handler.asyncio, "create_subprocess_shell", refuse_to_spawn)
+
+    result = asyncio.run(
+        web_handler._execute_web_test_command(
+            "definitely-not-a-real-command-xyz",
+            cwd=str(tmp_path),
+        )
+    )
+
+    assert result.exit_code is None
+    assert "Execution failed" in result.text
 
 
 # --------------------------------------------------------------------------

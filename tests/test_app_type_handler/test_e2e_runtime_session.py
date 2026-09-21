@@ -18,7 +18,6 @@ from pathlib import Path
 from unittest import mock
 
 from app_type_handler import web as web_handler
-from app_type_handler.test_results import parse_test_results
 
 
 class _FakeProcess:
@@ -41,14 +40,17 @@ class _CommandRecorder:
         timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
         web_port: int | None = None,
-    ) -> str:
+    ) -> web_handler._CommandResult:
         self.calls.append(command)
         code = 0
         for needle, value in self.exit_codes.items():
             if needle in command:
                 code = value
                 break
-        return f"Exit Code: {code}\nSTDOUT:\n{command} ran\n"
+        return web_handler._CommandResult(
+            exit_code=code,
+            text=f"Exit Code: {code}\nSTDOUT:\n{command} ran\n",
+        )
 
 
 def _make_workspace(tmp_path: Path) -> tuple[Path, str]:
@@ -93,11 +95,11 @@ def _make_session(db_path: str, fingerprint: str, port: int = 4321) -> web_handl
 
 
 def _patch_fresh_start(monkeypatch, recorder: _CommandRecorder, start_calls: list[str]) -> None:
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
-        return True, "build ok"
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+        return web_handler._FrontendBuildOutcome(ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0)
 
-    async def _fake_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, str]:
-        return True, "prepared"
+    async def _fake_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, int | None, str]:
+        return True, 0, "prepared"
 
     async def _fake_start(workspace_path: str, runtime_env: dict, web_port: int | None = None):
         start_calls.append("start")
@@ -138,7 +140,7 @@ def test_reuses_live_server_when_nothing_changed(tmp_path, monkeypatch) -> None:
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     assert start_calls == []
-    assert "Reused the live backend runtime" in result
+    assert "Reused the live backend runtime" in result.output
     assert "npm run db:seed" in recorder.calls
     # The database reset really ran: rows are gone, schema stays.
     connection = sqlite3.connect(env["ARC_E2E_DB_PATH"])
@@ -151,7 +153,7 @@ def test_reuses_live_server_when_nothing_changed(tmp_path, monkeypatch) -> None:
     assert tables
     # The runtime stays registered for the next attempt.
     assert handler._e2e_runtime_session is session
-    assert parse_test_results(result)["exit_code"] == 0
+    assert result.exit_code == 0
 
 
 def test_restarts_server_when_backend_source_changes(tmp_path, monkeypatch) -> None:
@@ -183,8 +185,8 @@ def test_restarts_server_when_backend_source_changes(tmp_path, monkeypatch) -> N
     assert terminated == [stale_session.process.pid]
     assert handler._e2e_runtime_session is not stale_session
     assert handler._e2e_runtime_session is not None
-    assert "Reused the live backend runtime" not in result
-    assert "Deferred: the backend runtime stays alive" in result
+    assert "Reused the live backend runtime" not in result.output
+    assert "Deferred: the backend runtime stays alive" in result.output
 
 
 def test_restarts_server_when_previous_process_died(tmp_path, monkeypatch) -> None:
@@ -262,10 +264,10 @@ def test_falls_back_to_fresh_start_when_reseeding_fails(tmp_path, monkeypatch) -
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     assert start_calls == ["start"]
-    assert "Reused the live backend runtime" not in result
+    assert "Reused the live backend runtime" not in result.output
     # The reset-failure reason must survive the fallback for debuggability.
-    assert "fell back to a fresh start" in result
-    assert "db:seed" in result
+    assert "fell back to a fresh start" in result.output
+    assert "db:seed" in result.output
 
 
 def test_runtime_session_is_strictly_per_instance(tmp_path, monkeypatch) -> None:
@@ -294,7 +296,7 @@ def test_runtime_session_is_strictly_per_instance(tmp_path, monkeypatch) -> None
     # Shutting down one instance leaves the other's session in place.
     asyncio.run(second.shutdown_e2e_runtime())
     assert first._e2e_runtime_session is session
-    assert "Exit Code: 0" in result
+    assert "Exit Code: 0" in result.output
 
 
 
@@ -341,7 +343,7 @@ def test_fresh_run_stores_session_and_defers_cleanup(tmp_path, monkeypatch) -> N
     assert terminated == []
     assert handler._e2e_runtime_session is not None
     assert handler._e2e_runtime_session.port == 4321
-    assert "Deferred: the backend runtime stays alive" in result
+    assert "Deferred: the backend runtime stays alive" in result.output
 
 
 def test_shutdown_e2e_runtime_terminates_the_session(tmp_path) -> None:
@@ -619,10 +621,10 @@ def test_e2e_result_contains_stage_timing_breakdown(tmp_path, monkeypatch) -> No
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
-    assert "=== Stage Timing ===" in result
+    assert "=== Stage Timing ===" in result.output
     # A fresh E2E run pays all four stages; each is reported as name=<n>s.
     for stage in ("frontend_build", "database_prepare", "backend_runtime", "playwright"):
-        assert stage + "=" in result
+        assert stage + "=" in result.output
 
 
 def test_e2e_stage_timing_reports_reused_stages(tmp_path, monkeypatch) -> None:
@@ -646,6 +648,6 @@ def test_e2e_stage_timing_reports_reused_stages(tmp_path, monkeypatch) -> None:
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
-    assert "=== Stage Timing ===" in result
-    assert "database_prepare=" in result
+    assert "=== Stage Timing ===" in result.output
+    assert "database_prepare=" in result.output
     assert start_calls == []  # reuse confirmed: no fresh backend start
