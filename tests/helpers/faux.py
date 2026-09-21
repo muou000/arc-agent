@@ -161,6 +161,17 @@ class FakeAppHandler:
         self._results.extend(results)
         return self
 
+    def _record_call(
+        self,
+        test_type: str,
+        file_paths: list[str],
+        failed_case_names: list[str] | None,
+    ) -> None:
+        """Append one call to the parallel ``calls``/``case_filters`` records."""
+
+        self.calls.append((test_type, list(file_paths)))
+        self.case_filters.append(list(failed_case_names) if failed_case_names else None)
+
     async def run_test_group(
         self,
         test_type: str,
@@ -169,8 +180,7 @@ class FakeAppHandler:
         failed_case_names: list[str] | None = None,
     ) -> TestRunResult:
         del web_port  # per-task port override; the fake records the call only
-        self.calls.append((test_type, list(file_paths)))
-        self.case_filters.append(list(failed_case_names) if failed_case_names else None)
+        self._record_call(test_type, file_paths, failed_case_names)
         if not self._results:
             raise RuntimeError(
                 f"FakeAppHandler ran out of scripted results after {len(self.calls)} call(s)."

@@ -1278,6 +1278,56 @@ def test_e2e_retry_rounds_filter_to_digest_failed_cases(tmp_project_dir: Path, a
     assert "passed (full layer)" in all_tool_results
 
 
+def test_non_e2e_layers_stay_full_even_when_the_digest_parses(tmp_project_dir: Path, arc_runtime) -> None:
+    """Per-case retry filtering is E2E-only: unit rounds run full and close normally.
+
+    A digest-parseable unit failure must not flip run_was_case_filtered (it
+    gates the layer-closing verdict): the full green retry closes the layer
+    in the same round instead of forcing a spurious extra round.
+    """
+
+    node_id = "REQ-TDD-GREP-UNIT"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    write_test_file(tmp_project_dir)
+    vitest_failure = (
+        "Exit Code: 1\n"
+        "\n=== Backend Vitest Batch ===\n"
+        " FAIL tests/unit/test_calc.py > Calc > adds two numbers\n"
+        "AssertionError: expected 2 got 1\n"
+        "Exit Code: 1\n"
+    )
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {}, call_id="r1"),
+            faux_text("repairing, next round"),
+            faux_tool_call("run_tests", {}, call_id="r2"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    fake = FakeAppHandler(
+        [
+            vitest_failure,          # baseline RED (digest parses)
+            vitest_failure,          # r1: full run, digest parses
+            passing_test_output(),   # r2: full retry closes the layer
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * 3
+    # No round carries a case filter; the full green retry closed the layer
+    # directly (no filter-note, no extra round).
+    assert fake.case_filters == [None, None, None]
+    all_tool_results = tool_results_text(model)
+    assert "passed (full layer)" in all_tool_results
+    assert "ARC_RETRY_FILTER_NOTE" not in all_tool_results
+
+
 def test_retry_falls_back_to_full_run_without_parseable_digest(tmp_project_dir: Path, arc_runtime) -> None:
     """A failure the digest cannot structure must not produce an empty filter."""
 

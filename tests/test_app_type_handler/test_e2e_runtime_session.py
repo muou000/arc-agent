@@ -13,6 +13,7 @@ when the node's IMPLEMENT phase finishes.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 import sqlite3
@@ -869,6 +870,52 @@ def test_case_grep_pattern_maps_display_titles_to_leaf_names() -> None:
     assert web_handler._build_case_grep_pattern([]) == ""
 
 
+def test_shell_single_arg_quotes_for_the_running_platform() -> None:
+    """The filter argument survives the platform's shell as one argv entry.
+
+    The commands run through ``create_subprocess_shell``: cmd.exe on Windows
+    (single quotes are not quoting there), /bin/sh elsewhere.
+    """
+
+    value = "rejects\\ duplicate\\ username|other\\ case"
+    quoted = web_handler._shell_single_arg(value)
+    if os.name == "nt":
+        # cmd metachars (space, pipe) force double quotes.
+        assert quoted == f'"{value}"'
+        assert web_handler._shell_single_arg("plain-case") == "plain-case"
+    else:
+        assert quoted == shlex.quote(value)
+
+
+def test_non_e2e_layers_ignore_the_case_filter(tmp_path, monkeypatch) -> None:
+    """Per-case filtering is an E2E capability: Vitest rounds run full and say so.
+
+    A filtered-shaped request on the unit layer must not filter the Vitest
+    command nor print the Failed Case Filter header - the runner has no such
+    mechanism, and phases must not treat the round as case-filtered.
+    """
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+    (workspace / "backend" / "tests").mkdir()
+    (workspace / "backend" / "tests" / "authApi.test.js").write_text("test('t', () => {});\n", encoding="utf-8")
+    handler = _make_handler(workspace)
+    recorder = _CommandRecorder()
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+
+    result = asyncio.run(
+        handler.run_test_group(
+            "unit",
+            ["backend/tests/authApi.test.js"],
+            web_port=4321,
+            failed_case_names=["Auth API > rejects duplicate username with 409"],
+        )
+    )
+
+    assert result.exit_code == 0
+    assert recorder.calls == ["npx vitest run tests/authApi.test.js"]
+    assert "Failed Case Filter" not in result.output
+
+
 def test_retry_round_playwright_command_carries_grep_filter(tmp_path, monkeypatch) -> None:
     """A retry round's runner command filters to the previously failing cases.
 
@@ -898,9 +945,10 @@ def test_retry_round_playwright_command_carries_grep_filter(tmp_path, monkeypatc
     assert len(playwright_commands) == 1
     command = playwright_commands[0]
     # The executor normalizes targets backend-relative; the filter appends as
-    # one quoted shell word after them (re.escape backslash-escapes spaces).
+    # one shell argument after them (re.escape backslash-escapes spaces; the
+    # quoting dialect is the running platform's - see _shell_single_arg).
     assert command.startswith("npx playwright test test-e2e/login.spec.ts --grep ")
-    assert shlex.quote(re.escape("rejects duplicate username")) in command
+    assert re.escape("rejects duplicate username") in command
     # The suite display segment must not leak into the pattern.
     assert "register" not in command.split("--grep", 1)[1]
     # The result header tells the agent the round was case-filtered.

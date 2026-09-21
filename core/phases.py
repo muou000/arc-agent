@@ -1108,8 +1108,13 @@ class WorkflowPhaseRunner:
             # Retry round (#115): the previous round's digest parsed failing
             # case names, so re-run only those. First round, cross-pass
             # rounds and any round after an unparseable/environmental
-            # failure carry no filter and run the full layer.
-            prior_failed_names = retry_case_names[selected_type]
+            # failure carry no filter and run the full layer. Per-case
+            # filtering is an E2E-runner capability today, so other layers
+            # always run full - and run_was_case_filtered (which gates the
+            # layer-closing verdict below) must only fire when the runner
+            # really filtered, never on an ignored filter.
+            case_filter_applies = selected_type.lower() == "e2e"
+            prior_failed_names = retry_case_names[selected_type] if case_filter_applies else []
             run_was_case_filtered = bool(prior_failed_names)
             if run_was_case_filtered:
                 await self._log(
@@ -1167,9 +1172,10 @@ class WorkflowPhaseRunner:
                 # contract must revalidate the whole layer, not just the cases
                 # that happened to report before the environment broke. An
                 # unparseable digest also degrades to the full run.
-                retry_case_names[selected_type] = (
-                    [] if run_result.environment_failure else digest_failed_test_names(failure_digest)
-                )
+                if case_filter_applies:
+                    retry_case_names[selected_type] = (
+                        [] if run_result.environment_failure else digest_failed_test_names(failure_digest)
+                    )
                 run_result.output += (
                     "\n\n"
                     + format_failure_digest(

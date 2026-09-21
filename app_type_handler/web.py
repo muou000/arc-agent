@@ -468,6 +468,23 @@ def _build_web_test_execution(
 _FAILED_CASE_TITLE_SEPARATOR = re.compile(r"\s*[›>]\s*")
 
 
+def _shell_single_arg(value: str) -> str:
+    """Quote ``value`` as one shell argument for the running platform.
+
+    The test commands run through ``create_subprocess_shell``: cmd.exe on
+    Windows, /bin/sh elsewhere. cmd.exe ignores POSIX single quotes and does
+    not treat ``\`` as an escape, so a shlex-quoted pattern would arrive at
+    Playwright split on its spaces; double quotes are the form both cmd.exe
+    and the MSVCRT argv parser hand over intact.
+    """
+
+    if os.name == "nt":
+        if re.search(r'[\s"&|<>^()]', value):
+            return '"' + value.replace('"', '\\"') + '"'
+        return value
+    return shlex.quote(value)
+
+
 def _build_case_grep_pattern(failed_case_names: list[str] | None) -> str:
     """Build the Playwright ``--grep`` regex for a retry round's failed cases.
 
@@ -595,6 +612,8 @@ def _prepend_group_execution_header(execution: dict[str, str], test_result: str)
         lines.extend(f"- {file_path}" for file_path in execution.get("resolved_targets", []))
         case_grep = execution.get("failed_case_grep", "")
         if case_grep:
+            # Runner-side fact for the agent; the agent-facing directive to
+            # re-run the full layer lives in core/phases' ARC_RETRY_FILTER_NOTE.
             lines.append(
                 "Failed Case Filter: this retry round re-ran only the previously "
                 f"failing case(s) (--grep {case_grep}); cases that passed in earlier "
@@ -3021,7 +3040,7 @@ class WebAppType(AppTypeHandler):
         # filter rides on the execution dict and survives that second attempt.
         case_grep = execution.get("failed_case_grep", "")
         if case_grep:
-            playwright_command += " --grep " + shlex.quote(case_grep)
+            playwright_command += " --grep " + _shell_single_arg(case_grep)
         playwright_result = await stage_timer.measure(
             "playwright",
             _execute_web_test_command(
