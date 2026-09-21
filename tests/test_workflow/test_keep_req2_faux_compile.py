@@ -356,6 +356,10 @@ def test_keep_req2_faux_compile_end_to_end(
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "1")
     monkeypatch.setenv("ARC_AUTO_TDD_RETRY", "0")
     monkeypatch.setenv("ARC_VISUAL_PRECOMPUTE", "0")
+    # No arbitration in this run: the faux scripts never drift their anchors,
+    # and an inherited ARC_MERGE_ARBITRATION from the host environment must
+    # not activate the escalation path mid-e2e.
+    monkeypatch.delenv("ARC_MERGE_ARBITRATION", raising=False)
     workspace, runtime = keep_req2_runtime
 
     tree = load_requirements(KEEP_REQ2_YAML)
@@ -452,3 +456,117 @@ def test_keep_req2_faux_compile_end_to_end(
     # (node ids carry dots, e.g. REQ-2.1 -> req_2.1.js).
     for slug in ("req_2.1", "req_2.8.3", "req_2.7.6.2"):
         assert (workspace / "backend" / "src" / "features" / f"{slug}.js").is_file(), slug
+
+
+def test_keep_req2_pipeline_mode_starts_dependent_design_before_dependency_implement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    keep_req2_runtime,
+) -> None:
+    """Issue #83's scheduling deliverable on the real fixture: with
+    ``ARC_DESIGN_GATE_PIPELINE`` on, a dependent's DESIGN is schedulable while
+    its declared dependency's IMPLEMENT is still pending - it starts the
+    moment the dependency's DESIGN completes, no longer queued behind the
+    dependency's landing IMPLEMENT.
+
+    Why the assertion watches scheduling decisions, not wall-clock start
+    order: the serial drain (``ARC_MAX_CONCURRENT_TASKS=1``, kept serial
+    because the product race of #91 fires at >=2 real slots) picks tasks in
+    flat queue order, and every dependency pair inside the fixture shares the
+    REQ-2 affinity subtree - so even when the dependent's DESIGN is runnable
+    first, the flat order may start the dependency's IMPLEMENT before it. The
+    observable contract under serial draining is therefore *which tasks were
+    runnable when*: each time the drain picks a task, the pipelined gate must
+    already consider the dependent's DESIGN runnable while the dependency's
+    IMPLEMENT has not completed - and the closed gate must not (that
+    difference is exactly the pipelining lever). A parallel-drain variant
+    asserting the interleaved start order lives in
+    test_design_gate_pipelining.py (stubbed phases, no #91 exposure)."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_AFFINITY_DEPTH", "2")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "1")
+    monkeypatch.setenv("ARC_AUTO_TDD_RETRY", "0")
+    monkeypatch.setenv("ARC_VISUAL_PRECOMPUTE", "0")
+    monkeypatch.setenv("ARC_DESIGN_GATE_PIPELINE", "1")
+    # Same isolation as the end-to-end test above: no arbitration here.
+    monkeypatch.delenv("ARC_MERGE_ARBITRATION", raising=False)
+    workspace, runtime = keep_req2_runtime
+
+    tree = load_requirements(KEEP_REQ2_YAML)
+    nodes = _walk_nodes(tree)
+    model = _NodeRoutedFauxModel()
+    model.set_node_scripts(
+        {node["id"]: _node_script(node, is_non_leaf) for node, is_non_leaf in nodes}
+    )
+    fake_handler = _BaselineRedHandler()
+
+    manager = ARCWorkflowManager(
+        workspace_path=str(workspace),
+        requirement_path=str(KEEP_REQ2_YAML),
+        app_type="web",
+        web_port=4200,
+        log_cb=lambda *args, **kwargs: None,
+    )
+    manager.runtime = runtime
+
+    # Scheduling-decision log: every time the drain begins a task, record
+    # whether REQ-2.2's DESIGN was already runnable (its dependency REQ-2.1's
+    # DESIGN done, IMPLEMENT not yet) at that moment.
+    pipeline_runnable_before_dependency_implement = False
+    original_begin = ARCWorkflowManager._begin_task
+
+    def begin_and_observe(self, task: dict, queue_state: dict) -> None:
+        nonlocal pipeline_runnable_before_dependency_implement
+        if (
+            task["node_id"] == "REQ-2.1"
+            and task["phase"] == "IMPLEMENT"
+            and not pipeline_runnable_before_dependency_implement
+        ):
+            rb_design = next(
+                (
+                    other
+                    for other in queue_state["tasks"]
+                    if other["node_id"] == "REQ-2.2" and other["phase"] == "DESIGN"
+                ),
+                None,
+            )
+            if rb_design is not None and self._task_dependencies_met(queue_state, rb_design):
+                pipeline_runnable_before_dependency_implement = True
+        original_begin(self, task, queue_state)
+
+    original_builder = ARCWorkflowManager._build_task_phase_runner
+
+    def build_with_faux(self, workspace_path: str, web_port: int | None):
+        runner = original_builder(self, workspace_path, web_port)
+        runner.interface_designer.model = model
+        runner.test_generator.model = model
+        runner.test_driven_developer.model = model
+        runner.app_handler = fake_handler
+        runner.test_driven_developer.app_handler = fake_handler
+        return runner
+
+    monkeypatch.setattr(ARCWorkflowManager, "_build_task_phase_runner", build_with_faux)
+    monkeypatch.setattr(ARCWorkflowManager, "_begin_task", begin_and_observe)
+    manager.interface_designer.model = model
+    manager.test_generator.model = model
+    manager.test_driven_developer.model = model
+    manager.phase_runner.app_handler = fake_handler
+    manager.phase_runner.test_driven_developer.app_handler = fake_handler
+
+    result = asyncio.run(manager.compile_requirement_tree(tree))
+
+    assert result["ok"] is True, result
+    assert pipeline_runnable_before_dependency_implement, (
+        "pipelined mode: REQ-2.2's DESIGN must be runnable while REQ-2.1's "
+        "IMPLEMENT has not completed (the dependency's DESIGN gating it has "
+        "already merged)"
+    )
+
+    # The serial flat order still lands REQ-2.2's IMPLEMENT after REQ-2.1's
+    # (the IMPLEMENT gate is unchanged); the durable queue is the evidence.
+    arc = workspace / ".arc"
+    queue = json.loads((arc / "processing_queue.json").read_text(encoding="utf-8"))
+    tasks = {task["task_id"]: task for task in queue["tasks"]}
+    assert tasks["REQ-2.1:IMPLEMENT"]["status"] == "COMPLETED"
+    assert tasks["REQ-2.2:IMPLEMENT"]["status"] == "COMPLETED"
+    assert tasks["REQ-2.2:DESIGN"]["status"] == "COMPLETED"
