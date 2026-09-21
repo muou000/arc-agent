@@ -26,3 +26,30 @@ def normalize_windows_extended_prefix_text(value: str | Path | None) -> str:
 
 def normalize_windows_extended_prefix_path(value: str | Path) -> Path:
     return Path(normalize_windows_extended_prefix_text(value))
+
+
+def normalize_workspace_relative_path(value: object, workspace_path: str) -> str:
+    """Normalize a manifest/agent path to a workspace-relative POSIX path.
+
+    Accepts virtual ``/workspace/`` roots (the agent filesystem view),
+    absolute host paths and plain relative paths, and strips ``./`` noise so
+    manifest registration and run_tests requests compare equal strings.
+    """
+
+    path = normalize_windows_extended_prefix_text(value)
+    if not path:
+        return ""
+    path = path.replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    if path == "/workspace":
+        return ""
+    if path.startswith("/workspace/"):
+        return path[len("/workspace/") :].lstrip("/")
+
+    workspace = normalize_windows_extended_prefix_text(Path(workspace_path).expanduser().resolve()).rstrip("/")
+    if path == workspace:
+        return ""
+    if path.startswith(workspace + "/"):
+        return path[len(workspace) + 1 :].lstrip("/")
+    return path.lstrip("/")
