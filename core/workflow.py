@@ -1507,14 +1507,7 @@ class ARCWorkflowManager:
         # The manager's reset-and-settle runs before the queue is mutated: a
         # failed reset leaves the worktree untouched, the requeue declines,
         # and the node fails with its conflicted commits intact.
-        settled = await self._settle_task_workspace(ctx, WorktreeTaskResult.RESET_FOR_RETRY)
-        if settled is None:
-            await self._log(
-                "Compiler",
-                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead.",
-                "error",
-                node_id,
-            )
+        if not await self._settle_for_conflict_requeue(ctx, node_id):
             return False
 
         design_task["status"] = TASK_PENDING
@@ -1631,14 +1624,7 @@ class ARCWorkflowManager:
         # The manager's reset-and-settle runs before the queue is mutated: a
         # failed reset leaves the worktree untouched, the requeue declines,
         # and the node fails with its conflicted commits intact.
-        settled = await self._settle_task_workspace(ctx, WorktreeTaskResult.RESET_FOR_RETRY)
-        if settled is None:
-            await self._log(
-                "Compiler",
-                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead.",
-                "error",
-                node_id,
-            )
+        if not await self._settle_for_conflict_requeue(ctx, node_id):
             return False
 
         implement_task["status"] = TASK_PENDING
@@ -1727,6 +1713,27 @@ class ARCWorkflowManager:
             get_file_claim_registry(self.workspace_path).release_node(ctx.node_id)
             self._release_port_slot(ctx.slot)
         return outcome
+
+    async def _settle_for_conflict_requeue(self, ctx: _TaskWorkspace, node_id: str) -> bool:
+        """Settle the task workspace for a conflict requeue.
+
+        The manager's reset-and-settle runs before the queue is mutated: a
+        failed reset leaves the worktree untouched, the requeue declines, and
+        the node fails with its conflicted commits intact. Returns ``False``
+        when the requeue must decline; the settle failure's cause is already
+        logged as a warning by ``_settle_task_workspace``.
+        """
+
+        settled = await self._settle_task_workspace(ctx, WorktreeTaskResult.RESET_FOR_RETRY)
+        if settled is None:
+            await self._log(
+                "Compiler",
+                f"Re-queueing {node_id} after its merge conflict failed; the node fails instead.",
+                "error",
+                node_id,
+            )
+            return False
+        return True
 
     def _acquire_port_slot(self, node_id: str) -> int:
         for slot in range(self._port_slot_count):

@@ -735,17 +735,21 @@ class NodeWorktreeManager:
         the scheduler only reports the task's result:
 
         - ``FAILED`` → ``PRESERVED``: the worktree keeps its state for
-          inspection and ``--retry`` exactly as the task left it (a conflicted
-          merge already quarantined it inside ``integrate``; a plain failure
-          stays un-quarantined and the next ``prepare``'s dirty check falls
-          back exactly as before).
+          inspection and ``--retry`` exactly as the task left it - whatever
+          quarantine ``integrate`` recorded stays in force (a conflicted
+          merge keeps the directory out of other nodes' hands); a plain
+          failure stays un-quarantined and the next ``prepare``'s dirty
+          check falls back exactly as before.
         - ``RESET_FOR_RETRY`` → the branch is reset to the current integration
           HEAD and the directory un-quarantined first (the conflict-aware
           requeue re-runs the node against the winning sibling's merged
           files), then the same decision as a merged task: a reusable group
           directory survives (``REUSED``), a node-keyed directory is removed
           (``DELETED``) and the retry's ``prepare`` recreates it from the
-          branch - which now sits at the integration HEAD.
+          branch - which now sits at the integration HEAD. Once the reset
+          has succeeded a failed removal must not fail the requeue (the
+          conflicted commits are already reset away), so the directory is
+          kept in its now-clean, reusable state and reported as ``REUSED``.
         - ``MERGED`` → ``REUSED`` for a reusable group directory,
           ``DELETED`` otherwise (branch kept).
 
@@ -755,10 +759,21 @@ class NodeWorktreeManager:
         directories are preserved for inspection and ``--retry``.
         """
 
-        if result is WorktreeTaskResult.RESET_FOR_RETRY:
-            self._reset_branch_to_integration(handle)
         if result is WorktreeTaskResult.FAILED:
             return WorktreeOutcome.PRESERVED
+        if result is WorktreeTaskResult.RESET_FOR_RETRY:
+            self._reset_branch_to_integration(handle)
+            if handle.reusable:
+                return WorktreeOutcome.REUSED
+            try:
+                self._remove_worktree(handle)
+            except WorktreeError:
+                # The reset already succeeded, so the requeue must proceed:
+                # the directory is clean at the integration HEAD - keep it as
+                # genuinely reusable instead of failing the requeue over a
+                # removal.
+                return WorktreeOutcome.REUSED
+            return WorktreeOutcome.DELETED
         if handle.reusable:
             return WorktreeOutcome.REUSED
         self._remove_worktree(handle)

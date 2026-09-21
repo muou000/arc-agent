@@ -260,6 +260,58 @@ def test_settle_retry_reset_deletes_the_node_worktree_keeps_the_reset_branch(tmp
     assert manager._branch_exists(handle.branch), "the branch stays for the retry's prepare"
 
 
+def test_settle_retry_reset_survives_a_failed_removal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once the retry reset has succeeded, a failed directory removal must not
+    fail the settle: the conflicted commits are already reset away, so the
+    requeue has to proceed - the directory is kept in its now-clean, reusable
+    state and reported as REUSED."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-1.1")
+    (Path(handle.path) / "backend" / "src.js").write_text("from worktree;\n", encoding="utf-8")
+    manager.commit(handle, "wip")
+    (repo / "backend" / "src.js").write_text("from integration;\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "integration edit"], repo)
+    with pytest.raises(MergeConflictError):
+        manager.integrate(handle, "REQ-1.1 conflict")
+
+    def broken_remove(_handle: object) -> None:
+        raise WorktreeError("refusing to delete the worktree")
+
+    monkeypatch.setattr(manager, "_remove_worktree", broken_remove)
+
+    outcome = manager.settle(handle, result=WorktreeTaskResult.RESET_FOR_RETRY)
+
+    assert outcome is WorktreeOutcome.REUSED
+    assert manager._is_registered(Path(handle.path)), "the directory survives the failed removal"
+    head = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    branch_head = _git(["rev-parse", handle.branch], repo).stdout.strip()
+    assert branch_head == head, "the reset still took effect"
+    assert not manager._worktree_dirty(handle.path), "the kept directory is clean for reuse"
+
+
+def test_settle_failed_task_keeps_an_in_force_quarantine(tmp_path: Path) -> None:
+    """A worktree quarantined by a conflicted merge stays quarantined when its
+    task settles as FAILED: the directory must not be handed to another node."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(handle.path) / "backend" / "src.js").write_text("from worktree;\n", encoding="utf-8")
+    manager.commit(handle, "wip")
+    (repo / "backend" / "src.js").write_text("from integration;\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "integration edit"], repo)
+    with pytest.raises(MergeConflictError):
+        manager.integrate(handle, "REQ-2.1 conflict")
+
+    outcome = manager.settle(handle, result=WorktreeTaskResult.FAILED)
+
+    assert outcome is WorktreeOutcome.PRESERVED
+    other = manager.prepare("REQ-2.2", group_key="REQ-2")
+    assert Path(other.path).name == "REQ-2.2", "the quarantined group dir is not handed out again"
+
+
 def test_integrate_commit_failure_names_the_branch(tmp_path: Path) -> None:
     repo, manager = _init_repo(tmp_path)
     handle = manager.prepare("REQ-1.1")
