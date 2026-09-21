@@ -2636,12 +2636,7 @@ class WebAppType(AppTypeHandler):
         stage_timer = _StageTimer()
 
         try:
-            (
-                body,
-                backend_cleanup_note,
-                playwright_command,
-                reused_runtime,
-            ) = await self._run_e2e_group_attempt(
+            body, backend_cleanup_note = await self._run_e2e_group_attempt(
                 execution,
                 stage_timer,
                 resolved_port,
@@ -2673,7 +2668,7 @@ class WebAppType(AppTypeHandler):
             )
             recovery_note = await self._terminate_e2e_session("SPA static-host recovery cleanup")
             try:
-                retried_body, _, _, _ = await self._run_e2e_group_attempt(
+                retried_body, _ = await self._run_e2e_group_attempt(
                     execution,
                     stage_timer,
                     resolved_port,
@@ -2720,7 +2715,7 @@ class WebAppType(AppTypeHandler):
         *,
         force_rebuild: bool,
         prior_cleanup_note: str,
-    ) -> tuple[str, str, str, bool]:
+    ) -> tuple[str, str]:
         """Run one grouped E2E attempt end to end and return its result body.
 
         ``run_test_group`` calls this once, and a second time with
@@ -2728,15 +2723,16 @@ class WebAppType(AppTypeHandler):
         static-host signature (see the recovery block there). The runtime env
         is rebuilt per attempt so each carries its own database label.
 
-        Returns ``(body, backend_cleanup_note, playwright_command,
-        reused_runtime)``; the extras keep the recovery block auditable
-        without re-deriving them from the body text.
+        Returns ``(body, backend_cleanup_note)``; the note lets the recovery
+        re-run carry the teardown evidence of the attempt before it.
         """
 
         build_ok, frontend_build_output = await stage_timer.measure(
             "frontend_build",
             _build_frontend_dist(self.workspace_path, force_rebuild=force_rebuild),
         )
+        # Failure bodies check the verdict here (post-build, pre-Playwright);
+        # the success body re-checks after Playwright — see the comment there.
         served_verdict = _frontend_serving_verdict(self.workspace_path)
         if not build_ok:
             failure_body = (
@@ -2747,7 +2743,7 @@ class WebAppType(AppTypeHandler):
             )
             if prior_cleanup_note:
                 failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{prior_cleanup_note}"
-            return failure_body, prior_cleanup_note, "", False
+            return failure_body, prior_cleanup_note
 
         e2e_runtime_env = _build_e2e_runtime_env(
             self.workspace_path,
@@ -2818,7 +2814,7 @@ class WebAppType(AppTypeHandler):
                 )
                 if backend_cleanup_note:
                     failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
-                return failure_body, backend_cleanup_note, "", False
+                return failure_body, backend_cleanup_note
 
             (
                 backend_process,
@@ -2843,7 +2839,7 @@ class WebAppType(AppTypeHandler):
                 )
                 if backend_cleanup_note:
                     failure_body += f"\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
-                return failure_body, backend_cleanup_note, "", False
+                return failure_body, backend_cleanup_note
             self._e2e_runtime_session = _E2EBackendSession(
                 process=backend_process,
                 port=resolved_port,
@@ -2907,7 +2903,7 @@ class WebAppType(AppTypeHandler):
             f"=== Backend Runtime Cleanup ===\n{cleanup_section}"
             + stage_timer.render()
         )
-        return body, backend_cleanup_note, playwright_command, reused_runtime
+        return body, backend_cleanup_note
 
     @classmethod
     def build_stack_block(
