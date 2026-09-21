@@ -1245,14 +1245,17 @@ def _frontend_serving_verdict(workspace_path: str) -> str:
 # artifact — `NotFoundError: Not Found` raised from send's internals with a
 # `sendfile` frame from Express on the stack. The generated fallback handler's
 # own function/file names drift between agent edits, so the anchors are the
-# stable library frames plus the sendFile call.
+# stable library frames plus the sendFile call. Each anchor is line-anchored
+# and the gaps between them are bounded (a few stack lines, not the whole
+# output), so the pattern cannot splice frames from two unrelated stacks.
 _SPA_STATIC_HOST_FAILURE = re.compile(
-    r"NotFoundError:\s*Not Found.*?"
-    r"at\s+(?:createHttpError|SendStream\.pipe)\b.*?"
-    r"send\\(?:index|lib)[^\r\n]*\r?\n.*?"
-    r"at\s+sendfile\b.*?"
-    r"at\s+.*?sendFile\b",
-    re.DOTALL,
+    r"NotFoundError:\s*Not Found[^\r\n]*\r?\n"
+    r"(?:[^\r\n]*\r?\n){0,2}?"
+    r"[^\r\n]*at\s+(?:createHttpError|SendStream\.pipe)\b[^\r\n]*\r?\n"
+    r"(?:[^\r\n]*\r?\n){0,2}?"
+    r"[^\r\n]*at\s+sendfile\b[^\r\n]*\r?\n"
+    r"(?:[^\r\n]*\r?\n){0,2}?"
+    r"[^\r\n]*at\s+\S*sendFile\b[^\r\n]*",
 )
 
 
@@ -2890,7 +2893,11 @@ class WebAppType(AppTypeHandler):
             cleanup_section = f"Previous runtime cleanup: {backend_cleanup_note}\n{deferred_cleanup}"
         body = (
             f"Exit Code: {playwright_exit_code}\n\n"
-            f"=== Frontend Build ===\n{frontend_build_output}\n\n{served_verdict}\n\n"
+            # Checked here — after Playwright ran — not right after the build:
+            # the verdict's job is to expose the artifact-vanished-after-build
+            # race, which a pre-Playwright snapshot cannot see.
+            f"=== Frontend Build ===\n{frontend_build_output}\n\n"
+            f"{_frontend_serving_verdict(self.workspace_path)}\n\n"
             f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n"
             f"DB Label: {e2e_runtime_env.get('ARC_E2E_DB_LABEL', 'unknown')}\n\n"
             f"=== Database Prepare ===\n{database_prepare_output}\n\n"
