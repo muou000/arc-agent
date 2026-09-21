@@ -27,7 +27,8 @@ from core.path_compat import normalize_windows_extended_prefix_text
 from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 from core.visual_analysis import analyze_and_attach_visual_references
 from app_type_handler.test_results import classify_test_failure, failure_fingerprint, parse_test_results
-from agents.tools.test_manifest import is_test_file_path, normalize_coverage_scope
+from agents.runtime.capabilities import is_test_file_path
+from agents.tools.test_manifest import normalize_coverage_scope
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]

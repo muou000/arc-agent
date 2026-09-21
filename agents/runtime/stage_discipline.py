@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
-from agents.tools.test_manifest import TestManifestLock, is_test_file_path, normalize_manifest_path
+from agents.runtime.capabilities import capability_for, is_test_file_path, normalize_manifest_path
+from agents.tools.test_manifest import TestManifestLock
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 
@@ -186,37 +187,52 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
     def _validate_tool_call(self, request: ToolCallRequest) -> str | None:
         name = str(request.tool_call.get("name", ""))
         args = request.tool_call.get("args", {}) or {}
-        if name == "execute":
-            return "`execute` is disabled in ARC's staged file workflow."
+        path = _discipline_path(args)
+        # The shared-surface guard runs ahead of the capability table so its
+        # remediation message keeps precedence: a TestGenerator writing
+        # template wiring (never a test asset) must be told to extend the
+        # surface additively, not just that the asset is out of scope. Both
+        # deny; only the message order is pinned here.
+        if name == "write_file" and self._template_shared_surfaces:
+            if blocked := self._validate_shared_surface(args):
+                return blocked
+        verdict = capability_for(self._stage, name, path)
+        if not verdict.allowed:
+            return verdict.message
+        # What remains is runtime state the static table cannot see: the
+        # manifest lock, write budgets, session ownership of deletes.
         if name == "delete":
-            if self._stage == "test_generation" and _is_test_asset(_discipline_path(args)):
-                # A green-baseline rejection may legitimately remove a test
-                # asset (duplicate or tautological coverage); deleting
-                # anything else stays blocked for every stage.
-                manifest_block = self._validate_test_manifest_path(args, operation="delete")
-                if manifest_block:
-                    return manifest_block
-                return self._validate_delete_rewrite_budget(args)
-            if self._stage == "implementation" and self._is_session_created_test_asset(args):
-                # IMPLEMENT may clean up diagnostic test files it created
-                # itself this pass (render probes, framework-behavior
-                # scratch files). Registered manifest tests and product
-                # files are not on this channel: they were not written
-                # here, so the path-ownership check below rejects them.
-                return self._validate_delete_rewrite_budget(args)
-            return f"`{name}` is disabled in ARC's staged file workflow."
-        if self._stage == "test_generation" and name in _VALIDATION_TOOLS:
-            return "TestGenerator only creates tests and its manifest; it must not run validation."
+            return self._validate_delete_channel(args)
         if name == "read_file":
             return self._validate_read(args)
         if name in _ADDITIVE_FILE_WRITE_TOOLS:
             return self._validate_append(args)
         if name in _FILE_WRITE_TOOLS:
-            if name == "write_file" and self._template_shared_surfaces:
-                if blocked := self._validate_shared_surface(args):
-                    return blocked
             return self._validate_write(args)
         return None
+
+    def _validate_delete_channel(self, args: dict[str, Any]) -> str | None:
+        """Runtime gates on the delete channels the capability table allows.
+
+        The table's static verdict already narrowed delete to test-asset
+        paths (test_generation and implementation); this adds what only the
+        running session knows. test_generation: the manifest lock on
+        declared paths plus the delete-rewrite budget. implementation: the
+        session also owns the channel (#89) — only a test file written this
+        pass may be removed (a diagnostic probe cleanup); registered
+        manifest tests and product files were not written here, so they stay
+        blocked with the table's own disabled message.
+        """
+
+        path = _discipline_path(args)
+        if self._stage == "test_generation":
+            manifest_block = self._validate_test_manifest_path(args, operation="delete")
+            if manifest_block:
+                return manifest_block
+            return self._validate_delete_rewrite_budget(args)
+        if path in self._written_paths:
+            return self._validate_delete_rewrite_budget(args)
+        return "`delete` is disabled in ARC's staged file workflow."
 
     def _validate_shared_surface(self, args: dict[str, Any]) -> str | None:
         """Reject whole-file rewrites of the template's shared runtime surfaces.
@@ -287,15 +303,15 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         return None
 
     def _validate_append(self, args: dict[str, Any]) -> str | None:
-        """Validate the DESIGN-only additive continuation tool.
+        """Validate the DESIGN-stage additive continuation tool.
 
-        The filesystem tool checks the real file length. This middleware keeps
-        ownership and stage policy here so appending cannot bypass claims,
-        write-count limits, or the observability used by InterfaceDesigner.
+        Stage availability is the capability table's verdict (enforced
+        pre-flight in ``_validate_tool_call``). The filesystem tool checks
+        the real file length; this middleware keeps ownership and per-pass
+        policy here so appending cannot bypass claims, write-count limits,
+        or the observability used by InterfaceDesigner.
         """
 
-        if self._stage != "interface_design":
-            return "append_file is only available during the interface_design stage."
         path = _discipline_path(args)
         if not path:
             return "append_file requires a workspace file_path."
@@ -368,23 +384,6 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             "coverage on a second path is not permitted; rework the content of a "
             "declared file instead."
         )
-
-    def _is_session_created_test_asset(self, args: dict[str, Any]) -> bool:
-        """Whether IMPLEMENT's delete target is a test file this pass wrote.
-
-        The simple-ticketing arc-output1 run showed the gap a blanket delete
-        ban leaves: a TDD agent that wrote render-probe diagnostics under
-        ``frontend/tests/`` could not clean them up, and the ``git add -A``
-        checkpoint shipped them into the delivery commit (``diag.test.tsx``,
-        ``RegisterPage.diag.test.tsx``). Restricting the release to paths in
-        ``_written_paths`` keeps every pre-existing surface off the channel:
-        a registered manifest test the node must keep satisfying, sibling
-        tests merged from another branch, and product files all fail this
-        check, so the only deletable file is one this session created.
-        """
-
-        path = _discipline_path(args)
-        return bool(path) and path in self._written_paths and _is_test_asset(path)
 
     def _validate_delete_rewrite_budget(self, args: dict[str, Any]) -> str | None:
         """Cap the delete-then-rewrite escape per test-file path.
@@ -476,12 +475,10 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 f"Repeated write blocked: {path} was already changed in this stage. "
                 f"{exit_text}"
             )
-        if self._stage == "test_generation" and not _is_test_asset(path):
-            return (
-                "TestGenerator may write only test files, test helpers/configuration, and the returned manifest; "
-                f"{path} is not a test asset."
-            )
         if self._stage == "test_generation":
+            # Whether the path is a test asset at all was already answered by
+            # the capability table (pre-flight); the manifest gate below adds
+            # the declaration requirement on top of it.
             blocked = self._validate_test_manifest_path(args, operation="write")
             if blocked:
                 return blocked
@@ -711,16 +708,3 @@ def _tool_result_failed(result: ToolMessage | Any) -> bool:
         return True
     content = str(getattr(result, "content", "") or "")
     return "Exit Code: 0" not in content and ("Exit Code:" in content or content.lstrip().startswith("Error:"))
-
-
-def _is_test_asset(path: str) -> bool:
-    normalized = path.replace("\\", "/").lower()
-    name = normalized.rsplit("/", 1)[-1]
-    # ``/test-e2e/`` is the web app type's E2E directory: its files may carry
-    # any JS/TS source name (the placement rule accepts plain names), so the
-    # segment must count as a test asset even without a `.test.`/`.spec.`
-    # marker — otherwise a declared `backend/test-e2e/login.js` would be
-    # rejected as "not a test asset" after passing the manifest declaration.
-    test_segments = ("/test/", "/tests/", "/__tests__/", "/e2e/", "/test-e2e/", "/__mocks__/")
-    test_names = (".test.", ".spec.", "playwright.config.", "vitest.config.", "jest.config.", "setup-tests.", "setuptests.")
-    return any(segment in normalized for segment in test_segments) or any(marker in name for marker in test_names)

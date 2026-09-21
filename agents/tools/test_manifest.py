@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from agents.runtime.capabilities import is_test_file_path, normalize_manifest_path
 from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -73,54 +74,6 @@ class TestManifestLock:
 
     def contains(self, file_path: str) -> bool:
         return normalize_manifest_path(file_path) in self.declared_files
-
-
-def normalize_manifest_path(value: Any) -> str:
-    """Canonicalize a tool-call or manifest path to workspace-relative form.
-
-    Accepts virtual (``/workspace/a/b.test.ts``), relative (``a/b.test.ts``,
-    ``./a/b.test.ts``) and absolute workspace-root-prefixed forms. Absolute
-    paths outside the workspace keep their ``/``-joined form (only used for
-    diagnostics; they never match a declared relative path).
-    """
-
-    path = re.sub(r"^\\\\\?\\", "", str(value or "").strip())
-    if not path:
-        return ""
-    path = path.replace("\\", "/")
-    while path.startswith("./"):
-        path = path[2:]
-    if path == "/workspace" or path == "/workspace/":
-        return ""
-    if path.startswith("/workspace/"):
-        return path[len("/workspace/") :].strip("/")
-    return path.strip("/")
-
-
-def is_test_file_path(path: str) -> bool:
-    """Whether a path is a *test file* (not a helper/config).
-
-    Mirrors ``_is_test_asset`` from ``stage_discipline`` for the subset that
-    the manifest lock governs: files whose name marks them as tests —
-    JavaScript-style ``.test.``/``.spec.`` names plus the Python unittest
-    conventions ``test_*.py``/``*_test.py`` (the CLI app type's layout). Web
-    E2E files are the one name-agnostic case: the app-type rule accepts any
-    JS/TS source name under ``test-e2e`` directories, so a path inside such
-    a directory counts as a test file regardless of its name. Helpers and
-    runner configs (``setup-tests.ts``, ``playwright.config.js``) are test
-    *assets* the stage may write freely — they carry no manifest entry, so
-    locking them would only add blocked-turn noise.
-    """
-
-    normalized = normalize_manifest_path(path).lower()
-    if "/test-e2e/" in f"/{normalized}/":
-        return True
-    name = normalized.rsplit("/", 1)[-1]
-    if ".test." in name or ".spec." in name:
-        return True
-    if not name.endswith(".py"):
-        return False
-    return name.startswith("test_") or name.endswith("_test.py")
 
 
 def build_declare_test_manifest_tool(

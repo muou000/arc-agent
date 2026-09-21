@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
+from agents.runtime.capabilities import normalize_manifest_path
 from agents.runtime.checkpointer import get_project_thread_namespace
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
@@ -16,7 +17,6 @@ from agents.runtime.runners import ainvoke_stage_agent
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_install_dependencies_tool
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
-from agents.tools.test_manifest import normalize_manifest_path
 from agents.tools.test_failure_digest import (
     build_failure_digest,
     extract_build_note,
