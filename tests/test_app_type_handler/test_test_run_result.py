@@ -15,7 +15,7 @@ import asyncio
 from pathlib import Path
 
 from app_type_handler import web as web_handler
-from app_type_handler.backend_runtime import InMemoryBackendRuntime
+from app_type_handler.backend_runtime import InMemoryBackendRuntime, _CommandResult
 
 
 _VITEST_FAILURE_OUTPUT = """Exit Code: 1
@@ -45,12 +45,12 @@ class _ScriptedCommands:
         timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
         web_port: int | None = None,
-    ) -> web_handler._CommandResult:
+    ) -> _CommandResult:
         self.calls.append(command)
         for needle, (code, text) in self.scripts.items():
             if needle in command:
-                return web_handler._CommandResult(exit_code=code, text=text)
-        return web_handler._CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
+                return _CommandResult(exit_code=code, text=text)
+        return _CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
 
 
 def _make_workspace(tmp_path: Path) -> Path:

@@ -6,18 +6,19 @@ import asyncio
 from pathlib import Path
 
 from app_type_handler import web as web_handler
+from app_type_handler.backend_runtime import _CommandResult
 
 
 class _BuildRecorder:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def __call__(self, command: str, cwd: str, timeout: float = 60.0, extra_env=None) -> web_handler._CommandResult:
+    async def __call__(self, command: str, cwd: str, timeout: float = 60.0, extra_env=None) -> _CommandResult:
         self.calls.append(command)
         dist_dir = Path(cwd) / "dist"
         dist_dir.mkdir(parents=True, exist_ok=True)
         (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-        return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\n")
+        return _CommandResult(exit_code=0, text="Exit Code: 0\n")
 
 
 def test_rebuilds_when_frontend_build_environment_changes(tmp_path: Path, monkeypatch) -> None:

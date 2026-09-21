@@ -1099,36 +1099,6 @@ class BackendRuntime:
         """The live session, if one is currently held."""
         return self._session
 
-    def seed_live_session(
-        self,
-        *,
-        port: int,
-        db_path: str,
-        fingerprint: str,
-        handle: Any | None = None,
-        start_command: str = "npm run start",
-        startup_detail: str = "started",
-        instance_fingerprint: str = "launcher:seeded",
-    ) -> BackendSession:
-        """Register a session as if ``ensure`` had started it (test setup).
-
-        Lets tests drive the reuse and terminate paths without a real spawn;
-        the process adapter passes a real (or duck-typed) process ``handle``,
-        the in-memory adapter leaves it ``None``.
-        """
-
-        session = BackendSession(
-            handle=handle,
-            port=port,
-            db_path=db_path,
-            fingerprint=fingerprint,
-            start_command=start_command,
-            startup_detail=startup_detail,
-            instance_fingerprint=instance_fingerprint,
-        )
-        self._session = session
-        return session
-
     async def ensure(
         self,
         port: int,
@@ -1136,19 +1106,18 @@ class BackendRuntime:
         fingerprint: str | None,
         *,
         runtime_env: dict[str, str],
-        prepare_database: bool = True,
     ) -> RuntimeAcquisition:
         """Return a live session matching the requested key, starting one if needed.
 
         See the class docstring for the reuse inputs and the fallback order.
-        ``prepare_database=False`` skips the file-level ``db:prepare:e2e`` on
-        the fresh-start branch — the merge-gate health probe boots the backend
-        without touching the database (it checks server boot, not data state).
         """
 
         loop = asyncio.get_running_loop()
         stage_seconds: dict[str, float] = {}
         cleanup_note = ""
+
+        def _record(stage: str, started: float) -> None:
+            stage_seconds[stage] = stage_seconds.get(stage, 0.0) + (loop.time() - started)
 
         session = self._session
         if (
@@ -1160,11 +1129,11 @@ class BackendRuntime:
         ):
             started = loop.time()
             serving = await self._serving(session)
-            stage_seconds["backend_runtime"] = stage_seconds.get("backend_runtime", 0.0) + (loop.time() - started)
+            _record("backend_runtime", started)
             if serving:
                 started = loop.time()
                 reset_ok, reset_output = await self.reset_db(runtime_env)
-                stage_seconds["database_prepare"] = stage_seconds.get("database_prepare", 0.0) + (loop.time() - started)
+                _record("database_prepare", started)
                 if reset_ok:
                     return RuntimeAcquisition(
                         session=session,
@@ -1182,22 +1151,21 @@ class BackendRuntime:
             cleanup_note = f"{cleanup_note}\n{stale_note}" if cleanup_note else stale_note
 
         db_output = ""
-        if prepare_database:
-            started = loop.time()
-            prepare_ok, _prepare_exit, prepare_output = await self._prepare_db(runtime_env)
-            stage_seconds["database_prepare"] = stage_seconds.get("database_prepare", 0.0) + (loop.time() - started)
-            db_output = prepare_output
-            if not prepare_ok:
-                return RuntimeAcquisition(
-                    db_output=prepare_output,
-                    cleanup_note=cleanup_note,
-                    failure_stage="database",
-                    stage_seconds=stage_seconds,
-                )
+        started = loop.time()
+        prepare_ok, _prepare_exit, prepare_output = await self._prepare_db(runtime_env)
+        _record("database_prepare", started)
+        db_output = prepare_output
+        if not prepare_ok:
+            return RuntimeAcquisition(
+                db_output=prepare_output,
+                cleanup_note=cleanup_note,
+                failure_stage="database",
+                stage_seconds=stage_seconds,
+            )
 
         started = loop.time()
         spawn = await self._spawn(port, runtime_env)
-        stage_seconds["backend_runtime"] = stage_seconds.get("backend_runtime", 0.0) + (loop.time() - started)
+        _record("backend_runtime", started)
         if spawn.handle is None:
             return RuntimeAcquisition(
                 db_output=db_output,

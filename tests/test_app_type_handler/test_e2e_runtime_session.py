@@ -31,6 +31,7 @@ import pytest
 from app_type_handler import backend_runtime as backend_runtime_module
 from app_type_handler import web as web_handler
 from app_type_handler.backend_runtime import (
+    BackendSession,
     InMemoryBackendRuntime,
     ProcessBackendRuntime,
     _build_e2e_runtime_env,
@@ -106,6 +107,34 @@ def _make_sqlite(db_path: str, with_data: bool = True) -> None:
         connection.close()
 
 
+def _seed_live_session(
+    runtime,
+    *,
+    port: int,
+    db_path: str,
+    fingerprint: str,
+    handle=None,
+) -> BackendSession:
+    """Register a live session on a runtime as if ``ensure`` had started it.
+
+    Test setup only: it lets the reuse and terminate paths be driven without
+    spawning; the process adapter passes a duck-typed process handle, the
+    in-memory adapter leaves it ``None``.
+    """
+
+    session = BackendSession(
+        handle=handle,
+        port=port,
+        db_path=db_path,
+        fingerprint=fingerprint,
+        start_command="npm run start",
+        startup_detail="started",
+        instance_fingerprint="launcher:seeded",
+    )
+    runtime._session = session
+    return session
+
+
 def _make_handler(tmp_path: Path, backend_runtime=...) -> web_handler.WebAppType:
     kwargs: dict = {}
     if backend_runtime is not ...:
@@ -177,7 +206,7 @@ def test_ensure_never_reuses_a_missing_fingerprint() -> None:
     """A None fingerprint (backend directory gone) always takes the fresh path."""
 
     runtime = InMemoryBackendRuntime()
-    runtime.seed_live_session(port=4321, db_path="suite.sqlite", fingerprint="fp1")
+    _seed_live_session(runtime, port=4321, db_path="suite.sqlite", fingerprint="fp1")
 
     acquisition = asyncio.run(
         runtime.ensure(4321, "suite.sqlite", None, runtime_env={"ARC_E2E_DB_PATH": "suite.sqlite"})
@@ -187,26 +216,9 @@ def test_ensure_never_reuses_a_missing_fingerprint() -> None:
     assert runtime.started == [4321]
 
 
-def test_ensure_skips_database_prepare_when_asked() -> None:
-    """`prepare_database=False` boots without touching the database.
-
-    This is the merge-gate health probe's mode: it checks server boot, not
-    data state.
-    """
-
-    runtime = InMemoryBackendRuntime()
-    acquisition = asyncio.run(
-        runtime.ensure(4321, "", None, runtime_env={}, prepare_database=False)
-    )
-
-    assert not acquisition.reused
-    assert runtime.prepared == []
-    assert acquisition.session is not None
-
-
 def test_terminate_clears_the_session_and_records_the_context() -> None:
     runtime = InMemoryBackendRuntime()
-    runtime.seed_live_session(port=4321, db_path="suite.sqlite", fingerprint="fp1")
+    _seed_live_session(runtime, port=4321, db_path="suite.sqlite", fingerprint="fp1")
 
     note = asyncio.run(runtime.terminate("Session teardown"))
 
@@ -228,7 +240,7 @@ def test_reuses_live_server_when_nothing_changed(tmp_path, monkeypatch) -> None:
     env = _make_env(workspace)
 
     runtime = InMemoryBackendRuntime()
-    seeded = runtime.seed_live_session(port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
+    seeded = _seed_live_session(runtime, port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
     handler = _make_handler(workspace, backend_runtime=runtime)
     recorder = _CommandRecorder()
     _patch_scaffold(monkeypatch, recorder)
@@ -248,7 +260,7 @@ def test_restarts_server_when_backend_source_changes(tmp_path, monkeypatch) -> N
     env = _make_env(workspace)
 
     runtime = InMemoryBackendRuntime()
-    stale = runtime.seed_live_session(port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
+    stale = _seed_live_session(runtime, port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
     handler = _make_handler(workspace, backend_runtime=runtime)
     recorder = _CommandRecorder()
     _patch_scaffold(monkeypatch, recorder)
@@ -278,7 +290,7 @@ def test_restarts_server_when_the_previous_process_stopped_serving(tmp_path, mon
     env = _make_env(workspace)
 
     runtime = InMemoryBackendRuntime()
-    runtime.seed_live_session(port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
+    _seed_live_session(runtime, port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
     runtime.serving = False
     handler = _make_handler(workspace, backend_runtime=runtime)
     recorder = _CommandRecorder()
@@ -294,7 +306,7 @@ def test_restarts_server_when_e2e_database_changes(tmp_path, monkeypatch) -> Non
     env = _make_env(workspace)
 
     runtime = InMemoryBackendRuntime()
-    runtime.seed_live_session(port=4321, db_path="some-other-database.sqlite", fingerprint=fingerprint)
+    _seed_live_session(runtime, port=4321, db_path="some-other-database.sqlite", fingerprint=fingerprint)
     handler = _make_handler(workspace, backend_runtime=runtime)
     recorder = _CommandRecorder()
     _patch_scaffold(monkeypatch, recorder)
@@ -309,7 +321,7 @@ def test_falls_back_to_fresh_start_when_reseeding_fails(tmp_path, monkeypatch) -
     env = _make_env(workspace)
 
     runtime = InMemoryBackendRuntime()
-    runtime.seed_live_session(port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
+    _seed_live_session(runtime, port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
     runtime.reset_ok = False
     runtime.reset_note = "re-seeding via `npm run db:seed` did not"
     handler = _make_handler(workspace, backend_runtime=runtime)
@@ -336,7 +348,7 @@ def test_runtime_session_is_strictly_per_instance(tmp_path, monkeypatch) -> None
     first = _make_handler(workspace, backend_runtime=first_runtime)
     second_runtime = InMemoryBackendRuntime()
     second = _make_handler(workspace, backend_runtime=second_runtime)
-    seeded = first_runtime.seed_live_session(port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
+    seeded = _seed_live_session(first_runtime, port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
 
     # The second instance starts blind even while the first holds a live session.
     assert second_runtime.session is None
@@ -374,7 +386,7 @@ def test_fresh_run_stores_session_and_defers_cleanup(tmp_path, monkeypatch) -> N
 def test_shutdown_e2e_runtime_terminates_the_session(tmp_path) -> None:
     runtime = InMemoryBackendRuntime()
     handler = _make_handler(tmp_path, backend_runtime=runtime)
-    runtime.seed_live_session(port=4321, db_path="unused.sqlite", fingerprint="fp")
+    _seed_live_session(runtime, port=4321, db_path="unused.sqlite", fingerprint="fp")
 
     asyncio.run(handler.shutdown_e2e_runtime())
 
@@ -591,7 +603,7 @@ def test_e2e_stage_timing_reports_reused_stages(tmp_path, monkeypatch) -> None:
     env = _make_env(workspace)
 
     runtime = InMemoryBackendRuntime()
-    runtime.seed_live_session(port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
+    _seed_live_session(runtime, port=4321, db_path=env["ARC_E2E_DB_PATH"], fingerprint=fingerprint)
     handler = _make_handler(workspace, backend_runtime=runtime)
     recorder = _CommandRecorder()
     _patch_scaffold(monkeypatch, recorder)
@@ -846,7 +858,8 @@ def test_process_teardown_surfaces_retained_crash_output(tmp_path) -> None:
         )
     handle = _DeadHandle()
     handle._arc_output_tails = (stdout_tail, stderr_tail, [])
-    runtime.seed_live_session(
+    _seed_live_session(
+    runtime,
         port=_free_port(), db_path="unused.sqlite", fingerprint="fp", handle=handle
     )
 
@@ -860,7 +873,8 @@ def test_process_teardown_surfaces_retained_crash_output(tmp_path) -> None:
 def test_process_teardown_without_retained_output_keeps_plain_note(tmp_path) -> None:
     runtime = ProcessBackendRuntime(str(tmp_path))
     handle = _DeadHandle()
-    runtime.seed_live_session(
+    _seed_live_session(
+    runtime,
         port=_free_port(), db_path="unused.sqlite", fingerprint="fp", handle=handle
     )
 
@@ -875,7 +889,8 @@ def test_process_serving_skips_the_http_probe_for_a_dead_process(tmp_path) -> No
 
     runtime = ProcessBackendRuntime(str(tmp_path))
     handle = _DeadHandle()
-    session = runtime.seed_live_session(
+    session = _seed_live_session(
+    runtime,
         port=_free_port(), db_path="unused.sqlite", fingerprint="fp", handle=handle
     )
 

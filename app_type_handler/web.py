@@ -19,10 +19,8 @@ from typing import Awaitable, Callable
 from .base import AppTypeHandler, GlueAnchorSpec, TEMPLATE_ID_BY_APP_TYPE
 from .backend_runtime import (
     BackendRuntime,
-    InMemoryBackendRuntime,
     ProcessBackendRuntime,
     _build_e2e_runtime_env,
-    _CommandResult,
     _execute_web_test_command,
     _resolve_backend_start_command,
     _tail,
@@ -191,15 +189,15 @@ class _StageTimer:
         try:
             return await awaitable
         finally:
-            self._stages[stage] = self._stages.get(stage, 0.0) + (time.monotonic() - started)
+            self.record(stage, time.monotonic() - started)
 
     def record(self, stage: str, elapsed: float) -> None:
-        """Merge an externally measured duration into the stage breakdown.
+        """Merge one measured duration into the stage breakdown.
 
-        The backend runtime measures its own sub-stages (reuse probe, database
-        reset, spawn) inside ``BackendRuntime.ensure`` and reports them on the
-        acquisition; the attempt folds them in here so the rendered breakdown
-        attributes each cost to the same stages as before the extraction.
+        ``measure`` wraps awaitables with this; the attempt also folds the
+        backend runtime's own sub-stage durations in (``BackendRuntime.ensure``
+        reports them on the acquisition), so both paths attribute cost to the
+        same stages.
         """
         self._stages[stage] = self._stages.get(stage, 0.0) + elapsed
 

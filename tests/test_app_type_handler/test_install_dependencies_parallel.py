@@ -11,6 +11,7 @@ import asyncio
 import json
 
 from app_type_handler import web as web_module
+from app_type_handler.backend_runtime import _CommandResult
 from app_type_handler.web import WebAppType
 
 
@@ -100,7 +101,7 @@ def test_playwright_install_overlaps_npm_install_after_cli_is_ready(tmp_path, mo
         if "playwright install" in command:
             browser_overlapped = bool(running)
         await asyncio.sleep(0.01)
-        return web_module._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nok\n")
+        return _CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nok\n")
 
     async def fake_peer_patch(_handler: WebAppType, _frontend_dir: str) -> None:
         return None

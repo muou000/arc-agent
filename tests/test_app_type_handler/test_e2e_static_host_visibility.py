@@ -21,7 +21,7 @@ import re
 from pathlib import Path
 
 from app_type_handler import web as web_handler
-from app_type_handler.backend_runtime import InMemoryBackendRuntime
+from app_type_handler.backend_runtime import InMemoryBackendRuntime, _CommandResult
 
 
 # The exact stack shape from the 2026-09-20 run (paths shortened).
@@ -72,12 +72,12 @@ class _RecoveryRecorder:
         timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
         web_port: int | None = None,
-    ) -> web_handler._CommandResult:
+    ) -> _CommandResult:
         if "playwright" in command:
             self.playwright_calls += 1
             if self.playwright_calls == 1:
-                return web_handler._CommandResult(exit_code=1, text=self.failure_output)
-            return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nall green\n")
+                return _CommandResult(exit_code=1, text=self.failure_output)
+            return _CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nall green\n")
         if "npm run build" in command:
             # `_build_frontend_dist` passes force_rebuild only when bypassing
             # the cache; the reuse path never reaches the command.
@@ -85,8 +85,8 @@ class _RecoveryRecorder:
             dist_dir = Path(cwd) / "dist"
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-            return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nvite build\n")
-        return web_handler._CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
+            return _CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nvite build\n")
+        return _CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
 
 
 def _make_workspace(tmp_path: Path) -> Path:
@@ -334,7 +334,7 @@ def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
             result = await super().__call__(command, cwd, timeout, extra_env, web_port)
             if "playwright" in command:
                 # Every playwright run fails with the signature.
-                return web_handler._CommandResult(exit_code=1, text=self.failure_output)
+                return _CommandResult(exit_code=1, text=self.failure_output)
             return result
 
     recorder = _AlwaysDeadHost(_SPA_DEAD_HOST_OUTPUT)
