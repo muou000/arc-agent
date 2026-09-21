@@ -18,6 +18,7 @@ import pytest
 from agents.tools.test_failure_digest import (
     build_failure_digest,
     extract_build_note,
+    extract_served_verdict,
     format_failure_digest,
     persist_run_output,
 )
@@ -178,6 +179,88 @@ _REBUILT_OUTPUT = (
     "Exit Code: 0\nSTDOUT:\nfake build\n\n"
     "Built `frontend/dist` from the current sources (fingerprint abc123def456).\n"
 )
+
+# The serving verdict line the web handler emits next to the build verdict
+# (`_frontend_serving_verdict`), distilled from the 2026-09-20 arc-output1
+# failure shape: builder says Reused, request-time stat says absent.
+_SERVED_PRESENT_OUTPUT = (
+    "Exit Code: 1\n"
+    "=== Frontend Build ===\n"
+    "Reused the existing `frontend/dist` because the frontend sources are unchanged "
+    "since the last successful build (fingerprint abc123def456).\n\n"
+    "Served index.html: D:\\ws\\frontend\\dist\\index.html (present, fingerprint 0cc57df7f84a)\n\n"
+    "=== E2E Runtime Env ===\n"
+    "DB Path: D:\\ws\\backend\\.arc-test-db\\suite-1.sqlite\n"
+)
+
+_SERVED_ABSENT_OUTPUT = (
+    "Exit Code: 1\n"
+    "=== Frontend Build ===\n"
+    "Reused the existing `frontend/dist` because the frontend sources are unchanged "
+    "since the last successful build (fingerprint abc123def456).\n\n"
+    "Served index.html: D:\\ws\\frontend\\dist\\index.html (absent)\n\n"
+    "=== E2E Runtime Env ===\n"
+    "DB Path: D:\\ws\\backend\\.arc-test-db\\suite-1.sqlite\n"
+)
+
+
+def test_extract_served_verdict_reads_present_line() -> None:
+    assert extract_served_verdict(_SERVED_PRESENT_OUTPUT) == (
+        "frontend/dist/index.html present at result time (fingerprint 0cc57df7f84a) "
+        "at D:\\ws\\frontend\\dist\\index.html"
+    )
+
+
+def test_extract_served_verdict_reads_absent_line() -> None:
+    assert extract_served_verdict(_SERVED_ABSENT_OUTPUT) == (
+        "frontend/dist/index.html absent at result time "
+        "(checked D:\\ws\\frontend\\dist\\index.html)"
+    )
+
+
+def test_extract_served_verdict_handles_unavailable_fingerprint() -> None:
+    output = (
+        "Served index.html: /workspace/frontend/dist/index.html "
+        "(present, fingerprint unavailable)\n"
+    )
+    assert extract_served_verdict(output) == (
+        "frontend/dist/index.html present at result time (fingerprint unavailable) "
+        "at /workspace/frontend/dist/index.html"
+    )
+
+
+def test_extract_served_verdict_is_empty_without_the_line() -> None:
+    assert extract_served_verdict(_REUSE_OUTPUT) == ""
+    assert extract_served_verdict("") == ""
+
+
+def test_extract_served_verdict_ignores_its_own_digest_block() -> None:
+    """Same re-extraction contract as the build note (see above)."""
+
+    note = extract_served_verdict(_SERVED_ABSENT_OUTPUT)
+    rendered = format_failure_digest(
+        build_failure_digest(_SERVED_ABSENT_OUTPUT),
+        test_type="E2E",
+        served=note,
+    )
+    assert extract_served_verdict(_SERVED_ABSENT_OUTPUT + "\n\n" + rendered) == note
+
+
+def test_format_includes_served_note_when_present() -> None:
+    text = format_failure_digest(
+        build_failure_digest("Exit Code: 1\n"),
+        test_type="E2E",
+        served="frontend/dist/index.html absent at result time (checked D:\\ws\\frontend\\dist\\index.html)",
+    )
+    assert (
+        "- served_artifact: frontend/dist/index.html absent at result time "
+        "(checked D:\\ws\\frontend\\dist\\index.html)" in text
+    )
+
+
+def test_format_omits_served_note_when_absent() -> None:
+    text = format_failure_digest(build_failure_digest("Exit Code: 1\n"), test_type="Unit")
+    assert "served_artifact:" not in text
 
 
 def test_extract_build_note_reads_handler_reuse_verdict() -> None:
