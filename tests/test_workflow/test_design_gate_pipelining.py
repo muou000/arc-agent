@@ -887,6 +887,50 @@ def test_pipeline_mode_arbitration_idempotent_repair_reports_success(
     )
 
 
+def test_drift_check_skips_without_failing_the_merge_when_the_store_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard's best-effort contract: a traceability store that cannot be
+    read (an older queue resumed, a store without the interfaces surface)
+    skips the drift check with a warning and never fails the merged node -
+    the review follow-up for the unreadable-store branch, which had no
+    direct test."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_DESIGN_GATE_PIPELINE", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "1")
+    monkeypatch.delenv("ARC_MERGE_ARBITRATION", raising=False)
+    manager = _make_drain_manager(tmp_path, ["R", "RA", "RB"], with_events_file=True)
+    queue_state = manager._load_or_create_processing_queue(_dependency_tree())
+    # The anchored contract is on disk and healthy, but the store raises on
+    # every read: the check must skip, not break the merge.
+    landed = Path(manager.workspace_path) / "backend" / "src" / "features" / "auth.js"
+    landed.parent.mkdir(parents=True, exist_ok=True)
+    landed.write_text("export const auth = { done: true };\n", encoding="utf-8")
+
+    def broken_list_interfaces(req_id: str | None = None) -> list[dict[str, Any]]:
+        raise RuntimeError("simulated unreadable store")
+
+    manager.runtime.traceability.list_interfaces = broken_list_interfaces
+
+    warnings: list[str] = []
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        return True
+
+    async def fake_log(source: str, message: str, status: str | None = None, node_id: str | None = None) -> None:
+        if status == "warning":
+            warnings.append(message)
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    monkeypatch.setattr(manager, "_log", fake_log)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    assert any("Contract drift check" in message and "skipped" in message for message in warnings)
+    assert queue_state["node_states"]["RA"] == NODE_PASSED, (
+        "an unreadable store must never turn a merged IMPLEMENT into a failure"
+    )
+
+
 def test_pipeline_mode_implemented_flags_reach_the_dependent_context(
     tmp_path: Path,
 ) -> None:
