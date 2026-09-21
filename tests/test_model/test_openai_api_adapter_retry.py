@@ -1,8 +1,11 @@
-"""Verify the ARC-level retry behaviour added to ``agents/model/openai_api_adapter.py``.
+"""Verify the single retry engine behind ARC's model call seam.
 
-The model layer used to only normalize provider exceptions: a single exhausted
-429 escaped as ``ARCModelAPIError`` and killed the running node. These tests pin
-the current contract:
+The model layer used to carry two parallel retry engines (a sync and an async
+copy) and two copies of every model-class helper, and its tests imported the
+private retry functions while swapping the module-level probe. These tests pin
+the current contract through the public seam only — a fake ``ModelTransport``
+drives the real engine, and the reachability probe / retry delay are injected
+parameters:
 
 * transient failures (429/408/409/5xx, connection and timeout errors) are
   retried with a short fixed delay, honoring ``Retry-After`` up to the cap;
@@ -10,18 +13,22 @@ the current contract:
   reachability probe instead of re-hanging until the full request timeout;
 * non-transient 4xx failures fail fast with the normalized error;
 * quota/billing exhaustion fails fast even when the provider returns it as a
-  429: the error text is deterministic, so retries would only burn backoff time;
+  429: the error text is deterministic, so retries would only burn backoff;
 * retries are configurable via ``ARC_MODEL_MAX_RETRIES`` and the delay env
   vars (``0`` restores the old no-retry behaviour);
 * a cross-call consecutive-failure budget (default 5) stops re-entering the
   retry chain against a dead endpoint; any success resets it;
-* anything that is not a model API exception propagates unwrapped.
+* every stream→plain fallback (trigger attempt + reason) is recorded on the
+  returned ``ModelCallOutcome`` — the fallback decision is assertable at the
+  seam without reaching into module internals;
+* the sync entry point drives the same engine — no second implementation.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
+from collections.abc import Iterator
 
 import httpx
 import pytest
@@ -30,12 +37,20 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimi
 
 from agents.model import openai_api_adapter as adapter
 from agents.model.openai_api_adapter import (
+    FALLBACK_CHUNK_TIMEOUT,
+    FALLBACK_CLIENT_ERROR,
+    FALLBACK_CONNECTION_FAILURE,
     ARCModelAPIError,
-    _acall_model_with_retries,
-    _call_model_with_retries,
-    _resolve_retry_policy,
+    ModelCallOutcome,
+    ModelTransport,
+    StreamFallback,
+    acall_model_with_retries,
+    call_model_with_retries,
+    empty_stream_error,
     probe_endpoint_reachable,
+    resolve_retry_policy,
     reset_consecutive_failure_budget_for_tests,
+    reset_streaming_support_cache_for_tests,
 )
 
 
@@ -59,57 +74,90 @@ def _connection_error() -> APIConnectionError:
     return APIConnectionError(message="connection refused", request=_request())
 
 
-class _FlakyCall:
-    """Zero-arg callable raising the queued exceptions before returning a value."""
+class _Recorder:
+    """Scripted two-transport fake.
 
-    def __init__(self, exceptions: list[Exception], final: str = "ok") -> None:
-        self._exceptions = list(exceptions)
-        self._final = final
-        self.calls = 0
+    Each leg raises its queued exceptions before returning its value, and the
+    per-leg call counts stay observable. Both legs are plain callables — the
+    engine awaits non-awaitable results as-is, so the same fake serves the
+    engine and both model classes; awaitable legs are covered explicitly in
+    :func:`test_async_engine_awaits_the_streamed_leg`.
+    """
 
-    def __call__(self) -> str:
-        self.calls += 1
-        if self._exceptions:
-            raise self._exceptions.pop(0)
-        return self._final
+    def __init__(
+        self,
+        plain_errors: list[Exception] | None = None,
+        streamed_errors: list[Exception] | None = None,
+        plain_value: object = "plain-ok",
+        streamed_value: object = "streamed-ok",
+    ) -> None:
+        self._plain_errors = list(plain_errors or [])
+        self._streamed_errors = list(streamed_errors or [])
+        self.plain_value = plain_value
+        self.streamed_value = streamed_value
+        self.calls = {"plain": 0, "streamed": 0}
+
+    def plain(self) -> object:
+        self.calls["plain"] += 1
+        if self._plain_errors:
+            raise self._plain_errors.pop(0)
+        return self.plain_value
+
+    def streamed(self) -> object:
+        self.calls["streamed"] += 1
+        if self._streamed_errors:
+            raise self._streamed_errors.pop(0)
+        return self.streamed_value
+
+    @property
+    def transport(self) -> ModelTransport:
+        return ModelTransport(plain=self.plain, streamed=self.streamed)
 
 
-class _AsyncFlakyCall(_FlakyCall):
-    """Awaitable variant used by the async retry loop."""
+def _call_engine(recorder: _Recorder, *, plain_only: bool = False, **overrides: object):
+    """Drive the real async engine with the fake transport and offline knobs.
 
-    async def __call__(self) -> str:  # type: ignore[override]
-        return _FlakyCall.__call__(self)
+    ``plain_only`` drops the streamed leg, mirroring transports that cannot
+    stream — the plain-path tests then behave like the pre-seam plain-call
+    tests instead of alternating transports on connection failures.
+    """
+
+    transport = (
+        ModelTransport(plain=recorder.plain, streamed=None) if plain_only else recorder.transport
+    )
+    kwargs: dict[str, object] = {
+        "api_mode": "chat_completions",
+        "model": "test-model",
+        "base_url": "https://model.test/v1",
+        "api_key": "test-key",
+        "prober": lambda base_url, api_key: True,
+        "sleeper": lambda seconds: None,
+    }
+    kwargs.update(overrides)
+    return asyncio.run(acall_model_with_retries(transport, **kwargs))
 
 
 @pytest.fixture(autouse=True)
-def _reset_failure_budget() -> None:
+def _reset_engine_state() -> Iterator[None]:
+    """The failure budget and the streaming-support cache are process-global."""
+
     reset_consecutive_failure_budget_for_tests()
+    reset_streaming_support_cache_for_tests()
     yield
     reset_consecutive_failure_budget_for_tests()
+    reset_streaming_support_cache_for_tests()
 
 
 @pytest.fixture(autouse=True)
-def _always_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Probe outcomes are asserted in dedicated tests; elsewhere answer yes."""
-
-    monkeypatch.setattr(adapter, "_endpoint_reachable", lambda base_url, api_key: True)
-
-    async def fake_areachable(base_url: str, api_key: str) -> bool:
-        return True
-
-    monkeypatch.setattr(adapter, "_aendpoint_reachable", fake_areachable)
-
-
-@pytest.fixture(autouse=True)
-def _reset_streaming_support_cache() -> None:
-    """The streaming-unsupported cache is process-global; isolate every test."""
-
-    adapter.reset_streaming_support_cache_for_tests()
-    yield
-    adapter.reset_streaming_support_cache_for_tests()
-
-
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic policy defaults: ambient env must not skew the engine.
+
+    The OPENAI_* endpoint vars are cleared too: model-class tests without an
+    explicit base_url hit the engine's default prober, and an ambient
+    OPENAI_API_BASE would turn that instant reachability answer into a real
+    network call.
+    """
+
     for name in (
         "ARC_MODEL_MAX_RETRIES",
         "ARC_MODEL_RETRY_DELAY",
@@ -118,6 +166,9 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "ARC_MODEL_TIMEOUT",
         "ARC_MODEL_CONNECT_TIMEOUT",
         "ARC_MODEL_STREAM_TRANSPORT",
+        "ARC_MODEL_STREAM_CHUNK_TIMEOUT",
+        "OPENAI_API_BASE",
+        "OPENAI_BASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -127,9 +178,8 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_retry_policy_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clear_env(monkeypatch)
-    policy = _resolve_retry_policy()
+def test_resolve_retry_policy_defaults() -> None:
+    policy = resolve_retry_policy()
     assert policy.max_retries == 3
     assert policy.retry_delay == 5.0
     assert policy.max_delay == 60.0
@@ -141,7 +191,7 @@ def test_resolve_retry_policy_honors_env_overrides(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "3")
     monkeypatch.setenv("ARC_MODEL_RETRY_MAX_DELAY", "9")
     monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "2")
-    policy = _resolve_retry_policy()
+    policy = resolve_retry_policy()
     assert policy.max_retries == 5
     assert policy.retry_delay == 3.0
     assert policy.max_delay == 9.0
@@ -153,7 +203,7 @@ def test_resolve_retry_policy_falls_back_on_invalid_values(monkeypatch: pytest.M
     monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "soon")
     monkeypatch.setenv("ARC_MODEL_RETRY_MAX_DELAY", "-5")
     monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "nope")
-    policy = _resolve_retry_policy()
+    policy = resolve_retry_policy()
     assert policy.max_retries == 3
     assert policy.retry_delay == 5.0
     assert policy.max_delay == 60.0
@@ -165,8 +215,7 @@ def test_resolve_retry_policy_falls_back_on_invalid_values(monkeypatch: pytest.M
 # ---------------------------------------------------------------------------
 
 
-def test_request_timeout_defaults_to_sdk_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clear_env(monkeypatch)
+def test_request_timeout_defaults_to_sdk_semantics() -> None:
     timeout = adapter.resolve_model_request_timeout()
     assert timeout.connect == 15.0
     assert timeout.read == 600.0
@@ -270,28 +319,25 @@ def test_stream_usage_env_restores_pre_fix_behaviour(
         ("off", False, False),
         (" Off ", False, False),  # surrounding whitespace + case folded
         # A typo or unrecognized value must not silently disable the fix
-        # (default-on, same invalid->default convention as _env_int/_env_float)
-        # but is logged once, like structured_output_supported's invalid-value
-        # warning; check_config surfaces it as a doctor warning too.
+        # (default-on, same invalid->default convention as the env int/float
+        # parsers) but is logged once; check_config surfaces it too.
         ("flase", True, True),
         ("maybe", True, True),
     ],
 )
 def test_resolve_stream_usage_parse_matrix(raw: str, expected: bool, warns: bool) -> None:
-    from agents.model import openai_api_adapter as adapter_module
-
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setenv("ARC_MODEL_STREAM_USAGE", raw)
-    adapter_module._ENV_WARNED.clear()
+    adapter._ENV_WARNED.clear()
     try:
-        with caplog_context(adapter_module) as records:
-            assert adapter_module.resolve_stream_usage() is expected
+        with caplog_context(adapter) as records:
+            assert adapter.resolve_stream_usage() is expected
             # A repeat resolve (every model build) must not re-log the typo.
-            adapter_module.resolve_stream_usage()
+            adapter.resolve_stream_usage()
         warning_records = [r for r in records if r.levelno >= logging.WARNING]
         assert len(warning_records) == (1 if warns else 0)
     finally:
-        adapter_module._ENV_WARNED.clear()
+        adapter._ENV_WARNED.clear()
         monkeypatch.undo()
 
 
@@ -350,7 +396,7 @@ def test_responses_mode_streaming_never_sends_stream_options(
 
 
 # ---------------------------------------------------------------------------
-# Retryable classification
+# Retryable classification, driven through the real engine
 # ---------------------------------------------------------------------------
 
 
@@ -369,11 +415,32 @@ def test_responses_mode_streaming_never_sends_stream_options(
         (_status_error(422), False),
         (_connection_error(), True),
         (APITimeoutError(_request()), True),
-        (RuntimeError("not a model error"), False),
     ],
 )
-def test_is_retryable_model_api_exception(exc: Exception, retryable: bool) -> None:
-    assert adapter._is_retryable_model_api_exception(exc) is retryable
+def test_engine_retries_transient_and_fails_fast_otherwise(
+    exc: Exception, retryable: bool
+) -> None:
+    """Classification is asserted by behaviour: a retryable failure comes back
+    for a second attempt (after the reachability probe for connection-class
+    errors), a non-retryable one stops after one attempt."""
+
+    recorder = _Recorder(plain_errors=[exc])
+    if retryable:
+        result = _call_engine(recorder, plain_only=True)
+        assert result.value == "plain-ok"
+        assert recorder.calls["plain"] == 2
+        return
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_engine(recorder, plain_only=True)
+    assert excinfo.value.status_code == getattr(exc, "status_code", None)
+    assert recorder.calls["plain"] == 1
+
+
+def test_non_model_exception_propagates_unwrapped() -> None:
+    recorder = _Recorder(plain_errors=[ValueError("boom")])
+    with pytest.raises(ValueError, match="boom"):
+        _call_engine(recorder)
+    assert recorder.calls["plain"] == 1
 
 
 @pytest.mark.parametrize(
@@ -394,39 +461,37 @@ def test_is_retryable_model_api_exception(exc: Exception, retryable: bool) -> No
         "Payment required to continue usage this month",
     ],
 )
-def test_quota_exhaustion_429_is_not_retryable(message: str) -> None:
-    assert adapter._is_retryable_model_api_exception(_rate_limit_error(message)) is False
+def test_quota_exhaustion_429_fails_fast_in_engine(message: str) -> None:
+    recorder = _Recorder(plain_errors=[_rate_limit_error(message)])
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_engine(recorder)
+    assert excinfo.value.status_code == 429
+    assert recorder.calls["plain"] == 1
 
 
-def test_quota_error_code_in_body_is_not_retryable() -> None:
-    exc = _rate_limit_error(
-        "Error code: 429",
-        body={"error": {"message": "request failed", "code": "insufficient_quota"}},
-    )
-    assert adapter._is_retryable_model_api_exception(exc) is False
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": {"message": "request failed", "code": "insufficient_quota"}},
+        {"error": "insufficient_quota"},
+        {"error": [{"message": "insufficient quota remaining"}]},
+        "insufficient_quota",
+    ],
+)
+def test_quota_error_in_body_fails_fast_in_engine(body: object) -> None:
+    recorder = _Recorder(plain_errors=[_rate_limit_error("Error code: 429", body=body)])
+    with pytest.raises(ARCModelAPIError):
+        _call_engine(recorder)
+    assert recorder.calls["plain"] == 1
 
 
-def test_error_as_string_in_body_is_not_retryable() -> None:
-    exc = _rate_limit_error("Error code: 429", body={"error": "insufficient_quota"})
-    assert adapter._is_retryable_model_api_exception(exc) is False
-
-
-def test_error_as_list_in_body_is_not_retryable() -> None:
-    exc = _rate_limit_error(
-        "Error code: 429", body={"error": [{"message": "insufficient quota remaining"}]}
-    )
-    assert adapter._is_retryable_model_api_exception(exc) is False
-
-
-def test_string_body_is_not_retryable() -> None:
-    exc = _rate_limit_error("Error code: 429", body="insufficient_quota")
-    assert adapter._is_retryable_model_api_exception(exc) is False
-
-
-def test_quota_text_wins_over_retryable_status() -> None:
+def test_quota_text_wins_over_retryable_status_in_engine() -> None:
     response = httpx.Response(503, request=_request(), headers={})
     exc = APIStatusError("Service Unavailable: billing hard limit reached", response=response, body=None)
-    assert adapter._is_retryable_model_api_exception(exc) is False
+    recorder = _Recorder(plain_errors=[exc])
+    with pytest.raises(ARCModelAPIError):
+        _call_engine(recorder)
+    assert recorder.calls["plain"] == 1
 
 
 @pytest.mark.parametrize(
@@ -435,31 +500,22 @@ def test_quota_text_wins_over_retryable_status() -> None:
         # Transient throttle wording must not be mistaken for quota exhaustion.
         "Rate limit reached for gpt-4 on requests per minute (RPM): Limit 500, Used 500",
         "Too many requests, please slow down",
-    ],
-)
-def test_transient_throttle_429_stays_retryable(message: str) -> None:
-    assert adapter._is_retryable_model_api_exception(_rate_limit_error(message)) is True
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
         # Generic billing mentions are not quota exhaustion.
         "Please update your billing email on file",
         "Billing details verified, no action needed",
+        # Throttle language wins over quota text.
+        "Quota exceeded for requests per minute under your rate limit",
     ],
 )
-def test_generic_billing_mention_stays_retryable(message: str) -> None:
-    assert adapter._is_retryable_model_api_exception(_rate_limit_error(message)) is True
-
-
-def test_throttle_language_wins_over_quota_text() -> None:
-    exc = _rate_limit_error("Quota exceeded for requests per minute under your rate limit")
-    assert adapter._is_retryable_model_api_exception(exc) is True
+def test_transient_throttle_429_is_retried_in_engine(message: str) -> None:
+    recorder = _Recorder(plain_errors=[_rate_limit_error(message)])
+    result = _call_engine(recorder)
+    assert result.value == "plain-ok"
+    assert recorder.calls["plain"] == 2
 
 
 # ---------------------------------------------------------------------------
-# Reachability probe
+# Reachability probe (the public probe helper keeps its transport injection)
 # ---------------------------------------------------------------------------
 
 
@@ -504,256 +560,235 @@ def test_probe_without_custom_base_url_assumes_reachable(monkeypatch: pytest.Mon
     assert probe_endpoint_reachable(base_url="", api_key="") is True
 
 
-def test_connection_failure_triggers_probe_rounds(monkeypatch: pytest.MonkeyPatch) -> None:
+# ---------------------------------------------------------------------------
+# Probe rounds inside the engine (injected fake prober, no module swaps)
+# ---------------------------------------------------------------------------
+
+# The engine's probe-round cap per real attempt (module constant); a totally
+# down endpoint is abandoned after one real attempt + cap rounds.
+_PROBE_ROUNDS = 3
+
+
+def test_connection_failure_triggers_probe_rounds() -> None:
     """A connection failure must not be re-attempted blind: the loop probes.
     A totally-down endpoint gives up after the probe-round cap, not after
     burning the full real-attempt budget."""
 
-    probes: list[str] = []
-    monkeypatch.setattr(
-        adapter, "_endpoint_reachable", lambda base_url, api_key: probes.append(base_url) or False
-    )
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
+    probed: list[str] = []
 
-    call = _FlakyCall([_connection_error()] * 10)
+    def prober(base_url: str, api_key: str) -> bool:
+        probed.append(base_url)
+        return False
+
+    recorder = _Recorder(plain_errors=[_connection_error()] * 10)
     with pytest.raises(ARCModelAPIError) as excinfo:
-        _call_model_with_retries(
-            call,
-            api_mode="chat_completions",
-            model="test-model",
-            base_url="https://model.test/v1",
-            api_key="test-key",
-        )
+        _call_engine(recorder, prober=prober)
 
     # One real attempt, then probe rounds: cap re-probes plus the final
     # confirming probe whose failure crosses the cap and raises (no further
     # real calls at any point).
-    assert call.calls == 1
-    assert probes == ["https://model.test/v1"] * (adapter._PROBE_ROUNDS_PER_ATTEMPT + 1)
+    assert recorder.calls["plain"] == 1
+    assert probed == ["https://model.test/v1"] * (_PROBE_ROUNDS + 1)
     assert "unreachable" in str(excinfo.value).lower()
 
 
-def test_probe_rounds_do_not_consume_the_model_attempt_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_probe_rounds_do_not_consume_the_model_attempt_budget() -> None:
     """While the endpoint stays unreachable, only probes fly — no model calls,
     and the default retry budget is untouched by probe failures (a connection
     blip that recovers still gets its full budget of real retries)."""
 
-    monkeypatch.setattr(adapter, "_endpoint_reachable", lambda base_url, api_key: False)
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
-
-    # Default policy (max_retries=3): one real failure, then probe rounds
-    # until the probe cap. The real-attempt count must stay at 1.
-    call = _FlakyCall([_connection_error()] * 10)
+    recorder = _Recorder(plain_errors=[_connection_error()] * 10)
     with pytest.raises(ARCModelAPIError):
-        _call_model_with_retries(
-            call,
-            api_mode="chat_completions",
-            model="test-model",
-            base_url="https://model.test/v1",
-            api_key="test-key",
-        )
-    assert call.calls == 1
+        _call_engine(recorder, prober=lambda base_url, api_key: False, sleeper=sleeps.append)
+    assert recorder.calls["plain"] == 1
     # Post-failure delay plus one delay per probe round.
-    assert sleeps == [5.0] * (1 + adapter._PROBE_ROUNDS_PER_ATTEMPT)
+    assert sleeps == [5.0] * (1 + _PROBE_ROUNDS)
 
 
-def test_probe_recovery_resumes_real_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_probe_recovery_resumes_real_attempts() -> None:
     """After the endpoint answers the probe again, the real call is retried —
     and a recovered probe round does not shorten the real-attempt budget."""
 
-    # Probe answers: first round unreachable, then recovered, then (after the
-    # second real failure) recovered again immediately.
-    probe_answers = iter([False, True, True])
-    monkeypatch.setattr(
-        adapter, "_endpoint_reachable", lambda base_url, api_key: next(probe_answers)
-    )
+    answers = iter([False, True, True])
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
-    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
-
-    call = _FlakyCall([_connection_error(), _connection_error()])
-    result = _call_model_with_retries(
-        call,
-        api_mode="chat_completions",
-        model="test-model",
-        base_url="https://model.test/v1",
-        api_key="test-key",
+    recorder = _Recorder(plain_errors=[_connection_error(), _connection_error()])
+    result = _call_engine(
+        recorder,
+        plain_only=True,
+        prober=lambda base_url, api_key: next(answers),
+        sleeper=sleeps.append,
     )
 
-    assert result == "ok"
+    assert result.value == "plain-ok"
     # All four budgeted real attempts were available; three were needed.
-    assert call.calls == 3
+    assert recorder.calls["plain"] == 3
     # One delay after each real failure, one between the two probe rounds.
     assert sleeps == [5.0, 5.0, 5.0]
 
 
 # ---------------------------------------------------------------------------
-# Retry loop
+# Retry loop (async engine)
 # ---------------------------------------------------------------------------
 
 
-def test_sync_call_retries_transient_429_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
+def test_async_engine_retries_transient_429_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "2")
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+    recorder = _Recorder(plain_errors=[_status_error(429), _status_error(429)])
+    result = _call_engine(recorder, sleeper=sleeps.append)
 
-    call = _FlakyCall([_status_error(429), _status_error(429)])
-    result = _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
-
-    assert result == "ok"
-    assert call.calls == 3
+    assert result.value == "plain-ok"
+    assert recorder.calls["plain"] == 3
     assert sleeps == [2.0, 2.0]
 
 
-def test_async_call_retries_transient_429_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
+def test_sync_engine_entry_drives_the_same_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync entry point is a thin adapter over the async engine: same
+    retry sequence, same outcome shape, no second implementation."""
+
     monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "2")
-    sleeps: list[float] = []
-
-    async def fake_asleep(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(adapter, "_asleep", fake_asleep)
-
-    call = _AsyncFlakyCall([_status_error(429), _connection_error()])
-    result = asyncio.run(
-        _acall_model_with_retries(call, api_mode="chat_completions", model="test-model")
+    recorder = _Recorder(plain_errors=[_status_error(429), _status_error(429)])
+    result = call_model_with_retries(
+        recorder.transport,
+        api_mode="chat_completions",
+        model="test-model",
+        base_url="https://model.test/v1",
+        api_key="test-key",
+        sleeper=lambda seconds: None,
+        prober=lambda base_url, api_key: True,
     )
 
-    assert result == "ok"
-    assert call.calls == 3
-    assert sleeps == [2.0, 2.0]
+    assert result.value == "plain-ok"
+    assert recorder.calls["plain"] == 3
+    assert result.outcome == ModelCallOutcome(
+        transport="plain", attempts=3, stream_fallbacks=()
+    )
 
 
-def test_non_retryable_401_fails_fast_without_wrapping_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sync_engine_entry_runs_from_inside_a_running_loop() -> None:
+    """Sync callers on a loop thread (streaming runtimes) are served by the
+    background engine loop instead of crashing inside asyncio.run."""
+
+    async def main():
+        return call_model_with_retries(
+            ModelTransport(plain=lambda: "plain-ok"),
+            api_mode="chat_completions",
+            model="loop-model",
+            base_url="https://loop.test/v1",
+            api_key="test-key",
+            sleeper=lambda seconds: None,
+            prober=lambda base_url, api_key: True,
+        )
+
+    result = asyncio.run(main())
+    assert result.value == "plain-ok"
+    assert result.outcome.attempts == 1
+
+
+def test_non_retryable_401_fails_fast_without_wrapping_delay() -> None:
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
-
-    call = _FlakyCall([_status_error(401)])
+    recorder = _Recorder(plain_errors=[_status_error(401)])
     with pytest.raises(ARCModelAPIError) as excinfo:
-        _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
+        _call_engine(recorder, sleeper=sleeps.append)
 
     assert excinfo.value.status_code == 401
-    assert call.calls == 1
+    assert recorder.calls["plain"] == 1
     assert sleeps == []
 
 
-def test_quota_429_fails_fast_without_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_quota_429_fails_fast_without_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
-
-    call = _FlakyCall(
-        [_rate_limit_error("You exceeded your current quota, please check your plan and billing details")]
+    recorder = _Recorder(
+        plain_errors=[
+            _rate_limit_error("You exceeded your current quota, please check your plan and billing details")
+        ]
     )
     with pytest.raises(ARCModelAPIError) as excinfo:
-        _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
+        _call_engine(recorder, sleeper=sleeps.append)
 
     assert excinfo.value.status_code == 429
-    assert call.calls == 1
+    assert recorder.calls["plain"] == 1
     assert sleeps == []
 
 
-def test_async_quota_429_fails_fast_without_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "3")
-    sleeps: list[float] = []
-
-    async def fake_asleep(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(adapter, "_asleep", fake_asleep)
-
-    call = _AsyncFlakyCall([_rate_limit_error("Monthly usage limit reached")])
-    with pytest.raises(ARCModelAPIError) as excinfo:
-        asyncio.run(_acall_model_with_retries(call, api_mode="chat_completions", model="test-model"))
-
-    assert excinfo.value.status_code == 429
-    assert call.calls == 1
-    assert sleeps == []
-
-
-def test_retry_exhaustion_raises_normalized_429(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retry_exhaustion_raises_normalized_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "2")
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-
-    call = _FlakyCall([_status_error(429)] * 10)
+    recorder = _Recorder(plain_errors=[_status_error(429)] * 10)
     with pytest.raises(ARCModelAPIError) as excinfo:
-        _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
+        _call_engine(recorder)
 
     assert excinfo.value.status_code == 429
-    assert call.calls == 3  # one original attempt plus two retries
+    assert recorder.calls["plain"] == 3  # one original attempt plus two retries
 
 
-def test_zero_max_retries_restores_no_retry_behaviour(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_zero_max_retries_restores_no_retry_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
-
-    call = _FlakyCall([_status_error(429)] * 5)
+    recorder = _Recorder(plain_errors=[_status_error(429)] * 5)
     with pytest.raises(ARCModelAPIError) as excinfo:
-        _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
+        _call_engine(recorder)
 
     assert excinfo.value.status_code == 429
-    assert call.calls == 1
+    assert recorder.calls["plain"] == 1
 
 
-def test_non_model_exception_propagates_unwrapped(monkeypatch: pytest.MonkeyPatch) -> None:
-    call = _FlakyCall([ValueError("boom")])
-    with pytest.raises(ValueError, match="boom"):
-        _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
-    assert call.calls == 1
-
-
-def test_retry_after_header_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retry_after_header_is_honored() -> None:
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+    recorder = _Recorder(plain_errors=[_status_error(429, headers={"retry-after": "7"})])
+    result = _call_engine(recorder, sleeper=sleeps.append)
 
-    call = _FlakyCall([_status_error(429, headers={"retry-after": "7"})])
-    result = _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
-
-    assert result == "ok"
+    assert result.value == "plain-ok"
     assert sleeps == [7.0]
 
 
-def test_retry_after_header_is_capped_at_max_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retry_after_header_is_capped_at_max_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_RETRY_MAX_DELAY", "10")
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+    recorder = _Recorder(plain_errors=[_status_error(429, headers={"retry-after": "999"})])
+    result = _call_engine(recorder, sleeper=sleeps.append)
 
-    call = _FlakyCall([_status_error(429, headers={"retry-after": "999"})])
-    result = _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
-
-    assert result == "ok"
+    assert result.value == "plain-ok"
     assert sleeps == [10.0]
 
 
-def test_retry_delay_is_the_fixed_short_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retry_delay_is_the_fixed_short_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "5")
     monkeypatch.setenv("ARC_MODEL_RETRY_MAX_DELAY", "20")
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+    recorder = _Recorder(plain_errors=[_status_error(500)] * 3)
+    result = _call_engine(recorder, sleeper=sleeps.append)
 
-    call = _FlakyCall([_status_error(500)] * 3)
-    result = _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
-
-    assert result == "ok"
-    assert call.calls == 4
+    assert result.value == "plain-ok"
+    assert recorder.calls["plain"] == 4
     # Fixed delay: no exponential growth between attempts.
     assert sleeps == [5.0, 5.0, 5.0]
 
 
-def test_retry_delay_is_capped_at_max_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retry_delay_is_capped_at_max_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "30")
     monkeypatch.setenv("ARC_MODEL_RETRY_MAX_DELAY", "20")
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
+    recorder = _Recorder(plain_errors=[_status_error(500)])
+    result = _call_engine(recorder, sleeper=sleeps.append)
 
-    call = _FlakyCall([_status_error(500)])
-    result = _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
-
-    assert result == "ok"
+    assert result.value == "plain-ok"
     assert sleeps == [20.0]
 
 
@@ -762,7 +797,9 @@ def test_retry_delay_is_capped_at_max_delay(monkeypatch: pytest.MonkeyPatch) -> 
 # ---------------------------------------------------------------------------
 
 
-def test_consecutive_failures_fail_fast_on_the_next_call(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_consecutive_failures_fail_fast_on_the_next_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Default budget 5: after five consecutive failed calls, the sixth does
     not enter the retry loop at all."""
 
@@ -771,88 +808,92 @@ def test_consecutive_failures_fail_fast_on_the_next_call(monkeypatch: pytest.Mon
     endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
 
     for _ in range(5):
-        call = _FlakyCall([_connection_error()])
+        recorder = _Recorder(plain_errors=[_connection_error()])
         with pytest.raises(ARCModelAPIError):
-            _call_model_with_retries(
-                call, api_mode="chat_completions", model="test-model", **endpoint
-            )
+            _call_engine(recorder, **endpoint)
 
     # Budget exhausted: the next call fails fast with the budget message,
     # without touching the model.
-    call = _FlakyCall([_connection_error()])
+    recorder = _Recorder(plain_errors=[_connection_error()])
     with pytest.raises(ARCModelAPIError, match="consecutive failed model calls"):
-        _call_model_with_retries(call, api_mode="chat_completions", model="test-model", **endpoint)
-    assert call.calls == 0
+        _call_engine(recorder, **endpoint)
+    assert recorder.calls["plain"] == 0
 
 
-def test_success_resets_the_consecutive_failure_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_success_resets_the_consecutive_failure_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
     monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "2")
     endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
 
-    failing = _FlakyCall([_connection_error()])
+    recorder = _Recorder(plain_errors=[_connection_error()])
     with pytest.raises(ARCModelAPIError):
-        _call_model_with_retries(failing, api_mode="chat_completions", model="test-model", **endpoint)
+        _call_engine(recorder, **endpoint)
 
     # A success in between resets the counter.
-    ok = _FlakyCall([], final="ok")
-    assert (
-        _call_model_with_retries(ok, api_mode="chat_completions", model="test-model", **endpoint)
-        == "ok"
-    )
+    ok = _Recorder()
+    assert _call_engine(ok, **endpoint).value == "plain-ok"
 
-    failing2 = _FlakyCall([_connection_error()])
+    recorder2 = _Recorder(plain_errors=[_connection_error()])
     with pytest.raises(ARCModelAPIError):
-        _call_model_with_retries(failing2, api_mode="chat_completions", model="test-model", **endpoint)
+        _call_engine(recorder2, **endpoint)
     # Only one consecutive failure so far: this call still entered the loop.
-    assert failing2.calls == 1
+    assert recorder2.calls["plain"] == 1
 
 
-def test_zero_budget_disables_the_circuit_breaker(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_zero_budget_disables_the_circuit_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
     monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "0")
     endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
 
     for _ in range(6):
-        call = _FlakyCall([_connection_error()])
+        recorder = _Recorder(plain_errors=[_connection_error()])
         with pytest.raises(ARCModelAPIError):
-            _call_model_with_retries(call, api_mode="chat_completions", model="test-model", **endpoint)
-        assert call.calls == 1
+            _call_engine(recorder, **endpoint)
+        assert recorder.calls["plain"] == 1
 
 
-def test_failure_budget_is_scoped_per_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_failure_budget_is_scoped_per_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
     monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "2")
 
     for _ in range(2):
-        call = _FlakyCall([_connection_error()])
+        recorder = _Recorder(plain_errors=[_connection_error()])
         with pytest.raises(ARCModelAPIError):
-            _call_model_with_retries(
-                call,
-                api_mode="chat_completions",
-                model="test-model",
+            _call_engine(
+                recorder,
                 base_url="https://a.test/v1",
                 api_key="key-a",
             )
 
     # Same failure count on a different endpoint: unaffected.
-    call = _FlakyCall([_connection_error()])
+    recorder = _Recorder(plain_errors=[_connection_error()])
     with pytest.raises(ARCModelAPIError) as excinfo:
-        _call_model_with_retries(
-            call,
-            api_mode="chat_completions",
-            model="test-model",
-            base_url="https://b.test/v1",
-            api_key="key-b",
-        )
+        _call_engine(recorder, base_url="https://b.test/v1", api_key="key-b")
     # Normalized per-attempt error, not the budget fail-fast message.
     assert "consecutive" not in str(excinfo.value)
-    assert call.calls == 1
+    assert recorder.calls["plain"] == 1
 
 
-def test_endpoint_key_never_contains_the_raw_api_key() -> None:
-    key = adapter._model_endpoint_key("m", "https://model.test/v1", "sk-secret")
-    assert "sk-secret" not in key
+def test_fail_fast_message_never_contains_the_raw_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "1")
+
+    recorder = _Recorder(plain_errors=[_connection_error()])
+    with pytest.raises(ARCModelAPIError):
+        _call_engine(recorder)
+
+    recorder2 = _Recorder()
+    with pytest.raises(ARCModelAPIError, match="consecutive failed model calls") as excinfo:
+        _call_engine(recorder2)
+    assert "test-key" not in str(excinfo.value)
 
 
 def test_stale_failures_leave_the_recovery_window(
@@ -868,15 +909,15 @@ def test_stale_failures_leave_the_recovery_window(
     endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
 
     for _ in range(2):
-        call = _FlakyCall([_connection_error()])
+        recorder = _Recorder(plain_errors=[_connection_error()])
         with pytest.raises(ARCModelAPIError):
-            _call_model_with_retries(call, api_mode="chat_completions", model="test-model", **endpoint)
+            _call_engine(recorder, **endpoint)
 
     # Budget tripped: the next call fails fast without touching the model.
-    tripped = _FlakyCall([_connection_error()])
+    tripped = _Recorder(plain_errors=[_connection_error()])
     with pytest.raises(ARCModelAPIError, match="consecutive failed model calls"):
-        _call_model_with_retries(tripped, api_mode="chat_completions", model="test-model", **endpoint)
-    assert tripped.calls == 0
+        _call_engine(tripped, **endpoint)
+    assert tripped.calls["plain"] == 0
 
     # Age both failures past the recovery window: the breaker must release,
     # letting the call enter the loop again (and fail per-attempt, not via
@@ -885,11 +926,11 @@ def test_stale_failures_leave_the_recovery_window(
         for ep_key, records in adapter._CONSECUTIVE_FAILURES.items():
             stale = adapter.time.monotonic() - (adapter._FAILURE_RECOVERY_WINDOW_SECONDS + 60.0)
             adapter._CONSECUTIVE_FAILURES[ep_key] = [(stale, exc) for _, exc in records]
-    aged = _FlakyCall([_connection_error()])
+    aged = _Recorder(plain_errors=[_connection_error()])
     with pytest.raises(ARCModelAPIError) as excinfo:
-        _call_model_with_retries(aged, api_mode="chat_completions", model="test-model", **endpoint)
+        _call_engine(aged, **endpoint)
     assert "consecutive" not in str(excinfo.value)
-    assert aged.calls == 1
+    assert aged.calls["plain"] == 1
 
 
 def test_endpoint_key_normalizes_explicit_and_env_credentials(
@@ -901,76 +942,100 @@ def test_endpoint_key_normalizes_explicit_and_env_credentials(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://model.test/v1")
     monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "2")
 
-    explicit = adapter._model_endpoint_key("m", "https://model.test/v1", "sk-env")
-    via_env = adapter._model_endpoint_key("m", "", "")
-    assert explicit == via_env
+    for _ in range(2):
+        recorder = _Recorder(plain_errors=[_connection_error()])
+        with pytest.raises(ARCModelAPIError):
+            _call_engine(recorder, api_key="sk-env")
+
+    # The same identity reached with the env fallback (empty explicit key):
+    # the budget is already tripped.
+    recorder = _Recorder()
+    with pytest.raises(ARCModelAPIError, match="consecutive failed model calls"):
+        _call_engine(recorder, api_key="")
 
 
 # ---------------------------------------------------------------------------
-# Wiring inside the ARC model classes
+# Wiring inside the ARC model classes (injected fake transport, no patching)
 # ---------------------------------------------------------------------------
 
 
-def test_arc_chat_openai_agenerate_retries_transient_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    from langchain_openai import ChatOpenAI
+def test_arc_chat_openai_agenerate_retries_transient_failures() -> None:
     from langchain_core.outputs import ChatResult
 
-    # These tests exercise the plain-attempt retry chain; keep them off the
-    # stream-first path so the unpatched _astream never touches the network.
-    monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
-    attempts = {"count": 0}
+    errors = [_status_error(429), _status_error(503)]
+    calls = {"count": 0}
 
-    async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise _status_error(429)
+    def plain() -> ChatResult:
+        calls["count"] += 1
+        if errors:
+            raise errors.pop(0)
         return ChatResult(generations=[])
 
-    monkeypatch.setattr(ChatOpenAI, "_agenerate", fake_agenerate)
-
-    async def run() -> ChatResult:
-        model = adapter.ARCChatOpenAI(
-            model="test-model",
-            api_key="test-key",
-            arc_api_mode="chat_completions",
-            arc_model_name="test-model",
-        )
-        return await model._agenerate([{"role": "user", "content": "hi"}])
-
-    result = asyncio.run(run())
-    assert attempts["count"] == 2
+    model = adapter.ARCChatOpenAI(
+        model="test-model",
+        api_key="test-key",
+        arc_api_mode="chat_completions",
+        arc_model_name="test-model",
+        arc_transport=ModelTransport(plain=plain),
+    )
+    result = asyncio.run(model._agenerate([{"role": "user", "content": "hi"}]))
+    assert calls["count"] == 3
     assert isinstance(result, ChatResult)
 
 
-def test_arc_compatible_chat_openai_agenerate_retries_transient_failures(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from agents.model.compatible_openai import CompatibleChatOpenAI
+def test_arc_compatible_chat_openai_agenerate_retries_transient_failures() -> None:
     from langchain_core.outputs import ChatResult
 
-    monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
-    attempts = {"count": 0}
+    errors = [_status_error(503), _status_error(503)]
+    calls = {"count": 0}
 
-    async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-        attempts["count"] += 1
-        if attempts["count"] <= 2:
-            raise _status_error(503)
+    def plain() -> ChatResult:
+        calls["count"] += 1
+        if errors:
+            raise errors.pop(0)
         return ChatResult(generations=[])
 
-    monkeypatch.setattr(CompatibleChatOpenAI, "_agenerate", fake_agenerate)
+    model = adapter.ARCCompatibleChatOpenAI(
+        model="test-model",
+        api_key="test-key",
+        arc_api_mode="responses",
+        arc_model_name="test-model",
+        arc_transport=ModelTransport(plain=plain),
+    )
+    result = asyncio.run(model._agenerate([{"role": "user", "content": "hi"}]))
+    assert calls["count"] == 3
+    assert isinstance(result, ChatResult)
 
-    async def run() -> ChatResult:
-        model = adapter.ARCCompatibleChatOpenAI(
-            model="test-model",
-            api_key="test-key",
-            arc_api_mode="responses",
-            arc_model_name="test-model",
-        )
-        return await model._agenerate([{"role": "user", "content": "hi"}])
 
-    result = asyncio.run(run())
-    assert attempts["count"] == 3
+def test_arc_chat_openai_generate_sync_path_retries_via_the_same_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync model-class path plugs its sync transport into the same engine
+    (delay env at 0 keeps the test off the real clock)."""
+
+    from langchain_core.outputs import ChatResult
+
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "0")
+    calls = {"count": 0}
+
+    def plain() -> ChatResult:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise _status_error(429)
+        return ChatResult(generations=[])
+
+    model = adapter.ARCChatOpenAI(
+        model="test-model",
+        api_key="test-key",
+        arc_api_mode="chat_completions",
+        arc_model_name="test-model",
+        arc_transport=ModelTransport(plain=plain),
+    )
+    result = model._generate([{"role": "user", "content": "hi"}])
+    assert calls["count"] == 2
     assert isinstance(result, ChatResult)
 
 
@@ -979,183 +1044,262 @@ def test_arc_compatible_chat_openai_agenerate_retries_transient_failures(
 # ---------------------------------------------------------------------------
 
 
-class _TransportRecorder:
-    """Records which transport served each attempt; plain fails, streamed answers."""
-
-    def __init__(self, exceptions: list[Exception] | None = None) -> None:
-        self.exceptions = list(exceptions or [])
-        self.plain_calls = 0
-        self.streamed_calls = 0
-
-    def plain(self) -> str:
-        self.plain_calls += 1
-        if self.exceptions:
-            raise self.exceptions.pop(0)
-        return "plain-ok"
-
-    def streamed(self) -> str:
-        self.streamed_calls += 1
-        if self.exceptions:
-            raise self.exceptions.pop(0)
-        return "streamed-ok"
-
-
-class _AsyncTransportRecorder(_TransportRecorder):
-    async def plain(self) -> str:  # type: ignore[override]
-        return _TransportRecorder.plain(self)
-
-    async def streamed(self) -> str:  # type: ignore[override]
-        return _TransportRecorder.streamed(self)
-
-
-def _clear_stream_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ARC_MODEL_STREAM_TRANSPORT", raising=False)
-
-
-def test_connection_failure_switches_next_attempt_to_streaming(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_connection_failure_switches_next_attempt_to_streaming() -> None:
     """The observed failure mode: a non-streaming POST dies mid-generation on a
     gateway idle timeout (connection reset) while the endpoint stays reachable;
     re-issuing the same request over the streaming transport keeps SSE chunks
     flowing and survives."""
 
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    recorder = _TransportRecorder([_connection_error()])
+    recorder = _Recorder(plain_errors=[_connection_error()])
+    result = _call_engine(recorder)
 
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=recorder.streamed,
-    )
-
-    assert result == "streamed-ok"
-    assert recorder.plain_calls == 1
-    assert recorder.streamed_calls == 1
+    assert result.value == "streamed-ok"
+    assert recorder.calls == {"plain": 1, "streamed": 1}
+    # plain→streamed is a transport switch, not a stream fallback.
+    assert result.outcome.stream_fallbacks == ()
+    assert result.outcome == ModelCallOutcome(transport="streamed", attempts=2)
 
 
-def test_streamed_retry_failure_falls_back_to_plain_attempts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A streamed attempt that still fails with a connection error must be
-    followed by a plain attempt (alternate transports), and a non-connection
-    failure inside a streamed attempt returns to plain attempts."""
+def test_async_engine_awaits_the_streamed_leg() -> None:
+    """The engine must await awaitable transport legs (the async model class
+    hands it coroutines)."""
 
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    recorder = _TransportRecorder([_connection_error(), _connection_error()])
+    recorder = _Recorder(plain_errors=[_connection_error()])
 
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=recorder.streamed,
-    )
+    async def streamed() -> str:
+        recorder.calls["streamed"] += 1
+        return "streamed-ok"
 
-    assert result == "plain-ok"
-    assert recorder.plain_calls == 2
-    assert recorder.streamed_calls == 1
-
-
-def test_non_connection_failure_never_switches_transport(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    recorder = _TransportRecorder([_status_error(429)])
-
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=recorder.streamed,
-    )
-
-    assert result == "plain-ok"
-    assert recorder.plain_calls == 2
-    assert recorder.streamed_calls == 0
-
-
-def test_stream_transport_env_flag_forces_plain_retry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    recorder = _TransportRecorder([_connection_error()])
-
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=recorder.streamed,
-    )
-
-    assert result == "plain-ok"
-    assert recorder.plain_calls == 2
-    assert recorder.streamed_calls == 0
-
-
-def test_async_connection_failure_switches_to_streaming(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_stream_env(monkeypatch)
-
-    async def fake_asleep(seconds: float) -> None:
-        return None
-
-    monkeypatch.setattr(adapter, "_asleep", fake_asleep)
-    recorder = _AsyncTransportRecorder([_connection_error()])
-
-    async def run() -> str:
-        return await _acall_model_with_retries(
-            recorder.plain,
+    transport = ModelTransport(plain=recorder.plain, streamed=streamed)
+    result = asyncio.run(
+        acall_model_with_retries(
+            transport,
             api_mode="chat_completions",
             model="test-model",
-            streamed_retry=recorder.streamed,
+            base_url="https://model.test/v1",
+            api_key="test-key",
+            prober=lambda base_url, api_key: True,
+            sleeper=lambda seconds: None,
         )
+    )
 
-    result = asyncio.run(run())
-
-    assert result == "streamed-ok"
-    assert recorder.plain_calls == 1
-    assert recorder.streamed_calls == 1
+    assert result.value == "streamed-ok"
+    assert recorder.calls == {"plain": 1, "streamed": 1}
 
 
-def test_streamed_retry_without_hook_stays_plain(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Callers that predate the streaming hook (or a model class without a
-    stream implementation) keep the original plain retry behaviour."""
+def test_streamed_retry_failure_falls_back_to_plain_attempts() -> None:
+    """A streamed attempt that still fails with a connection error must be
+    followed by a plain attempt (alternate transports), and the fallback is
+    recorded with its trigger and reason."""
 
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    call = _FlakyCall([_connection_error()])
+    recorder = _Recorder(plain_errors=[_connection_error()], streamed_errors=[_connection_error()])
+    result = _call_engine(recorder)
 
-    result = _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
+    assert result.value == "plain-ok"
+    assert recorder.calls == {"plain": 2, "streamed": 1}
+    assert result.outcome.stream_fallbacks == (
+        StreamFallback(FALLBACK_CONNECTION_FAILURE, 2),
+    )
 
-    assert result == "ok"
-    assert call.calls == 2
+
+def test_non_connection_failure_never_switches_transport() -> None:
+    recorder = _Recorder(plain_errors=[_status_error(429)])
+    result = _call_engine(recorder)
+
+    assert result.value == "plain-ok"
+    assert recorder.calls == {"plain": 2, "streamed": 0}
+    assert result.outcome.stream_fallbacks == ()
+
+
+def test_stream_transport_env_off_strips_even_injected_stream_legs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ARC_MODEL_STREAM_TRANSPORT=0 is authoritative: the streamed leg is
+    stripped from every transport, injected or not, so no alternation can
+    reintroduce streaming (the model is built without a base_url, so the
+    engine's default prober answers instantly without network)."""
+
+    monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "0")
+    recorder = _Recorder(plain_errors=[_connection_error()] * 10)
+    model = adapter.ARCChatOpenAI(
+        model="test-model",
+        api_key="test-key",
+        arc_api_mode="chat_completions",
+        arc_model_name="test-model",
+        arc_transport=recorder.transport,
+    )
+
+    # Connection failures probe (instantly reachable: no base_url) and then
+    # re-attempt plain until the retry budget is spent; streaming never
+    # rejoins because the env switch stripped the streamed leg.
+    with pytest.raises(ARCModelAPIError):
+        asyncio.run(model._agenerate([{"role": "user", "content": "hi"}]))
+    assert recorder.calls["plain"] == 1 + resolve_retry_policy().max_retries
+    assert recorder.calls["streamed"] == 0
+
+
+def _plain_only_engine_call(recorder: _Recorder):
+    return asyncio.run(
+        acall_model_with_retries(
+            ModelTransport(plain=recorder.plain, streamed=None),
+            api_mode="chat_completions",
+            model="test-model",
+            base_url="https://model.test/v1",
+            api_key="test-key",
+            prober=lambda base_url, api_key: True,
+            sleeper=lambda seconds: None,
+        )
+    )
+
+
+def test_transport_without_stream_leg_retries_plain() -> None:
+    recorder = _Recorder(plain_errors=[_connection_error()])
+    result = _plain_only_engine_call(recorder)
+
+    assert result.value == "plain-ok"
+    assert recorder.calls == {"plain": 2, "streamed": 0}
+
+
+# ---------------------------------------------------------------------------
+# Stream-first transport (ARC_MODEL_STREAM_TRANSPORT=stream, the default)
+# ---------------------------------------------------------------------------
+
+
+def test_stream_first_serves_the_first_attempt_streamed() -> None:
+    """Default mode: the very first attempt already streams, so a gateway
+    idle-timeout drop never gets a chance to kill the call."""
+
+    recorder = _Recorder()
+    result = _call_engine(recorder, stream_first=True)
+
+    assert result.value == "streamed-ok"
+    assert recorder.calls == {"plain": 0, "streamed": 1}
+    assert result.outcome == ModelCallOutcome(transport="streamed", attempts=1)
+
+
+def test_stream_first_client_error_falls_back_without_spending_budget() -> None:
+    """A provider answering the streamed request with 4xx does not support
+    streaming: the loop must re-attempt plain immediately (no retry delay, no
+    budget consumption) and remember the endpoint for the rest of the process.
+    The fallback decision — trigger attempt and reason — lands on the outcome."""
+
+    sleeps: list[float] = []
+    recorder = _Recorder(streamed_errors=[_status_error(400)])
+    result = _call_engine(
+        recorder, stream_first=True, model="sf-model", sleeper=sleeps.append
+    )
+
+    assert result.value == "plain-ok"
+    assert recorder.calls == {"plain": 1, "streamed": 1}
+    assert sleeps == []  # the fallback re-attempt is immediate
+    assert result.outcome.stream_fallbacks == (
+        StreamFallback(FALLBACK_CLIENT_ERROR, 1),
+    )
+
+    # The endpoint is remembered: a second call goes plain from the start.
+    recorder2 = _Recorder()
+    result2 = _call_engine(recorder2, stream_first=True, model="sf-model")
+    assert result2.value == "plain-ok"
+    assert recorder2.calls["streamed"] == 0
+    assert result2.outcome.stream_fallbacks == ()
+
+
+def test_streaming_unsupported_mark_expires_after_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 4xx mark must not route the endpoint to plain forever: after the TTL
+    the next call rediscovers streaming (a gateway misconfiguration can be
+    transient, and a permanent mark would re-expose large-output turns to the
+    idle-timeout drop for the rest of a long run)."""
+
+    recorder = _Recorder(streamed_errors=[_status_error(400)])
+    result = _call_engine(
+        recorder, stream_first=True, model="ttl-model"
+    )
+    assert result.value == "plain-ok"
+    assert result.outcome.stream_fallbacks == (StreamFallback(FALLBACK_CLIENT_ERROR, 1),)
+
+    # Still within the TTL: the mark holds, second call starts plain.
+    recorder2 = _Recorder()
+    result2 = _call_engine(recorder2, stream_first=True, model="ttl-model")
+    assert result2.value == "plain-ok"
+    assert recorder2.calls["streamed"] == 0
+
+    # Shrink the TTL to zero: the mark expires immediately and streaming is
+    # retried.
+    monkeypatch.setattr(adapter, "_STREAMING_UNSUPPORTED_TTL_SECONDS", 0.0)
+    recorder3 = _Recorder()
+    result3 = _call_engine(recorder3, stream_first=True, model="ttl-model")
+    assert result3.value == "streamed-ok"
+    assert recorder3.calls["streamed"] == 1
+    assert result3.outcome.stream_fallbacks == ()
+
+
+def test_stream_first_server_error_keeps_streaming_on_retries() -> None:
+    """A 5xx from the streamed attempt is transient: retry with the streamed
+    transport still selected (unlike a connection failure, which alternates)."""
+
+    recorder = _Recorder(streamed_errors=[_status_error(503)])
+    result = _call_engine(recorder, stream_first=True)
+
+    assert result.value == "streamed-ok"
+    assert recorder.calls == {"plain": 0, "streamed": 2}
+    assert result.outcome.stream_fallbacks == ()
+
+
+def test_stream_first_connection_failure_alternates_transports() -> None:
+    """A connection failure on the streamed first attempt probes, then
+    alternates to plain — and back to streamed on a further connection
+    failure. Only the stream→plain direction is a recorded fallback."""
+
+    recorder = _Recorder(plain_errors=[_connection_error()], streamed_errors=[_connection_error()])
+    result = _call_engine(recorder, stream_first=True)
+
+    assert result.value == "streamed-ok"
+    assert recorder.calls == {"plain": 1, "streamed": 2}
+    assert result.outcome.stream_fallbacks == (
+        StreamFallback(FALLBACK_CONNECTION_FAILURE, 1),
+    )
+
+
+def test_stream_first_env_retry_mode_keeps_plain_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ARC_MODEL_STREAM_TRANSPORT=retry restores the PR #44 behaviour: plain
+    first, streaming only after a connection-class failure. Asserted through
+    the model class so the env→engine mapping is what is under test."""
+
+    monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "retry")
+    recorder = _Recorder()
+    model = adapter.ARCChatOpenAI(
+        model="test-model",
+        api_key="test-key",
+        arc_api_mode="chat_completions",
+        arc_model_name="test-model",
+        arc_transport=recorder.transport,
+    )
+    result = asyncio.run(model._agenerate([{"role": "user", "content": "hi"}]))
+
+    assert result == "plain-ok"
+    assert recorder.calls == {"plain": 1, "streamed": 0}
 
 
 def test_arc_chat_openai_uses_streaming_after_connection_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end at the model-class layer in retry mode: the plain _agenerate
-    dies on a connection error (the gateway idle-timeout signature), the retry
-    loop re-issues the request through _astream, and the accumulated stream result
-    is returned to the agent layer. The real ``agenerate_from_stream`` runs so
-    the accumulated result is produced exactly as in production."""
+    """End-to-end at the model-class layer in retry mode: the plain langchain
+    generate dies on a connection error (the gateway idle-timeout signature),
+    the engine re-issues the request through the real streamed helper
+    (accumulating _astream), and the accumulated stream result is returned to
+    the agent layer exactly as in production."""
 
     from langchain_core.messages import AIMessageChunk
-    from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+    from langchain_core.outputs import ChatGenerationChunk, ChatResult
     from langchain_openai import ChatOpenAI
 
     monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "retry")
-
-    async def fake_asleep(seconds: float) -> None:
-        return None
-
-    monkeypatch.setattr(adapter, "_asleep", fake_asleep)
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "0")
     calls = {"plain": 0, "streamed": 0}
 
     async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -1169,274 +1313,29 @@ def test_arc_chat_openai_uses_streaming_after_connection_failure(
     monkeypatch.setattr(ChatOpenAI, "_agenerate", fake_agenerate)
     monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
 
-    async def run() -> ChatResult:
-        model = adapter.ARCChatOpenAI(
-            model="test-model",
-            api_key="test-key",
-            arc_api_mode="chat_completions",
-            arc_model_name="test-model",
-        )
-        return await model._agenerate([{"role": "user", "content": "hi"}])
-
-    result = asyncio.run(run())
+    model = adapter.ARCChatOpenAI(
+        model="test-model",
+        api_key="test-key",
+        arc_api_mode="chat_completions",
+        arc_model_name="test-model",
+    )
+    result = asyncio.run(model._agenerate([{"role": "user", "content": "hi"}]))
     assert calls == {"plain": 1, "streamed": 1}
     assert result.generations[0].message.content == "recovered"
-
-
-# ---------------------------------------------------------------------------
-# Underlying-cause visibility in error messages
-# ---------------------------------------------------------------------------
-
-
-def test_short_error_text_includes_the_cause_chain() -> None:
-    transport = httpx.ConnectError("[Errno 111] Connect call failed")
-    sdk_error = APIConnectionError(message="Connection error.", request=_request())
-    sdk_error.__cause__ = transport
-
-    text = adapter._short_error_text(sdk_error)
-
-    assert "Connection error." in text
-    assert "caused by ConnectError" in text
-    assert "[Errno 111] Connect call failed" in text
-
-
-def test_short_error_text_handles_cycle_and_missing_cause() -> None:
-    first = APIConnectionError(message="Connection error.", request=_request())
-    second = httpx.ReadError("peer closed connection without response")
-    first.__cause__ = second
-    second.__cause__ = first  # defensive: a cycle must not loop forever
-
-    text = adapter._short_error_text(first)
-    assert "peer closed connection" in text
-
-    bare = APIConnectionError(message="Connection error.", request=_request())
-    assert adapter._short_error_text(bare) == "Connection error."
-
-
-def test_raised_error_carries_the_cause_chain(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
-    transport = httpx.ReadError("peer closed connection without response")
-    sdk_error = APIConnectionError(message="Connection error.", request=_request())
-    sdk_error.__cause__ = transport
-    call = _FlakyCall([sdk_error])
-
-    with pytest.raises(ARCModelAPIError) as excinfo:
-        _call_model_with_retries(call, api_mode="chat_completions", model="test-model")
-
-    message = str(excinfo.value)
-    assert "type=APIConnectionError" in message
-    assert "caused by ReadError: peer closed connection" in message
-
-
-# ---------------------------------------------------------------------------
-# Stream-first transport (ARC_MODEL_STREAM_TRANSPORT=stream, the default)
-# ---------------------------------------------------------------------------
-
-
-def test_stream_first_serves_the_first_attempt_streamed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Default mode: the very first attempt already streams, so a gateway
-    idle-timeout drop never gets a chance to kill the call."""
-
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    recorder = _TransportRecorder()
-
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=recorder.streamed,
-        stream_first=True,
-    )
-
-    assert result == "streamed-ok"
-    assert recorder.plain_calls == 0
-    assert recorder.streamed_calls == 1
-
-
-def test_stream_first_client_error_falls_back_without_spending_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A provider answering the streamed request with 4xx does not support
-    streaming: the loop must re-attempt plain immediately (no retry delay, no
-    budget consumption) and remember the endpoint for the rest of the process."""
-
-    _clear_stream_env(monkeypatch)
-    sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
-    adapter.reset_streaming_support_cache_for_tests()
-    recorder = _TransportRecorder([_status_error(400)])
-
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="sf-model",
-        base_url="https://sf.test/v1",
-        streamed_retry=recorder.streamed,
-        stream_first=True,
-    )
-
-    assert result == "plain-ok"
-    assert recorder.streamed_calls == 1
-    assert recorder.plain_calls == 1
-    assert sleeps == []  # the fallback re-attempt is immediate
-
-    # The endpoint is remembered: a second call goes plain from the start.
-    recorder2 = _TransportRecorder()
-    result2 = _call_model_with_retries(
-        recorder2.plain,
-        api_mode="chat_completions",
-        model="sf-model",
-        base_url="https://sf.test/v1",
-        streamed_retry=recorder2.streamed,
-        stream_first=True,
-    )
-    assert result2 == "plain-ok"
-    assert recorder2.streamed_calls == 0
-    assert recorder2.plain_calls == 1
-    adapter.reset_streaming_support_cache_for_tests()
-
-
-def test_stream_first_server_error_keeps_streaming_on_retries(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A 5xx from the streamed attempt is transient: retry with the streamed
-    transport still selected (unlike a connection failure, which alternates)."""
-
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    recorder = _TransportRecorder([_status_error(503)])
-
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=recorder.streamed,
-        stream_first=True,
-    )
-
-    assert result == "streamed-ok"
-    assert recorder.streamed_calls == 2
-    assert recorder.plain_calls == 0
-
-
-def test_stream_first_connection_failure_alternates_transports(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A connection failure on the streamed first attempt probes, then
-    alternates to plain - and back to streamed on a further connection
-    failure."""
-
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    recorder = _TransportRecorder([_connection_error(), _connection_error()])
-
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=recorder.streamed,
-        stream_first=True,
-    )
-
-    assert result == "streamed-ok"
-    assert recorder.streamed_calls == 2
-    assert recorder.plain_calls == 1
-
-
-def test_stream_first_env_retry_mode_keeps_plain_first(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ARC_MODEL_STREAM_TRANSPORT=retry restores the PR #44 behaviour: plain
-    first, streaming only after a connection-class failure."""
-
-    monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "retry")
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    recorder = _TransportRecorder()
-
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=recorder.streamed,
-        stream_first=adapter.ARCChatOpenAI(
-            model="t", api_key="k", arc_api_mode="chat_completions", arc_model_name="t"
-        )._arc_should_stream_first(),
-    )
-
-    assert result == "plain-ok"
-    assert recorder.plain_calls == 1
-    assert recorder.streamed_calls == 0
-
-
-def test_stream_first_mode_disabled_by_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ARC_MODEL_STREAM_TRANSPORT=0: the model class reports no stream-first,
-    so the first attempt is plain and stays plain."""
-
-    monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
-    model = adapter.ARCChatOpenAI(
-        model="t", api_key="k", arc_api_mode="chat_completions", arc_model_name="t"
-    )
-    assert model._arc_should_stream_first() is False
-
-
-def test_stream_first_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clear_stream_env(monkeypatch)
-    model = adapter.ARCChatOpenAI(
-        model="t", api_key="k", arc_api_mode="chat_completions", arc_model_name="t"
-    )
-    assert model._arc_should_stream_first() is True
-
-
-def test_empty_stream_is_treated_as_connection_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A stream that closes without any generation chunk must retry (switching
-    transport), not surface a bogus empty result. ``agenerate_from_stream``
-    raises ValueError("No generations found in stream.") for such streams; the
-    model-class streamed hook converts it into a connection-class error."""
-
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-
-    def streamed() -> "ChatResult":
-        # Simulate what the model-class hook does when the underlying
-        # agenerate_from_stream raises its no-generations ValueError.
-        raise adapter._arc_empty_stream_error()
-
-    def plain() -> str:
-        return "plain-ok"
-
-    result = _call_model_with_retries(
-        plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=streamed,
-        stream_first=True,
-    )
-
-    assert result == "plain-ok"
 
 
 def test_arc_chat_openai_streams_first_attempt_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Model-class wiring: with the default env, _agenerate's first attempt
-    goes through _astream (via the streamed hook), no plain attempt needed."""
+    goes through the real streamed helper, and the plain langchain generate is
+    never reached."""
 
     from langchain_core.messages import AIMessageChunk
-    from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+    from langchain_core.outputs import ChatGenerationChunk, ChatResult
     from langchain_openai import ChatOpenAI
 
-    _clear_stream_env(monkeypatch)
-    adapter.reset_streaming_support_cache_for_tests()
-
-    async def fake_asleep(seconds: float) -> None:
-        return None
-
-    monkeypatch.setattr(adapter, "_asleep", fake_asleep)
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "0")
     calls = {"plain": 0, "streamed": 0}
 
     async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -1450,33 +1349,41 @@ def test_arc_chat_openai_streams_first_attempt_by_default(
     monkeypatch.setattr(ChatOpenAI, "_agenerate", fake_agenerate)
     monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
 
-    async def run() -> ChatResult:
-        model = adapter.ARCChatOpenAI(
-            model="test-model",
-            api_key="test-key",
-            arc_api_mode="chat_completions",
-            arc_model_name="test-model",
-        )
-        return await model._agenerate([{"role": "user", "content": "hi"}])
-
-    result = asyncio.run(run())
+    model = adapter.ARCChatOpenAI(
+        model="test-model",
+        api_key="test-key",
+        arc_api_mode="chat_completions",
+        arc_model_name="test-model",
+    )
+    result = asyncio.run(model._agenerate([{"role": "user", "content": "hi"}]))
     assert calls == {"plain": 0, "streamed": 1}
     assert result.generations[0].message.content == "first-attempt-streamed"
-    adapter.reset_streaming_support_cache_for_tests()
 
 
-def test_arc_streamed_hook_converts_no_generations_valueerror(
+def test_empty_stream_via_the_real_streamed_helper_recovers_plain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The model-class streamed hook must translate the accumulator's
-    ValueError into a connection-class error the retry loop understands."""
+    """The real streamed helper must translate the accumulator's "No
+    generations" ValueError into a connection-class error the engine
+    understands: an empty SSE body must not surface as a bogus empty result —
+    the call recovers over plain instead."""
 
+    from langchain_core.messages import AIMessageChunk
+    from langchain_core.outputs import ChatGeneration, ChatResult
     from langchain_openai import ChatOpenAI
+
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "0")
+
+    async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessageChunk(content="plain-recovery"))]
+        )
 
     async def fake_astream(self, messages, stop=None, run_manager=None, **kwargs):
         return
         yield  # pragma: no cover - empty async generator
 
+    monkeypatch.setattr(ChatOpenAI, "_agenerate", fake_agenerate)
     monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
 
     model = adapter.ARCChatOpenAI(
@@ -1485,117 +1392,95 @@ def test_arc_streamed_hook_converts_no_generations_valueerror(
         arc_api_mode="chat_completions",
         arc_model_name="test-model",
     )
-
-    import asyncio
-    from openai import APIConnectionError
-
-    async def run():
-        try:
-            await model._arc_streamed_agenerate(
-                [{"role": "user", "content": "hi"}], stop=None, run_manager=None
-            )
-        except APIConnectionError as exc:
-            return str(exc)
-        return "no-error"
-
-    message = asyncio.run(run())
-    assert "without any generation chunks" in message
+    result = asyncio.run(model._agenerate([{"role": "user", "content": "hi"}]))
+    assert result.generations[0].message.content == "plain-recovery"
 
 
-# ---------------------------------------------------------------------------
-# Review fixes: streaming-unsupported TTL and empty-stream probe skip
-# ---------------------------------------------------------------------------
+def test_empty_stream_is_treated_as_connection_failure() -> None:
+    """A stream that closes without any generation chunk must retry (switching
+    transport), not surface a bogus empty result. The streamed leg raises the
+    contract's ``empty_stream_error``; the engine skips the reachability probe
+    (the endpoint just answered HTTP 200) and switches directly."""
 
-
-def test_streaming_unsupported_mark_expires_after_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 4xx mark must not route the endpoint to plain forever: after the TTL
-    the next call rediscovers streaming (a gateway misconfiguration can be
-    transient, and a permanent mark would re-expose large-output turns to the
-    idle-timeout drop for the rest of a long run)."""
-
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    adapter.reset_streaming_support_cache_for_tests()
-
-    # First call: streamed attempt answers 4xx -> plain fallback + mark.
-    recorder = _TransportRecorder([_status_error(400)])
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="ttl-model",
-        base_url="https://ttl.test/v1",
-        streamed_retry=recorder.streamed,
-        stream_first=True,
-    )
-    assert result == "plain-ok"
-
-    # Still within the TTL: the mark holds, second call starts plain.
-    recorder2 = _TransportRecorder()
-    result2 = _call_model_with_retries(
-        recorder2.plain,
-        api_mode="chat_completions",
-        model="ttl-model",
-        base_url="https://ttl.test/v1",
-        streamed_retry=recorder2.streamed,
-        stream_first=True,
-    )
-    assert result2 == "plain-ok"
-    assert recorder2.streamed_calls == 0
-
-    # Age the mark past the TTL: streaming is retried.
-    with adapter._STREAMING_UNSUPPORTED_LOCK:
-        adapter._STREAMING_UNSUPPORTED[("ttl-model", "https://ttl.test/v1")] = (
-            adapter.time.monotonic() - (adapter._STREAMING_UNSUPPORTED_TTL_SECONDS + 1.0)
-        )
-    recorder3 = _TransportRecorder()
-    result3 = _call_model_with_retries(
-        recorder3.plain,
-        api_mode="chat_completions",
-        model="ttl-model",
-        base_url="https://ttl.test/v1",
-        streamed_retry=recorder3.streamed,
-        stream_first=True,
-    )
-    assert result3 == "streamed-ok"
-    assert recorder3.streamed_calls == 1
-    adapter.reset_streaming_support_cache_for_tests()
-
-
-def test_empty_stream_skips_the_reachability_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An empty stream proves the endpoint just answered with HTTP 200, so the
-    retry must switch transport directly instead of waiting on probe rounds."""
-
-    _clear_stream_env(monkeypatch)
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
-    probe_calls = {"count": 0}
-    real_probe = adapter._endpoint_reachable
+    probes = {"count": 0}
 
-    def counting_probe(base_url: str, api_key: str) -> bool:
-        probe_calls["count"] += 1
-        return real_probe(base_url, api_key)
+    def prober(base_url: str, api_key: str) -> bool:
+        probes["count"] += 1
+        return True
 
-    monkeypatch.setattr(adapter, "_endpoint_reachable", counting_probe)
+    def streamed() -> object:
+        raise empty_stream_error()
 
-    empty_results = [adapter._arc_empty_stream_error()]
-
-    def streamed() -> str:
-        raise empty_results.pop(0)
-
-    def plain() -> str:
-        return "plain-ok"
-
-    result = _call_model_with_retries(
-        plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=streamed,
-        stream_first=True,
+    transport = ModelTransport(plain=lambda: "plain-ok", streamed=streamed)
+    result = asyncio.run(
+        acall_model_with_retries(
+            transport,
+            api_mode="chat_completions",
+            model="test-model",
+            base_url="https://model.test/v1",
+            api_key="test-key",
+            stream_first=True,
+            sleeper=sleeps.append,
+            prober=prober,
+        )
     )
 
-    assert result == "plain-ok"
-    assert probe_calls["count"] == 0  # no probe round before the plain retry
+    assert result.value == "plain-ok"
+    assert probes["count"] == 0  # no probe round before the plain retry
     assert sleeps == [5.0]  # only the retry delay, no probe-wait sleeps
+    assert result.outcome.stream_fallbacks == (
+        StreamFallback(FALLBACK_CONNECTION_FAILURE, 1),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Underlying-cause visibility in error messages
+# ---------------------------------------------------------------------------
+
+
+def test_raised_error_carries_the_cause_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    transport_error = httpx.ReadError("peer closed connection without response")
+    sdk_error = APIConnectionError(message="Connection error.", request=_request())
+    sdk_error.__cause__ = transport_error
+
+    recorder = _Recorder(plain_errors=[sdk_error])
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_engine(recorder)
+
+    message = str(excinfo.value)
+    assert "type=APIConnectionError" in message
+    assert "caused by ReadError: peer closed connection" in message
+
+
+def test_cyclic_cause_chain_does_not_hang_the_error_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    first = APIConnectionError(message="Connection error.", request=_request())
+    second = httpx.ReadError("peer closed connection without response")
+    first.__cause__ = second
+    second.__cause__ = first  # defensive: a cycle must not loop forever
+
+    recorder = _Recorder(plain_errors=[first])
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_engine(recorder, plain_only=True)
+    assert "peer closed connection" in str(excinfo.value)
+
+
+def test_bare_error_message_has_no_cause_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    recorder = _Recorder(
+        plain_errors=[APIConnectionError(message="Connection error.", request=_request())]
+    )
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_engine(recorder, plain_only=True)
+    assert "error=Connection error." in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -1617,103 +1502,115 @@ class _StreamChunkTimeoutError(TimeoutError):
 _StreamChunkTimeoutError.__name__ = "StreamChunkTimeoutError"
 
 
-def test_stream_chunk_timeout_detected_direct_and_wrapped() -> None:
-    """The watchdog error is recognized both raw and wrapped in the ValueError
-    that agenerate_from_stream re-raises mid-iteration; unrelated timeouts and
-    other exceptions are not."""
-
-    direct = _StreamChunkTimeoutError()
-    wrapped = ValueError("No generations found in stream.")
-    wrapped.__cause__ = _StreamChunkTimeoutError()
-    plain_timeout = TimeoutError("unrelated asyncio timeout")
-
-    assert adapter._is_stream_chunk_timeout(direct) is True
-    assert adapter._is_stream_chunk_timeout(wrapped) is True
-    assert adapter._is_stream_chunk_timeout(plain_timeout) is False
-    assert adapter._is_stream_chunk_timeout(_connection_error()) is False
-    assert adapter._is_stream_chunk_timeout(_status_error(500)) is False
-
-
-def test_stream_first_chunk_timeout_switches_transport_without_probe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_stream_first_chunk_timeout_switches_transport_without_probe() -> None:
     """The online-run failure mode: a streamed attempt stalls between chunks.
     The loop must re-attempt over plain immediately — no probe round, no retry
     delay, no budget burn — instead of letting the error escape to the agent
     layer, whose ainvoke fallback would replay the whole session (and stream
     again, hitting the same stall)."""
 
-    _clear_stream_env(monkeypatch)
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_sleep", sleeps.append)
-    probe_calls = {"count": 0}
-    monkeypatch.setattr(
-        adapter, "_endpoint_reachable", lambda *args, **kwargs: probe_calls.__setitem__("count", probe_calls["count"] + 1) or True
-    )
-    recorder = _TransportRecorder([_StreamChunkTimeoutError()])
+    probes = {"count": 0}
 
-    result = _call_model_with_retries(
-        recorder.plain,
-        api_mode="chat_completions",
-        model="test-model",
-        streamed_retry=recorder.streamed,
-        stream_first=True,
-    )
+    def prober(base_url: str, api_key: str) -> bool:
+        probes["count"] += 1
+        return True
 
-    assert result == "plain-ok"
-    assert recorder.streamed_calls == 1
-    assert recorder.plain_calls == 1
-    assert probe_calls["count"] == 0  # endpoint provably alive: no probe round
+    recorder = _Recorder(streamed_errors=[_StreamChunkTimeoutError()])
+    result = _call_engine(recorder, stream_first=True, sleeper=sleeps.append, prober=prober)
+
+    assert result.value == "plain-ok"
+    assert recorder.calls == {"plain": 1, "streamed": 1}
+    assert probes["count"] == 0  # endpoint provably alive: no probe round
     assert sleeps == []  # transport switch is immediate
+    assert result.outcome.stream_fallbacks == (
+        StreamFallback(FALLBACK_CHUNK_TIMEOUT, 1),
+    )
 
 
-def test_async_stream_chunk_timeout_switches_transport(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Async variant: the chunk watchdog on a streamed attempt retries over
-    plain on the same call, without probe rounds."""
+def test_async_engine_chunk_timeout_switches_transport() -> None:
+    """Async engine on awaitable legs: the chunk watchdog on a streamed attempt
+    retries over plain on the same call, without probe rounds."""
 
-    _clear_stream_env(monkeypatch)
+    calls = {"plain": 0, "streamed": 0}
     sleeps: list[float] = []
-    monkeypatch.setattr(adapter, "_asleep", sleeps.append)
-    recorder = _AsyncTransportRecorder([_StreamChunkTimeoutError()])
 
+    async def plain() -> str:
+        calls["plain"] += 1
+        return "plain-ok"
+
+    async def streamed() -> str:
+        calls["streamed"] += 1
+        raise _StreamChunkTimeoutError()
+
+    transport = ModelTransport(plain=plain, streamed=streamed)
     result = asyncio.run(
-        _acall_model_with_retries(
-            recorder.plain,
+        acall_model_with_retries(
+            transport,
             api_mode="chat_completions",
             model="test-model",
-            streamed_retry=recorder.streamed,
+            base_url="https://model.test/v1",
+            api_key="test-key",
             stream_first=True,
+            sleeper=sleeps.append,
+            prober=lambda base_url, api_key: True,
         )
     )
 
-    assert result == "plain-ok"
-    assert recorder.streamed_calls == 1
-    assert recorder.plain_calls == 1
+    assert result.value == "plain-ok"
+    assert calls == {"plain": 1, "streamed": 1}
     assert sleeps == []
 
 
-def test_plain_attempt_chunk_timeout_shape_still_retries_via_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_wrapped_chunk_timeout_is_still_classified() -> None:
+    """``agenerate_from_stream`` re-raises mid-iteration errors wrapped in
+    ValueError; the engine must still see the watchdog in ``__cause__`` and
+    take the transport-switch path."""
+
+    wrapped = ValueError("No generations found in stream.")
+    wrapped.__cause__ = _StreamChunkTimeoutError()
+    recorder = _Recorder(streamed_errors=[wrapped])
+    result = _call_engine(recorder, stream_first=True)
+
+    assert result.value == "plain-ok"
+    assert recorder.calls == {"plain": 1, "streamed": 1}
+    assert result.outcome.stream_fallbacks == (
+        StreamFallback(FALLBACK_CHUNK_TIMEOUT, 1),
+    )
+
+
+def test_plain_attempt_chunk_timeout_shape_still_propagates_raw() -> None:
     """A watchdog-shaped error raised by a *plain* attempt (no streamed
     transport configured) is not an OpenAI/httpx exception, so the retry
     budget contract keeps its old behaviour: it propagates unwrapped instead
     of being silently retried forever."""
 
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-
-    def plain() -> str:
-        raise _StreamChunkTimeoutError()
-
+    recorder = _Recorder(plain_errors=[_StreamChunkTimeoutError()])
     with pytest.raises(_StreamChunkTimeoutError):
-        _call_model_with_retries(
-            plain,
-            api_mode="chat_completions",
-            model="test-model",
-        )
+        _call_engine(recorder)
+    assert recorder.calls["plain"] == 1
+
+
+def test_repeated_chunk_timeouts_are_bounded_by_the_retry_budget() -> None:
+    """Both transports stalling must terminate through the retry budget,
+    never spin in a zero-delay retry loop. The watchdog error is not an
+    OpenAI/httpx exception, so it surfaces raw (the historical contract for
+    non-model-API exceptions), but only after the budget is spent."""
+
+    watchdogs = [_StreamChunkTimeoutError()] * 20
+    recorder = _Recorder(plain_errors=list(watchdogs), streamed_errors=list(watchdogs))
+    with pytest.raises(TimeoutError):
+        _call_engine(recorder, stream_first=True)
+
+    # 1 free switch + (max_retries + 1) budgeted attempts (the last one is
+    # the attempt that trips the budget and raises) = 5 with defaults.
+    max_retries = resolve_retry_policy().max_retries
+    assert recorder.calls["plain"] + recorder.calls["streamed"] == 1 + max_retries + 1
+
+
+# ---------------------------------------------------------------------------
+# Stream chunk timeout resolution
+# ---------------------------------------------------------------------------
 
 
 def test_resolve_stream_chunk_timeout_env_matrix(
@@ -1733,9 +1630,10 @@ def test_resolve_stream_chunk_timeout_env_matrix(
         "-5": 90.0,
     }
     for raw, expected in cases.items():
-        monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raw) if raw else monkeypatch.delenv(
-            "ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False
-        )
+        if raw:
+            monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raw)
+        else:
+            monkeypatch.delenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False)
         assert adapter.resolve_stream_chunk_timeout() == expected, f"env={raw!r}"
 
 
@@ -1768,77 +1666,42 @@ def test_build_openai_chat_model_passes_stream_chunk_timeout(
     default (120s, not tunable from ARC before) no longer governs stall
     detection."""
 
-    adapter.reset_model_cache_for_tests()
-    monkeypatch.delenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False)
-    model = adapter.build_openai_chat_model("chunk-timeout-model", api_key="k")
-    assert model.stream_chunk_timeout == 90.0
+    from agents.model.openai_api_adapter import reset_model_cache_for_tests
 
-    monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", "33")
-    adapter.reset_model_cache_for_tests()
-    model33 = adapter.build_openai_chat_model("chunk-timeout-model-33", api_key="k")
-    assert model33.stream_chunk_timeout == 33.0
-    adapter.reset_model_cache_for_tests()
-
-
-def test_successful_attempt_records_transport_meta(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The retry loop publishes which transport answered and how many attempts
-    it took, so llm_usage events can attribute latency per transport."""
-
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-
-    token = adapter._last_call_meta.set(None)
+    reset_model_cache_for_tests()
     try:
-        recorder = _TransportRecorder([_StreamChunkTimeoutError()])
-        result = _call_model_with_retries(
-            recorder.plain,
-            api_mode="chat_completions",
-            model="test-model",
-            streamed_retry=recorder.streamed,
-            stream_first=True,
-        )
-        assert result == "plain-ok"
-        meta = adapter._last_call_meta.get()
-        assert meta == {"transport": "plain", "attempts": 2}
+        monkeypatch.delenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", raising=False)
+        model = adapter.build_openai_chat_model("chunk-timeout-model", api_key="k")
+        assert model.stream_chunk_timeout == 90.0
 
-        recorder2 = _TransportRecorder()
-        result2 = _call_model_with_retries(
-            recorder2.plain,
-            api_mode="chat_completions",
-            model="test-model",
-            streamed_retry=recorder2.streamed,
-            stream_first=True,
-        )
-        assert result2 == "streamed-ok"
-        assert adapter._last_call_meta.get() == {"transport": "streamed", "attempts": 1}
+        monkeypatch.setenv("ARC_MODEL_STREAM_CHUNK_TIMEOUT", "33")
+        reset_model_cache_for_tests()
+        model33 = adapter.build_openai_chat_model("chunk-timeout-model-33", api_key="k")
+        assert model33.stream_chunk_timeout == 33.0
     finally:
-        adapter._last_call_meta.reset(token)
+        reset_model_cache_for_tests()
 
 
-def test_repeated_chunk_timeouts_are_bounded_by_the_retry_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Both transports stalling must terminate through the retry budget,
-    never spin in a zero-delay retry loop. The watchdog error is not an
-    OpenAI/httpx exception, so it surfaces raw (the historical contract for
-    non-model-API exceptions), but only after the budget is spent."""
+# ---------------------------------------------------------------------------
+# Outcome observability at the seam
+# ---------------------------------------------------------------------------
 
-    _clear_stream_env(monkeypatch)
-    monkeypatch.setattr(adapter, "_sleep", lambda seconds: None)
-    adapter.reset_consecutive_failure_budget_for_tests()
-    # Every attempt on either transport raises the watchdog error.
-    recorder = _TransportRecorder([_StreamChunkTimeoutError()] * 20)
 
-    with pytest.raises(TimeoutError):
-        _call_model_with_retries(
-            recorder.plain,
-            api_mode="chat_completions",
-            model="test-model",
-            streamed_retry=recorder.streamed,
-            stream_first=True,
-        )
+def test_outcome_reports_which_transport_answered() -> None:
+    """The engine's outcome is the seam's verdict: which transport answered,
+    how many real attempts it took, and every stream→plain fallback with its
+    trigger and reason."""
 
-    # 1 free switch + (max_retries + 1) budgeted attempts (the last one is
-    # the attempt that trips the budget and raises) = 5 with defaults.
-    max_retries = adapter._resolve_retry_policy().max_retries
-    assert recorder.streamed_calls + recorder.plain_calls == 1 + max_retries + 1
+    recorder = _Recorder(streamed_errors=[_StreamChunkTimeoutError()])
+    result = _call_engine(recorder, stream_first=True)
+    assert result.outcome == ModelCallOutcome(
+        transport="plain",
+        attempts=2,
+        stream_fallbacks=(StreamFallback(FALLBACK_CHUNK_TIMEOUT, 1),),
+    )
+
+    recorder2 = _Recorder()
+    result2 = _call_engine(recorder2, stream_first=True)
+    assert result2.outcome == ModelCallOutcome(
+        transport="streamed", attempts=1, stream_fallbacks=()
+    )
