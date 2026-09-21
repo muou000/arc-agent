@@ -63,11 +63,11 @@ def _node_supports_require_esm(version_text: str) -> bool:
 # Generous because a cold machine downloads ~150 MB of browser binaries. Once
 # the machine-wide Playwright cache is warm the command exits in seconds.
 PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
-# One timeout source for every command a system-side test run can spawn
-# (Playwright batches, Vitest batches, npm scripts the E2E executor invokes).
-# Vitest batches pass no override and share this budget: a wedged run must
-# fail within one bound regardless of which runner executed it.
-SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS = 120.0
+# The single timeout source for the E2E test-runner command (the Playwright
+# batch). The helper's own npm-script invocations inside the E2E attempt
+# (db:prepare / db:seed, frontend build) keep their individual budgets —
+# they are not per-path forks of the runner timeout this constant replaced.
+E2E_RUNNER_TIMEOUT_SECONDS = 120.0
 # The browser task starts with npm, but waits until npm has materialized the
 # local Playwright CLI before touching the workspace. This preserves the
 # package-version coupling while overlapping the browser download with the
@@ -1410,16 +1410,13 @@ def _render_e2e_failure_body(
     if database_prepare_output:
         if backend_startup_failed:
             # The old backend-startup body ordered this section ahead of the
-            # runtime env; keep the exact ordering.
+            # runtime env; keep the exact ordering. The runtime env always
+            # exists here: a backend-startup failure implies the build
+            # succeeded, and the env is built right after it.
             prepare_index = next(
-                (i for i, section in enumerate(sections) if section.startswith("=== E2E Runtime Env ===")),
-                None,
+                i for i, section in enumerate(sections) if section.startswith("=== E2E Runtime Env ===")
             )
-            prepare_section = f"=== Database Prepare ===\n{database_prepare_output}"
-            if prepare_index is None:
-                sections.append(prepare_section)
-            else:
-                sections.insert(prepare_index, prepare_section)
+            sections.insert(prepare_index, f"=== Database Prepare ===\n{database_prepare_output}")
         else:
             sections.append(f"=== Database Prepare ===\n{database_prepare_output}")
     if backend_startup_failed:
@@ -2534,15 +2531,16 @@ class WebAppType(AppTypeHandler):
 
     async def run_test_file(self, test_type: str, file_path: str, web_port: int | None = None) -> TestRunResult:
         resolved_port = int(web_port) if web_port is not None else get_web_port()
+        # E2E has exactly one executor (the grouped attempt pipeline); a
+        # single-file request is that pipeline with one target, not a second,
+        # divergent command path with its own timeout budget. Redirect before
+        # the execution log so the file is logged once, by the group runner.
+        if (test_type or "").strip().lower() == "e2e":
+            return await self.run_test_group("e2e", [file_path], web_port=resolved_port)
         await self._log("System", f"System test execution ({test_type}): {file_path}")
         validation_error = self.validate_test_path(test_type, file_path)
         if validation_error:
             return TestRunResult(exit_code=1, output=f"Exit Code: 1\nSTDERR:\n{validation_error}\n")
-        if (test_type or "").strip().lower() == "e2e":
-            # E2E has exactly one executor (the grouped attempt pipeline);
-            # a single-file request is that pipeline with one target, not a
-            # second, divergent command path with its own timeout budget.
-            return await self.run_test_group("e2e", [file_path], web_port=resolved_port)
         try:
             execution = _build_web_test_execution(test_type, file_path, self.workspace_path, web_port=resolved_port)
         except ValueError as exc:
@@ -2679,7 +2677,6 @@ class WebAppType(AppTypeHandler):
                 backend_result = await _execute_web_test_command(
                     backend_command,
                     cwd=execution["backend_working_directory"],
-                    timeout=SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS,
                     web_port=resolved_port,
                 )
                 sections.append(f"=== Backend Vitest Batch ===\n{backend_result.text}")
@@ -2690,7 +2687,6 @@ class WebAppType(AppTypeHandler):
                 frontend_result = await _execute_web_test_command(
                     frontend_command,
                     cwd=execution["frontend_working_directory"],
-                    timeout=SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS,
                     web_port=resolved_port,
                 )
                 sections.append(f"=== Frontend Vitest Batch ===\n{frontend_result.text}")
@@ -2976,7 +2972,7 @@ class WebAppType(AppTypeHandler):
             _execute_web_test_command(
                 playwright_command,
                 cwd=execution["working_directory"],
-                timeout=SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS,
+                timeout=E2E_RUNNER_TIMEOUT_SECONDS,
                 extra_env=e2e_runtime_env,
                 web_port=resolved_port,
             ),

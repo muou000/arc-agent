@@ -22,13 +22,12 @@ def test_web_rejects_traversal_and_shell_syntax() -> None:
 
 
 def test_web_execution_builder_rejects_an_unsafe_target() -> None:
-    unsafe_path = "backend/test-e2e/home.js & whoami &.js"
+    unsafe_path = "frontend/tests/home.test.ts & whoami &.test.ts"
 
     try:
-        _build_web_test_execution("e2e", unsafe_path, "workspace")
+        _build_web_test_execution("unit", unsafe_path, "workspace")
     except ValueError as exc:
-        # e2e is not a single-file type anymore; either rejection is correct.
-        assert "test type" in str(exc).lower() or "test path" in str(exc).lower()
+        assert "test path" in str(exc).lower()
     else:
         raise AssertionError("unsafe web test path was accepted by the execution builder")
 

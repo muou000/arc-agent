@@ -776,12 +776,13 @@ def test_e2e_recovery_cleanup_note_survives_into_failure_bodies(tmp_path, monkey
 
 
 def test_e2e_timeout_has_a_single_source(tmp_path, monkeypatch) -> None:
-    """Every command the system-side test runs shares one timeout budget.
+    """The E2E runner command draws its timeout from one named constant.
 
-    The batch paths used to diverge: Vitest batches ran on the helper's 60s
-    default while the Playwright batch passed a one-off 120.0. Both now draw
-    from `SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS`, so a wedged run fails within
-    one bound no matter which runner executed it.
+    The batch path used to pass a one-off ``120.0`` to the Playwright command
+    while the deleted single-file path rode the helper's 60s default. The
+    named constant is the single source; a path fork reintroducing a literal
+    (or dropping the override back to the default) changes the recorded value
+    and fails here.
     """
 
     workspace, _fingerprint = _make_workspace(tmp_path)
@@ -790,22 +791,23 @@ def test_e2e_timeout_has_a_single_source(tmp_path, monkeypatch) -> None:
     seen_timeouts: list[float | None] = []
 
     async def _recording_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None, web_port=None):
-        seen_timeouts.append(timeout)
+        if "playwright" in command:
+            seen_timeouts.append(timeout)
         return web_handler._CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
 
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+    # The fresh-start harness routes _execute_web_test_command through its
+    # own recorder; layer the timeout probe on top of it.
     monkeypatch.setattr(web_handler, "_execute_web_test_command", _recording_command)
 
     asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
-    assert seen_timeouts == [web_handler.SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS]
 
-    seen_timeouts.clear()
-    asyncio.run(
-        handler.run_test_group("unit", ["backend/tests/a.test.js", "frontend/tests/b.test.ts"], web_port=4321)
-    )
-    assert seen_timeouts == [
-        web_handler.SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS,
-        web_handler.SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS,
-    ]
+    # The attempt reached the Playwright stage (fresh backend start happened)
+    # and its timeout is the one named constant.
+    assert start_calls == ["start"]
+    assert seen_timeouts == [web_handler.E2E_RUNNER_TIMEOUT_SECONDS]
 
 
 def test_single_file_e2e_request_routes_to_the_group_executor(tmp_path, monkeypatch) -> None:
