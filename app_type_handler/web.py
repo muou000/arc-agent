@@ -4,13 +4,10 @@ import json
 import sys
 import asyncio
 import shutil
-import sqlite3
 import logging
 import subprocess
-import signal
 import hashlib
 import inspect
-import threading
 import time
 import urllib.request
 from contextlib import suppress
@@ -20,6 +17,19 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .base import AppTypeHandler, GlueAnchorSpec, TEMPLATE_ID_BY_APP_TYPE
+from .backend_runtime import (
+    BackendRuntime,
+    InMemoryBackendRuntime,
+    ProcessBackendRuntime,
+    _build_e2e_runtime_env,
+    _CommandResult,
+    _execute_web_test_command,
+    _resolve_backend_start_command,
+    _tail,
+    backend_source_fingerprint,
+    spawn_backend_process,
+    terminate_backend_process,
+)
 from .path_validation import is_scoped_test_path, normalize_safe_relative_path
 from .test_results import TestRunResult, parse_test_run
 from .template_patches import (
@@ -164,13 +174,6 @@ def node_modules_ready(target_dir: str) -> bool:
         return False
 
 
-def _tail(text: str, limit: int = 1500) -> str:
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    return "...[truncated]...\n" + text[-limit:]
-
-
 class _StageTimer:
     """Per-stage wall-clock timing for one ``run_tests`` execution.
 
@@ -189,6 +192,16 @@ class _StageTimer:
             return await awaitable
         finally:
             self._stages[stage] = self._stages.get(stage, 0.0) + (time.monotonic() - started)
+
+    def record(self, stage: str, elapsed: float) -> None:
+        """Merge an externally measured duration into the stage breakdown.
+
+        The backend runtime measures its own sub-stages (reuse probe, database
+        reset, spawn) inside ``BackendRuntime.ensure`` and reports them on the
+        acquisition; the attempt folds them in here so the rendered breakdown
+        attributes each cost to the same stages as before the extraction.
+        """
+        self._stages[stage] = self._stages.get(stage, 0.0) + elapsed
 
     def render(self) -> str:
         if not self._stages:
@@ -302,64 +315,6 @@ async def run_npm_install(
         None,
     )
     return False
-
-
-@dataclass
-class _CommandResult:
-    """Structured outcome of one shell command plus its rendered text.
-
-    ``exit_code`` is ``None`` when the command never produced one (timeout,
-    spawn failure); ``text`` is the model-facing rendering, whose shape is
-    unchanged from the days when callers parsed the code back out of it.
-    """
-
-    exit_code: int | None
-    text: str
-
-
-async def _execute_web_test_command(
-    command: str,
-    cwd: str,
-    timeout: float = 60.0,
-    extra_env: dict[str, str] | None = None,
-    web_port: int | None = None,
-) -> _CommandResult:
-    process = None
-    try:
-        process = await asyncio.create_subprocess_shell(
-            command,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={
-                **os.environ,
-                "PYTHONIOENCODING": "utf-8",
-                "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8",
-                **build_web_runtime_env(web_port=web_port),
-                **(extra_env or {}),
-            },
-        )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        output = stdout.decode("utf-8", errors="replace")
-        error = stderr.decode("utf-8", errors="replace")
-
-        result = f"Exit Code: {process.returncode}\n"
-        if output:
-            result += f"STDOUT:\n{output}\n"
-        if error:
-            result += f"STDERR:\n{error}\n"
-        if len(result) > 4000:
-            result = result[:2000] + "\n...[OUTPUT TRUNCATED]...\n" + result[-2000:]
-        return _CommandResult(
-            exit_code=process.returncode if process.returncode is not None else -1,
-            text=result,
-        )
-    except asyncio.TimeoutError:
-        if process:
-            await finalize_subprocess(process, force_kill=True)
-        return _CommandResult(exit_code=None, text=f"Command timed out after {timeout} seconds.")
-    except Exception as exc:
-        return _CommandResult(exit_code=None, text=f"Execution failed: {str(exc)}")
 
 
 def _normalize_backend_test_path(file_path: str) -> str:
@@ -565,480 +520,6 @@ def _prepend_group_execution_header(execution: dict[str, str], test_result: str)
         lines.extend(f"- {file_path}" for file_path in execution.get("resolved_targets", []))
 
     return f"{chr(10).join(lines)}\n\n{test_result}"
-
-
-async def _wait_for_http_server(host: str, port: int, timeout: float = 20.0) -> bool:
-    """Wait until the port answers with a complete HTTP response.
-
-    A TCP listener alone does not prove the application layer is serving:
-    startup work (route registration, asynchronous database initialization)
-    may still be in flight when the socket starts accepting. Both backend
-    startup and session reuse therefore require an HTTP round trip. Any
-    response status counts - a 404 from an app without the template's
-    `/api/health` endpoint still proves the HTTP stack answers requests -
-    while connection failures and silent sockets keep the probe polling.
-    """
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-
-    while loop.time() < deadline:
-        try:
-            reader, writer = await asyncio.open_connection(host, port)
-        except OSError:
-            await asyncio.sleep(0.5)
-            continue
-        try:
-            request = (
-                f"GET /api/health HTTP/1.1\r\n"
-                f"Host: {host}:{port}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
-            )
-            writer.write(request.encode("ascii"))
-            await writer.drain()
-            status_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
-        except (OSError, asyncio.TimeoutError):
-            await asyncio.sleep(0.5)
-            continue
-        finally:
-            writer.close()
-            with suppress(OSError):
-                await writer.wait_closed()
-        if status_line.startswith(b"HTTP/"):
-            return True
-        await asyncio.sleep(0.5)
-
-    return False
-
-
-async def _wait_for_tcp_server_shutdown(host: str, port: int, timeout: float = 10.0) -> bool:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-
-    while loop.time() < deadline:
-        try:
-            reader, writer = await asyncio.open_connection(host, port)
-            writer.close()
-            await writer.wait_closed()
-            await asyncio.sleep(0.25)
-        except OSError:
-            return True
-
-    return False
-
-
-def _list_port_owner_pids(port: int) -> list[int]:
-    normalized_port = str(int(port))
-    pids: set[int] = set()
-
-    try:
-        if os.name == "nt":
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "tcp"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-            output = (result.stdout or "") + "\n" + (result.stderr or "")
-            for line in output.splitlines():
-                parts = line.split()
-                if len(parts) < 5:
-                    continue
-                protocol, local_address, _, state, pid_text = parts[:5]
-                if protocol.upper() != "TCP":
-                    continue
-                if state.upper() != "LISTENING":
-                    continue
-                if not local_address.endswith(f":{normalized_port}"):
-                    continue
-                try:
-                    pid = int(pid_text)
-                except ValueError:
-                    continue
-                if pid > 0:
-                    pids.add(pid)
-        else:
-            result = subprocess.run(
-                ["lsof", "-ti", f"TCP:{normalized_port}", "-sTCP:LISTEN"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-            for line in (result.stdout or "").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    pid = int(line)
-                except ValueError:
-                    continue
-                if pid > 0:
-                    pids.add(pid)
-    except Exception:
-        return []
-
-    current_pid = os.getpid()
-    return sorted(pid for pid in pids if pid != current_pid)
-
-
-def _read_linux_process_cwd(pid: int) -> str:
-    try:
-        return os.readlink(f"/proc/{pid}/cwd")
-    except Exception:
-        return ""
-
-
-def _read_unix_process_ps(pid: int) -> dict[str, str]:
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "ppid=", "-o", "comm=", "-o", "args="],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        line = (result.stdout or "").strip()
-        match = re.match(r"^\s*(\d+)\s+(\S+)\s+(.*)$", line)
-        if not match:
-            return {}
-        return {
-            "ppid": match.group(1).strip(),
-            "name": match.group(2).strip(),
-            "command": match.group(3).strip(),
-        }
-    except Exception:
-        return {}
-
-
-def _read_macos_process_cwd(pid: int) -> str:
-    try:
-        result = subprocess.run(
-            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        for line in (result.stdout or "").splitlines():
-            if line.startswith("n"):
-                return line[1:].strip()
-    except Exception:
-        return ""
-    return ""
-
-
-def _read_windows_process_info(pid: int) -> dict[str, str]:
-    powershell_candidates = [
-        ["powershell", "-NoProfile", "-Command"],
-        ["pwsh", "-NoProfile", "-Command"],
-    ]
-    script = (
-        f'$p = Get-CimInstance Win32_Process -Filter "ProcessId = {pid}"; '
-        'if ($p) { '
-        'Write-Output ("PPID=" + [string]$p.ParentProcessId); '
-        'Write-Output ("NAME=" + [string]$p.Name); '
-        'Write-Output ("EXE=" + [string]$p.ExecutablePath); '
-        'Write-Output ("CMD=" + [string]$p.CommandLine); '
-        '}'
-    )
-    for prefix in powershell_candidates:
-        try:
-            result = subprocess.run(
-                [*prefix, script],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-        except Exception:
-            continue
-
-        info: dict[str, str] = {}
-        for line in (result.stdout or "").splitlines():
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            info[key.strip().lower()] = value.strip()
-        if info:
-            return info
-    return {}
-
-
-def _get_process_fingerprint(pid: int) -> dict[str, str]:
-    info: dict[str, str] = {"pid": str(pid)}
-
-    if os.name == "nt":
-        windows_info = _read_windows_process_info(pid)
-        info["ppid"] = windows_info.get("ppid", "")
-        info["name"] = windows_info.get("name", "")
-        info["exe"] = windows_info.get("exe", "")
-        info["command"] = windows_info.get("cmd", "")
-        info["cwd"] = ""
-        return info
-
-    unix_info = _read_unix_process_ps(pid)
-    info["ppid"] = unix_info.get("ppid", "")
-    info["name"] = unix_info.get("name", "")
-    info["command"] = unix_info.get("command", "")
-    info["exe"] = ""
-    if sys.platform.startswith("linux"):
-        info["cwd"] = _read_linux_process_cwd(pid)
-    elif sys.platform == "darwin":
-        info["cwd"] = _read_macos_process_cwd(pid)
-    else:
-        info["cwd"] = ""
-    return info
-
-
-def _format_backend_instance_fingerprint(*, launcher_pid: int | None, port: int) -> str:
-    owner_pids = _list_port_owner_pids(port)
-    fingerprint_pids: list[int] = []
-    if launcher_pid and launcher_pid > 0:
-        fingerprint_pids.append(launcher_pid)
-    fingerprint_pids.extend(pid for pid in owner_pids if pid not in fingerprint_pids)
-
-    lines = [
-        f"Platform: {sys.platform}",
-        f"Launcher PID: {launcher_pid if launcher_pid and launcher_pid > 0 else 'unknown'}",
-        f"Port Owner PID(s): {', '.join(str(pid) for pid in owner_pids) if owner_pids else 'none detected'}",
-    ]
-    if launcher_pid and launcher_pid > 0 and launcher_pid not in owner_pids:
-        lines.append(
-            "Note: launcher PID does not own the port directly. This is expected when `npm` or a shell spawns the actual backend child process."
-        )
-
-    for pid in fingerprint_pids:
-        info = _get_process_fingerprint(pid)
-        lines.extend(
-            [
-                f"- PID {pid}",
-                f"  PPID: {info.get('ppid') or 'unknown'}",
-                f"  Name: {info.get('name') or 'unknown'}",
-                f"  Executable: {info.get('exe') or 'unknown'}",
-                f"  Command: {info.get('command') or 'unknown'}",
-                f"  CWD: {info.get('cwd') or 'unavailable'}",
-            ]
-        )
-
-    return "\n".join(lines)
-
-
-async def _force_kill_pid(pid: int) -> None:
-    if pid <= 0 or pid == os.getpid():
-        return
-
-    try:
-        if os.name == "nt":
-            process = await asyncio.create_subprocess_exec(
-                "taskkill",
-                "/PID",
-                str(pid),
-                "/T",
-                "/F",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await process.communicate()
-            return
-        os.kill(pid, signal.SIGKILL)
-    except Exception:
-        return
-
-
-def _is_process_descendant(pid: int, ancestor_pid: int) -> bool:
-    if pid == ancestor_pid:
-        return True
-
-    seen: set[int] = set()
-    current_pid = pid
-    while current_pid > 0 and current_pid not in seen:
-        seen.add(current_pid)
-        raw_parent_pid = _get_process_fingerprint(current_pid).get("ppid", "")
-        try:
-            parent_pid = int(raw_parent_pid)
-        except (TypeError, ValueError):
-            return False
-        if parent_pid == ancestor_pid:
-            return True
-        current_pid = parent_pid
-    return False
-
-
-def _capture_owned_port_processes(port: int, launcher_pid: int) -> dict[int, dict[str, str]]:
-    return {
-        pid: _get_process_fingerprint(pid)
-        for pid in _list_port_owner_pids(port)
-        if _is_process_descendant(pid, launcher_pid)
-    }
-
-
-def _process_fingerprint_matches(expected: dict[str, str], current: dict[str, str]) -> bool:
-    # `ppid` is deliberately excluded. Force-release is only needed when graceful
-    # termination failed to kill the backend child, and in exactly that scenario
-    # the launcher is dead - on POSIX the surviving child is re-parented, so its
-    # ppid no longer matches the capture-time value. name/exe/command/cwd still
-    # pin the identity against PID reuse.
-    identity_keys = ("name", "exe", "command", "cwd")
-    comparable_keys = [key for key in identity_keys if expected.get(key)]
-    return bool(comparable_keys) and all(current.get(key) == expected[key] for key in comparable_keys)
-
-
-async def _force_release_port(
-    port: int,
-    *,
-    allowed_processes: dict[int, dict[str, str]],
-) -> list[int]:
-    killed_pids: list[int] = []
-    for pid in _list_port_owner_pids(port):
-        expected_fingerprint = allowed_processes.get(pid)
-        if expected_fingerprint is None:
-            continue
-        current_fingerprint = _get_process_fingerprint(pid)
-        if not _process_fingerprint_matches(expected_fingerprint, current_fingerprint):
-            continue
-        await _force_kill_pid(pid)
-        killed_pids.append(pid)
-    return killed_pids
-
-
-async def _ensure_port_released(
-    port: int,
-    *,
-    context: str,
-    timeout: float = 5.0,
-    allowed_processes: dict[int, dict[str, str]] | None = None,
-) -> str:
-    if await _wait_for_tcp_server_shutdown("127.0.0.1", port, timeout=timeout):
-        return f"{context}: port {port} is released."
-
-    owners_before_force = _list_port_owner_pids(port)
-    if not allowed_processes:
-        raise RuntimeError(
-            f"{context}: port {port} is still occupied; refusing to terminate unknown "
-            f"owner PID(s): {owners_before_force or 'unknown'}."
-        )
-    killed_pids = await _force_release_port(port, allowed_processes=allowed_processes)
-
-    if await _wait_for_tcp_server_shutdown("127.0.0.1", port, timeout=10.0):
-        if killed_pids:
-            return (
-                f"{context}: force-released port {port} by terminating PID(s) "
-                f"{', '.join(str(pid) for pid in killed_pids)}."
-            )
-        return f"{context}: port {port} is released."
-
-    owners_after_force = _list_port_owner_pids(port)
-    raise RuntimeError(
-        f"{context}: port {port} is still occupied after forced cleanup. "
-        f"Owners before force: {owners_before_force or 'unknown'}. "
-        f"Killed: {killed_pids or 'none'}. "
-        f"Remaining owners: {owners_after_force or 'unknown'}."
-    )
-
-
-async def _terminate_process(process: asyncio.subprocess.Process | None, *, port: int | None = None) -> str:
-    owned_processes = (
-        _capture_owned_port_processes(port, process.pid)
-        if process is not None and port is not None
-        else {}
-    )
-    await finalize_subprocess(process, force_kill=False)
-    await _await_output_tail_drains(process)
-
-    if port is None:
-        return "No port cleanup required."
-
-    return await _ensure_port_released(
-        port,
-        context="Backend runtime cleanup",
-        allowed_processes=owned_processes,
-    )
-
-
-async def _await_output_tail_drains(
-    process: asyncio.subprocess.Process | None,
-    timeout: float = 2.0,
-) -> None:
-    """Wait for the anchored pipe drains of a terminated process to finish.
-
-    The process death closes the pipes, so the drain tasks normally exit on
-    their next read; awaiting them here keeps teardown deterministic (no
-    pending-task warnings when the surrounding event loop closes right after)
-    and bounds how long a stuck drain can outlive its process.
-    """
-
-    if process is None:
-        return
-    drains = getattr(process, "_arc_output_tails", None)
-    if not drains:
-        return
-    pending = [task for task in drains[2] if not task.done()]
-    if not pending:
-        return
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*pending, return_exceptions=True),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        for task in pending:
-            task.cancel()
-
-
-def _read_package_scripts(package_dir: str) -> dict[str, str]:
-    package_json_path = os.path.join(package_dir, "package.json")
-    if not os.path.exists(package_json_path):
-        return {}
-
-    try:
-        with open(package_json_path, "r", encoding="utf-8") as package_file:
-            package_data = json.load(package_file)
-    except Exception:
-        return {}
-
-    scripts = package_data.get("scripts")
-    return scripts if isinstance(scripts, dict) else {}
-
-
-def _resolve_backend_start_command(backend_path: str) -> str | None:
-    scripts = _read_package_scripts(backend_path)
-    if "start" in scripts:
-        return "npm run start"
-    return None
-
-
-def _slugify_identifier(value: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
-    return normalized or "playwright-e2e"
-
-
-def _build_e2e_runtime_env(workspace_path: str, targets: list[str], web_port: int | None = None) -> dict[str, str]:
-    normalized_targets = [target.replace("\\", "/").strip() for target in targets if target and str(target).strip()]
-    suite_label = _slugify_identifier("-".join(normalized_targets) or "playwright-e2e")
-    suite_hash = hashlib.sha1("\n".join(normalized_targets or ["playwright-e2e"]).encode("utf-8")).hexdigest()[:10]
-    backend_path = os.path.join(workspace_path, "backend")
-    e2e_db_root = os.path.join(backend_path, ".arc-test-db")
-    e2e_db_path = os.path.abspath(os.path.join(e2e_db_root, f"{suite_label}-{suite_hash}.sqlite"))
-    resolved_port = int(web_port) if web_port is not None else get_web_port()
-    return {
-        **build_web_runtime_env(web_port=resolved_port),
-        # The template's `playwright.config.js` and the agent-facing stack notes
-        # both document `PLAYWRIGHT_BASE_URL` as the origin under test. Nothing
-        # used to set it, so Playwright fell back to its own default port and
-        # every E2E run navigated to a dead origin.
-        "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{resolved_port}",
-        "ARC_DB_FILE": e2e_db_path,
-        "ARC_E2E_DB_PATH": e2e_db_path,
-        "ARC_E2E_DB_LABEL": suite_label,
-    }
 
 
 FRONTEND_BUILD_FINGERPRINT_FILENAME = ".arc-build-fingerprint.json"
@@ -1441,348 +922,6 @@ def _render_e2e_failure_body(
     return body
 
 
-async def _prepare_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -> tuple[bool, int | None, str]:
-    backend_path = os.path.join(workspace_path, "backend")
-    prepare_result = await _execute_web_test_command(
-        "npm run db:prepare:e2e",
-        cwd=backend_path,
-        timeout=60.0,
-        extra_env=runtime_env,
-    )
-    return prepare_result.exit_code == 0, prepare_result.exit_code, prepare_result.text
-
-
-async def _seed_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -> tuple[bool, str]:
-    backend_path = os.path.join(workspace_path, "backend")
-    seed_result = await _execute_web_test_command(
-        "npm run db:seed",
-        cwd=backend_path,
-        timeout=60.0,
-        extra_env=runtime_env,
-    )
-    return seed_result.exit_code == 0, seed_result.text
-
-
-# How much of a failed backend's console output is echoed into the test
-# failure body. Startup crashes (the Express 5 wildcard-route throw, a bad
-# import) print a stack trace well under this size; the cap keeps a chatty
-# server that never became ready from flooding the TDD repair context.
-_BACKEND_STARTUP_OUTPUT_LIMIT = 4000
-
-# The tail buffer keeps this many raw bytes per stream so a startup crash is
-# still observable when the process wrote a lot before dying. Ring size is
-# deliberately larger than the echo limit: the newest bytes survive, and the
-# memory cost per backend runtime is bounded.
-_BACKEND_OUTPUT_TAIL_BYTES = 64 * 1024
-
-
-class _ProcessOutputTail:
-    """Background consumer of one subprocess pipe, keeping the newest bytes.
-
-    The backend runtime's pipes must be read continuously for the whole
-    process lifetime: a server that prints more than the OS pipe buffer would
-    otherwise block on its next write and appear to hang. The newest
-    ``_BACKEND_OUTPUT_TAIL_BYTES`` are retained so a failed startup can still
-    echo the crashing output into the test failure body.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._chunks: bytearray = bytearray()
-
-    async def consume(self, stream: asyncio.StreamReader | None) -> None:
-        if stream is None:
-            return
-        while True:
-            try:
-                chunk = await stream.read(65536)
-            except (OSError, ValueError):
-                # A closed/invalid pipe ends the drain; the retained tail stays.
-                return
-            except asyncio.CancelledError:
-                # Cancellation is a stop request, not an error: exit without
-                # swallowing it, so `Task.cancel()` keeps its meaning for
-                # test-harness teardowns and loop shutdown paths.
-                raise
-            if not chunk:
-                # Cancelled reads surface as EOF (the StreamReader ends its
-                # pending waiters with an empty result); a real EOF ends here
-                # too. Either way the newest bytes are already retained.
-                return
-            with self._lock:
-                self._chunks.extend(chunk)
-                if len(self._chunks) > _BACKEND_OUTPUT_TAIL_BYTES:
-                    del self._chunks[:-_BACKEND_OUTPUT_TAIL_BYTES]
-
-    def text(self) -> str:
-        with self._lock:
-            raw = bytes(self._chunks)
-        text = raw.decode("utf-8", errors="replace")
-        # The ring cut can split a multi-byte UTF-8 sequence at the buffer
-        # head, decoding to a stray U+FFFD that would lead the echoed output.
-        # Drop that one leading replacement character; every later character
-        # is a complete sequence.
-        if text.startswith("\ufffd"):
-            text = text[1:]
-        return text
-
-
-def _start_output_tails(
-    process: asyncio.subprocess.Process,
-) -> tuple[_ProcessOutputTail, _ProcessOutputTail]:
-    """Spawn consumers for both pipes of a freshly started runtime.
-
-    The consuming tasks and their tails are anchored on the ``Process`` object
-    itself: asyncio keeps only weak references to running tasks, so a task
-    created here and dropped would be garbage-collected mid-session and the
-    pipes would fill up again. Attaching to the process (which every caller
-    holds for the runtime's whole lifetime) keeps the drains alive until the
-    process is torn down.
-    """
-
-    stdout_tail = _ProcessOutputTail()
-    stderr_tail = _ProcessOutputTail()
-    drains: list[asyncio.Task[None]] = []
-    for tail, stream in ((stdout_tail, process.stdout), (stderr_tail, process.stderr)):
-        try:
-            drains.append(asyncio.get_running_loop().create_task(tail.consume(stream)))
-        except RuntimeError:
-            # Only reachable if a future caller invokes this outside a running
-            # loop (today every call site is inside an async function, which
-            # always has one). Never silent: an undrained pipe would freeze a
-            # chatty backend, and that failure mode must be diagnosable.
-            logger.warning(
-                "No running event loop to anchor the %s pipe drain; the backend "
-                "runtime's output pipe may block once the OS buffer fills.",
-                stream,
-            )
-            continue
-    # Strong reference for the process lifetime: the caller holds the Process
-    # (E2E session state, test locals), which transitively keeps the drain
-    # tasks alive — the running loop alone would not. The attribute must stay
-    # populated for as long as the Process object lives: a second
-    # _terminate_process call on the same object still reads it, and dropping
-    # it mid-flight would orphan still-pending drains back to weak references.
-    process._arc_output_tails = (stdout_tail, stderr_tail, drains)  # type: ignore[attr-defined]
-    return stdout_tail, stderr_tail
-
-
-async def _format_backend_output(
-    stdout_tail: _ProcessOutputTail,
-    stderr_tail: _ProcessOutputTail,
-) -> str:
-    """Render the retained console output of a backend, newest bytes first.
-
-    Callers invoke this after ``_terminate_process`` has already awaited the
-    drain tasks (process death closed the pipes, every buffered byte is in
-    the tails), so no flush wait is needed here.
-    """
-
-    sections: list[str] = []
-    stdout_text = _tail(stdout_tail.text(), _BACKEND_STARTUP_OUTPUT_LIMIT)
-    stderr_text = _tail(stderr_tail.text(), _BACKEND_STARTUP_OUTPUT_LIMIT)
-    if stdout_text:
-        sections.append(f"STDOUT:\n{stdout_text}")
-    if stderr_text:
-        sections.append(f"STDERR:\n{stderr_text}")
-    return "\n".join(sections)
-
-
-async def _start_backend_runtime(
-    workspace_path: str,
-    runtime_env: dict[str, str],
-    web_port: int | None = None,
-) -> tuple[asyncio.subprocess.Process | None, str, str, str]:
-    """Start the backend runtime and wait until it serves HTTP.
-
-    The returned ``Process`` carries the anchored pipe drains
-    (``_arc_output_tails``); the caller owns that object for the runtime's
-    whole lifetime and must clean it up through ``_terminate_process`` -
-    the single teardown path that releases the port and awaits the drains.
-    Every current call site (probe_backend_health,
-    run_test_group's session) funnels there; a new call site bypassing it
-    would leave the drains pending on a dead process.
-    """
-
-    backend_path = os.path.join(workspace_path, "backend")
-    resolved_port = int(web_port) if web_port is not None else get_web_port()
-    start_command = _resolve_backend_start_command(backend_path)
-    if not start_command:
-        return None, "", (
-            "Backend package.json must define `start` so the backend can host the built frontend on the single web port."
-        ), ""
-
-    try:
-        startup_cleanup_note = await _ensure_port_released(
-            resolved_port,
-            context="Pre-start port cleanup",
-            timeout=1.0,
-        )
-    except RuntimeError as exc:
-        return None, start_command, str(exc), ""
-
-    try:
-        backend_process = await asyncio.create_subprocess_shell(
-            start_command,
-            cwd=backend_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={
-                **os.environ,
-                **runtime_env,
-            },
-        )
-    except Exception as exc:
-        return None, start_command, f"Failed to start backend runtime with `{start_command}`: {str(exc)}", ""
-
-    # Consume the pipes from the first moment: a chatty server would otherwise
-    # block on a full OS pipe buffer during the startup wait itself. The tails
-    # also retain the newest output for the failure body below.
-    stdout_tail, stderr_tail = _start_output_tails(backend_process)
-
-    server_ready = await _wait_for_http_server("127.0.0.1", resolved_port, timeout=20.0)
-    if not server_ready:
-        cleanup_note = ""
-        try:
-            cleanup_note = await _terminate_process(backend_process, port=resolved_port)
-        except Exception as cleanup_exc:
-            cleanup_note = f"Backend runtime cleanup after failed startup also failed: {cleanup_exc}"
-        captured_output = await _format_backend_output(stdout_tail, stderr_tail)
-        return None, start_command, (
-            f"Failed to start backend runtime with `{start_command}` on port {resolved_port} "
-            "within 20 seconds.\n"
-            f"{startup_cleanup_note}\n"
-            f"{cleanup_note}\n"
-            f"=== Backend Process Output ===\n{captured_output or '(the process produced no output)'}"
-        ), ""
-
-    instance_fingerprint = _format_backend_instance_fingerprint(
-        launcher_pid=backend_process.pid,
-        port=resolved_port,
-    )
-    return backend_process, start_command, startup_cleanup_note, instance_fingerprint
-
-
-@dataclass
-class _E2EBackendSession:
-    """A backend runtime kept alive across E2E attempts within one TDD session."""
-
-    process: asyncio.subprocess.Process
-    port: int
-    db_path: str
-    fingerprint: str
-    start_command: str
-    startup_detail: str
-    instance_fingerprint: str
-
-
-_BACKEND_FINGERPRINT_SKIPPED_DIRS = frozenset(
-    # `test-e2e` specs run in the Playwright process, never inside the express
-    # server, so spec-only edits must not force a server restart.
-    # `.arc-test-db` holds the per-suite sqlite files, not server code.
-    {"node_modules", ".arc-test-db", "dist", "dist-ssr", "coverage", ".git", "test-e2e"}
-)
-
-
-def _backend_source_fingerprint(backend_path: str) -> str | None:
-    """Content hash of the backend sources a running E2E server executes.
-
-    Feeds the session-scoped E2E runtime reuse decision: a live server may
-    only be reused while the code it loaded is byte-for-byte unchanged.
-    Returns ``None`` when the backend directory is missing, which makes the
-    caller fall back to a fresh start.
-
-    Deliberately a pure source-tree hash: the other reuse dimensions (web
-    port, E2E database path) are session-key comparisons in
-    `_try_reuse_e2e_backend_session`, and runtime-env values that vary per
-    attempt would spuriously break reuse here.
-    """
-
-    root = Path(backend_path)
-    if not root.is_dir():
-        return None
-    digest = hashlib.sha256()
-    visited_real_dirs: set[str] = set()
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-        real_dir = os.path.realpath(dirpath)
-        if real_dir in visited_real_dirs:
-            dirnames[:] = []
-            continue
-        visited_real_dirs.add(real_dir)
-        dirnames[:] = sorted(name for name in dirnames if name not in _BACKEND_FINGERPRINT_SKIPPED_DIRS)
-        for filename in sorted(filenames):
-            path = Path(dirpath) / filename
-            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-            try:
-                digest.update(path.read_bytes())
-            except OSError:
-                digest.update(b"<unreadable>")
-    return digest.hexdigest()
-
-
-def _reset_sqlite_database_rows(db_path: str) -> tuple[bool, str]:
-    """Delete every row of every user table while keeping schema objects.
-
-    The file-level reset in `db:prepare:e2e` deletes the sqlite file, which
-    cannot run while the reused E2E server holds an open handle on it (an
-    unrecoverable in-use error on Windows). A row-level wipe reproduces the
-    prepared state - schema intact, zero rows, autoincrement counters reset -
-    against the same file the live server reads. Schema sources are guaranteed
-    unchanged by the backend fingerprint check that gates the reuse.
-
-    A schema with user triggers refuses the wipe: `DELETE` fires them, and a
-    trigger writing into an already-cleared table would leave rows behind that
-    a fresh `db:prepare:e2e` would never contain. Refusing keeps the caller on
-    the fresh-start path, which is always semantically equivalent.
-    """
-
-    if not os.path.exists(db_path):
-        return False, f"E2E database file is missing: {db_path}"
-    try:
-        connection = sqlite3.connect(db_path, timeout=5.0)
-    except (sqlite3.Error, OSError) as exc:
-        # OSError/PermissionError included: on Windows a sharing violation on
-        # the file the live server holds open surfaces here, and the caller
-        # must take the fresh-start fallback instead of crashing.
-        return False, f"{type(exc).__name__}: {exc}"
-    try:
-        connection.execute("PRAGMA foreign_keys = OFF;")
-        trigger_names = [
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall()
-        ]
-        if trigger_names:
-            return False, (
-                "E2E database schema defines user triggers ("
-                + ", ".join(trigger_names)
-                + "); a row-level wipe would fire them and diverge from the "
-                "file-level `db:prepare:e2e` state."
-            )
-        table_names = [
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall()
-        ]
-        if not table_names:
-            return False, "E2E database has no user tables; the schema was never initialized."
-        for name in table_names:
-            connection.execute('DELETE FROM "' + name.replace('"', '""') + '"')
-        has_sequence = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
-        ).fetchone()
-        if has_sequence is not None:
-            connection.execute("DELETE FROM sqlite_sequence")
-        connection.commit()
-        return True, "Cleared rows of: " + ", ".join(table_names)
-    except (sqlite3.Error, OSError) as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-    finally:
-        connection.close()
-
-
 async def probe_backend_health(workspace_path: str, port: int | None = None) -> str | None:
     """Boot the workspace's backend and check its health endpoint.
 
@@ -1795,6 +934,10 @@ async def probe_backend_health(workspace_path: str, port: int | None = None) -> 
     Returns ``None`` on success. Workspaces without a backend ``start``
     command have nothing to verify and also return ``None``; a failed
     teardown or any other failure returns a short reason string.
+
+    A stateless consumer of the backend_runtime module: it spawns and tears
+    the probe process down through the module's mechanism functions and keeps
+    no session state (nothing to reuse, no database to prepare).
     """
 
     backend_path = os.path.join(workspace_path, "backend")
@@ -1803,12 +946,12 @@ async def probe_backend_health(workspace_path: str, port: int | None = None) -> 
         return None
 
     runtime_env = _build_e2e_runtime_env(workspace_path, ["merge-health-probe"], web_port=resolved_port)
-    process, _start_command, _cleanup_note, _fingerprint = await _start_backend_runtime(
+    spawn = await spawn_backend_process(
         workspace_path,
         runtime_env,
         web_port=resolved_port,
     )
-    if process is None:
+    if spawn.handle is None:
         return "backend runtime failed to start on the merged workspace"
 
     health_url = f"http://127.0.0.1:{resolved_port}/api/health"
@@ -1833,7 +976,7 @@ async def probe_backend_health(workspace_path: str, port: int | None = None) -> 
                 last_error = f"health endpoint unreachable: {type(exc).__name__}: {exc}"
     finally:
         try:
-            await _terminate_process(process, port=resolved_port)
+            await terminate_backend_process(spawn.handle, port=resolved_port)
         except Exception as exc:
             cleanup_error = f"backend runtime cleanup failed: {type(exc).__name__}: {exc}"
 
@@ -1874,17 +1017,30 @@ class WebAppType(AppTypeHandler):
         }
     )
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, backend_runtime: BackendRuntime | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Session-scoped E2E backend runtime (see `_try_reuse_e2e_backend_session`).
+        # Session-scoped E2E backend runtime owner (app_type_handler.backend_runtime).
         # Strictly per instance: parallel worktree tasks build one handler per
         # task, and a task must never observe another task's live runtime.
-        self._e2e_runtime_session: _E2EBackendSession | None = None
+        # Tests inject InMemoryBackendRuntime; production resolves the process
+        # adapter lazily at first use (see `_backend_runtime_or_default`).
+        self._backend_runtime: BackendRuntime | None = backend_runtime
         # One-shot budget for the SPA static-host self-heal (dead `send`
         # NotFoundError in a sendFile frame): a second occurrence of the same
         # signature means the rebuild did not cure it, and the failure must go
         # to the agent instead of looping system-side.
         self._spa_static_host_recovery_used: bool = False
+
+    def _backend_runtime_or_default(self) -> BackendRuntime:
+        if self._backend_runtime is None:
+            # Resolved at first use so the process adapter captures the
+            # module-level command runner as it reads right then: tests that
+            # monkeypatch the runner before driving a run still reach the
+            # runtime's database commands through the patched runner.
+            self._backend_runtime = ProcessBackendRuntime(
+                self.workspace_path, command_runner=_execute_web_test_command
+            )
+        return self._backend_runtime
 
     @classmethod
     def prerequisite_commands(cls) -> list[str]:
@@ -2556,87 +1712,8 @@ class WebAppType(AppTypeHandler):
             exit_code=command_result.exit_code if command_result.exit_code is not None else -1,
         )
 
-    async def _try_reuse_e2e_backend_session(
-        self,
-        e2e_runtime_env: dict[str, str],
-        resolved_port: int,
-        backend_fingerprint: str | None,
-    ) -> _E2EBackendSession | None:
-        """Return the live session runtime when this batch can run on it.
-
-        Reuse requires the previous server process to still be alive and
-        serving, and the backend sources, web port and E2E database path to be
-        identical to the ones it was started with. Any mismatch returns
-        ``None`` and the caller takes the fresh-start path.
-        """
-
-        session = self._e2e_runtime_session
-        if session is None:
-            return None
-        if session.process.returncode is not None:
-            return None
-        if session.port != resolved_port:
-            return None
-        if session.db_path != e2e_runtime_env.get("ARC_E2E_DB_PATH", ""):
-            return None
-        if backend_fingerprint is None or session.fingerprint != backend_fingerprint:
-            return None
-        if not await _wait_for_http_server("127.0.0.1", resolved_port, timeout=5.0):
-            return None
-        return session
-
-    async def _reset_live_e2e_database(self, e2e_runtime_env: dict[str, str]) -> tuple[bool, str]:
-        """Reset the E2E database rows while the backend runtime stays alive.
-
-        `db:prepare:e2e` recreates the database file, which cannot run against
-        a server that holds the file open. The row-level wipe plus a
-        `db:seed` re-run reproduces the prepared-and-seeded state on the same
-        file; a failure here makes the caller rebuild everything from scratch.
-        """
-
-        reset_ok, reset_output = await asyncio.to_thread(
-            _reset_sqlite_database_rows,
-            e2e_runtime_env.get("ARC_E2E_DB_PATH", ""),
-        )
-        if not reset_ok:
-            return False, f"Row-level reset of the live E2E database was not possible: {reset_output}"
-        seed_ok, seed_output = await _seed_e2e_database(self.workspace_path, e2e_runtime_env)
-        if not seed_ok:
-            return False, (
-                "Row-level reset of the live E2E database succeeded, but re-seeding "
-                f"via `npm run db:seed` did not.\n{seed_output}"
-            )
-        return True, (
-            "Reset the live E2E database at row level and re-seeded it; the backend runtime was kept alive.\n"
-            f"{reset_output}\n{seed_output}"
-        )
-
-    async def _terminate_e2e_session(self, context: str) -> str:
-        """Tear down the session-scoped E2E runtime, if one is alive."""
-
-        session = self._e2e_runtime_session
-        if session is None:
-            return ""
-        self._e2e_runtime_session = None
-        try:
-            note = await _terminate_process(session.process, port=session.port)
-        except Exception as exc:
-            return f"Backend runtime cleanup failed: {exc}"
-        # A server that crashed mid-session (the chatty-output scenario the
-        # drains defend against) leaves its dying words only in the tail
-        # buffers; surface them here so the teardown note carries the crash
-        # evidence, mirroring the startup-failure body.
-        anchor = getattr(session.process, "_arc_output_tails", None)
-        if anchor is not None:
-            captured = await _format_backend_output(anchor[0], anchor[1])
-            if captured:
-                note = (
-                    f"{note}\n=== Backend Process Output (session teardown) ===\n{captured}"
-                )
-        return note
-
     async def shutdown_e2e_runtime(self) -> None:
-        note = await self._terminate_e2e_session("E2E runtime session shutdown")
+        note = await self._backend_runtime_or_default().terminate("E2E runtime session shutdown")
         if note:
             await self._log("System", f"Session-scoped E2E backend runtime shut down. {note}")
 
@@ -2745,7 +1822,9 @@ class WebAppType(AppTypeHandler):
                 "E2E failure matches the SPA static-host signature (send NotFoundError in sendFile); "
                 "forcing one frontend rebuild + backend restart retry.",
             )
-            recovery_note = await self._terminate_e2e_session("SPA static-host recovery cleanup")
+            recovery_note = await self._backend_runtime_or_default().terminate(
+                "SPA static-host recovery cleanup"
+            )
             try:
                 retried_result, retried_cleanup_note = await self._run_e2e_group_attempt(
                     execution,
@@ -2854,60 +1933,35 @@ class WebAppType(AppTypeHandler):
         )
         facts.runtime_env = e2e_runtime_env
 
-        backend_start_command = ""
-        backend_startup_detail = ""
-        backend_instance_fingerprint = ""
         backend_cleanup_note = prior_cleanup_note
-        database_prepare_output = ""
-        reused_runtime = False
         # Off the event loop: hashing a large backend tree is pure blocking I/O
         # and must not freeze concurrent runner work on the same loop.
         backend_fingerprint = await asyncio.to_thread(
-            _backend_source_fingerprint,
+            backend_source_fingerprint,
             os.path.join(self.workspace_path, "backend"),
         )
-        reused_session = await stage_timer.measure(
-            "backend_runtime",
-            self._try_reuse_e2e_backend_session(
-                e2e_runtime_env,
-                resolved_port,
-                backend_fingerprint,
-            ),
+        # One session owner: reuse-or-rebuild, database reset and stale teardown
+        # all live in BackendRuntime.ensure now (app_type_handler/backend_runtime.py).
+        runtime = self._backend_runtime_or_default()
+        acquisition = await runtime.ensure(
+            resolved_port,
+            e2e_runtime_env.get("ARC_E2E_DB_PATH", ""),
+            backend_fingerprint,
+            runtime_env=e2e_runtime_env,
         )
-        if reused_session is not None:
-            reset_ok, reset_output = await stage_timer.measure(
-                "database_prepare", self._reset_live_e2e_database(e2e_runtime_env)
+        for stage, elapsed in acquisition.stage_seconds.items():
+            stage_timer.record(stage, elapsed)
+        if acquisition.cleanup_note:
+            backend_cleanup_note = (
+                f"{backend_cleanup_note}\n{acquisition.cleanup_note}"
+                if backend_cleanup_note
+                else acquisition.cleanup_note
             )
-            database_prepare_output = reset_output
-            if reset_ok:
-                reused_runtime = True
-                backend_start_command = reused_session.start_command
-                backend_startup_detail = reused_session.startup_detail
-                backend_instance_fingerprint = reused_session.instance_fingerprint
-            else:
-                # The fresh start below overwrites database_prepare_output,
-                # so carry the reset failure reason in the cleanup note:
-                # both failure bodies and the deferred-cleanup section
-                # surface it there.
-                backend_cleanup_note = (
-                    f"{backend_cleanup_note}\n" if backend_cleanup_note else ""
-                ) + (
-                    "Live E2E runtime reset was not possible; fell back to a fresh start: "
-                    f"{reset_output}"
-                )
+        database_prepare_output = acquisition.db_output
 
-        if not reused_runtime:
-            stale_note = await self._terminate_e2e_session("Stale E2E runtime cleanup")
-            if stale_note:
-                backend_cleanup_note = (
-                    f"{backend_cleanup_note}\n{stale_note}" if backend_cleanup_note else stale_note
-                )
-            database_ready, _prepare_exit, database_prepare_output = await stage_timer.measure(
-                "database_prepare",
-                _prepare_e2e_database(self.workspace_path, e2e_runtime_env),
-            )
-            if not database_ready:
-                facts.cleanup_note = backend_cleanup_note
+        if acquisition.session is None:
+            facts.cleanup_note = backend_cleanup_note
+            if acquisition.failure_stage == "database":
                 return (
                     parse_test_run(
                         _render_e2e_failure_body(
@@ -2923,46 +1977,29 @@ class WebAppType(AppTypeHandler):
                     ),
                     backend_cleanup_note,
                 )
-
-            (
-                backend_process,
-                backend_start_command,
-                backend_startup_detail,
-                backend_instance_fingerprint,
-            ) = await stage_timer.measure(
-                "backend_runtime",
-                _start_backend_runtime(
-                    self.workspace_path, e2e_runtime_env, web_port=resolved_port
-                ),
-            )
-            if backend_process is None:
-                facts.cleanup_note = backend_cleanup_note
-                return (
-                    parse_test_run(
-                        _render_e2e_failure_body(
-                            facts,
-                            headline=None,  # the backend sections carry the failure
-                            served_verdict=served_verdict,
-                            database_prepare_output=database_prepare_output,
-                            backend_start_command=backend_start_command,
-                            backend_startup_detail=backend_startup_detail,
-                            stage_timer=stage_timer,
-                        ),
-                        exit_code=1,
-                        build_note=build.note,
-                        served_verdict=_frontend_serving_note(self.workspace_path),
+            return (
+                parse_test_run(
+                    _render_e2e_failure_body(
+                        facts,
+                        headline=None,  # the backend sections carry the failure
+                        served_verdict=served_verdict,
+                        database_prepare_output=database_prepare_output,
+                        backend_start_command=acquisition.start_command,
+                        backend_startup_detail=acquisition.startup_detail,
+                        stage_timer=stage_timer,
                     ),
-                    backend_cleanup_note,
-                )
-            self._e2e_runtime_session = _E2EBackendSession(
-                process=backend_process,
-                port=resolved_port,
-                db_path=e2e_runtime_env.get("ARC_E2E_DB_PATH", ""),
-                fingerprint=backend_fingerprint or "",
-                start_command=backend_start_command,
-                startup_detail=backend_startup_detail,
-                instance_fingerprint=backend_instance_fingerprint,
+                    exit_code=1,
+                    build_note=build.note,
+                    served_verdict=_frontend_serving_note(self.workspace_path),
+                ),
+                backend_cleanup_note,
             )
+
+        reused_runtime = acquisition.reused
+        acquired_session = acquisition.session
+        backend_start_command = acquired_session.start_command
+        backend_startup_detail = acquired_session.startup_detail
+        backend_instance_fingerprint = acquired_session.instance_fingerprint
 
         playwright_command = "npx playwright test"
         if execution.get("resolved_targets"):
