@@ -145,6 +145,10 @@ class FakeAppHandler:
     def __init__(self, results: list[str] | None = None) -> None:
         self._results: deque[str] = deque(results or [])
         self.calls: list[tuple[str, list[str]]] = []
+        # Parallel to ``calls``: the failed-case filter each call carried
+        # (None = unfiltered full run). Lets TDD-loop tests assert which
+        # rounds re-ran only the digest's failed cases.
+        self.case_filters: list[list[str] | None] = []
         self.shutdown_calls = 0
         self.install_calls: list[tuple[str, str]] = []
         self._install_results: deque[str] = deque()
@@ -162,9 +166,11 @@ class FakeAppHandler:
         test_type: str,
         file_paths: list[str],
         web_port: int | None = None,
+        failed_case_names: list[str] | None = None,
     ) -> TestRunResult:
         del web_port  # per-task port override; the fake records the call only
         self.calls.append((test_type, list(file_paths)))
+        self.case_filters.append(list(failed_case_names) if failed_case_names else None)
         if not self._results:
             raise RuntimeError(
                 f"FakeAppHandler ran out of scripted results after {len(self.calls)} call(s)."

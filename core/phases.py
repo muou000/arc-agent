@@ -16,6 +16,7 @@ from agents.tools.test_contract_check import (
 )
 from agents.tools.test_failure_digest import (
     build_failure_digest,
+    digest_failed_test_names,
     format_failure_digest,
     persist_run_output,
 )
@@ -960,6 +961,15 @@ class WorkflowPhaseRunner:
         # failed run_tests call appends its fingerprint; three identical
         # consecutive fingerprints force a hypothesis-rotation directive.
         fingerprint_history: dict[str, list[str]] = {test_type: [] for test_type in ordered_types}
+        # Failed-case names parsed from a layer's most recent failed run
+        # digest (#115). A retry round re-runs only these cases through the
+        # runner's per-case filter (the web E2E executor's Playwright
+        # --grep); empty means run the full layer. Cleared whenever a round
+        # passes (the closing round must be a full run) and when the failure
+        # was environmental (the repair contract must revalidate broadly) -
+        # and unreachable across TDD passes, whose first round always runs
+        # the full layer.
+        retry_case_names: dict[str, list[str]] = {test_type: [] for test_type in ordered_types}
         # Missing-package environment failures get one install_dependencies
         # repair cycle per layer (see _installable_environment_failure); other
         # environmental failures keep the original close-the-layer behavior.
@@ -1095,10 +1105,26 @@ class WorkflowPhaseRunner:
                 f"`run_tests` {selected_type} usage {usage_by_type[selected_type]}/{TDD_RUN_TESTS_BUDGET}.",
                 node_id=node_id,
             )
+            # Retry round (#115): the previous round's digest parsed failing
+            # case names, so re-run only those. First round, cross-pass
+            # rounds and any round after an unparseable/environmental
+            # failure carry no filter and run the full layer.
+            prior_failed_names = retry_case_names[selected_type]
+            run_was_case_filtered = bool(prior_failed_names)
+            if run_was_case_filtered:
+                await self._log(
+                    "TestDrivenDeveloper",
+                    (
+                        f"`run_tests` {selected_type} retry filters to the {len(prior_failed_names)} "
+                        "failing case(s) parsed from the previous round's digest."
+                    ),
+                    node_id=node_id,
+                )
             run_result = await self.app_handler.run_test_group(
                 selected_type,
                 selected_files,
                 web_port=self.web_port,
+                failed_case_names=list(prior_failed_names) if prior_failed_names else None,
             )
             exit_code = run_result.exit_code
             passed = run_result.passed_run
@@ -1135,10 +1161,19 @@ class WorkflowPhaseRunner:
                 # Structured per-test digest appended to the tool result: the
                 # model sees each failed test's location and expected/received
                 # up front instead of mining the long raw output for them.
+                failure_digest = build_failure_digest(run_result.output)
+                # Remember the parsed names for the next round's case filter.
+                # An environmental failure clears them: the workspace-repair
+                # contract must revalidate the whole layer, not just the cases
+                # that happened to report before the environment broke. An
+                # unparseable digest also degrades to the full run.
+                retry_case_names[selected_type] = (
+                    [] if run_result.environment_failure else digest_failed_test_names(failure_digest)
+                )
                 run_result.output += (
                     "\n\n"
                     + format_failure_digest(
-                        build_failure_digest(run_result.output),
+                        failure_digest,
                         test_type=selected_type,
                         raw_output_path=run_log_path or None,
                         fingerprint=run_result.fingerprint,
@@ -1148,6 +1183,11 @@ class WorkflowPhaseRunner:
                     )
                     + "\n"
                 )
+            else:
+                # A passing round resets the filter so the next round
+                # revalidates the full layer; a case-filtered green round only
+                # proves the previously failing cases now pass.
+                retry_case_names[selected_type] = []
             output = run_result.output
             await self._log(
                 "TestDrivenDeveloper",
@@ -1180,12 +1220,19 @@ class WorkflowPhaseRunner:
                     file_state_by_type[selected_type][path] = "green"
                 # A layer passes only through a passing run that covered every
                 # registered file; a passing subset run keeps the layer open.
+                # A case-filtered run (#115) is such a subset at case level:
+                # only the previously failing cases were re-verified, so the
+                # layer-closing verdict stays with a full (unfiltered) run.
                 registered_layer_files = {
                     str(item.get("file_path", "") or "").strip()
                     for item in groups[selected_type.lower()]
                     if str(item.get("file_path", "") or "").strip()
                 }
-                if registered_layer_files and set(selected_files) >= registered_layer_files:
+                if (
+                    not run_was_case_filtered
+                    and registered_layer_files
+                    and set(selected_files) >= registered_layer_files
+                ):
                     full_layer_passed[selected_type] = True
                 if environment_failure is not None:
                     # The reported environment failure was repaired (e.g. the
@@ -1323,6 +1370,27 @@ class WorkflowPhaseRunner:
                     output += (
                         f"- {len(not_yet_run)} file(s) in this layer have not been run yet: "
                         f"{', '.join(not_yet_run)}.\n"
+                    )
+            if run_was_case_filtered:
+                # The agent must know this round was partial at case level: on
+                # a pass it must spend one more round on the unfiltered layer
+                # (if it stops here, the system-run regression below closes the
+                # layer instead); on a failure the digest below only covers the
+                # re-run cases.
+                if passed:
+                    output += (
+                        "\nARC_RETRY_FILTER_NOTE:\n"
+                        f"- This round re-ran only the previously failing {selected_type} case(s); "
+                        "the layer is not closed yet. Call run_tests once more for the full "
+                        "layer - the next round runs unfiltered, and a passing full run closes "
+                        "the layer.\n"
+                    )
+                else:
+                    output += (
+                        "\nARC_RETRY_FILTER_NOTE:\n"
+                        f"- This round re-ran only the previously failing {selected_type} case(s); "
+                        "cases that passed in earlier rounds were not re-verified here. The digest "
+                        "above lists the still-failing case(s) the next round will re-run.\n"
                     )
             if full_layer_passed[selected_type] and next_type:
                 # Advance immediately instead of waiting for the session to
