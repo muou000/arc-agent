@@ -28,6 +28,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 | `ARC_NODE_WORKTREES` | 开 | 每节点隔离 worktree 并行 |
 | `ARC_MAX_CONCURRENT_TASKS` | `3` | 并行模式同时运行任务数（上限 8） |
 | `ARC_AFFINITY_DEPTH` | `1` | 亲和分组切分深度 |
+| `ARC_MERGE_ARBITRATION` | 关 | 合并层语义冲突 LLM 仲裁 |
 | `ARC_VISUAL_PRECOMPUTE` | 开 | 编译前并发预分析需求参考图 |
 | `ARC_VISUAL_PRECOMPUTE_CONCURRENCY` | `4` | 参考图预分析并发调用数 |
 | `ARC_VISUAL_ANALYSIS_CONCURRENCY` | `4` | 需求截图并发分析上限（1-8） |
@@ -65,8 +66,9 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 - `ARC_NODE_WORKTREES`：总开关。设 `0/false/no/off` 恢复共享工作区的严格串行调度。
 - `ARC_MAX_CONCURRENT_TASKS`：同时运行的任务数（仅并行模式生效，默认 3，钳制在 1-8）。
 - `ARC_AFFINITY_DEPTH`：亲和分组切分深度。默认 1 = 顶层子树一组；设 2 起宽子树的深层子树各自成组并行（如 simple-keep 的 REQ-2），组内仍串行。
+- `ARC_MERGE_ARBITRATION`：合并层语义冲突 LLM 仲裁（默认关闭，设 `1/true/yes/on` 启用）。
 
-行为概要：同一子树的任务在共享 worktree 目录中顺序执行（兄弟节点不竞争同一批骨架文件），不同子树并行，空闲槽位会从其他子树窃取任务；父子之间 DESIGN 串行，子节点从包含父壳层的 integration HEAD 出发做增量编辑；需求树声明的 `dependencies` 对 DESIGN 和 IMPLEMENT 都做门禁，依赖节点失败时依赖方标记 `BLOCKED_BY_DEPENDENCY` 而非静默 PENDING；跨子树共享 glue 文件的纯追加冲突由合并层机械消解并受合并后健康检查门禁约束，其余冲突按阶段各重排一次（DESIGN 冲突重排 DESIGN，IMPLEMENT 冲突只重排 IMPLEMENT、已完成的 DESIGN 产物保留；两阶段预算独立，重试从已合并的 integration HEAD 出发、冲突路径注入 prompt 绕行指引），同阶段二次冲突终判失败并保留该节点的 worktree 供排查。调度与合并的完整语义（含依赖环丢弃、亲和权重、文件占用注册）是维护者契约，见根目录 `AGENTS.md` 的「工作流和队列」。
+行为概要：同一子树的任务在共享 worktree 目录中顺序执行（兄弟节点不竞争同一批骨架文件），不同子树并行，空闲槽位会从其他子树窃取任务；父子之间 DESIGN 串行，子节点从包含父壳层的 integration HEAD 出发做增量编辑；需求树声明的 `dependencies` 对 DESIGN 和 IMPLEMENT 都做门禁，依赖节点失败时依赖方标记 `BLOCKED_BY_DEPENDENCY` 而非静默 PENDING；跨子树共享 glue 文件的纯追加冲突由合并层机械消解并受合并后健康检查门禁约束；启用 `ARC_MERGE_ARBITRATION` 时非追加冲突和健康门禁失败先升级给主模型仲裁一次（输入只含冲突文件三方内容与按冲突文件裁剪的双方契约卡，编辑仅限冲突文件集，产物须过健康门禁复验，每节点预算一次且两触发点共享，全程留痕 `merge_arbitration` runner 事件），仲裁失败或未启用的其余冲突按阶段各重排一次（DESIGN 冲突重排 DESIGN，IMPLEMENT 冲突只重排 IMPLEMENT、已完成的 DESIGN 产物保留；两阶段预算独立，重试从已合并的 integration HEAD 出发、冲突路径注入 prompt 绕行指引），同阶段二次冲突终判失败并保留该节点的 worktree 供排查。调度与合并的完整语义（含依赖环丢弃、亲和权重、文件占用注册）是维护者契约，见根目录 `AGENTS.md` 的「工作流和队列」。
 
 ## 视觉分析
 
