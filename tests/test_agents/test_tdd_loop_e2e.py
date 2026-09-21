@@ -871,6 +871,78 @@ def test_no_reverify_when_no_later_layer_green(tmp_project_dir: Path, arc_runtim
     assert reverify == []
 
 
+def test_no_reverify_while_environment_failure_unresolved(tmp_project_dir: Path, arc_runtime) -> None:
+    """An unresolved environment failure disables the re-verification channel.
+
+    The channel exists for "budget exhausted" failures. While the workspace
+    is environmentally broken at verdict time (here: the E2E baseline and
+    every agent attempt die on a missing dependency, and the wasted repair
+    grants force-spend the E2E budget), no failing layer is re-verified -
+    even the budget-exhausted Unit layer with a green Integration layer
+    behind it. A re-run would only re-hit the broken workspace, and the
+    node fails on the environment regardless.
+    """
+
+    node_id = "REQ-TDD-REVERIFY-ENV"
+    tests = [
+        {"test_id": "T-U", "type": "Unit", "file_path": UNIT_TEST_FILE},
+        {"test_id": "T-I", "type": "Integration", "file_path": INTEGRATION_TEST_FILE},
+        {"test_id": "T-E", "type": "E2E", "file_path": E2E_TEST_FILE},
+    ]
+    seed_node(arc_runtime, node_id, tests)
+
+    script = [faux_tool_call("run_tests", {}, call_id=f"u{i}") for i in range(TDD_RUN_TESTS_BUDGET)]
+    script += [
+        # Budget gate: in-session advance to Integration, which passes.
+        faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="closed"),
+        faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="i1"),
+        faux_text("unit closed; integration green"),
+        # The E2E session cannot get past the broken workspace: the baseline
+        # already failed environmentally, and every attempt stays
+        # environmental until the wasted grants force-spend the layer budget.
+        faux_tool_call("run_tests", {"test_type": "E2E"}, call_id="e1"),
+        faux_tool_call("run_tests", {"test_type": "E2E"}, call_id="e2"),
+        faux_tool_call("run_tests", {"test_type": "E2E"}, call_id="e3"),
+        faux_text("workspace is broken, giving up"),
+    ]
+    model = FauxChatModel(responses=script)
+    env_failure = failing_test_output(detail=MISSING_DEP_OUTPUT)
+    outputs = [
+        failing_test_output(detail=f"unit failure {i}")
+        for i in range(TDD_RUN_TESTS_BUDGET + 1)
+    ]
+    outputs += [
+        passing_test_output(),
+        # E2E baseline, then three environmental agent attempts (repair
+        # contract, install grant, force-spend).
+        env_failure,
+        env_failure,
+        env_failure,
+        env_failure,
+    ]
+    fake = FakeAppHandler(outputs)
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is False
+    # No re-verification of the budget-exhausted Unit layer despite the
+    # green Integration layer: environment_failure is set at verdict time.
+    # A 17th scripted call (or result) would raise: script exhausted.
+    assert fake.calls == (
+        [("Unit", [UNIT_TEST_FILE])] * (TDD_RUN_TESTS_BUDGET + 1)
+        + [("Integration", [INTEGRATION_TEST_FILE])]
+        + [("E2E", [E2E_TEST_FILE])] * 4
+    )
+    assert arc_runtime.traceability.get_test("T-U")["passed"] is False
+    assert arc_runtime.traceability.get_test("T-I")["passed"] is True
+    assert arc_runtime.traceability.get_test("T-E")["passed"] is False
+    reverify = [
+        event for event in read_runner_events(arc_runtime) if event["type"] == "layer_reverify"
+    ]
+    assert reverify == []
+
+
 def test_no_reverify_when_budget_not_exhausted(tmp_project_dir: Path, arc_runtime) -> None:
     """A layer that failed without exhausting its budget is never re-verified.
 

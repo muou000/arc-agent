@@ -1802,14 +1802,25 @@ class WorkflowPhaseRunner:
         the next layer's session, so by the time a later layer passes, the
         failed layer's tests may already be green. Without a re-run the
         verdict lands between "fix landed" and "fix verified" and fails a
-        node whose code is correct. When the failed layer exhausted its
-        budget (the same condition the failure detail reports — environment
-        failures force-spend the budget too, so they are excluded here) and
-        some later layer is green, run the layer's manifest files once. A
-        pass closes the layer; a failure falls through to the ordinary
-        failure bookkeeping with no second attempt. Layer ordering, budgets
-        and manifest lock semantics are untouched: this runs after the agent
-        sessions, outside the budget counters.
+        node whose code is correct.
+
+        A layer qualifies when its budget is spent (the condition the failure
+        detail reports as "budget exhausted") with no unresolved environment
+        failure at verdict time, and some later layer is green: a layer that
+        ran after this one closed went green, so the fix may have landed
+        after this layer's budget died. A still-red layer in between does not
+        block - the green run still proves late edits landed, and layer
+        verdicts stay independent, so nothing red is masked. (A budget spent
+        on a since-repaired environment failure qualifies the same way: the
+        repair was itself a late fix.) An unresolved environment failure
+        blocks the channel: the re-run would only re-hit the broken
+        workspace.
+
+        The re-run covers exactly the layer's manifest files, runs once,
+        after the agent sessions and outside the budget counters. A pass
+        closes the layer; a failure falls through to the ordinary failure
+        bookkeeping. Layer ordering, budgets and manifest lock semantics are
+        untouched.
         """
 
         used = usage_by_type.get(test_type, 0)
@@ -1819,6 +1830,17 @@ class WorkflowPhaseRunner:
         if not any(full_layer_passed.get(later) for later in ordered_types[successor_index:]):
             return
         layer_files = collect_test_files(groups[test_type.lower()])
+
+        def record_reverify(status: str, message: str | None = None) -> None:
+            self.events.record_layer_reverify(
+                node_id=node_id,
+                layer=test_type,
+                status=status,
+                files=layer_files,
+                used=used,
+                message=message,
+            )
+
         await self._log(
             "TestDrivenDeveloper",
             (
@@ -1827,13 +1849,7 @@ class WorkflowPhaseRunner:
             ),
             node_id=node_id,
         )
-        self.events.record_layer_reverify(
-            node_id=node_id,
-            layer=test_type,
-            status="triggered",
-            files=layer_files,
-            used=used,
-        )
+        record_reverify("triggered")
         reverify_result = await self.app_handler.run_test_group(
             test_type,
             layer_files,
@@ -1851,13 +1867,7 @@ class WorkflowPhaseRunner:
                 status="ok",
                 node_id=node_id,
             )
-            self.events.record_layer_reverify(
-                node_id=node_id,
-                layer=test_type,
-                status="passed",
-                files=layer_files,
-                used=used,
-            )
+            record_reverify("passed")
             return
         await self._log(
             "TestDrivenDeveloper",
@@ -1868,14 +1878,7 @@ class WorkflowPhaseRunner:
             status="error",
             node_id=node_id,
         )
-        self.events.record_layer_reverify(
-            node_id=node_id,
-            layer=test_type,
-            status="failed",
-            files=layer_files,
-            used=used,
-            message=summarize_batch_output(reverify_result.output),
-        )
+        record_reverify("failed", summarize_batch_output(reverify_result.output))
 
     def _prepare_interfaces(self, node_id: str, interfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         prepared: list[dict[str, Any]] = []
