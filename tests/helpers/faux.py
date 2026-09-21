@@ -247,7 +247,7 @@ def drive_scripted_tool_call(
             faux_text("DONE"),
         ]
     )
-    agent = build_stage_agent(
+    built = build_stage_agent(
         name="fs_behavior_probe",
         stage=stage,
         model=model,
@@ -262,7 +262,7 @@ def drive_scripted_tool_call(
     )
     asyncio.run(
         ainvoke_stage_agent(
-            agent,
+            built.agent,
             message="run the scripted tool call",
             context=AgentRuntimeContext(
                 node_id="REQ-FS-PROBE",
