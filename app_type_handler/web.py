@@ -1432,7 +1432,7 @@ async def _start_backend_runtime(
     (``_arc_output_tails``); the caller owns that object for the runtime's
     whole lifetime and must clean it up through ``_terminate_process`` -
     the single teardown path that releases the port and awaits the drains.
-    Every current call site (probe_backend_health, run_test_file,
+    Every current call site (probe_backend_health,
     run_test_group's session) funnels there; a new call site bypassing it
     would leave the drains pending on a dead process.
     """
