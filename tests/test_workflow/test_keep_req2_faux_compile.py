@@ -348,9 +348,9 @@ def test_keep_req2_faux_compile_end_to_end(
     # swallowed the contended write, the index held files the disk never
     # materialized, the task's `git add -A .` staged their deletion, and a
     # later sibling's merge hit a modify/delete conflict (2/3 runs failed at
-    # 2 slots, 3/3 at 3). The manager's integration lock now excludes
+    # 2 slots, 3/3 at 3). The manager's integration gate now excludes
     # prepare/reset from integrate, so 2 slots is also a regression pin; the
-    # deterministic lock-contract tests live in test_worktree_manager.py.
+    # deterministic gate-contract tests live in test_worktree_manager.py.
     monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     monkeypatch.setenv("ARC_AFFINITY_DEPTH", "2")
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")

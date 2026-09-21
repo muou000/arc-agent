@@ -848,8 +848,23 @@ def test_integrate_arbitration_reports_failed_reverify_result(tmp_path: Path) ->
 
 
 # ----------------------------------------------------------------------
-# Issue #91: prepare/reset must exclude integrate on the integration lock
+# Issue #91: prepare/reset must exclude integrate on the integration gate
 # ----------------------------------------------------------------------
+
+
+def _hold_gate(gate: Any, mode: str, release: threading.Event) -> None:
+    """Hold the integration gate in ``mode`` ("reader"/"writer") on a worker
+    thread until ``release`` is set; return once the gate is held."""
+
+    held = threading.Event()
+
+    def run() -> None:
+        with getattr(gate, mode)():
+            held.set()
+            release.wait(10)
+
+    threading.Thread(target=run, daemon=True).start()
+    assert held.wait(10), f"gate never entered {mode}"
 
 
 def _prepare_in_thread(manager: NodeWorktreeManager, node_id: str, group_key: str):
@@ -875,7 +890,7 @@ def test_prepare_waits_for_in_flight_integration(tmp_path: Path) -> None:
     worktree while another group's integrate may be moving that branch. A
     checkout that lost that race materialized its index without its files and
     the task's ``git add -A .`` staged sibling-owned files as deletions. The
-    integration lock must keep prepare out of integrate's critical section.
+    gate's writer side must keep prepare out of integrate's critical section.
     """
 
     repo, manager = _init_repo(tmp_path)
@@ -884,31 +899,53 @@ def test_prepare_waits_for_in_flight_integration(tmp_path: Path) -> None:
     manager.integrate(first, "REQ-2.1 (implement): one")
 
     release = threading.Event()
-    lock_held = threading.Event()
-
-    def hold_lock() -> None:
-        with manager.integration_gate.writer():
-            lock_held.set()
-            release.wait(10)
-
-    holder = threading.Thread(target=hold_lock, daemon=True)
-    holder.start()
-    assert lock_held.wait(10)
+    _hold_gate(manager.integration_gate, "writer", release)
 
     # REQ-2.2 has no branch yet, so prepare takes the checkout -B path that
     # lost the race in issue #91.
     thread, outcome = _prepare_in_thread(manager, "REQ-2.2", "REQ-2")
     try:
         thread.join(0.5)
-        assert not outcome, "prepare ran while the integration lock was held"
+        assert not outcome, "prepare ran while the integration gate was held as writer"
     finally:
         release.set()
     thread.join(10)
     assert "handle" in outcome, f"prepare never completed: {outcome.get('error')}"
-    holder.join(10)
     # The checkout -B started from the integration HEAD that already holds the
     # merged sibling file.
     assert (Path(outcome["handle"].path) / "backend" / "one.js").exists()
+
+
+def test_integrate_waits_for_in_flight_prepare(tmp_path: Path) -> None:
+    """The writer side pinned through integrate itself: while a prepare holds
+    the gate as a reader, the merge must wait (without this, deleting
+    integrate's writer acquisition would pass every other test)."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+    (Path(handle.path) / "backend" / "feature.js").write_text("feature;\n", encoding="utf-8")
+
+    release = threading.Event()
+    _hold_gate(manager.integration_gate, "reader", release)
+
+    outcome: dict[str, Any] = {}
+
+    def run_integrate() -> None:
+        try:
+            outcome["result"] = manager.integrate(handle, "REQ-2.1 (implement): feature")
+        except Exception as exc:  # pragma: no cover - failure is the signal
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run_integrate, daemon=True)
+    thread.start()
+    try:
+        thread.join(0.5)
+        assert not outcome, "integrate ran while a prepare held the gate as reader"
+    finally:
+        release.set()
+    thread.join(10)
+    assert "result" in outcome, f"integrate never completed: {outcome.get('error')}"
+    assert (repo / "backend" / "feature.js").exists(), "merge must land after waiting"
 
 
 def test_reset_branch_to_integration_waits_for_in_flight_integration(
@@ -921,16 +958,7 @@ def test_reset_branch_to_integration_waits_for_in_flight_integration(
     handle = manager.prepare("REQ-2.1")
 
     release = threading.Event()
-    lock_held = threading.Event()
-
-    def hold_lock() -> None:
-        with manager.integration_gate.writer():
-            lock_held.set()
-            release.wait(10)
-
-    holder = threading.Thread(target=hold_lock, daemon=True)
-    holder.start()
-    assert lock_held.wait(10)
+    _hold_gate(manager.integration_gate, "writer", release)
 
     outcome: dict[str, Any] = {}
 
@@ -945,12 +973,11 @@ def test_reset_branch_to_integration_waits_for_in_flight_integration(
     reset_thread.start()
     try:
         reset_thread.join(0.5)
-        assert not outcome, "reset ran while the integration lock was held"
+        assert not outcome, "reset ran while the integration gate was held as writer"
     finally:
         release.set()
     reset_thread.join(10)
     assert outcome.get("done"), f"reset never completed: {outcome.get('error')}"
-    holder.join(10)
 
 
 def test_prepare_raises_when_the_checkout_fails(
