@@ -20,6 +20,7 @@ one affinity group. These tests pin the fixture's contract so later levers
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,7 @@ def _nodes_by_id(tree: dict) -> dict[str, dict]:
 
 
 def _manager(tmp_path: Path, requirement_path: Path) -> ARCWorkflowManager:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     return ARCWorkflowManager(
         workspace_path=str(tmp_path),
         requirement_path=str(requirement_path),
@@ -77,8 +79,11 @@ def test_keep_req2_holds_the_verbatim_req2_subtree() -> None:
             assert sub_node.get(field) == full_node.get(field), (node_id, field)
         assert (sub_node.get("scenarios") or []) == (full_node.get("scenarios") or []), node_id
 
-    # The two edges pointing outside the slice are preserved verbatim (they are
-    # silently filtered at queue build, exactly as in the parent tree).
+    # The two edges pointing outside the slice are preserved verbatim. In the
+    # parent tree they are real scheduling edges (REQ-1 exists there); in this
+    # slice the queue builder's unknown-id rule silently filters them, which
+    # is the fixture's intended degradation — no drop warning, same as any
+    # other out-of-tree reference.
     assert sub_nodes["REQ-2"]["dependencies"] == ["REQ-1"]
     assert sub_nodes["REQ-2.1"]["dependencies"] == ["REQ-1.1"]
 
@@ -101,8 +106,10 @@ def test_keep_req2_queue_builds_cleanly(tmp_path: Path, monkeypatch: pytest.Monk
 
     sub_tree = load_requirements(KEEP_REQ2_YAML)
     full_tree = load_requirements(KEEP_YAML)
-    queue = _manager(tmp_path, KEEP_REQ2_YAML)._load_or_create_processing_queue(sub_tree)
-    full_queue = _manager(tmp_path, KEEP_YAML)._load_or_create_processing_queue(full_tree)
+    # Separate workspace dirs: the create path does not persist the queue
+    # today, but the comparison must not lean on that implementation detail.
+    queue = _manager(tmp_path / "sub", KEEP_REQ2_YAML)._load_or_create_processing_queue(sub_tree)
+    full_queue = _manager(tmp_path / "full", KEEP_YAML)._load_or_create_processing_queue(full_tree)
 
     assert queue["dropped_dependency_edges"] == []
     assert full_queue["dropped_dependency_edges"] == []
@@ -204,8 +211,6 @@ def test_keep_req2_tests_and_reference_are_scoped_to_the_subtree() -> None:
     sub_nodes = _nodes_by_id(sub_tree)
     referenced = set()
     for node in sub_nodes.values():
-        import re
-
         referenced.update(re.findall(r"reference/([a-z_]+\.png)", str(node.get("description") or "")))
     present = {p.name for p in (base / "requirements" / "reference").glob("*.png")}
     # label_filtered_list.png is referenced by REQ-2.7.6 but absent from the

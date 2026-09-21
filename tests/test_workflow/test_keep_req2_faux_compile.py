@@ -63,11 +63,10 @@ from tests.helpers.faux import (
     faux_text,
     faux_tool_call,
 )
-
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-KEEP_REQ2_YAML = REPO_ROOT / "arc-bench-test" / "keep-req2" / "requirements" / "requirements.yaml"
-
-FEATURE_SUBTREES = ("REQ-2.3", "REQ-2.4", "REQ-2.5", "REQ-2.6", "REQ-2.7", "REQ-2.8")
+from tests.test_workflow.test_keep_req2_fixture import (
+    FEATURE_SUBTREES,
+    KEEP_REQ2_YAML,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +225,10 @@ class _NodeRoutedFauxModel(FauxChatModel):
 
     def set_node_scripts(self, scripts: dict[str, list[BaseMessage]]) -> None:
         self._scripts = {node_id: list(turns) for node_id, turns in scripts.items()}
+
+    def routed_nodes(self) -> set[str]:
+        """Node ids this model has served at least one scripted turn for."""
+        return set(self._routed)
 
     def pending_counts(self) -> dict[str, int]:
         return {node_id: len(turns) for node_id, turns in self._scripts.items() if turns}
@@ -416,7 +419,7 @@ def test_keep_req2_faux_compile_end_to_end(
     # Every leaf's script was consumed exactly; non-leaf nodes never touch
     # the model (DESIGN skip path + direct IMPLEMENT completion).
     assert model.pending_counts() == {}, model.pending_counts()
-    assert set(model._routed) == {
+    assert set(model.routed_nodes()) == {
         node["id"] for node, is_non_leaf in nodes if not is_non_leaf
     }
 
