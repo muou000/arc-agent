@@ -46,5 +46,6 @@ GitHub 的 issue 和 PR 共用一个编号空间，裸 `#42` 可能是两者之�
 
 ## 本仓库补充
 
-- 仓库目前没有在用 issue：标签只有 GitHub 默认集，历史上 issue 数为 0。首次使用时需要创建自定义标签（`gh label create`）：五个 triage 标签（见 `docs/agents/triage-labels.md`）和 wayfinder 系列（`wayfinder:map`、`wayfinder:research`、`wayfinder:prototype`、`wayfinder:grilling`、`wayfinder:task`）。
+- 自定义标签现状（2026-09-21 更新）：triage 标签中除 GitHub 默认的 `wontfix` 外均已创建（`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`，见 `docs/agents/triage-labels.md`）；`architecture` 用于架构评审产出的深化机会。wayfinder 系列（`wayfinder:map`、`wayfinder:research`、`wayfinder:prototype`、`wayfinder:grilling`、`wayfinder:task`）尚未创建，首次使用 `/wayfinder` 时用 `gh label create` 补上。
+- issue 正文沿用 `to-tickets` 的模板：`## Parent`（无父 issue 时省略该节）/ `## What to build` / `## Acceptance criteria` / `## Blocked by`。阻塞边以原生 issue dependencies 为权威表示，正文同时保留 `Blocked by: #<n>` 行，便于在 UI 之外阅读。
 - 开发任务一律在独立 git worktree 中进行，通过 push 任务分支 + PR 合并回 `main`（见根 `AGENTS.md`）。「发布到 issue tracker」创建 issue 不受此限制，但任何代码落地仍走 worktree + PR。
