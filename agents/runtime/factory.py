@@ -76,6 +76,20 @@ class StageAgentBuild:
         except Exception:
             return []
 
+    def write_events(self) -> list[str]:
+        """Write/edit/delete events the discipline observed, in call order.
+
+        Same bargain as :meth:`materialized_paths`: empty without a
+        discipline, never raises.
+        """
+
+        if self.stage_discipline is None:
+            return []
+        try:
+            return list(self.stage_discipline.write_events())
+        except Exception:
+            return []
+
 
 class OpenAIGlobSchema(BaseModel):
     """OpenAI-compatible schema for the glob tool.

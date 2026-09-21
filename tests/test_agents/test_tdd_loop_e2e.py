@@ -1300,6 +1300,155 @@ def test_followup_session_receives_digest_and_diff_hint(tmp_project_dir: Path, a
 
 
 # ---------------------------------------------------------------------------
+# Test-edit stall hint: repeated fingerprint after only-test-file edits
+# ---------------------------------------------------------------------------
+
+
+INTEGRATION_TEST_FILE_TSX = "tests/integration/loginPage.test.tsx"
+
+
+def write_integration_test_file(tmp_project_dir: Path, marker: str = "2") -> None:
+    """Seed the Integration tsx file the stall-hint tests edit."""
+
+    path = tmp_project_dir / INTEGRATION_TEST_FILE_TSX
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "import { render, screen } from '@testing-library/react';\n"
+        "it('logs in', () => {\n"
+        f"  expect(add(1, 1)).toBe({marker});\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+
+def test_repeated_fingerprint_after_test_file_edits_injects_stall_hint(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """Editing only test files between two same-fingerprint failures fires the hint.
+
+    The easy-ticketbooking (2026-09-21) REQ-2 shape: the model edited the same
+    Integration test file's it-block eight times while the failure fingerprint
+    stood still, burning ~3.5 minutes before it first touched the source. The
+    digest of the SECOND failure must carry the TEST-EDIT STALL guidance, both
+    in-session (the run_tests tool result) and in the cross-session handoff.
+    """
+
+    node_id = "REQ-TDD-STALL-HINT"
+    tests = [{"test_id": "T1", "type": "Integration", "file_path": INTEGRATION_TEST_FILE_TSX}]
+    seed_node(arc_runtime, node_id, tests)
+    write_integration_test_file(tmp_project_dir)
+
+    model = FauxChatModel(
+        responses=[
+            # Baseline red is handed to the first session; the agent edits the
+            # TEST file twice, re-running between the edits.
+            faux_tool_call(
+                "edit_file",
+                {
+                    "file_path": f"/workspace/{INTEGRATION_TEST_FILE_TSX}",
+                    "old_string": "expect(add(1, 1)).toBe(2)",
+                    "new_string": "expect(add(1, 1)).toBe(3)",
+                },
+                call_id="e1",
+            ),
+            faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="r1"),
+            faux_tool_call(
+                "edit_file",
+                {
+                    "file_path": f"/workspace/{INTEGRATION_TEST_FILE_TSX}",
+                    "old_string": "expect(add(1, 1)).toBe(3)",
+                    "new_string": "expect(add(1, 1)).toBe(4)",
+                },
+                call_id="e2",
+            ),
+            faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="r2"),
+            faux_text("still failing, ending turn"),
+            # Session 2 makes no run_tests call, ending the layer.
+            faux_text("no more attempts"),
+        ]
+    )
+    # Baseline + two agent runs, all failing with the SAME detail so the
+    # fingerprint repeats.
+    fake = FakeAppHandler([failing_test_output(detail="AssertionError: expected 'Login' to equal 'Log in'")] * 3)
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    handoffs = track_tdd_handoffs(tdd)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is False
+    # The hint must fire on the SECOND failure's run_tests result only. The
+    # model history accumulates tool messages, so count the distinct
+    # occurrences inside the final turn's message list (call 4: one per
+    # accumulated run_tests result).
+    final_turn_tool_results = "\n".join(
+        str(m.content) for m in model.calls[-1] if getattr(m, "type", "") == "tool"
+    )
+    assert final_turn_tool_results.count("TEST-EDIT STALL") == 1
+    # The hint names the edited test file and points at the implementation.
+    assert "TEST-EDIT STALL: the last 1 edit all landed in test files" in final_turn_tool_results
+    assert f"`{INTEGRATION_TEST_FILE_TSX}`" in final_turn_tool_results
+    assert "implementation or environment layer" in final_turn_tool_results
+    # ...and the cross-session handoff (session 2's prompt) carries the same
+    # hint inside the digest evidence.
+    assert len(handoffs) == 2
+    assert "TEST-EDIT STALL" in handoffs[1]
+
+
+def test_repeated_fingerprint_after_source_edit_keeps_stall_hint_silent(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A source edit between two same-fingerprint failures must NOT fire the hint.
+
+    The claim "all recent edits landed in test files" stays true only when it
+    is true; the unchanged-fingerprint-despite-source-edit case is the diff
+    hint's ("DID NOT change") territory.
+    """
+
+    node_id = "REQ-TDD-STALL-HINT-SRC"
+    tests = [{"test_id": "T1", "type": "Integration", "file_path": INTEGRATION_TEST_FILE_TSX}]
+    seed_node(arc_runtime, node_id, tests)
+    write_integration_test_file(tmp_project_dir)
+    source_path = tmp_project_dir / "src" / "calc.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+
+    model = FauxChatModel(
+        responses=[
+            # Baseline red; the agent runs once (no prior failure, no hint),
+            # edits the SOURCE file, then re-runs into the same fingerprint.
+            faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="r1"),
+            faux_tool_call(
+                "edit_file",
+                {
+                    "file_path": "/workspace/src/calc.py",
+                    "old_string": "return a - b",
+                    "new_string": "return a + b",
+                },
+                call_id="e1",
+            ),
+            faux_tool_call("run_tests", {"test_type": "Integration"}, call_id="r2"),
+            faux_text("still failing, ending turn"),
+            faux_text("no more attempts"),
+        ]
+    )
+    fake = FakeAppHandler([failing_test_output(detail="AssertionError: expected 'Login' to equal 'Log in'")] * 3)
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    handoffs = track_tdd_handoffs(tdd)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is False
+    all_tool_results = tool_results_text(model)
+    assert "TEST-EDIT STALL" not in all_tool_results
+    # The existing cross-session diff hint still reports the unchanged
+    # fingerprint for the source-editing session.
+    assert len(handoffs) == 2
+    assert "DID NOT change" in handoffs[1]
+
+
+# ---------------------------------------------------------------------------
 # Missing-package environment failures get one install_dependencies cycle
 # ---------------------------------------------------------------------------
 

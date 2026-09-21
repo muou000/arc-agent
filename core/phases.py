@@ -1135,6 +1135,10 @@ class WorkflowPhaseRunner:
                 # Structured per-test digest appended to the tool result: the
                 # model sees each failed test's location and expected/received
                 # up front instead of mining the long raw output for them.
+                # The adapter's stall chain still holds the PREVIOUS failure's
+                # state here (this closure advances it only after returning),
+                # so the hint compares this fingerprint against the failure
+                # before it.
                 run_result.output += (
                     "\n\n"
                     + format_failure_digest(
@@ -1145,6 +1149,9 @@ class WorkflowPhaseRunner:
                         environment_failure=run_result.environment_failure,
                         build=run_result.build_note,
                         served=run_result.served_verdict,
+                        test_edit_hint=self.test_driven_developer.test_edit_stall_hint(
+                            selected_type, run_result.fingerprint
+                        ),
                     )
                     + "\n"
                 )
