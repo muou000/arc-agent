@@ -15,7 +15,7 @@ import time
 import urllib.request
 from contextlib import suppress
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -63,6 +63,11 @@ def _node_supports_require_esm(version_text: str) -> bool:
 # Generous because a cold machine downloads ~150 MB of browser binaries. Once
 # the machine-wide Playwright cache is warm the command exits in seconds.
 PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
+# One timeout source for every command a system-side test run can spawn
+# (Playwright batches, Vitest batches, npm scripts the E2E executor invokes).
+# Vitest batches pass no override and share this budget: a wedged run must
+# fail within one bound regardless of which runner executed it.
+SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS = 120.0
 # The browser task starts with npm, but waits until npm has materialized the
 # local Playwright CLI before touching the workspace. This preserves the
 # package-version coupling while overlapping the browser download with the
@@ -422,6 +427,12 @@ def _build_web_test_execution(
     workspace_path: str,
     web_port: int | None = None,
 ) -> dict[str, str]:
+    """Build the execution plan for one Vitest test file.
+
+    ``e2e`` is not a valid single-file type here: every E2E run goes through
+    the grouped attempt pipeline (see ``run_test_group``), so ``run_test_file``
+    routes e2e requests there before reaching this builder.
+    """
     normalized_type = (test_type or "").strip().lower()
     safe_file_path = _validate_web_test_path(normalized_type, file_path)
     if safe_file_path is None:
@@ -433,13 +444,8 @@ def _build_web_test_execution(
     if normalized_type in {"unit", "integration"}:
         runner = "Vitest"
         command = f"npx vitest run {resolved_file_path}" if resolved_file_path else "npx vitest run"
-    elif normalized_type == "e2e":
-        runner = "Playwright"
-        working_directory = os.path.join(workspace_path, "backend")
-        resolved_file_path = _normalize_backend_test_path(safe_file_path)
-        command = f"npx playwright test {resolved_file_path}" if resolved_file_path else "npx playwright test"
     else:
-        raise ValueError("Unknown test type. Must be 'unit', 'integration', or 'e2e'.")
+        raise ValueError("Unknown test type. Must be 'unit' or 'integration' (e2e runs grouped).")
 
     return {
         "runner": runner,
@@ -1337,6 +1343,105 @@ def _is_spa_static_host_failure(output: str) -> bool:
     """True when a failed E2E output carries the dead-static-host signature."""
 
     return bool(_SPA_STATIC_HOST_FAILURE.search(output or ""))
+
+
+@dataclass
+class _E2EAttemptFacts:
+    """Facts one E2E attempt has established when a failure ends it.
+
+    Fields fill in as the attempt progresses (build, then runtime env, then
+    database, then backend), so the single failure renderer
+    :func:`_render_e2e_failure_body` can assemble the body of any premature
+    exit — build failure, database-prepare failure, backend-startup failure —
+    from whatever the attempt had gathered by then, instead of each exit
+    point hand-writing its own body from a slightly different subset.
+    """
+
+    #: Output of the frontend build stage (always known: it runs first).
+    build_output: str
+    #: Accumulated teardown evidence: what this attempt inherited from the
+    #: attempt before it (recovery path) plus any stale-session cleanup that
+    #: happened during this attempt.
+    cleanup_note: str = ""
+    #: Runtime env of this attempt (known once the build succeeded).
+    runtime_env: dict[str, str] = field(default_factory=dict)
+
+
+def _render_e2e_failure_body(
+    facts: _E2EAttemptFacts,
+    *,
+    headline: str | None,
+    served_verdict: str,
+    stage_timer: _StageTimer,
+    database_prepare_output: str = "",
+    backend_start_command: str = "",
+    backend_startup_detail: str = "",
+) -> str:
+    """Assemble the failure body of an E2E attempt that ended early.
+
+    ``headline`` leads the body for build/database failures; the
+    backend-startup failure passes ``None`` because its own sections (the
+    backend runtime command and its startup detail) are the failure evidence.
+    Sections appear only when the attempt got far enough to know them.
+
+    The layout reproduces the three hand-written bodies this renderer
+    replaced, byte for byte. Their shared shape: ``Exit Code: 1``, the
+    headline, build + serving verdict, then whichever facts exist; the timing
+    block closes the assembled part; the previous-cleanup note is appended
+    last. Two layout quirks of the old bodies are kept on purpose so the
+    model-facing text does not shift: the backend-startup failure orders
+    Database Prepare *before* the runtime env and ends its STDERR section
+    with a trailing newline (the build/db failures use the runtime-env-first
+    order and no trailing newline), and each failure's final append produced
+    its own blank-line count before the cleanup note.
+    """
+
+    backend_startup_failed = bool(backend_startup_detail or backend_start_command)
+    sections: list[str] = []
+    if headline:
+        sections.append(headline)
+    sections.append(f"=== Frontend Build ===\n{facts.build_output}")
+    sections.append(served_verdict)
+    if facts.runtime_env:
+        sections.append(
+            "=== E2E Runtime Env ===\n"
+            f"DB Path: {facts.runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}"
+        )
+    if database_prepare_output:
+        if backend_startup_failed:
+            # The old backend-startup body ordered this section ahead of the
+            # runtime env; keep the exact ordering.
+            prepare_index = next(
+                (i for i, section in enumerate(sections) if section.startswith("=== E2E Runtime Env ===")),
+                None,
+            )
+            prepare_section = f"=== Database Prepare ===\n{database_prepare_output}"
+            if prepare_index is None:
+                sections.append(prepare_section)
+            else:
+                sections.insert(prepare_index, prepare_section)
+        else:
+            sections.append(f"=== Database Prepare ===\n{database_prepare_output}")
+    if backend_startup_failed:
+        stderr_section = (
+            f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
+            f"STDERR:\n{backend_startup_detail or 'No startup detail recorded.'}\n"
+        )
+        sections.append(stderr_section)
+
+    body = "Exit Code: 1\n\n" + "\n\n".join(sections) + stage_timer.render()
+    if facts.cleanup_note:
+        if not facts.runtime_env:
+            # Build failure: the note joined with a blank line after the
+            # timing block.
+            body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{facts.cleanup_note}"
+        else:
+            # The timing block ends with one newline; the old appends added
+            # one more for the db failure ("\n\n") and relied on the STDERR
+            # section's trailing newline for the backend failure ("\n").
+            separator = "\n" if backend_startup_failed else "\n\n"
+            body += f"{separator}=== Previous Backend Runtime Cleanup ===\n{facts.cleanup_note}"
+    return body
 
 
 async def _prepare_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -> tuple[bool, int | None, str]:
@@ -2433,6 +2538,11 @@ class WebAppType(AppTypeHandler):
         validation_error = self.validate_test_path(test_type, file_path)
         if validation_error:
             return TestRunResult(exit_code=1, output=f"Exit Code: 1\nSTDERR:\n{validation_error}\n")
+        if (test_type or "").strip().lower() == "e2e":
+            # E2E has exactly one executor (the grouped attempt pipeline);
+            # a single-file request is that pipeline with one target, not a
+            # second, divergent command path with its own timeout budget.
+            return await self.run_test_group("e2e", [file_path], web_port=resolved_port)
         try:
             execution = _build_web_test_execution(test_type, file_path, self.workspace_path, web_port=resolved_port)
         except ValueError as exc:
@@ -2569,6 +2679,7 @@ class WebAppType(AppTypeHandler):
                 backend_result = await _execute_web_test_command(
                     backend_command,
                     cwd=execution["backend_working_directory"],
+                    timeout=SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS,
                     web_port=resolved_port,
                 )
                 sections.append(f"=== Backend Vitest Batch ===\n{backend_result.text}")
@@ -2579,6 +2690,7 @@ class WebAppType(AppTypeHandler):
                 frontend_result = await _execute_web_test_command(
                     frontend_command,
                     cwd=execution["frontend_working_directory"],
+                    timeout=SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS,
                     web_port=resolved_port,
                 )
                 sections.append(f"=== Frontend Vitest Batch ===\n{frontend_result.text}")
@@ -2716,21 +2828,22 @@ class WebAppType(AppTypeHandler):
             "frontend_build",
             _build_frontend_dist(self.workspace_path, force_rebuild=force_rebuild),
         )
+        facts = _E2EAttemptFacts(
+            build_output=build.output,
+            cleanup_note=prior_cleanup_note,
+        )
         # Failure bodies check the verdict here (post-build, pre-Playwright);
         # the success body re-checks after Playwright — see the comment there.
         served_verdict = _frontend_serving_verdict(self.workspace_path)
         if not build.ok:
-            failure_body = (
-                "Exit Code: 1\n\n"
-                "Frontend build failed before E2E startup.\n\n"
-                f"=== Frontend Build ===\n{build.output}\n\n{served_verdict}"
-                + stage_timer.render()
-            )
-            if prior_cleanup_note:
-                failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{prior_cleanup_note}"
             return (
                 parse_test_run(
-                    failure_body,
+                    _render_e2e_failure_body(
+                        facts,
+                        headline="Frontend build failed before E2E startup.",
+                        served_verdict=served_verdict,
+                        stage_timer=stage_timer,
+                    ),
                     exit_code=1,
                     build_note=build.note,
                     served_verdict=_frontend_serving_note(self.workspace_path),
@@ -2743,6 +2856,7 @@ class WebAppType(AppTypeHandler):
             execution.get("resolved_targets", []),
             web_port=resolved_port,
         )
+        facts.runtime_env = e2e_runtime_env
 
         backend_start_command = ""
         backend_startup_detail = ""
@@ -2797,19 +2911,16 @@ class WebAppType(AppTypeHandler):
                 _prepare_e2e_database(self.workspace_path, e2e_runtime_env),
             )
             if not database_ready:
-                failure_body = (
-                    "Exit Code: 1\n\n"
-                    "E2E database preparation failed before backend startup.\n\n"
-                    f"=== Frontend Build ===\n{build.output}\n\n{served_verdict}\n\n"
-                    f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
-                    f"=== Database Prepare ===\n{database_prepare_output}"
-                    + stage_timer.render()
-                )
-                if backend_cleanup_note:
-                    failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
+                facts.cleanup_note = backend_cleanup_note
                 return (
                     parse_test_run(
-                        failure_body,
+                        _render_e2e_failure_body(
+                            facts,
+                            headline="E2E database preparation failed before backend startup.",
+                            served_verdict=served_verdict,
+                            database_prepare_output=database_prepare_output,
+                            stage_timer=stage_timer,
+                        ),
                         exit_code=1,
                         build_note=build.note,
                         served_verdict=_frontend_serving_note(self.workspace_path),
@@ -2829,20 +2940,18 @@ class WebAppType(AppTypeHandler):
                 ),
             )
             if backend_process is None:
-                failure_body = (
-                    "Exit Code: 1\n\n"
-                    f"=== Frontend Build ===\n{build.output}\n\n{served_verdict}\n\n"
-                    f"=== Database Prepare ===\n{database_prepare_output}\n\n"
-                    f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
-                    f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
-                    f"STDERR:\n{backend_startup_detail or 'No startup detail recorded.'}\n"
-                    + stage_timer.render()
-                )
-                if backend_cleanup_note:
-                    failure_body += f"\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
+                facts.cleanup_note = backend_cleanup_note
                 return (
                     parse_test_run(
-                        failure_body,
+                        _render_e2e_failure_body(
+                            facts,
+                            headline=None,  # the backend sections carry the failure
+                            served_verdict=served_verdict,
+                            database_prepare_output=database_prepare_output,
+                            backend_start_command=backend_start_command,
+                            backend_startup_detail=backend_startup_detail,
+                            stage_timer=stage_timer,
+                        ),
                         exit_code=1,
                         build_note=build.note,
                         served_verdict=_frontend_serving_note(self.workspace_path),
@@ -2867,7 +2976,7 @@ class WebAppType(AppTypeHandler):
             _execute_web_test_command(
                 playwright_command,
                 cwd=execution["working_directory"],
-                timeout=120.0,
+                timeout=SYSTEM_TEST_COMMAND_TIMEOUT_SECONDS,
                 extra_env=e2e_runtime_env,
                 web_port=resolved_port,
             ),
