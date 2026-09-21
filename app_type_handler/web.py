@@ -21,6 +21,7 @@ from typing import Awaitable, Callable
 
 from .base import AppTypeHandler, GlueAnchorSpec, TEMPLATE_ID_BY_APP_TYPE
 from .path_validation import is_scoped_test_path, normalize_safe_relative_path
+from .test_results import TestRunResult, parse_test_run
 from .template_patches import (
     ALREADY_APPLIED,
     APPLIED,
@@ -298,13 +299,26 @@ async def run_npm_install(
     return False
 
 
+@dataclass
+class _CommandResult:
+    """Structured outcome of one shell command plus its rendered text.
+
+    ``exit_code`` is ``None`` when the command never produced one (timeout,
+    spawn failure); ``text`` is the model-facing rendering, whose shape is
+    unchanged from the days when callers parsed the code back out of it.
+    """
+
+    exit_code: int | None
+    text: str
+
+
 async def _execute_web_test_command(
     command: str,
     cwd: str,
     timeout: float = 60.0,
     extra_env: dict[str, str] | None = None,
     web_port: int | None = None,
-) -> str:
+) -> _CommandResult:
     process = None
     try:
         process = await asyncio.create_subprocess_shell(
@@ -331,23 +345,16 @@ async def _execute_web_test_command(
             result += f"STDERR:\n{error}\n"
         if len(result) > 4000:
             result = result[:2000] + "\n...[OUTPUT TRUNCATED]...\n" + result[-2000:]
-        return result
+        return _CommandResult(
+            exit_code=process.returncode if process.returncode is not None else -1,
+            text=result,
+        )
     except asyncio.TimeoutError:
         if process:
             await finalize_subprocess(process, force_kill=True)
-        return f"Command timed out after {timeout} seconds."
+        return _CommandResult(exit_code=None, text=f"Command timed out after {timeout} seconds.")
     except Exception as exc:
-        return f"Execution failed: {str(exc)}"
-
-def _extract_exit_code(command_output: str) -> int | None:
-    for line in (command_output or "").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Exit Code:"):
-            try:
-                return int(stripped.split("Exit Code:", 1)[1].strip())
-            except ValueError:
-                return None
-    return None
+        return _CommandResult(exit_code=None, text=f"Execution failed: {str(exc)}")
 
 
 def _normalize_backend_test_path(file_path: str) -> str:
@@ -1149,7 +1156,28 @@ def _record_frontend_fingerprint(frontend_path: str, fingerprint: str, dist_fing
         return
 
 
-async def _build_frontend_dist(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
+# Digest-phrased verdict for a build that failed before the E2E run could
+# start. The failure bodies embed the same sentence (with the trailing
+# period) as their headline; the note form is what the failure digest echoes.
+_FRONTEND_BUILD_FAILED_NOTE = "frontend build failed before E2E startup"
+
+
+@dataclass
+class _FrontendBuildOutcome:
+    """Structured frontend-build verdict plus its rendered section text.
+
+    ``note`` is the build verdict in the failure-digest phrasing; the handler
+    knows it at build time, so nothing downstream re-parses the rendered
+    output to recover it.
+    """
+
+    ok: bool
+    note: str
+    output: str
+    exit_code: int = 1
+
+
+async def _build_frontend_dist(workspace_path: str, *, force_rebuild: bool = False) -> _FrontendBuildOutcome:
     frontend_path = os.path.join(workspace_path, "frontend")
     dist_index_path = Path(frontend_path) / "dist" / "index.html"
     fingerprint = _frontend_source_fingerprint(frontend_path)
@@ -1168,42 +1196,55 @@ async def _build_frontend_dist(workspace_path: str, *, force_rebuild: bool = Fal
         and dist_fingerprint is not None
         and recorded_build == (fingerprint, dist_fingerprint)
     ):
-        return True, (
-            "Reused the existing `frontend/dist` because the frontend sources are unchanged "
-            f"since the last successful build (fingerprint {fingerprint[:12]}).\n"
+        return _FrontendBuildOutcome(
+            ok=True,
+            note=f"reused existing frontend/dist (fingerprint {fingerprint[:12]})",
+            output=(
+                "Reused the existing `frontend/dist` because the frontend sources are unchanged "
+                f"since the last successful build (fingerprint {fingerprint[:12]}).\n"
+            ),
+            exit_code=0,
         )
 
     # A failed/interrupted build may leave a partial output tree behind. The
     # old record must not make that tree eligible for reuse on the next run.
     _clear_recorded_frontend_fingerprint(frontend_path)
-    frontend_build_output = await _execute_web_test_command(
+    build_result = await _execute_web_test_command(
         "npm run build",
         cwd=frontend_path,
         timeout=120.0,
     )
-    build_ok = _extract_exit_code(frontend_build_output) == 0 and dist_index_path.is_file()
+    build_exit_code = build_result.exit_code if build_result.exit_code is not None else 1
+    build_ok = build_result.exit_code == 0 and dist_index_path.is_file()
+    build_output = build_result.text
     if build_ok:
         rebuilt_dist_fingerprint = _frontend_dist_fingerprint(frontend_path)
         if fingerprint is not None and rebuilt_dist_fingerprint is not None:
             _record_frontend_fingerprint(frontend_path, fingerprint, rebuilt_dist_fingerprint)
+        build_note = "rebuilt frontend/dist from current sources"
         if fingerprint is not None:
             # The reuse path states its verdict in prose; the rebuild path used
             # to leave only raw npm output, so nothing in the run result named
             # what was actually served. Emit the same kind of deterministic
-            # verdict (with the source fingerprint) the failure digest parses.
-            frontend_build_output += (
+            # verdict (with the source fingerprint) the failure digest echoes.
+            build_note += f" (fingerprint {fingerprint[:12]})"
+            build_output += (
                 "\nBuilt `frontend/dist` from the current sources "
                 f"(fingerprint {fingerprint[:12]}).\n"
             )
-        return True, frontend_build_output
+        return _FrontendBuildOutcome(ok=True, note=build_note, output=build_output, exit_code=build_exit_code)
 
     if dist_index_path.exists():
-        return False, frontend_build_output
+        return _FrontendBuildOutcome(
+            ok=False, note=_FRONTEND_BUILD_FAILED_NOTE, output=build_output, exit_code=build_exit_code
+        )
 
-    return (
-        False,
-        frontend_build_output
+    return _FrontendBuildOutcome(
+        ok=False,
+        note=_FRONTEND_BUILD_FAILED_NOTE,
+        output=build_output
         + "\nFrontend build did not produce `frontend/dist/index.html`, so backend hosting cannot start.\n",
+        exit_code=1,
     )
 
 
@@ -1213,9 +1254,13 @@ async def _build_frontend_dist(workspace_path: str, *, force_rebuild: bool = Fal
 # Re-checking at result-assembly time reports what the backend can serve NOW,
 # and the digest-side regex parses this exact line shape.
 _SERVED_VERDICT_PREFIX = "Served index.html: "
-# Truncation shared by the verdict line and the digest-side regex that parses
-# it (agents/tools/test_failure_digest.py imports this constant): the two ends
-# must never drift, or the digest stops recognizing the handler's own line.
+# Marker carried by a backend-runtime cleanup that itself failed (the teardown
+# exception note). A run whose cleanup failed is a failure for the agent even
+# when the tests passed, so the exit verdict flips when this marker is present.
+_CLEANUP_FAILURE_MARKER = "Backend runtime cleanup failed:"
+# Truncation shared by the verdict line and its digest-phrased twin
+# (``_frontend_serving_note``): the two renderings cross-reference the same
+# fingerprint, so they must never drift.
 SERVED_VERDICT_FINGERPRINT_CHARS = 12
 
 
@@ -1247,6 +1292,26 @@ def _frontend_serving_verdict(workspace_path: str) -> str:
     return f"{_SERVED_VERDICT_PREFIX}{dist_index_path} ({state}{detail})"
 
 
+def _frontend_serving_note(workspace_path: str) -> str:
+    """Digest-phrased twin of :func:`_frontend_serving_verdict`.
+
+    States the same on-disk fact in the phrasing the failure digest echoes,
+    computed from the same facts at assembly time — the historical regex
+    round-trip through the rendered line (and its re-extraction guards) is
+    gone because nothing re-parses the transcription anymore.
+    """
+
+    dist_index_path = Path(workspace_path) / "frontend" / "dist" / "index.html"
+    if not dist_index_path.is_file():
+        return f"frontend/dist/index.html absent at result time (checked {dist_index_path})"
+    fingerprint = _frontend_dist_fingerprint(os.path.join(workspace_path, "frontend"))
+    detail = (fingerprint or "")[:SERVED_VERDICT_FINGERPRINT_CHARS] or "unavailable"
+    return (
+        f"frontend/dist/index.html present at result time (fingerprint {detail}) "
+        f"at {dist_index_path}"
+    )
+
+
 # Failure signature of a dead SPA static host (the 2026-09-20 arc-output1 run):
 # the backend's SPA fallback called sendFile, `send` re-stats the file per
 # request, and the stat failed although the build cache vouched for the
@@ -1274,26 +1339,26 @@ def _is_spa_static_host_failure(output: str) -> bool:
     return bool(_SPA_STATIC_HOST_FAILURE.search(output or ""))
 
 
-async def _prepare_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -> tuple[bool, str]:
+async def _prepare_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -> tuple[bool, int | None, str]:
     backend_path = os.path.join(workspace_path, "backend")
-    prepare_output = await _execute_web_test_command(
+    prepare_result = await _execute_web_test_command(
         "npm run db:prepare:e2e",
         cwd=backend_path,
         timeout=60.0,
         extra_env=runtime_env,
     )
-    return _extract_exit_code(prepare_output) == 0, prepare_output
+    return prepare_result.exit_code == 0, prepare_result.exit_code, prepare_result.text
 
 
 async def _seed_e2e_database(workspace_path: str, runtime_env: dict[str, str]) -> tuple[bool, str]:
     backend_path = os.path.join(workspace_path, "backend")
-    seed_output = await _execute_web_test_command(
+    seed_result = await _execute_web_test_command(
         "npm run db:seed",
         cwd=backend_path,
         timeout=60.0,
         extra_env=runtime_env,
     )
-    return _extract_exit_code(seed_output) == 0, seed_output
+    return seed_result.exit_code == 0, seed_result.text
 
 
 # How much of a failed backend's console output is echoed into the test
@@ -2164,11 +2229,11 @@ class WebAppType(AppTypeHandler):
             cwd=frontend_dir,
             timeout=180.0,
         )
-        if _extract_exit_code(result) != 0:
+        if result.exit_code != 0:
             await self._log(
                 "System",
                 "Workspace verification failed: frontend build did not succeed. "
-                "Aborting before the node loop. " + _tail(result),
+                "Aborting before the node loop. " + _tail(result.text),
                 "error",
                 None,
             )
@@ -2237,7 +2302,7 @@ class WebAppType(AppTypeHandler):
             cwd=backend_dir,
             timeout=PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS,
         )
-        if _extract_exit_code(result) == 0:
+        if result.exit_code == 0:
             await self._log("System", "Workspace verification passed: Playwright browsers ready.")
             self._playwright_browsers_ready = True
             return True
@@ -2245,7 +2310,7 @@ class WebAppType(AppTypeHandler):
         await self._log(
             "System",
             "Workspace verification failed: Playwright browsers could not be installed, so every "
-            "E2E test would fail on a missing browser. Aborting before the node loop. " + _tail(result),
+            "E2E test would fail on a missing browser. Aborting before the node loop. " + _tail(result.text),
             "error",
             None,
         )
@@ -2357,25 +2422,31 @@ class WebAppType(AppTypeHandler):
             cwd=os.path.join(self.workspace_path, "backend"),
             timeout=120.0,
         )
-        return f"=== Frontend Build Result ===\n{frontend_result}\n\n=== Backend Build Result ===\n{backend_result}"
+        return (
+            f"=== Frontend Build Result ===\n{frontend_result.text}\n\n"
+            f"=== Backend Build Result ===\n{backend_result.text}"
+        )
 
-    async def run_test_file(self, test_type: str, file_path: str, web_port: int | None = None) -> str:
+    async def run_test_file(self, test_type: str, file_path: str, web_port: int | None = None) -> TestRunResult:
         resolved_port = int(web_port) if web_port is not None else get_web_port()
         await self._log("System", f"System test execution ({test_type}): {file_path}")
         validation_error = self.validate_test_path(test_type, file_path)
         if validation_error:
-            return f"Exit Code: 1\nSTDERR:\n{validation_error}\n"
+            return TestRunResult(exit_code=1, output=f"Exit Code: 1\nSTDERR:\n{validation_error}\n")
         try:
             execution = _build_web_test_execution(test_type, file_path, self.workspace_path, web_port=resolved_port)
         except ValueError as exc:
-            return str(exc)
+            return TestRunResult(exit_code=1, output=str(exc))
 
-        result_body = await _execute_web_test_command(
+        command_result = await _execute_web_test_command(
             execution["command"],
             cwd=execution["working_directory"],
             web_port=resolved_port,
         )
-        return _prepend_test_execution_header(execution, result_body)
+        return parse_test_run(
+            _prepend_test_execution_header(execution, command_result.text),
+            exit_code=command_result.exit_code if command_result.exit_code is not None else -1,
+        )
 
     async def _try_reuse_e2e_backend_session(
         self,
@@ -2461,14 +2532,17 @@ class WebAppType(AppTypeHandler):
         if note:
             await self._log("System", f"Session-scoped E2E backend runtime shut down. {note}")
 
-    async def run_test_group(self, test_type: str, file_paths: list[str], web_port: int | None = None) -> str:
+    async def run_test_group(self, test_type: str, file_paths: list[str], web_port: int | None = None) -> TestRunResult:
         resolved_port = int(web_port) if web_port is not None else get_web_port()
         normalized_type = (test_type or "").strip().lower()
         if not file_paths:
-            return (
-                "Exit Code: 1\n"
-                "STDERR:\n"
-                f"No test files were configured for the current {test_type} batch.\n"
+            return TestRunResult(
+                exit_code=1,
+                output=(
+                    "Exit Code: 1\n"
+                    "STDERR:\n"
+                    f"No test files were configured for the current {test_type} batch.\n"
+                ),
             )
 
         for file_path in file_paths:
@@ -2479,12 +2553,12 @@ class WebAppType(AppTypeHandler):
         if invalid_errors:
             error_lines = ["Exit Code: 1", "STDERR:"]
             error_lines.extend(invalid_errors)
-            return "\n".join(error_lines) + "\n"
+            return TestRunResult(exit_code=1, output="\n".join(error_lines) + "\n")
 
         try:
             execution = _build_web_group_execution(test_type, file_paths, self.workspace_path, web_port=resolved_port)
         except ValueError as exc:
-            return str(exc)
+            return TestRunResult(exit_code=1, output=str(exc))
 
         if normalized_type in {"unit", "integration"}:
             sections: list[str] = []
@@ -2497,11 +2571,8 @@ class WebAppType(AppTypeHandler):
                     cwd=execution["backend_working_directory"],
                     web_port=resolved_port,
                 )
-                sections.append(f"=== Backend Vitest Batch ===\n{backend_result}")
-                backend_exit_code = _extract_exit_code(backend_result)
-                if backend_exit_code is None:
-                    backend_exit_code = 1
-                exit_codes.append(backend_exit_code)
+                sections.append(f"=== Backend Vitest Batch ===\n{backend_result.text}")
+                exit_codes.append(backend_result.exit_code if backend_result.exit_code is not None else 1)
 
             if execution.get("frontend_targets"):
                 frontend_command = "npx vitest run " + " ".join(execution["frontend_targets"])
@@ -2510,26 +2581,29 @@ class WebAppType(AppTypeHandler):
                     cwd=execution["frontend_working_directory"],
                     web_port=resolved_port,
                 )
-                sections.append(f"=== Frontend Vitest Batch ===\n{frontend_result}")
-                frontend_exit_code = _extract_exit_code(frontend_result)
-                if frontend_exit_code is None:
-                    frontend_exit_code = 1
-                exit_codes.append(frontend_exit_code)
+                sections.append(f"=== Frontend Vitest Batch ===\n{frontend_result.text}")
+                exit_codes.append(frontend_result.exit_code if frontend_result.exit_code is not None else 1)
 
             if not sections:
-                return _prepend_group_execution_header(
-                    execution,
-                    "Exit Code: 1\nSTDERR:\nNo resolvable Vitest targets were found for this batch.\n",
+                return parse_test_run(
+                    _prepend_group_execution_header(
+                        execution,
+                        "Exit Code: 1\nSTDERR:\nNo resolvable Vitest targets were found for this batch.\n",
+                    ),
+                    exit_code=1,
                 )
 
             batch_exit_code = 0 if exit_codes and all(code == 0 for code in exit_codes) else 1
             body = f"Exit Code: {batch_exit_code}\n\n" + "\n\n".join(sections)
-            return _prepend_group_execution_header(execution, body)
+            return parse_test_run(
+                _prepend_group_execution_header(execution, body),
+                exit_code=batch_exit_code,
+            )
 
         stage_timer = _StageTimer()
 
         try:
-            body, backend_cleanup_note = await self._run_e2e_group_attempt(
+            result, backend_cleanup_note = await self._run_e2e_group_attempt(
                 execution,
                 stage_timer,
                 resolved_port,
@@ -2537,9 +2611,12 @@ class WebAppType(AppTypeHandler):
                 prior_cleanup_note="",
             )
         except Exception as exc:
-            return (
-                f"Failed to start grouped E2E execution: {str(exc)}"
-                + stage_timer.render()
+            return TestRunResult(
+                exit_code=1,
+                output=(
+                    f"Failed to start grouped E2E execution: {str(exc)}"
+                    + stage_timer.render()
+                ),
             )
 
         # Self-heal the dead static host once (the 2026-09-20 arc-output1 run
@@ -2548,10 +2625,11 @@ class WebAppType(AppTypeHandler):
         # the live runtime this once — force a rebuild, restart the backend,
         # rerun the batch. The retried body leads; the failed attempt survives
         # as a superseded appendix for the failure evidence.
+        retried_cleanup_note = backend_cleanup_note
         if (
-            _extract_exit_code(body) != 0
+            result.exit_code != 0
             and not self._spa_static_host_recovery_used
-            and _is_spa_static_host_failure(body)
+            and _is_spa_static_host_failure(result.output)
         ):
             self._spa_static_host_recovery_used = True
             await self._log(
@@ -2561,7 +2639,7 @@ class WebAppType(AppTypeHandler):
             )
             recovery_note = await self._terminate_e2e_session("SPA static-host recovery cleanup")
             try:
-                retried_body, _ = await self._run_e2e_group_attempt(
+                retried_result, retried_cleanup_note = await self._run_e2e_group_attempt(
                     execution,
                     stage_timer,
                     resolved_port,
@@ -2569,28 +2647,31 @@ class WebAppType(AppTypeHandler):
                     prior_cleanup_note=recovery_note or backend_cleanup_note,
                 )
             except Exception as exc:
-                retried_body = (
-                    f"Failed to retry grouped E2E execution after SPA static-host recovery: {str(exc)}"
-                    + stage_timer.render()
+                retried_result = TestRunResult(
+                    exit_code=1,
+                    output=(
+                        f"Failed to retry grouped E2E execution after SPA static-host recovery: {str(exc)}"
+                        + stage_timer.render()
+                    ),
                 )
             # Same self-check the non-recovery path applies below, on the
             # retried attempt alone: a retried pass whose cleanup failed is
             # still a failure for the agent.
-            if "Backend runtime cleanup failed:" in retried_body and "Exit Code: 0" in retried_body:
-                retried_body = retried_body.replace("Exit Code: 0", "Exit Code: 1", 1)
+            if _CLEANUP_FAILURE_MARKER in retried_cleanup_note and retried_result.exit_code == 0:
+                retried_result.exit_code = 1
+                retried_result.output = retried_result.output.replace("Exit Code: 0", "Exit Code: 1", 1)
             # The retried attempt leads so exit-code parsing and the agent both
             # read the retried verdict first; the failed attempt survives as an
             # appendix for the failure evidence (the NotFoundError stack).
-            first_attempt_exit = _extract_exit_code(body)
-            appendix = body
-            if first_attempt_exit is not None:
-                appendix = appendix.replace(
-                    f"Exit Code: {first_attempt_exit}",
-                    f"Exit Code (superseded by the recovery retry): {first_attempt_exit}",
-                    1,
-                )
-            body = (
-                f"{retried_body.rstrip()}\n\n"
+            first_attempt_exit = result.exit_code
+            appendix = result.output
+            appendix = appendix.replace(
+                f"Exit Code: {first_attempt_exit}",
+                f"Exit Code (superseded by the recovery retry): {first_attempt_exit}",
+                1,
+            )
+            retried_result.output = (
+                f"{retried_result.output.rstrip()}\n\n"
                 f"=== SPA Static-Host Recovery Retry ===\n"
                 "The first attempt of this batch failed with the dead static-host signature "
                 "(the backend could not stat `frontend/dist/index.html` at request time "
@@ -2600,10 +2681,16 @@ class WebAppType(AppTypeHandler):
                 "First attempt (superseded, kept for the failure evidence):\n\n"
                 f"{appendix}"
             )
+            result = retried_result
 
-        if "Backend runtime cleanup failed:" in body and "Exit Code: 0" in body:
-            body = body.replace("Exit Code: 0", "Exit Code: 1", 1)
-        return _prepend_group_execution_header(execution, body)
+        if (
+            _CLEANUP_FAILURE_MARKER in (backend_cleanup_note + "\n" + retried_cleanup_note)
+            and result.exit_code == 0
+        ):
+            result.exit_code = 1
+            result.output = result.output.replace("Exit Code: 0", "Exit Code: 1", 1)
+        result.output = _prepend_group_execution_header(execution, result.output)
+        return result
 
     async def _run_e2e_group_attempt(
         self,
@@ -2613,35 +2700,43 @@ class WebAppType(AppTypeHandler):
         *,
         force_rebuild: bool,
         prior_cleanup_note: str,
-    ) -> tuple[str, str]:
-        """Run one grouped E2E attempt end to end and return its result body.
+    ) -> tuple[TestRunResult, str]:
+        """Run one grouped E2E attempt end to end and return its result.
 
         ``run_test_group`` calls this once, and a second time with
         ``force_rebuild=True`` when the first attempt died on the SPA
         static-host signature (see the recovery block there). The runtime env
         is rebuilt per attempt so each carries its own database label.
 
-        Returns ``(body, backend_cleanup_note)``; the note lets the recovery
+        Returns ``(result, backend_cleanup_note)``; the note lets the recovery
         re-run carry the teardown evidence of the attempt before it.
         """
 
-        build_ok, frontend_build_output = await stage_timer.measure(
+        build = await stage_timer.measure(
             "frontend_build",
             _build_frontend_dist(self.workspace_path, force_rebuild=force_rebuild),
         )
         # Failure bodies check the verdict here (post-build, pre-Playwright);
         # the success body re-checks after Playwright — see the comment there.
         served_verdict = _frontend_serving_verdict(self.workspace_path)
-        if not build_ok:
+        if not build.ok:
             failure_body = (
                 "Exit Code: 1\n\n"
                 "Frontend build failed before E2E startup.\n\n"
-                f"=== Frontend Build ===\n{frontend_build_output}\n\n{served_verdict}"
+                f"=== Frontend Build ===\n{build.output}\n\n{served_verdict}"
                 + stage_timer.render()
             )
             if prior_cleanup_note:
                 failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{prior_cleanup_note}"
-            return failure_body, prior_cleanup_note
+            return (
+                parse_test_run(
+                    failure_body,
+                    exit_code=1,
+                    build_note=build.note,
+                    served_verdict=_frontend_serving_note(self.workspace_path),
+                ),
+                prior_cleanup_note,
+            )
 
         e2e_runtime_env = _build_e2e_runtime_env(
             self.workspace_path,
@@ -2697,7 +2792,7 @@ class WebAppType(AppTypeHandler):
                 backend_cleanup_note = (
                     f"{backend_cleanup_note}\n{stale_note}" if backend_cleanup_note else stale_note
                 )
-            database_ready, database_prepare_output = await stage_timer.measure(
+            database_ready, _prepare_exit, database_prepare_output = await stage_timer.measure(
                 "database_prepare",
                 _prepare_e2e_database(self.workspace_path, e2e_runtime_env),
             )
@@ -2705,14 +2800,22 @@ class WebAppType(AppTypeHandler):
                 failure_body = (
                     "Exit Code: 1\n\n"
                     "E2E database preparation failed before backend startup.\n\n"
-                    f"=== Frontend Build ===\n{frontend_build_output}\n\n{served_verdict}\n\n"
+                    f"=== Frontend Build ===\n{build.output}\n\n{served_verdict}\n\n"
                     f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
                     f"=== Database Prepare ===\n{database_prepare_output}"
                     + stage_timer.render()
                 )
                 if backend_cleanup_note:
                     failure_body += f"\n\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
-                return failure_body, backend_cleanup_note
+                return (
+                    parse_test_run(
+                        failure_body,
+                        exit_code=1,
+                        build_note=build.note,
+                        served_verdict=_frontend_serving_note(self.workspace_path),
+                    ),
+                    backend_cleanup_note,
+                )
 
             (
                 backend_process,
@@ -2728,7 +2831,7 @@ class WebAppType(AppTypeHandler):
             if backend_process is None:
                 failure_body = (
                     "Exit Code: 1\n\n"
-                    f"=== Frontend Build ===\n{frontend_build_output}\n\n{served_verdict}\n\n"
+                    f"=== Frontend Build ===\n{build.output}\n\n{served_verdict}\n\n"
                     f"=== Database Prepare ===\n{database_prepare_output}\n\n"
                     f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n\n"
                     f"=== Backend Runtime Command ===\n{backend_start_command or 'Unavailable'}\n\n"
@@ -2737,7 +2840,15 @@ class WebAppType(AppTypeHandler):
                 )
                 if backend_cleanup_note:
                     failure_body += f"\n=== Previous Backend Runtime Cleanup ===\n{backend_cleanup_note}"
-                return failure_body, backend_cleanup_note
+                return (
+                    parse_test_run(
+                        failure_body,
+                        exit_code=1,
+                        build_note=build.note,
+                        served_verdict=_frontend_serving_note(self.workspace_path),
+                    ),
+                    backend_cleanup_note,
+                )
             self._e2e_runtime_session = _E2EBackendSession(
                 process=backend_process,
                 port=resolved_port,
@@ -2761,9 +2872,7 @@ class WebAppType(AppTypeHandler):
                 web_port=resolved_port,
             ),
         )
-        playwright_exit_code = _extract_exit_code(playwright_result)
-        if playwright_exit_code is None:
-            playwright_exit_code = 1
+        playwright_exit_code = playwright_result.exit_code if playwright_result.exit_code is not None else 1
         if reused_runtime:
             backend_runtime_section = (
                 "Reused the live backend runtime from an earlier E2E attempt in this TDD session "
@@ -2790,18 +2899,26 @@ class WebAppType(AppTypeHandler):
             # Checked here — after Playwright ran — not right after the build:
             # the verdict's job is to expose the artifact-vanished-after-build
             # race, which a pre-Playwright snapshot cannot see.
-            f"=== Frontend Build ===\n{frontend_build_output}\n\n"
+            f"=== Frontend Build ===\n{build.output}\n\n"
             f"{_frontend_serving_verdict(self.workspace_path)}\n\n"
             f"=== E2E Runtime Env ===\nDB Path: {e2e_runtime_env.get('ARC_E2E_DB_PATH', 'unknown')}\n"
             f"DB Label: {e2e_runtime_env.get('ARC_E2E_DB_LABEL', 'unknown')}\n\n"
             f"=== Database Prepare ===\n{database_prepare_output}\n\n"
             f"=== Backend Runtime ===\n{backend_runtime_section}\n\n"
             f"=== Backend Instance Fingerprint ===\n{backend_instance_fingerprint or 'No backend instance fingerprint recorded.'}\n\n"
-            f"{playwright_result}\n\n"
+            f"{playwright_result.text}\n\n"
             f"=== Backend Runtime Cleanup ===\n{cleanup_section}"
             + stage_timer.render()
         )
-        return body, backend_cleanup_note
+        return (
+            parse_test_run(
+                body,
+                exit_code=playwright_exit_code,
+                build_note=build.note,
+                served_verdict=_frontend_serving_note(self.workspace_path),
+            ),
+            backend_cleanup_note,
+        )
 
     @classmethod
     def build_stack_block(
