@@ -29,13 +29,16 @@ class _BuildRecorder:
         cwd: str,
         timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
-    ) -> str:
+    ) -> web_handler._CommandResult:
         self.calls.append(command)
         if self.produce_dist:
             dist_dir = Path(cwd) / "dist"
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-        return f"Exit Code: {self.exit_code}\nSTDOUT:\nfake build\n"
+        return web_handler._CommandResult(
+            exit_code=self.exit_code,
+            text=f"Exit Code: {self.exit_code}\nSTDOUT:\nfake build\n",
+        )
 
 
 def _make_workspace(tmp_path: Path) -> Path:
@@ -69,7 +72,7 @@ def _try_symlink_to(link: Path, target: Path) -> None:
         pytest.skip("this host silently drops directory symlinks")
 
 
-def _build(workspace_root: Path) -> tuple[bool, str]:
+def _build(workspace_root: Path) -> web_handler._FrontendBuildOutcome:
     return asyncio.run(web_handler._build_frontend_dist(str(workspace_root)))
 
 
@@ -78,13 +81,13 @@ def test_reuses_dist_when_sources_are_unchanged(tmp_path, monkeypatch) -> None:
     recorder = _BuildRecorder()
     monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
-    first_ok, first_output = _build(workspace)
-    second_ok, second_output = _build(workspace)
+    first = _build(workspace)
+    second = _build(workspace)
 
-    assert first_ok and second_ok
+    assert first.ok and second.ok
     assert recorder.calls == ["npm run build"]
-    assert "fake build" in first_output
-    assert "Reused the existing" in second_output
+    assert "fake build" in first.output
+    assert "Reused the existing" in second.output
 
 
 def test_rebuilds_when_a_source_file_changes(tmp_path, monkeypatch) -> None:
@@ -112,19 +115,19 @@ def test_rebuild_output_states_the_verdict_with_source_fingerprint(tmp_path, mon
     monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
     fingerprint_v1 = web_handler._frontend_source_fingerprint(str(workspace / "frontend"))
-    first_ok, first_output = _build(workspace)
+    first = _build(workspace)
     (workspace / "frontend" / "src" / "main.js").write_text("console.log('v2')\n", encoding="utf-8")
     fingerprint_v2 = web_handler._frontend_source_fingerprint(str(workspace / "frontend"))
-    second_ok, second_output = _build(workspace)
+    second = _build(workspace)
 
-    assert first_ok and second_ok
+    assert first.ok and second.ok
     assert (
         f"Built `frontend/dist` from the current sources (fingerprint {fingerprint_v1[:12]})"
-        in first_output
+        in first.output
     )
     assert (
         f"Built `frontend/dist` from the current sources (fingerprint {fingerprint_v2[:12]})"
-        in second_output
+        in second.output
     )
 
 
@@ -138,11 +141,11 @@ def test_rebuilds_when_a_dist_artifact_changes(tmp_path, monkeypatch) -> None:
         "<html>partial rebuild</html>\n",
         encoding="utf-8",
     )
-    ok, output = _build(workspace)
+    outcome = _build(workspace)
 
-    assert ok is True
+    assert outcome.ok is True
     assert recorder.calls == ["npm run build", "npm run build"]
-    assert "Reused the existing" not in output
+    assert "Reused the existing" not in outcome.output
 
 
 def test_rebuilds_when_the_built_dist_disappears(tmp_path, monkeypatch) -> None:
@@ -166,8 +169,8 @@ def test_a_failed_build_records_no_fingerprint(tmp_path, monkeypatch) -> None:
     recorder = _BuildRecorder(exit_code=1, produce_dist=False)
     monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
-    ok, _ = _build(workspace)
-    assert ok is False
+    ok = _build(workspace)
+    assert ok.ok is False
     assert web_handler._read_recorded_frontend_fingerprint(str(workspace / "frontend")) is None
 
     _build(workspace)
@@ -184,9 +187,9 @@ def test_a_failed_rebuild_clears_the_previous_fingerprint(tmp_path, monkeypatch)
     recorder.exit_code = 1
     recorder.produce_dist = False
 
-    ok, _ = _build(workspace)
+    outcome = _build(workspace)
 
-    assert ok is False
+    assert outcome.ok is False
     assert web_handler._read_recorded_frontend_fingerprint(str(workspace / "frontend")) is None
 
 
@@ -199,9 +202,9 @@ def test_a_stale_dist_without_a_recorded_fingerprint_is_not_reused(tmp_path, mon
     recorder = _BuildRecorder()
     monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
-    ok, _ = _build(workspace)
+    outcome = _build(workspace)
 
-    assert ok is True
+    assert outcome.ok is True
     assert recorder.calls == ["npm run build"]
 
 
@@ -220,11 +223,11 @@ def test_a_legacy_source_only_fingerprint_is_not_reused(tmp_path, monkeypatch) -
     recorder = _BuildRecorder()
     monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
-    ok, output = _build(workspace)
+    outcome = _build(workspace)
 
-    assert ok is True
+    assert outcome.ok is True
     assert recorder.calls == ["npm run build"]
-    assert "Reused the existing" not in output
+    assert "Reused the existing" not in outcome.output
 
 
 def test_fingerprint_ignores_build_output_and_dependencies(tmp_path) -> None:
@@ -283,13 +286,13 @@ def test_build_rebuilds_when_linked_source_changes(tmp_path, monkeypatch) -> Non
     recorder = _BuildRecorder()
     monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
-    first_ok, _ = _build(tmp_path)
-    assert first_ok
+    first = _build(tmp_path)
+    assert first.ok
     assert recorder.calls == ["npm run build"]
 
     (shared_src / "main.js").write_text("console.log('v2')\n", encoding="utf-8")
-    second_ok, second_output = _build(tmp_path)
+    second = _build(tmp_path)
 
-    assert second_ok
+    assert second.ok
     assert recorder.calls == ["npm run build", "npm run build"]
-    assert "Reused the existing" not in second_output
+    assert "Reused the existing" not in second.output

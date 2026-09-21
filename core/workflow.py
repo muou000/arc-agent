@@ -21,6 +21,7 @@ from core.commits import build_commit_message
 from core.config import load_project_env, set_app_type, set_web_port, set_workspace_root
 from core.files import load_requirements, read_json_file, validate_requirement_tree, write_json_file
 from core.logging import append_debug_log, write_terminal_log
+from core.contract_drift import ContractDrift, detect_contract_drift
 from core.merge_arbitration import (
     ArbitrationInput,
     MergeArbiter,
@@ -132,6 +133,28 @@ def _affinity_depth() -> int:
     except ValueError:
         return 1
     return max(depth, 1)
+
+
+DESIGN_GATE_PIPELINE_ENV = "ARC_DESIGN_GATE_PIPELINE"
+
+
+def _design_pipelining_enabled() -> bool:
+    """Whether a dependent's DESIGN waits only for its dependencies' DESIGNs.
+
+    Default off: the dependent's DESIGN waits for every declared dependency's
+    IMPLEMENT (the run8 serial semantics PR #38 installed, which eliminates
+    run7's parallel duplicate implementations). With the gate open the wait
+    relaxes to the dependency's DESIGN completing and merging - its
+    registered interface cards, which carry the ``implemented`` flag, are
+    then readable and the dependent designs against them incrementally. The
+    semantic conflicts this re-exposes are owned by the merge rails
+    (additive resolution + health gate + arbitration, #81) and by the
+    contract drift check this ticket adds; the dependent's IMPLEMENT still
+    waits for the dependency's IMPLEMENT (its scenarios read runtime state
+    only the landed implementation creates).
+    """
+
+    return os.environ.get(DESIGN_GATE_PIPELINE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -1053,7 +1076,226 @@ class ARCWorkflowManager:
         if not committed:
             await self._log("Compiler", "No file changes detected for this checkpoint.", node_id=node_id)
         await self._log("Compiler", f"Integrated {node_id}: {detail}.", node_id=node_id)
+        if phase == PHASE_IMPLEMENT:
+            await self._check_contract_drift(node_id)
         return True, detail, []
+
+    async def _check_contract_drift(self, node_id: str) -> None:
+        """Validate the node's registered contracts against the merged tree.
+
+        Under DESIGN gate pipelining a dependent designs against this node's
+        registered interface cards while this node is still implementing, so
+        the card's anchor (``file_path`` + ``first_line``) is the contract the
+        dependent relies on. When this IMPLEMENT merges, the landed tree must
+        still honor every anchor; an implementation that moved or reshaped a
+        registered surface is drift.
+
+        The check is a guard, not a gate: with ``ARC_MERGE_ARBITRATION`` on
+        and the node's arbitration budget unspent, the drift escalates through
+        the health-gate arbitration path (the #81 contract: the arbiter may
+        restore the drifted anchors inside the drift file set, one attempt,
+        re-verified); otherwise - gate off, budget spent, or arbitration
+        declined - the drift is recorded as a ``contract_drift`` runner event
+        and a warning without blocking the merge, and downstream TDD red
+        lights remain the final backstop (issue #83's contract: 仲裁未合入或
+        关闭时记告警不阻塞).
+
+        A store that cannot be read here (an older queue being resumed, a
+        store without the interfaces surface) means no registered contracts
+        to check: skip rather than fail the merge - same best-effort contract
+        as the audit emit below.
+        """
+
+        try:
+            registered = self.runtime.traceability.list_interfaces(req_id=node_id)
+        except Exception as exc:  # noqa: BLE001 - the guard must never break the merge
+            await self._log(
+                "Compiler",
+                (
+                    f"Contract drift check for {node_id} skipped: the traceability "
+                    f"store could not be read ({type(exc).__name__}: {exc})."
+                ),
+                "warning",
+                node_id,
+            )
+            return
+        if not registered:
+            return
+        drift = detect_contract_drift(registered, workspace_root=self.workspace_path)
+        if not drift:
+            return
+
+        drift_paths = sorted({item.file_path for item in drift})
+        await self._emit_contract_drift_event(
+            {
+                "type": "contract_drift",
+                "node_id": node_id,
+                "drift": [item.to_payload() for item in drift],
+                "arbitration": arbitration_enabled(),
+            }
+        )
+        await self._log(
+            "Compiler",
+            (
+                f"Contract drift after merging IMPLEMENT of {node_id}: "
+                + "; ".join(item.describe() for item in drift)
+                + "."
+            ),
+            "warning",
+            node_id,
+        )
+
+        if not arbitration_enabled():
+            return
+        if sessions.load_node_session(node_id).get(merge_arbitration_budget_key()):
+            await self._log(
+                "Compiler",
+                f"Contract drift arbitration for {node_id} skipped: the node's single arbitration budget is already spent.",
+                "warning",
+                node_id,
+            )
+            return
+
+        repair = await self._arbitrate_contract_drift(node_id, drift, drift_paths)
+        if repair:
+            await self._log(
+                "Compiler",
+                f"Contract drift arbitration for {node_id} restored the registered anchors: {', '.join(drift_paths)}.",
+                node_id,
+            )
+            await self._emit_contract_drift_event(
+                {
+                    "type": "contract_drift",
+                    "node_id": node_id,
+                    "drift": [item.to_payload() for item in drift],
+                    "arbitration": True,
+                    "outcome": "repaired",
+                }
+            )
+        else:
+            await self._log(
+                "Compiler",
+                (
+                    f"Contract drift arbitration for {node_id} did not restore the anchors; "
+                    "the merge stands and downstream TDD red lights are the backstop."
+                ),
+                "warning",
+                node_id,
+            )
+
+    async def _arbitrate_contract_drift(
+        self,
+        node_id: str,
+        drift: list[ContractDrift],
+        drift_paths: list[str],
+    ) -> bool:
+        """One arbitration attempt to restore the drifted anchors.
+
+        Reuses the #81 machinery (pruned input, narrow edit rights inside the
+        drift file set, budget marked spent before the model call, audit
+        events) with the drift trigger framed like a health-gate failure: the
+        arbiter sees the currently landed content (what drifted) plus the
+        registered contracts it must honor, and rewrites only the drift
+        files. The result is re-verified by the same anchor check; a failed
+        attempt leaves the merge as it stands. Unlike the mid-merge hooks
+        this runs after the merge commit, so a successful repair is committed
+        as its own follow-up on the integration branch.
+        """
+
+        # Mark the budget spent *before* the model call: a crashed arbitration
+        # must not buy a second attempt (same contract as the merge hooks).
+        sessions.merge_node_session(node_id, {merge_arbitration_budget_key(): True})
+        files: dict[str, dict[str, str | None]] = {}
+        for path in drift_paths:
+            files[path] = {
+                "resolved": read_workspace_file(self.workspace_path, path),
+                "base": None,
+                "ours": None,
+                "theirs": None,
+            }
+        registered = {
+            str(item.get("interface_id") or "").strip(): item
+            for item in self.runtime.traceability.list_interfaces(req_id=node_id)
+        }
+        contract_cards = {
+            node_id: {
+                "interfaces": [
+                    registered.get(item.interface_id, {"interface_id": item.interface_id})
+                    for item in drift
+                ],
+                "registered_anchors": [item.to_payload() for item in drift],
+            }
+        }
+        arbitration_input = ArbitrationInput(
+            trigger=TRIGGER_HEALTH_GATE,
+            ours_label=self._integration_side_label(node_id),
+            theirs_label=node_id,
+            files=files,
+            contract_cards=contract_cards,
+            gate_failure=(
+                "post-merge contract drift: the implementation no longer honors the "
+                "anchors its DESIGN registered; dependents designed against these "
+                "registered contracts, so each anchor (file_path + first_line) must "
+                "be addressable again in the drifted files"
+            ),
+        )
+        arbiter = MergeArbiter(
+            model=self._build_arbitration_model(),
+            workspace_path=self.workspace_path,
+            emit_event=self._emit_merge_arbitration_event,
+        )
+        result = await arbiter.arbitrate(
+            "",
+            self._integration_side_label(node_id),
+            arbitration_input,
+            node_id=node_id,
+            phase=PHASE_IMPLEMENT,
+        )
+        if not result.accepted:
+            return False
+        for path in result.applied:
+            self._worktree_manager._git(
+                ["add", "--", path], cwd=self.workspace_path, check=False
+            )
+        remaining = detect_contract_drift(
+            self.runtime.traceability.list_interfaces(req_id=node_id),
+            workspace_root=self.workspace_path,
+        )
+        if remaining:
+            return False
+        # An accepted arbitration whose rewrite is byte-identical to what is
+        # already on disk (the anchors were somehow already honored) leaves
+        # nothing to commit: that is a successful repair, not a failure, so a
+        # "nothing to commit" outcome counts as repaired.
+        commit = self._worktree_manager._git(
+            [
+                "commit",
+                "-m",
+                f"contract drift arbitration: restore registered anchors of {node_id}",
+            ],
+            cwd=self.workspace_path,
+            check=False,
+        )
+        if commit.returncode == 0:
+            return True
+        return "nothing to commit" in (commit.stdout + commit.stderr).lower()
+
+    async def _emit_contract_drift_event(self, payload: dict[str, Any]) -> None:
+        """Persist one contract-drift audit record (best effort)."""
+
+        try:
+            from arcbench_agent_runtime.events import utc_timestamp
+
+            payload = {"timestamp": utc_timestamp(), **payload}
+            from arcbench_agent_runtime.jsonio import append_jsonl
+
+            append_jsonl(self.runtime.paths.runner_events_path, payload)
+        except Exception as exc:  # noqa: BLE001 - audit must never break the merge
+            append_debug_log(
+                "ContractDrift",
+                f"contract drift audit emit failed: {type(exc).__name__}: {exc}",
+                workspace_root=self.workspace_path,
+            )
 
     def _build_merge_arbitration_hooks(
         self,
@@ -2094,23 +2336,27 @@ class ARCWorkflowManager:
         the parent's merged shell, so a parent's rewrite of shared surfaces can
         never conflict with a child's additive edits in flight; a failed parent
         does not block its children, matching the failed-descendant rule
-        below) and for the IMPLEMENT of every node the requirement declares as
-        a ``dependency``: an IMPLEMENT task completes only after its work is
-        merged, so the dependent designs against the dependency's real
-        surfaces (routes, session helpers) and reuses them instead of
-        designing a duplicate - run7's parallel run had the login node write
-        its own auth routes precisely because its design ran before the
-        registration node's routes existed. A node's IMPLEMENT waits for its
-        own DESIGN, for every descendant node's IMPLEMENT (children before
-        their parent; a failed descendant keeps the parent IMPLEMENT from
-        claiming completion over an incomplete subtree),
-        and for the IMPLEMENT of every declared dependency: the node's
-        scenarios routinely read runtime state (accounts, routes, orders) that
-        only those nodes create, so implementing earlier turns a missing
-        prerequisite into a false test failure. A failed dependency blocks both
-        phases and is propagated as ``BLOCKED_BY_DEPENDENCY``; only a completed
-        dependency exposes a verified reusable surface. Independent subtrees
-        still drain in parallel. Sibling subtrees otherwise impose no order on each other,
+        below) and for the declared dependencies: by default the dependency's
+        IMPLEMENT (an IMPLEMENT task completes only after its work is merged,
+        so the dependent designs against the dependency's real surfaces
+        (routes, session helpers) and reuses them instead of designing a
+        duplicate - run7's parallel run had the login node write its own auth
+        routes precisely because its design ran before the registration node's
+        routes existed); with ``ARC_DESIGN_GATE_PIPELINE`` on, only the
+        dependency's DESIGN (merged, so its registered interface cards are
+        readable and the dependent designs incrementally against them; the
+        drift this exposes is owned by the merge rails plus the contract
+        drift check). A node's IMPLEMENT waits for its own DESIGN, for every
+        descendant node's IMPLEMENT (children before their parent; a failed
+        descendant keeps the parent IMPLEMENT from claiming completion over an
+        incomplete subtree), and for the IMPLEMENT of every declared
+        dependency: the node's scenarios routinely read runtime state
+        (accounts, routes, orders) that only those nodes create, so
+        implementing earlier turns a missing prerequisite into a false test
+        failure. A failed dependency blocks both phases and is propagated as
+        ``BLOCKED_BY_DEPENDENCY``; only a completed dependency exposes a
+        verified reusable surface. Independent subtrees still drain in
+        parallel. Sibling subtrees otherwise impose no order on each other,
         which is what makes parallel draining sound.
         """
 
@@ -2130,7 +2376,9 @@ class ARCWorkflowManager:
                 # instead of designing against an unknown baseline.
                 if parent_design_status not in {TASK_COMPLETED, TASK_FAILED}:
                     return False
-            return ARCWorkflowManager._declared_dependencies_satisfied(queue_state, node_id)
+            return ARCWorkflowManager._declared_dependencies_satisfied(
+                queue_state, node_id, phase=PHASE_DESIGN
+            )
         if phase == PHASE_IMPLEMENT:
             for other in queue_state["tasks"]:
                 if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
@@ -2151,25 +2399,51 @@ class ARCWorkflowManager:
         return True
 
     @staticmethod
-    def _declared_dependencies_satisfied(queue_state: dict[str, Any], node_id: str) -> bool:
-        """True when every declared dependency's IMPLEMENT task has passed.
+    def _declared_dependencies_satisfied(
+        queue_state: dict[str, Any],
+        node_id: str,
+        *,
+        phase: str = PHASE_IMPLEMENT,
+    ) -> bool:
+        """True when every declared dependency has passed the required phase.
 
-        An IMPLEMENT completes only after its work is merged, so satisfied
-        dependencies mean the dependency's surfaces are already on the
-        integration HEAD the task starts from. A failed dependency is not
-        satisfied; the scheduler propagates an explicit blocked state to the
-        dependent instead of designing or implementing against an unverified
-        surface. A dependency with no IMPLEMENT task
-        means the queue is inconsistent with the tree it was built from
-        (restored maps are validated against this): block, matching the
-        unknown-parent rule.
+        Default (gate closed, and for IMPLEMENT tasks in every mode): the
+        dependency's IMPLEMENT must have passed. An IMPLEMENT completes only
+        after its work is merged, so satisfied dependencies mean the
+        dependency's surfaces are already on the integration HEAD the task
+        starts from. A failed dependency is not satisfied; the scheduler
+        propagates an explicit blocked state to the dependent instead of
+        designing or implementing against an unverified surface. A dependency
+        with no IMPLEMENT task means the queue is inconsistent with the tree
+        it was built from (restored maps are validated against this): block,
+        matching the unknown-parent rule.
+
+        Pipeline mode (``ARC_DESIGN_GATE_PIPELINE``, DESIGN tasks only): the
+        dependency's DESIGN must have passed - it merged, so the registered
+        interface cards are readable and the dependent designs against them.
+        The same failed/unknown rules apply (a failed DESIGN never exposed a
+        usable contract baseline; a dependency without a DESIGN task is an
+        inconsistent queue). IMPLEMENT tasks keep the default rule.
         """
 
+        pipelined = phase == PHASE_DESIGN and _design_pipelining_enabled()
         for dependency_id in (queue_state.get("dependencies") or {}).get(node_id, []):
-            dependency_status = ARCWorkflowManager._implement_status(queue_state, dependency_id)
+            if pipelined:
+                dependency_status = ARCWorkflowManager._design_status(queue_state, dependency_id)
+            else:
+                dependency_status = ARCWorkflowManager._implement_status(queue_state, dependency_id)
             if dependency_status != TASK_COMPLETED:
                 return False
         return True
+
+    @staticmethod
+    def _design_status(queue_state: dict[str, Any], node_id: str) -> str | None:
+        """Status of a node's DESIGN task, or None when the queue has none."""
+
+        for other in queue_state["tasks"]:
+            if other["phase"] == PHASE_DESIGN and other["node_id"] == node_id:
+                return str(other.get("status", ""))
+        return None
 
     @staticmethod
     def _implement_status(queue_state: dict[str, Any], node_id: str) -> str | None:

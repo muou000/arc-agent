@@ -54,7 +54,7 @@ def test_scripted_tool_calls_drive_real_agent_loop(tmp_project_dir: Path) -> Non
 
         return text
 
-    agent = build_stage_agent(
+    built = build_stage_agent(
         name="faux_harness",
         stage="implementation",
         model=model,
@@ -67,7 +67,7 @@ def test_scripted_tool_calls_drive_real_agent_loop(tmp_project_dir: Path) -> Non
         tools=[echo],
     )
 
-    payload = _invoke(agent, "run the script", tmp_project_dir)
+    payload = _invoke(built.agent, "run the script", tmp_project_dir)
 
     # The loop consumed the whole script and ended on the final text turn.
     assert model.call_count == 3
@@ -114,7 +114,7 @@ def test_length_truncated_tool_call_is_failed_and_reissued(tmp_project_dir: Path
         ]
     )
 
-    agent = build_stage_agent(
+    built = build_stage_agent(
         name="faux_harness",
         stage="implementation",
         model=model,
@@ -127,7 +127,7 @@ def test_length_truncated_tool_call_is_failed_and_reissued(tmp_project_dir: Path
         tools=[],
     )
 
-    payload = _invoke(agent, "run the script", tmp_project_dir)
+    payload = _invoke(built.agent, "run the script", tmp_project_dir)
 
     assert model.call_count == 3
     assert payload["summary"] == "DONE"

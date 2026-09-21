@@ -11,6 +11,11 @@ adapter over the same module — its baseline runs and red/green/unverified
 classification flow through :func:`classify_file_state` and
 ``TddTestExecutor.run_baseline_file`` instead of a second private copy of
 the same strategy.
+
+Every run crosses the handler seam as a :class:`~app_type_handler.test_results.TestRunResult`
+(the handler fills the structural fields while it still knows the facts);
+the executor only appends the model-facing extras (persisted-log pointer,
+failure digest) and never re-parses the transcription.
 """
 
 from __future__ import annotations
@@ -21,16 +26,10 @@ from typing import Any, Awaitable, Callable
 
 from agents.tools.test_failure_digest import (
     build_failure_digest,
-    extract_build_note,
-    extract_served_verdict,
     format_failure_digest,
     persist_run_output,
 )
-from app_type_handler.test_results import (
-    classify_test_failure,
-    failure_fingerprint,
-    parse_test_results,
-)
+from app_type_handler.test_results import TestRunResult
 from core.path_compat import normalize_workspace_relative_path
 from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 
@@ -42,7 +41,7 @@ TDD_STALL_THRESHOLD = 3
 TDD_BATCH_ORDER = CANONICAL_TEST_TYPES
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
-RunGroup = Callable[[str, list[str]], Awaitable[str]]
+RunGroup = Callable[[str, list[str]], Awaitable[TestRunResult]]
 
 #: Per-file verification state: ``"green"`` (passed), ``"red"`` (verifiably
 #: failing), or ``None`` (no verified state: never run, or the run stopped at
@@ -50,25 +49,25 @@ RunGroup = Callable[[str, list[str]], Awaitable[str]]
 FileState = str | None
 
 
-def _overall_exit_code(output: str) -> int:
-    """Single parse point for the overall exit code of a batch run output."""
+def _rejection(message: str) -> TestRunResult:
+    """A refused run_tests request: exit 1 with the gate copy as the output."""
 
-    return int(parse_test_results(output).get("exit_code", -1))
+    return TestRunResult(exit_code=1, output=message)
 
 
-def classify_file_state(output: str) -> FileState:
-    """Shared red/green/unverified semantics over one batch run output.
+def classify_file_state(result: TestRunResult) -> FileState:
+    """Shared red/green/unverified semantics over one structured run result.
 
-    ``green`` = the run passed (overall Exit Code 0); ``None`` = the run
-    failed for an environmental reason (broken workspace, missing runner -
-    the file is UNVERIFIED, not red); ``red`` = a verified failing run.
-    Both the TDD loop and the DESIGN baseline gate derive file states
-    through this predicate, so "red" means the same thing on both sides.
+    ``green`` = the run passed (exit code 0); ``None`` = the run failed for
+    an environmental reason (broken workspace, missing runner — the file is
+    UNVERIFIED, not red); ``red`` = a verified failing run. Both the TDD loop
+    and the DESIGN baseline gate derive file states through this predicate,
+    so "red" means the same thing on both sides.
     """
 
-    if _overall_exit_code(output) == 0:
+    if result.exit_code == 0:
         return "green"
-    return None if classify_test_failure(output) else "red"
+    return None if result.environment_failure else "red"
 
 
 def collect_test_files(tests: list[dict[str, Any]]) -> list[str]:
@@ -84,11 +83,13 @@ def collect_test_files(tests: list[dict[str, Any]]) -> list[str]:
 
 @dataclass
 class BaselineRun:
-    """One system-run batch: raw output plus the shared state classification."""
+    """One system-run batch: transcription plus the shared classification."""
 
     output: str
     exit_code: int
     state: FileState
+    #: Environmental verdict ("" when the failure is the implementation's own).
+    environment_failure: str = ""
 
 
 def _installable_environment_failure(reason: str | None) -> str:
@@ -155,7 +156,7 @@ class TddTestExecutor:
         self._layer_passed: dict[str, bool] = {}
         self._fingerprints: dict[str, list[str]] = {}
         self._install_attempts: dict[str, int] = {}
-        self._outputs: dict[str, str] = {}
+        self._results: dict[str, TestRunResult] = {}
         self._active_layer: str | None = None
         self._env_failure: str | None = None
 
@@ -178,7 +179,7 @@ class TddTestExecutor:
         self._layer_passed = {t: False for t in self._ordered}
         self._fingerprints = {t: [] for t in self._ordered}
         self._install_attempts = {t: 0 for t in self._ordered}
-        self._outputs = {}
+        self._results = {}
         self._active_layer = None
         self._env_failure = None
         return list(self._ordered)
@@ -235,14 +236,16 @@ class TddTestExecutor:
     def file_states(self, test_type: str) -> dict[str, FileState]:
         return dict(self._file_states.get(test_type, {}))
 
-    def layer_output(self, test_type: str) -> str:
-        return self._outputs.get(test_type, "")
+    def layer_result(self, test_type: str) -> TestRunResult | None:
+        """The layer's latest run result (agent run or system regression)."""
+
+        return self._results.get(test_type)
 
     def fingerprints(self, test_type: str) -> list[str]:
         return list(self._fingerprints.get(test_type, []))
 
     def is_stalled(self, test_type: str) -> bool:
-        """Whether the layer's last ``stall_threshold`` fingerprints are identical."""
+        """Whether the layer's last ``TDD_STALL_THRESHOLD`` fingerprints are identical."""
 
         history = self._fingerprints.get(test_type, [])
         recent = history[-TDD_STALL_THRESHOLD :]
@@ -279,8 +282,8 @@ class TddTestExecutor:
         self,
         requested_type: str | None = None,
         requested_files: list[str] | None = None,
-    ) -> str:
-        """Run the agent's requested tests; returns the full run_tests result.
+    ) -> TestRunResult:
+        """Run the agent's requested tests; returns the structured run result.
 
         This is the contract the TDD agent experiences through the
         ``run_tests`` tool: budget consumption and exhaustion copy,
@@ -291,7 +294,7 @@ class TddTestExecutor:
 
         requested = str(requested_type or "").strip()
         if self._active_layer is None:
-            return (
+            return _rejection(
                 "Exit Code: 1\n"
                 "STDERR:\n"
                 "No active TDD test layer is currently scheduled.\n"
@@ -301,14 +304,14 @@ class TddTestExecutor:
         else:
             selected_type = canonical_test_type(requested)
             if selected_type is None or selected_type not in self._ordered:
-                return (
+                return _rejection(
                     "Exit Code: 1\n"
                     "STDERR:\n"
                     f"Unsupported current-node test_type={requested!r}. "
                     f"Available ordered layers: {', '.join(self._ordered)}.\n"
                 )
             if selected_type != self._active_layer:
-                return (
+                return _rejection(
                     "Exit Code: 1\n"
                     "STDERR:\n"
                     f"The active TDD layer is `{self._active_layer}`, but run_tests requested `{selected_type}`. "
@@ -323,7 +326,7 @@ class TddTestExecutor:
         registered = self.registered_files(selected_type)
         unknown = [path for path in selected_files if path not in registered]
         if unknown:
-            return (
+            return _rejection(
                 "Exit Code: 1\n"
                 "STDERR:\n"
                 f"run_tests({selected_type}) may only execute registered {selected_type} tests for the current node. "
@@ -336,7 +339,7 @@ class TddTestExecutor:
                 status="error",
             )
             if self._env_failure is not None:
-                return (
+                return _rejection(
                     "Exit Code: 1\n"
                     "STDERR:\n"
                     f"run_tests budget exhausted for {selected_type}: {used}/{TDD_RUN_TESTS_BUDGET}.\n"
@@ -359,7 +362,7 @@ class TddTestExecutor:
                 # it visits each layer once and its session loop breaks on
                 # the budget check, so a closed layer never runs again.
                 self._active_layer = closed_next_type
-                return (
+                return _rejection(
                     "Exit Code: 1\n"
                     "STDERR:\n"
                     f"The {selected_type} layer is closed: run_tests budget exhausted at "
@@ -369,7 +372,7 @@ class TddTestExecutor:
                     f"Apply a concrete repair before spending the {closed_next_type} budget, or end your turn "
                     f"with a concise summary of the failing {selected_type} tests and the next edit target.\n"
                 )
-            return (
+            return _rejection(
                 "Exit Code: 1\n"
                 "STDERR:\n"
                 f"The {selected_type} layer is closed: run_tests budget exhausted at "
@@ -381,9 +384,8 @@ class TddTestExecutor:
         await self._log(
             f"`run_tests` {selected_type} usage {self._usage[selected_type]}/{TDD_RUN_TESTS_BUDGET}."
         )
-        output = await self._run_group(selected_type, selected_files)
-        exit_code = _overall_exit_code(output)
-        passed = exit_code == 0
+        result = await self._run_group(selected_type, selected_files)
+        passed = result.passed_run
         # Persist every run's raw output under .arc/tdd_runs (ignored by
         # Git checkpoints/merges) and expose it to the agent: in-session
         # via a pointer line, cross-session via the structured digest in
@@ -397,7 +399,7 @@ class TddTestExecutor:
                 self._node_id,
                 selected_type,
                 used + 1,
-                output,
+                result.output,
             )
         except OSError as exc:
             await self._log(
@@ -405,7 +407,8 @@ class TddTestExecutor:
                 status="warning",
             )
         if run_log_path:
-            output += (
+            result.run_log_path = run_log_path
+            result.output += (
                 f"\n\nARC_RUN_OUTPUT_LOG: the complete raw output of this run is saved at "
                 f"`{run_log_path}`. Read that file for the full output of this attempt "
                 "instead of re-running the tests.\n"
@@ -414,16 +417,16 @@ class TddTestExecutor:
             # Structured per-test digest appended to the tool result: the
             # model sees each failed test's location and expected/received
             # up front instead of mining the long raw output for them.
-            output += (
+            result.output += (
                 "\n\n"
                 + format_failure_digest(
-                    build_failure_digest(output),
+                    build_failure_digest(result.output),
                     test_type=selected_type,
                     raw_output_path=run_log_path or None,
-                    fingerprint=failure_fingerprint(output),
-                    environment_failure=classify_test_failure(output),
-                    build=extract_build_note(output),
-                    served=extract_served_verdict(output),
+                    fingerprint=result.fingerprint,
+                    environment_failure=result.environment_failure,
+                    build=result.build_note,
+                    served=result.served_verdict,
                 )
                 + "\n"
             )
@@ -434,7 +437,7 @@ class TddTestExecutor:
                 f"attempt={self._usage[selected_type]}/{TDD_RUN_TESTS_BUDGET}\n"
                 f"test_files={json.dumps(selected_files, ensure_ascii=False)}\n"
                 "----- BEGIN RAW TEST OUTPUT -----\n"
-                f"{output.rstrip()}\n"
+                f"{result.output.rstrip()}\n"
                 "----- END RAW TEST OUTPUT -----"
             ),
             status="debug",
@@ -442,13 +445,13 @@ class TddTestExecutor:
         await self._log(
             (
                 f"`run_tests` {selected_type} {'passed' if passed else 'failed'} "
-                f"with Exit Code: {exit_code} "
+                f"with Exit Code: {result.exit_code} "
                 f"on attempt {self._usage[selected_type]}/{TDD_RUN_TESTS_BUDGET}: "
                 f"{', '.join(selected_files)}"
             ),
             status="ok" if passed else "error",
         )
-        self._outputs[selected_type] = output
+        self._results[selected_type] = result
         if passed:
             for path in selected_files:
                 self._file_states[selected_type][path] = "green"
@@ -471,8 +474,8 @@ class TddTestExecutor:
             for path in selected_files:
                 if self._file_states[selected_type].get(path) != "green":
                     self._file_states[selected_type][path] = "red"
-            self._fingerprints[selected_type].append(failure_fingerprint(output))
-            failure_now = classify_test_failure(output) or None
+            self._fingerprints[selected_type].append(result.fingerprint)
+            failure_now = result.environment_failure or None
             if self._env_failure is None:
                 if failure_now:
                     self._env_failure = failure_now
@@ -533,7 +536,7 @@ class TddTestExecutor:
         # would send the agent after files with no failure evidence yet.
         still_red = sorted(path for path, state in layer_file_states.items() if state == "red")
         not_yet_run = sorted(path for path, state in layer_file_states.items() if state is None)
-        output += (
+        result.output += (
             "\n\nARC_TEST_FILE_STATUS:\n"
             f"- Layer `{selected_type}` per-file state:\n"
             + "\n".join(
@@ -554,7 +557,7 @@ class TddTestExecutor:
                 ),
                 status="error",
             )
-            output += (
+            result.output += (
                 "- STALL DETECTED: the same failure fingerprint has repeated "
                 f"{len(recent)} times in a row. Your recent edits are not changing the failure. "
                 "Before the next run_tests call, you MUST rotate your hypothesis: "
@@ -569,12 +572,12 @@ class TddTestExecutor:
             # A passing run on a subset of files: verified-red files stay
             # repair targets, never-run files are simply the next work.
             if still_red:
-                output += (
+                result.output += (
                     f"- {len(still_red)} file(s) in this layer are still red: {', '.join(still_red)}. "
                     "The layer passes only when every file is green and a final full-layer run passes.\n"
                 )
             if not_yet_run:
-                output += (
+                result.output += (
                     f"- {len(not_yet_run)} file(s) in this layer have not been run yet: "
                     f"{', '.join(not_yet_run)}.\n"
                 )
@@ -591,7 +594,7 @@ class TddTestExecutor:
             # session; the outer scheduler will baseline them before their
             # first agent session (in-session advances pin the active
             # layer, and the baseline loop only runs per layer).
-            output += (
+            result.output += (
                 "\nARC_TEST_LAYER_STATUS:\n"
                 f"- {selected_type} passed (full layer).\n"
                 f"- The system has advanced the active layer to `{next_type}`; "
@@ -601,13 +604,13 @@ class TddTestExecutor:
                 "- Do not return IMPLEMENTED until all scheduled layers have been attempted and passed.\n"
             )
         elif self._layer_passed[selected_type]:
-            output += (
+            result.output += (
                 "\nARC_TEST_LAYER_STATUS:\n"
                 f"- {selected_type} passed (full layer).\n"
                 "- This is the last scheduled test layer. You may return IMPLEMENTED only if all earlier scheduled layers also passed.\n"
             )
         elif self._env_failure and self._usage[selected_type] >= TDD_RUN_TESTS_BUDGET:
-            output += (
+            result.output += (
                 "\nARC_TEST_LAYER_STATUS:\n"
                 f"- {selected_type} is still failing for an environmental reason "
                 f"({self._env_failure}).\n"
@@ -616,7 +619,7 @@ class TddTestExecutor:
                 "dependency instead.\n"
             )
         elif self._env_failure:
-            output += (
+            result.output += (
                 "\nARC_TEST_LAYER_STATUS:\n"
                 f"- {selected_type} could not run: {self._env_failure}.\n"
                 "- This is your one repair-and-revalidate attempt for this environment failure.\n"
@@ -627,7 +630,7 @@ class TddTestExecutor:
                 "mid-run: end your turn with a short report naming the missing dependency "
                 "and do not call run_tests again.\n"
             )
-        return output
+        return result
 
     async def run_baseline_file(self, test_type: str, file_path: str) -> BaselineRun:
         """System-run one file's baseline and classify its state (no budget).
@@ -639,15 +642,20 @@ class TddTestExecutor:
         it explicitly via :meth:`record_file_state`.
         """
 
-        output = await self._run_group(test_type, [file_path])
-        state = classify_file_state(output)
+        result = await self._run_group(test_type, [file_path])
+        state = classify_file_state(result)
         self._file_states.setdefault(test_type, {})[file_path] = state
-        return BaselineRun(output=output, exit_code=_overall_exit_code(output), state=state)
+        return BaselineRun(
+            output=result.output,
+            exit_code=result.exit_code,
+            state=state,
+            environment_failure=result.environment_failure,
+        )
 
     async def run_full_layer(self, test_type: str) -> BaselineRun:
         """System-run the whole layer once (closing regression).
 
-        Records the layer output and closes the layer on a passing run. A
+        Records the layer result and closes the layer on a passing run. A
         failing combined run demotes every non-green file to ``red`` (a
         combined failure may implicate any file that is not already verified
         green); verified-green files keep their state so already-passing
@@ -655,10 +663,9 @@ class TddTestExecutor:
         """
 
         files = self.layer_files(test_type)
-        output = await self._run_group(test_type, files)
-        self._outputs[test_type] = output
-        state = classify_file_state(output)
-        exit_code = _overall_exit_code(output)
+        result = await self._run_group(test_type, files)
+        self._results[test_type] = result
+        state = classify_file_state(result)
         if state == "green":
             self._layer_passed[test_type] = True
         else:
@@ -666,7 +673,12 @@ class TddTestExecutor:
             for path in files:
                 if layer_states.get(path) != "green":
                     layer_states[path] = "red"
-        return BaselineRun(output=output, exit_code=exit_code, state=state)
+        return BaselineRun(
+            output=result.output,
+            exit_code=result.exit_code,
+            state=state,
+            environment_failure=result.environment_failure,
+        )
 
     async def _log(self, message: str, status: str | None = None) -> None:
         if self._log_cb is None:

@@ -4,14 +4,13 @@ import inspect
 import json
 import os
 import re
-from pathlib import Path
+from dataclasses import replace
 from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field, create_model
 
 from langchain.agents.structured_output import ToolStrategy
 
-from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.interface_designer import get_system_prompt, get_user_prompt
 from agents.design.contract_skeleton import (
@@ -21,11 +20,10 @@ from agents.design.contract_skeleton import (
     merge_filled_contracts,
 )
 from agents.model.openai_api_adapter import json_schema_structured_output_supported
-from agents.runtime.checkpointer import get_project_thread_namespace
-from agents.runtime.contracts import AgentRuntimeContext
-from agents.runtime.factory import build_stage_agent
-from agents.runtime.runners import ainvoke_stage_agent, salvage_json_objects
+from agents.runtime.factory import StageAgentBuild
+from agents.runtime.runners import salvage_json_objects
 from agents.runtime.stage_discipline import MAX_DESIGN_WRITES, MAX_NON_LEAF_DESIGN_WRITES
+from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
 from agents.tools.traceability import build_traceability_tools
 
@@ -124,7 +122,7 @@ class InterfaceDesigner:
         context_workspace_root: str | None = None,
     ) -> None:
         self.log_cb = log_cb
-        self.model = model or os.environ.get("MODEL", "openai:gpt-5.4")
+        self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
         self.workspace_root = workspace_root
         self.requirement_path = requirement_path or ""
         self.app_type = app_type
@@ -163,24 +161,19 @@ class InterfaceDesigner:
         node_id: str,
         requirement_data: dict[str, Any],
     ) -> dict[str, Any]:
-        workspace_root = str(Path(
-            self.workspace_root
-            or context_pipeline.config.workspace_dir
-            or os.environ.get("ARC_WORKSPACE_ROOT")
-            or os.getcwd()
-        ).expanduser().resolve())
-        app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
-        required_skill_names = interface_design_skills(requirement_data)
-        context_pipeline.configure(
-            workspace_dir=self.context_workspace_root or workspace_root,
-            app_type=app_type,
-        )
-        static_context, dynamic_context = context_pipeline.build_agent_context_split(
+        session = StageSession(
+            agent_name=self.agent_name,
             node_id=node_id,
-            agent_type=self.agent_name,
-            map_workspace_dir=workspace_root,
+            phase="DESIGN",
+            model=self.model,
+            log_cb=self.log_cb,
+            workspace_root=self.workspace_root,
+            requirement_path=self.requirement_path,
+            app_type=self.app_type,
+            context_workspace_root=self.context_workspace_root,
         )
-        context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
+        required_skill_names = interface_design_skills(requirement_data)
+        context_text = session.build_context()
 
         # Write-time contract registration: every contract-embodied write is
         # derived into pending contract ids the moment it lands, and the
@@ -191,7 +184,7 @@ class InterfaceDesigner:
         # 3/3-nodes-per-run norm.
         pending_registry = PendingContractRegistry(
             node_id=node_id,
-            workspace_root=workspace_root,
+            workspace_root=session.workspace_root,
             interface_ids_by_file=self._registered_interfaces_by_file(),
         )
         # Pin the tier once per run: the repair flows below rebuild agents and
@@ -200,10 +193,8 @@ class InterfaceDesigner:
         # probing).
         max_design_writes = self._max_design_writes(requirement_data)
         self._current_max_design_writes = max_design_writes
-        agent = self._build_agent(
-            node_id=node_id,
-            workspace_root=workspace_root,
-            app_type=app_type,
+        built = self._build_agent(
+            session,
             required_skill_names=required_skill_names,
             response_format=InterfaceDesignResponse,
             pending_contract_registry=pending_registry,
@@ -218,22 +209,8 @@ class InterfaceDesigner:
         )
         await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking interface design.", node_id=node_id)
-        agent_context = AgentRuntimeContext(
-            node_id=node_id,
-            phase="DESIGN",
-            app_type=app_type,
-            workspace_root=workspace_root,
-            requirement_path=self.requirement_path,
-        )
-        payload = await ainvoke_stage_agent(
-            agent,
-            message=message,
-            context=agent_context,
-            thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:InterfaceDesigner",
-            label=self.agent_name,
-            log_cb=self.log_cb,
-        )
-        bundle = await self._normalize_with_recovery(payload, node_id=node_id, agent=agent)
+        payload = await session.invoke(built, message=message)
+        bundle = await self._normalize_with_recovery(payload, node_id=node_id, built=built)
         pending_ids = pending_registry.pending_contract_ids()
         if pending_ids:
             await self._log(
@@ -251,12 +228,11 @@ class InterfaceDesigner:
         evidence_paths = materialized_paths or list(bundle["files_written"])
         if not bundle["interfaces"] and evidence_paths:
             repaired = await self._repair_empty_interfaces(
-                agent,
+                session,
+                built,
                 node_id=node_id,
-                agent_context=agent_context,
                 evidence_paths=evidence_paths,
                 materialized_paths=materialized_paths,
-                app_type=app_type,
                 required_skill_names=required_skill_names,
                 pending_contract_registry=pending_registry,
             )
@@ -273,10 +249,9 @@ class InterfaceDesigner:
             # first spends one backfill ask anchored on the parent/dependency
             # contracts already stored in the registry.
             repaired = await self._repair_reuse_only_interfaces(
-                agent,
+                session,
+                built,
                 node_id=node_id,
-                agent_context=agent_context,
-                app_type=app_type,
                 required_skill_names=required_skill_names,
                 pending_contract_registry=pending_registry,
             )
@@ -292,55 +267,46 @@ class InterfaceDesigner:
 
     def _build_agent(
         self,
+        session: StageSession,
         *,
-        node_id: str,
-        workspace_root: str,
-        app_type: str,
         required_skill_names: list[str],
         response_format: Any,
         pending_contract_registry: PendingContractRegistry | None = None,
         max_design_writes: int | None = None,
-    ) -> Any:
+    ) -> StageAgentBuild:
         """Build the InterfaceDesigner deep-agent with a given response format.
 
         The skills source is attached unconditionally: the runtime skills
         section lists the whole catalog and this stage agent picks what it
         needs to read; ``required_skill_names`` only adds the safety-floor
-        activation policy on top. ``app_type`` selects the template shared
-        surfaces that stage discipline protects from whole-file rewrites (see
-        ``AppTypeHandler.template_shared_surfaces``). ``max_design_writes``
-        tiers the DESIGN write budget (leaf vs non-leaf shell pass).
+        activation policy on top. The session's ``app_type`` selects the
+        template shared surfaces that stage discipline protects from
+        whole-file rewrites (see ``AppTypeHandler.template_shared_surfaces``);
+        ``max_design_writes`` tiers the DESIGN write budget (leaf vs non-leaf
+        shell pass).
         """
 
-        return build_stage_agent(
+        return session.build_agent(
             name="interface_designer",
             stage="interface_design",
-            model=self.model,
             system_prompt="\n\n".join(
                 [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=response_format,
-            workspace_root=workspace_root,
-            writable_roots=[workspace_root],
+            tools=build_traceability_tools(node_id=session.node_id, log_cb=self.log_cb),
             skills=[SKILLS_SOURCE],
-            memory=[],
-            tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
-            node_id=node_id,
-            claims_workspace_root=self.context_workspace_root or workspace_root,
             pending_contract_registry=pending_contract_registry,
-            app_type=app_type,
             max_design_writes=max_design_writes,
         )
 
     async def _repair_empty_interfaces(
         self,
-        agent: Any,
+        session: StageSession,
+        built: StageAgentBuild,
         *,
         node_id: str,
-        agent_context: AgentRuntimeContext,
         evidence_paths: list[str],
         materialized_paths: list[str],
-        app_type: str = "",
         required_skill_names: list[str] | None = None,
         pending_contract_registry: PendingContractRegistry | None = None,
     ) -> dict[str, Any]:
@@ -361,7 +327,7 @@ class InterfaceDesigner:
         falls back to the open re-serialization question on the same thread.
         """
 
-        skeletons = self._derive_skeletons(node_id=node_id, materialized_paths=materialized_paths, workspace_root=agent_context.workspace_root)
+        skeletons = self._derive_skeletons(node_id=node_id, materialized_paths=materialized_paths, workspace_root=session.workspace_root)
         if skeletons:
             await self._log(
                 f"Response recorded no interface contracts for {len(evidence_paths)} file(s); "
@@ -374,10 +340,9 @@ class InterfaceDesigner:
             # skeletons were derived against (the agent's filesystem root),
             # not whatever the caller happened to pass through.
             fill_agent = self._constrained_repair_agent(
-                agent,
+                session,
+                built,
                 node_id=node_id,
-                workspace_root=agent_context.workspace_root,
-                app_type=app_type,
                 required_skill_names=required_skill_names,
                 min_items=len(skeletons),
                 pending_contract_registry=pending_contract_registry,
@@ -385,8 +350,8 @@ class InterfaceDesigner:
             )
             merged = await self._fill_skeletons(
                 fill_agent,
+                session=session,
                 node_id=node_id,
-                agent_context=agent_context,
                 skeletons=skeletons,
                 evidence_paths=evidence_paths,
             )
@@ -399,15 +364,11 @@ class InterfaceDesigner:
             status="warning",
             node_id=node_id,
         )
-        repair_payload = await ainvoke_stage_agent(
-            agent,
+        repair_payload = await session.invoke(
+            built,
             message=self._repair_message(evidence_paths, expected_count=len(skeletons)),
-            context=agent_context,
-            thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:InterfaceDesigner",
-            label=self.agent_name,
-            log_cb=self.log_cb,
         )
-        repaired = await self._normalize_with_recovery(repair_payload, node_id=node_id, agent=agent)
+        repaired = await self._normalize_with_recovery(repair_payload, node_id=node_id, built=built)
         if repaired["interfaces"]:
             return {"interfaces": repaired["interfaces"], "files_written": repaired["files_written"], "summary": repaired["summary"]}
         await self._log(
@@ -419,11 +380,10 @@ class InterfaceDesigner:
 
     async def _repair_reuse_only_interfaces(
         self,
-        agent: Any,
+        session: StageSession,
+        built: StageAgentBuild,
         *,
         node_id: str,
-        agent_context: AgentRuntimeContext,
-        app_type: str = "",
         required_skill_names: list[str] | None = None,
         pending_contract_registry: PendingContractRegistry | None = None,
     ) -> dict[str, Any]:
@@ -455,23 +415,18 @@ class InterfaceDesigner:
             node_id=node_id,
         )
         fill_agent = self._constrained_repair_agent(
-            agent,
+            session,
+            built,
             node_id=node_id,
-            workspace_root=agent_context.workspace_root,
-            app_type=app_type,
             required_skill_names=required_skill_names,
             min_items=1,
             pending_contract_registry=pending_contract_registry,
             max_design_writes=self._current_max_design_writes,
         )
         try:
-            payload = await ainvoke_stage_agent(
+            payload = await session.invoke(
                 fill_agent,
                 message=self._reuse_backfill_message(candidates),
-                context=agent_context,
-                thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:InterfaceDesigner",
-                label=self.agent_name,
-                log_cb=self.log_cb,
             )
         except Exception as exc:
             # The constrained repair schema raises on minItems violations; the
@@ -491,7 +446,7 @@ class InterfaceDesigner:
                 node_id=node_id,
             )
             return {"interfaces": salvaged}
-        repaired = await self._normalize_with_recovery(payload, node_id=node_id, agent=fill_agent)
+        repaired = await self._normalize_with_recovery(payload, node_id=node_id, built=fill_agent)
         if repaired["interfaces"]:
             # Nothing was written in this shape, so the repair must not adopt
             # a files_written claim either — the workflow gate stays keyed on
@@ -614,55 +569,51 @@ class InterfaceDesigner:
 
     def _constrained_repair_agent(
         self,
-        agent: Any,
+        session: StageSession,
+        built: StageAgentBuild,
         *,
         node_id: str,
-        workspace_root: str,
-        app_type: str,
         required_skill_names: list[str] | None,
         min_items: int,
         pending_contract_registry: PendingContractRegistry | None = None,
         max_design_writes: int | None = None,
-    ) -> Any:
+    ) -> StageAgentBuild:
         """Rebuild the agent with a minItems-constrained schema when possible.
 
         The constrained schema only changes the final structured-output tool:
         same thread (checkpointer resumes the conversation), same tools, same
-        discipline. When native json_schema is unavailable the original agent
+        discipline. When native json_schema is unavailable the original build
         is returned unchanged and the repair relies on prompting + retries +
         the mechanical fallback.
         """
 
-        if not workspace_root or required_skill_names is None:
-            return agent
+        if required_skill_names is None:
+            return built
         constrained = _dynamic_repair_response_format(min_items)
         if constrained is None:
-            return agent
+            return built
         try:
             rebuilt = self._build_agent(
-                node_id=node_id,
-                workspace_root=workspace_root,
-                app_type=app_type,
+                session,
                 required_skill_names=required_skill_names,
                 response_format=constrained,
                 pending_contract_registry=pending_contract_registry,
                 max_design_writes=max_design_writes,
             )
         except Exception:
-            return agent
+            return built
         # Carry the discipline over so materialized-write ground truth stays
         # observable to the normalization path on the rebuilt agent.
-        discipline = getattr(agent, "arc_stage_discipline", None)
-        if discipline is not None:
-            rebuilt.arc_stage_discipline = discipline
+        if built.stage_discipline is not None:
+            rebuilt = replace(rebuilt, stage_discipline=built.stage_discipline)
         return rebuilt
 
     async def _fill_skeletons(
         self,
-        agent: Any,
+        built: StageAgentBuild,
         *,
+        session: StageSession,
         node_id: str,
-        agent_context: AgentRuntimeContext,
         skeletons: list[ContractSkeleton],
         evidence_paths: list[str],
     ) -> list[dict[str, Any]]:
@@ -677,7 +628,7 @@ class InterfaceDesigner:
         """
 
         merged = await self._fill_skeletons_pass(
-            agent, node_id=node_id, agent_context=agent_context, skeletons=skeletons,
+            built, session=session, node_id=node_id, skeletons=skeletons,
             message=self._skeleton_fill_message(skeletons, evidence_paths, expected_count=len(skeletons)),
         )
         merged = self._drop_blank_records(merged)
@@ -706,7 +657,7 @@ class InterfaceDesigner:
                 )
             for batch in self._batches(gaps):
                 batch_merged = await self._fill_skeletons_pass(
-                    agent, node_id=node_id, agent_context=agent_context, skeletons=batch,
+                    built, session=session, node_id=node_id, skeletons=batch,
                     message=self._skeleton_fill_message(batch, evidence_paths, expected_count=len(skeletons), batch_mode=True),
                 )
                 batch_merged = self._drop_blank_records(batch_merged)
@@ -734,22 +685,15 @@ class InterfaceDesigner:
 
     async def _fill_skeletons_pass(
         self,
-        agent: Any,
+        built: StageAgentBuild,
         *,
+        session: StageSession,
         node_id: str,
-        agent_context: AgentRuntimeContext,
         skeletons: list[ContractSkeleton],
         message: str,
     ) -> list[dict[str, Any]]:
         try:
-            payload = await ainvoke_stage_agent(
-                agent,
-                message=message,
-                context=agent_context,
-                thread_id=f"{get_project_thread_namespace()}:{node_id}:DESIGN:InterfaceDesigner",
-                label=self.agent_name,
-                log_cb=self.log_cb,
-            )
+            payload = await session.invoke(built, message=message)
         except Exception as exc:
             # A failed fill pass must not sink the whole repair — but the
             # constrained repair schema raises on minItems violations, and
@@ -770,7 +714,7 @@ class InterfaceDesigner:
                 node_id=node_id,
             )
             return []
-        filled = await self._normalize_with_recovery(payload, node_id=node_id, agent=agent)
+        filled = await self._normalize_with_recovery(payload, node_id=node_id, built=built)
         records = filled.get("interfaces") or []
         if not records:
             return []
@@ -900,7 +844,7 @@ class InterfaceDesigner:
         self,
         payload: dict[str, Any],
         node_id: str,
-        agent: Any = None,
+        built: StageAgentBuild | None = None,
     ) -> dict[str, Any]:
         """Normalize a design payload, lifting contracts buried in prose.
 
@@ -923,7 +867,7 @@ class InterfaceDesigner:
         """
 
         bundle = self._normalize_design_payload(payload)
-        materialized_paths = self._stage_materialized_paths(agent)
+        materialized_paths = built.materialized_paths() if built is not None else []
         bundle["materialized_paths"] = materialized_paths
         if bundle["interfaces"]:
             return bundle
@@ -1006,16 +950,6 @@ class InterfaceDesigner:
                 ]
             return recovered
         return {}
-
-    @staticmethod
-    def _stage_materialized_paths(agent: Any) -> list[str]:
-        discipline = getattr(agent, "arc_stage_discipline", None)
-        if discipline is None:
-            return []
-        try:
-            return list(discipline.materialized_paths())
-        except Exception:
-            return []
 
     @staticmethod
     def _repair_message(recorded_paths: list[str], *, expected_count: int = 0) -> str:

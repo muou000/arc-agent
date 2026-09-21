@@ -20,12 +20,15 @@ Both raise loudly when a script is exhausted, so tests fail instead of looping.
 from __future__ import annotations
 
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field, PrivateAttr
+
+from app_type_handler.test_results import TestRunResult, parse_test_run
 
 
 def faux_text(text: str) -> AIMessage:
@@ -132,7 +135,12 @@ class FauxChatModel(BaseChatModel):
 
 
 class FakeAppHandler:
-    """Stand-in for ``AppTypeHandler`` with scripted ``run_test_group`` outputs."""
+    """Stand-in for ``AppTypeHandler`` with scripted ``run_test_group`` outputs.
+
+    Scripts are plain runner texts (the shape real handlers render); each is
+    converted through the single parser into the :class:`TestRunResult` the
+    phase side consumes.
+    """
 
     def __init__(self, results: list[str] | None = None) -> None:
         self._results: deque[str] = deque(results or [])
@@ -154,14 +162,14 @@ class FakeAppHandler:
         test_type: str,
         file_paths: list[str],
         web_port: int | None = None,
-    ) -> str:
+    ) -> TestRunResult:
         del web_port  # per-task port override; the fake records the call only
         self.calls.append((test_type, list(file_paths)))
         if not self._results:
             raise RuntimeError(
                 f"FakeAppHandler ran out of scripted results after {len(self.calls)} call(s)."
             )
-        return self._results.popleft()
+        return parse_test_run(self._results.popleft())
 
     async def shutdown_e2e_runtime(self) -> None:
         self.shutdown_calls += 1
@@ -201,3 +209,79 @@ def failing_test_output(detail: str = "AssertionError: expected 2 got 1") -> str
 
 def passing_test_output(detail: str = "1 passed") -> str:
     return test_result(0, detail)
+
+
+def drive_scripted_tool_call(
+    workspace_root: Path,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    *,
+    stage: str = "implementation",
+    call_id: str = "call-probe-1",
+) -> list[str]:
+    """Drive exactly one scripted tool call through a real ``build_stage_agent`` agent.
+
+    Builds the production stage agent (scripted by ``FauxChatModel``), issues
+    the tool call, then ends the loop with a plain text turn. Returns the
+    ToolMessage contents the model received on the following turn — the same
+    text a real provider would see, middleware chain included. Tests use this
+    to assert filesystem behaviors through the build path instead of applying
+    runtime patches themselves.
+
+    Stateless: the agent is built with ``checkpointer=None``.
+    """
+
+    import asyncio
+
+    from agents.runtime.contracts import AgentRuntimeContext
+    from agents.runtime.factory import build_stage_agent
+    from agents.runtime.runners import ainvoke_stage_agent
+
+    phase = {"implementation": "IMPLEMENT", "test_generation": "TEST_GENERATION"}.get(stage)
+    if phase is None:
+        raise ValueError(f"unsupported probe stage: {stage!r}")
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(tool_name, tool_args, call_id=call_id),
+            faux_text("DONE"),
+        ]
+    )
+    built = build_stage_agent(
+        name="fs_behavior_probe",
+        stage=stage,
+        model=model,
+        system_prompt="You are a test agent.",
+        response_format=None,
+        workspace_root=str(workspace_root),
+        writable_roots=[str(workspace_root)],
+        skills=[],
+        memory=[],
+        tools=[],
+        checkpointer=None,
+    )
+    asyncio.run(
+        ainvoke_stage_agent(
+            built.agent,
+            message="run the scripted tool call",
+            context=AgentRuntimeContext(
+                node_id="REQ-FS-PROBE",
+                phase=phase,
+                app_type="web",
+                workspace_root=str(workspace_root),
+                requirement_path="",
+            ),
+            thread_id=f"REQ-FS-PROBE:{tool_name}:{call_id}",
+            label="FsBehaviorProbe",
+        )
+    )
+    if model.call_count < 2:
+        raise AssertionError(
+            f"expected the probe loop to reach a second model turn after the "
+            f"{tool_name} call (call_count={model.call_count})"
+        )
+    return [
+        str(message.content)
+        for message in model.calls[1]
+        if getattr(message, "type", "") == "tool"
+    ]

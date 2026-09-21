@@ -9,8 +9,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable
-from contextvars import ContextVar
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
 
@@ -97,10 +96,6 @@ def _stream_transport_mode() -> str:
     return "stream"
 
 
-def _stream_transport_enabled() -> bool:
-    return _stream_transport_mode() != "off"
-
-
 # Providers that answered a streamed request with a client error: streaming is
 # unsupported there, so every later call goes plain without paying the failed
 # streamed attempt again. Keyed by (model, base_url); a process-wide cache
@@ -185,15 +180,15 @@ class OpenAIAdapterConfig:
 
 
 @dataclass(frozen=True)
-class _ModelRetryPolicy:
+class ModelRetryPolicy:
     max_retries: int
     retry_delay: float
     max_delay: float
     max_consecutive_failures: int
 
 
-def _resolve_retry_policy() -> _ModelRetryPolicy:
-    return _ModelRetryPolicy(
+def resolve_retry_policy() -> ModelRetryPolicy:
+    return ModelRetryPolicy(
         max_retries=_env_int("ARC_MODEL_MAX_RETRIES", _DEFAULT_MAX_RETRIES),
         retry_delay=_env_float("ARC_MODEL_RETRY_DELAY", _DEFAULT_RETRY_DELAY),
         max_delay=_env_float("ARC_MODEL_RETRY_MAX_DELAY", _DEFAULT_RETRY_MAX_DELAY),
@@ -245,10 +240,12 @@ class ARCModelAPIError(RuntimeError):
         self.original = original
 
 
-def _arc_empty_stream_error() -> APIConnectionError:
+def empty_stream_error() -> APIConnectionError:
     """A stream that closed without any generation chunk, as a connection error.
 
-    The retry loop treats connection-class failures as "transport suspect" —
+    Part of the ``ModelTransport`` contract: a ``streamed`` callable raises
+    this when the SSE body closed without producing a single generation chunk.
+    The retry engine treats connection-class failures as "transport suspect" —
     the stream transport gets marked not-first-choice — which is exactly the
     handling an empty SSE body deserves. The ``_arc_empty_stream`` marker
     additionally skips the reachability probe round: the endpoint just
@@ -296,47 +293,69 @@ def _has_stream_chunk_timeout_type(exc: BaseException | None) -> bool:
     return type(exc).__name__ == "StreamChunkTimeoutError" and isinstance(exc, TimeoutError)
 
 
-# Transport metadata of the most recent retry-loop call on this execution
-# context ({"transport": "streamed"|"plain", "attempts": int}). The retry
-# helpers keep returning the bare result — dozens of tests call them directly
-# — so the model classes read this after the call to attribute llm_usage
-# events with which transport actually answered and how many attempts it took.
-_last_call_meta: ContextVar[dict[str, Any] | None] = ContextVar(
-    "arc_model_last_call_meta", default=None
-)
+# ---------------------------------------------------------------------------
+# Model call seam: transport, call outcome
+# ---------------------------------------------------------------------------
+
+# Recorded reasons for falling back from the streamed to the plain transport
+# (the "when to drop streaming" decisions, observable on ModelCallOutcome).
+FALLBACK_CLIENT_ERROR = "client_error"  # the provider answered the streamed request with 4xx
+FALLBACK_CHUNK_TIMEOUT = "chunk_timeout"  # the streamed attempt stalled between SSE chunks
+FALLBACK_CONNECTION_FAILURE = "connection_failure"  # a connection-class failure alternated transports
 
 
-def _note_successful_attempt(*, transport: str, attempts: int) -> None:
-    _last_call_meta.set({"transport": transport, "attempts": attempts})
+@dataclass(frozen=True)
+class ModelTransport:
+    """The two HTTP transports one model call may ride — the request seam.
+
+    ``plain`` is the non-streaming attempt; ``streamed`` the SSE attempt
+    (``None`` when this call may not stream at all). Both callables may be
+    sync or async. Production transports are built by the ARC model classes
+    from the langchain SDK; offline tests inject fakes here to drive the real
+    retry engine without a network. A streamed callable that closes the SSE
+    body without any generation chunk raises :func:`empty_stream_error`.
+    """
+
+    plain: Callable[[], Any]
+    streamed: Callable[[], Any] | None = None
 
 
-def _record_call_usage(result: Any, *, model: str, api_mode: OpenAIAPIMode, messages, started_at: float) -> None:
-    """Emit one usage record with the call's latency/transport telemetry."""
+@dataclass(frozen=True)
+class StreamFallback:
+    """One recorded decision to fall back from the streamed to the plain transport."""
 
-    meta = _last_call_meta.get() or {}
-    try:
-        record_chat_result_usage(
-            result,
-            model=model,
-            api_mode=api_mode,
-            messages=messages,
-            duration_s=time.monotonic() - started_at,
-            transport=str(meta.get("transport") or ""),
-            attempts=meta.get("attempts"),
-        )
-    finally:
-        # Reset even on capture failure: a stale transport marker must not
-        # attribute the next call to this call's transport.
-        _last_call_meta.set(None)
+    reason: str  # a FALLBACK_* constant: the trigger classification
+    attempt: int  # 1-based index of the streamed attempt that triggered it
 
 
-class ARCChatOpenAI(ChatOpenAI):
-    """ChatOpenAI with ARC-level API error normalization and transient-failure retries."""
+@dataclass(frozen=True)
+class ModelCallOutcome:
+    """How the retry engine served one call — observable at the seam."""
 
-    _arc_api_mode: OpenAIAPIMode = PrivateAttr(default="chat_completions")
-    _arc_model_name: str = PrivateAttr(default="")
-    _arc_base_url: str = PrivateAttr(default="")
-    _arc_api_key: str = PrivateAttr(default="")
+    transport: str  # "plain" | "streamed": which transport finally answered
+    attempts: int  # real attempts made (reachability probe rounds excluded)
+    stream_fallbacks: tuple[StreamFallback, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModelCallResult:
+    """The model call's return value plus the engine's outcome metadata."""
+
+    value: Any
+    outcome: ModelCallOutcome
+
+
+class _ARCRetryModelMixin:
+    """Shared ARC plumbing for the ARC model classes.
+
+    Both ARC model classes (standard chat-completions and the Responses-
+    compatible variant) share this mixin: the same construction kwargs, the
+    same generate/stream helpers, and the same wiring from a per-call
+    transport into the single retry engine. Only the langchain base class
+    (and therefore the provider payload shape) differs. Private attribute
+    declarations stay on the concrete classes: pydantic collects
+    ``PrivateAttr`` declarations from pydantic model classes only.
+    """
 
     def __init__(
         self,
@@ -345,6 +364,7 @@ class ARCChatOpenAI(ChatOpenAI):
         arc_model_name: str,
         arc_base_url: str = "",
         arc_api_key: str = "",
+        arc_transport: ModelTransport | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -352,46 +372,89 @@ class ARCChatOpenAI(ChatOpenAI):
         self._arc_model_name = arc_model_name
         self._arc_base_url = arc_base_url
         self._arc_api_key = arc_api_key
+        self._arc_transport = arc_transport
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
-        parent = super()
         started_at = time.monotonic()
-        result = await _acall_model_with_retries(
-            lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
+        transport = self._arc_build_transport(
+            messages, stop=stop, run_manager=run_manager, is_async=True, **kwargs
+        )
+        call = await acall_model_with_retries(
+            transport,
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
             base_url=self._arc_base_url,
             api_key=self._arc_api_key,
-            streamed_retry=lambda: self._arc_streamed_agenerate(
-                messages, stop=stop, run_manager=run_manager, **kwargs
-            ),
             stream_first=self._arc_should_stream_first(),
         )
-        _record_call_usage(
-            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages,
-            started_at=started_at,
-        )
-        return result
+        self._arc_record_call_usage(call, messages=messages, started_at=started_at)
+        return call.value
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
-        parent = super()
         started_at = time.monotonic()
-        result = _call_model_with_retries(
-            lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
+        transport = self._arc_build_transport(
+            messages, stop=stop, run_manager=run_manager, is_async=False, **kwargs
+        )
+        call = call_model_with_retries(
+            transport,
             api_mode=self._arc_api_mode,
             model=self._arc_model_name,
             base_url=self._arc_base_url,
             api_key=self._arc_api_key,
-            streamed_retry=lambda: self._arc_streamed_generate(
-                messages, stop=stop, run_manager=run_manager, **kwargs
-            ),
             stream_first=self._arc_should_stream_first(),
         )
-        _record_call_usage(
-            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages,
-            started_at=started_at,
+        self._arc_record_call_usage(call, messages=messages, started_at=started_at)
+        return call.value
+
+    def _arc_build_transport(
+        self, messages, *, stop, run_manager, is_async: bool, **kwargs
+    ) -> ModelTransport:
+        """Build the production transport, or pass through an injected one.
+
+        The default plain attempt is the langchain SDK generate; the streamed
+        attempt accumulates the SSE stream into a ChatResult (see the streamed
+        helpers). ``ARC_MODEL_STREAM_TRANSPORT=off`` strips the streamed leg
+        from every transport, injected or not, so the env switch stays the one
+        authority on whether streaming may happen at all.
+        """
+
+        transport = self._arc_transport
+        if transport is None:
+            parent = super()
+            if is_async:
+                transport = ModelTransport(
+                    plain=lambda: parent._agenerate(
+                        messages, stop=stop, run_manager=run_manager, **kwargs
+                    ),
+                    streamed=lambda: self._arc_streamed_agenerate(
+                        messages, stop=stop, run_manager=run_manager, **kwargs
+                    ),
+                )
+            else:
+                transport = ModelTransport(
+                    plain=lambda: parent._generate(
+                        messages, stop=stop, run_manager=run_manager, **kwargs
+                    ),
+                    streamed=lambda: self._arc_streamed_generate(
+                        messages, stop=stop, run_manager=run_manager, **kwargs
+                    ),
+                )
+        if _stream_transport_mode() == "off":
+            return ModelTransport(plain=transport.plain, streamed=None)
+        return transport
+
+    def _arc_record_call_usage(self, call: ModelCallResult, *, messages, started_at: float) -> None:
+        """Emit one usage record with the call's latency/transport telemetry."""
+
+        record_chat_result_usage(
+            call.value,
+            model=self._arc_model_name,
+            api_mode=self._arc_api_mode,
+            messages=messages,
+            duration_s=time.monotonic() - started_at,
+            transport=call.outcome.transport,
+            attempts=call.outcome.attempts,
         )
-        return result
 
     def _arc_should_stream_first(self) -> bool:
         """Whether the first attempt of a call may go over the streaming transport."""
@@ -420,10 +483,10 @@ class ARCChatOpenAI(ChatOpenAI):
             )
         except ValueError as exc:
             if "No generations" in str(exc):
-                raise _arc_empty_stream_error() from exc
+                raise empty_stream_error() from exc
             raise
         if not result.generations:
-            raise _arc_empty_stream_error()
+            raise empty_stream_error()
         return result
 
     def _arc_streamed_generate(self, messages, *, stop, run_manager, **kwargs):
@@ -435,109 +498,31 @@ class ARCChatOpenAI(ChatOpenAI):
             )
         except ValueError as exc:
             if "No generations" in str(exc):
-                raise _arc_empty_stream_error() from exc
+                raise empty_stream_error() from exc
             raise
         if not result.generations:
-            raise _arc_empty_stream_error()
+            raise empty_stream_error()
         return result
 
 
-class ARCCompatibleChatOpenAI(CompatibleChatOpenAI):
+class ARCChatOpenAI(_ARCRetryModelMixin, ChatOpenAI):
+    """ChatOpenAI with ARC-level API error normalization and transient-failure retries."""
+
+    _arc_api_mode: OpenAIAPIMode = PrivateAttr(default="chat_completions")
+    _arc_model_name: str = PrivateAttr(default="")
+    _arc_base_url: str = PrivateAttr(default="")
+    _arc_api_key: str = PrivateAttr(default="")
+    _arc_transport: ModelTransport | None = PrivateAttr(default=None)
+
+
+class ARCCompatibleChatOpenAI(_ARCRetryModelMixin, CompatibleChatOpenAI):
     """Responses-compatible ChatOpenAI with ARC-level API error normalization and transient-failure retries."""
 
     _arc_api_mode: OpenAIAPIMode = PrivateAttr(default="responses")
     _arc_model_name: str = PrivateAttr(default="")
     _arc_base_url: str = PrivateAttr(default="")
     _arc_api_key: str = PrivateAttr(default="")
-
-    def __init__(
-        self,
-        *args: Any,
-        arc_api_mode: OpenAIAPIMode,
-        arc_model_name: str,
-        arc_base_url: str = "",
-        arc_api_key: str = "",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self._arc_api_mode = arc_api_mode
-        self._arc_model_name = arc_model_name
-        self._arc_base_url = arc_base_url
-        self._arc_api_key = arc_api_key
-
-    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
-        parent = super()
-        started_at = time.monotonic()
-        result = await _acall_model_with_retries(
-            lambda: parent._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs),
-            api_mode=self._arc_api_mode,
-            model=self._arc_model_name,
-            base_url=self._arc_base_url,
-            api_key=self._arc_api_key,
-            streamed_retry=lambda: self._arc_streamed_agenerate(
-                messages, stop=stop, run_manager=run_manager, **kwargs
-            ),
-            stream_first=self._arc_should_stream_first(),
-        )
-        _record_call_usage(
-            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages,
-            started_at=started_at,
-        )
-        return result
-
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
-        parent = super()
-        started_at = time.monotonic()
-        result = _call_model_with_retries(
-            lambda: parent._generate(messages, stop=stop, run_manager=run_manager, **kwargs),
-            api_mode=self._arc_api_mode,
-            model=self._arc_model_name,
-            base_url=self._arc_base_url,
-            api_key=self._arc_api_key,
-            streamed_retry=lambda: self._arc_streamed_generate(
-                messages, stop=stop, run_manager=run_manager, **kwargs
-            ),
-            stream_first=self._arc_should_stream_first(),
-        )
-        _record_call_usage(
-            result, model=self._arc_model_name, api_mode=self._arc_api_mode, messages=messages,
-            started_at=started_at,
-        )
-        return result
-
-    def _arc_should_stream_first(self) -> bool:
-        """Whether the first attempt of a call may go over the streaming transport."""
-
-        return (
-            _stream_transport_mode() == "stream"
-            and not _streaming_marked_unsupported(self._arc_model_name, self._arc_base_url)
-        )
-
-    async def _arc_streamed_agenerate(self, messages, *, stop, run_manager, **kwargs):
-        try:
-            result = await agenerate_from_stream(
-                super()._astream(messages, stop=stop, run_manager=run_manager, **kwargs)
-            )
-        except ValueError as exc:
-            if "No generations" in str(exc):
-                raise _arc_empty_stream_error() from exc
-            raise
-        if not result.generations:
-            raise _arc_empty_stream_error()
-        return result
-
-    def _arc_streamed_generate(self, messages, *, stop, run_manager, **kwargs):
-        try:
-            result = generate_from_stream(
-                super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs)
-            )
-        except ValueError as exc:
-            if "No generations" in str(exc):
-                raise _arc_empty_stream_error() from exc
-            raise
-        if not result.generations:
-            raise _arc_empty_stream_error()
-        return result
+    _arc_transport: ModelTransport | None = PrivateAttr(default=None)
 
 
 def build_openai_chat_model(
@@ -1133,17 +1118,25 @@ def _raise_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model
     raise wrapped from exc
 
 
-def _call_model_with_retries(
-    call: Callable[[], Any],
+async def acall_model_with_retries(
+    transport: ModelTransport,
     *,
     api_mode: OpenAIAPIMode,
     model: str,
     base_url: str = "",
     api_key: str = "",
-    streamed_retry: Callable[[], Any] | None = None,
     stream_first: bool = False,
-) -> Any:
-    """Invoke a model call, retrying transient failures with a short fixed delay.
+    sleeper: Callable[[float], Any] | None = None,
+    prober: Callable[[str, str], Any] | None = None,
+) -> ModelCallResult:
+    """Invoke one model call over ``transport``, retrying transient failures.
+
+    This is the only retry engine: the sync entry point
+    (:func:`call_model_with_retries`) drives this coroutine, so the retry,
+    reachability-probe and stream-chunk-timeout budget logic exists exactly
+    once. ``sleeper`` (default ``asyncio.sleep`` wrapper) and ``prober``
+    (default the GET /models reachability probe) are injection points for
+    offline tests.
 
     Failure detection has three layers. The per-call loop bounds one
     invocation (default 1 original + 3 real retries). After a connection-class
@@ -1156,21 +1149,25 @@ def _call_model_with_retries(
     attempts, later calls fail fast instead of re-burning the retry chain.
     Any success resets the counter.
 
-    Streaming transport (``streamed_retry`` provided by the ARC model classes):
-    with ``stream_first`` (ARC_MODEL_STREAM_TRANSPORT=stream, the default) the
-    very first attempt streams — a non-streaming response carries zero bytes
-    while the model thinks, which gateways with an idle timeout (observed
-    ~120s) drop mid generation, while SSE chunks keep the connection alive.
-    A streamed attempt answered by a client error (4xx: the provider rejects
-    streaming) marks the endpoint streaming-unsupported for the whole process
-    and immediately re-attempts plain, without consuming the retry budget.
-    Without ``stream_first`` (mode ``retry``) the first attempt stays plain and
-    only a connection-class failure switches transport; transports alternate
-    on further connection failures and any non-connection error returns to
-    plain attempts.
+    Streaming transport (``transport.streamed`` supplied by the ARC model
+    classes): with ``stream_first`` (ARC_MODEL_STREAM_TRANSPORT=stream, the
+    default) the very first attempt streams — a non-streaming response carries
+    zero bytes while the model thinks, which gateways with an idle timeout
+    (observed ~120s) drop mid generation, while SSE chunks keep the connection
+    alive. A streamed attempt answered by a client error (4xx: the provider
+    rejects streaming) marks the endpoint streaming-unsupported for the whole
+    process and immediately re-attempts plain, without consuming the retry
+    budget. Without ``stream_first`` (mode ``retry``) the first attempt stays
+    plain and only a connection-class failure switches transport; transports
+    alternate on further connection failures and any non-connection error
+    returns to plain attempts. Every stream→plain fallback is recorded on the
+    returned outcome (trigger attempt + reason), so the fallback decision is
+    assertable at this seam without reaching into module internals.
     """
 
-    policy = _resolve_retry_policy()
+    policy = resolve_retry_policy()
+    sleeper = sleeper or _asleep
+    prober = prober or _aendpoint_reachable
     endpoint_key = _model_endpoint_key(model, base_url, api_key)
     _check_consecutive_failure_budget(endpoint_key, api_mode=api_mode, model=model, base_url=base_url, api_key=api_key)
     failed_attempts = 0
@@ -1178,12 +1175,15 @@ def _call_model_with_retries(
     probe_next = False
     attempt_count = 0
     chunk_timeout_switches = 0
+    fallbacks: list[StreamFallback] = []
     stream_retry = bool(
-        stream_first and streamed_retry is not None and not _streaming_marked_unsupported(model, base_url)
+        stream_first
+        and transport.streamed is not None
+        and not _streaming_marked_unsupported(model, base_url)
     )
     while True:
         if probe_next:
-            if not _endpoint_reachable(base_url, api_key):
+            if not await _await_if_needed(prober(base_url, api_key)):
                 # The endpoint is down: probing is cheap, a real attempt is
                 # not, and the unreachable window already counts towards the
                 # consecutive-failure budget, so re-probe (up to the cap)
@@ -1198,160 +1198,16 @@ def _call_model_with_retries(
                         attempts=failed_attempts,
                     )
                 _log_unreachable_probe(probe_rounds=probe_rounds, policy=policy)
-                _sleep(policy.retry_delay)
+                await _await_if_needed(sleeper(policy.retry_delay))
                 continue
             # The endpoint answers again; fall through to the real attempt.
             probe_next = False
             probe_rounds = 0
         attempt: Callable[[], Any]
-        if stream_retry and streamed_retry is not None:
-            attempt = streamed_retry
+        if stream_retry and transport.streamed is not None:
+            attempt = transport.streamed
         else:
-            attempt = call
-        attempt_count += 1
-        try:
-            result = attempt()
-        except Exception as exc:
-            if stream_retry and _is_client_error(exc):
-                # The provider rejected the streamed request itself (4xx):
-                # not transient, and not the plain transport's fault. Switch
-                # the endpoint to plain for the rest of the process and
-                # re-attempt immediately without spending the retry budget.
-                _mark_streaming_unsupported(model, base_url)
-                logger.warning(
-                    "Provider rejected the streamed request (%s); "
-                    "falling back to non-streaming requests for this endpoint.",
-                    _short_error_text(exc, limit=200),
-                )
-                stream_retry = False
-                continue
-            if _is_stream_chunk_timeout(exc) and (
-                stream_retry or chunk_timeout_switches > 0
-            ):
-                # The attempt stalled between chunks (watchdog error). The
-                # first stall on the streamed transport gets one immediate
-                # free transport switch (no probe round, no delay, no budget
-                # burn — the common case recovers here). Every further stall,
-                # on either transport, counts as a budgeted attempt so a
-                # fully stalled endpoint cannot loop for free forever.
-                # The guard routes a watchdog-shaped error from a plain
-                # attempt (no streamed transport configured, no stall seen
-                # yet) to the generic path below: there it is not a
-                # retryable model-API exception, so the budget check fails
-                # immediately and _raise_model_api_exception re-raises it
-                # as-is (the exception is not OpenAI/httpx, so the wrapper
-                # passes it through untouched — the pre-watchdog contract).
-                chunk_timeout_switches += 1
-                if chunk_timeout_switches == 1:
-                    _record_model_failure(endpoint_key)
-                    _log_model_retry(
-                        exc,
-                        failed_attempts=failed_attempts + 1,
-                        policy=policy,
-                        delay=0.0,
-                        stream_retry=not stream_retry or not _stream_transport_enabled(),
-                    )
-                    if streamed_retry is not None and _stream_transport_enabled():
-                        stream_retry = not stream_retry
-                    continue
-                failed_attempts += 1
-                _record_model_failure(endpoint_key, exc=exc)
-                if failed_attempts > policy.max_retries:
-                    _raise_model_api_exception(exc, api_mode=api_mode, model=model)
-                _log_model_retry(
-                    exc,
-                    failed_attempts=failed_attempts,
-                    policy=policy,
-                    delay=0.0,
-                    stream_retry=not stream_retry or not _stream_transport_enabled(),
-                )
-                if streamed_retry is not None and _stream_transport_enabled():
-                    stream_retry = not stream_retry
-                continue
-            failed_attempts += 1
-            _record_model_failure(endpoint_key, exc=exc)
-            if not _should_retry_model_exception(exc, failed_attempts=failed_attempts, policy=policy):
-                _raise_model_api_exception(exc, api_mode=api_mode, model=model)
-            delay = _compute_retry_delay(policy, exc)
-            next_stream = (
-                _is_connection_failure(exc)
-                and streamed_retry is not None
-                and _stream_transport_enabled()
-                and not stream_retry
-            )
-            _log_model_retry(
-                exc, failed_attempts=failed_attempts, policy=policy, delay=delay, stream_retry=next_stream
-            )
-            _sleep(delay)
-            if _is_connection_failure(exc):
-                # An empty stream proves the endpoint just answered with HTTP
-                # 200, so the reachability probe would only burn its wait;
-                # switch transport and re-attempt directly.
-                probe_next = not _is_empty_stream_error(exc)
-                # Only a connection-class failure is transport-suspicious:
-                # alternate. Any other retryable error keeps the current
-                # transport (a 5xx says nothing about stream vs plain).
-                if streamed_retry is not None and _stream_transport_enabled():
-                    stream_retry = not stream_retry
-            continue
-        _reset_model_failures(endpoint_key)
-        _note_successful_attempt(
-            transport="streamed" if stream_retry else "plain", attempts=attempt_count
-        )
-        return result
-
-
-async def _acall_model_with_retries(
-    call: Callable[[], Any],
-    *,
-    api_mode: OpenAIAPIMode,
-    model: str,
-    base_url: str = "",
-    api_key: str = "",
-    streamed_retry: Callable[[], Any] | None = None,
-    stream_first: bool = False,
-) -> Any:
-    """Async variant of ``_call_model_with_retries``; see its docstring for the retry contract."""
-
-    policy = _resolve_retry_policy()
-    endpoint_key = _model_endpoint_key(model, base_url, api_key)
-    _check_consecutive_failure_budget(
-        endpoint_key, api_mode=api_mode, model=model, base_url=base_url, api_key=api_key
-    )
-    failed_attempts = 0
-    probe_rounds = 0
-    probe_next = False
-    attempt_count = 0
-    chunk_timeout_switches = 0
-    stream_retry = bool(
-        stream_first and streamed_retry is not None and not _streaming_marked_unsupported(model, base_url)
-    )
-    while True:
-        if probe_next:
-            if not await _aendpoint_reachable(base_url, api_key):
-                # The endpoint is down: probing is cheap, a real attempt is
-                # not, and the unreachable window already counts towards the
-                # consecutive-failure budget, so re-probe (up to the cap)
-                # instead of burning a real attempt against it.
-                _record_model_failure(endpoint_key)
-                probe_rounds += 1
-                if probe_rounds > _PROBE_ROUNDS_PER_ATTEMPT:
-                    _raise_endpoint_unreachable(
-                        api_mode=api_mode,
-                        model=model,
-                        base_url=base_url,
-                        attempts=failed_attempts,
-                    )
-                _log_unreachable_probe(probe_rounds=probe_rounds, policy=policy)
-                await _asleep(policy.retry_delay)
-                continue
-            # The endpoint answers again; fall through to the real attempt.
-            probe_next = False
-            probe_rounds = 0
-        if stream_retry and streamed_retry is not None:
-            attempt = streamed_retry
-        else:
-            attempt = call
+            attempt = transport.plain
         attempt_count += 1
         try:
             result = await _await_if_needed(attempt())
@@ -1362,6 +1218,9 @@ async def _acall_model_with_retries(
                 # the endpoint to plain for the rest of the process and
                 # re-attempt immediately without spending the retry budget.
                 _mark_streaming_unsupported(model, base_url)
+                fallbacks.append(
+                    StreamFallback(reason=FALLBACK_CLIENT_ERROR, attempt=attempt_count)
+                )
                 logger.warning(
                     "Provider rejected the streamed request (%s); "
                     "falling back to non-streaming requests for this endpoint.",
@@ -1385,6 +1244,10 @@ async def _acall_model_with_retries(
                 # immediately and _raise_model_api_exception re-raises it
                 # as-is (the exception is not OpenAI/httpx, so the wrapper
                 # passes it through untouched — the pre-watchdog contract).
+                if stream_retry:
+                    fallbacks.append(
+                        StreamFallback(reason=FALLBACK_CHUNK_TIMEOUT, attempt=attempt_count)
+                    )
                 chunk_timeout_switches += 1
                 if chunk_timeout_switches == 1:
                     _record_model_failure(endpoint_key)
@@ -1393,9 +1256,9 @@ async def _acall_model_with_retries(
                         failed_attempts=failed_attempts + 1,
                         policy=policy,
                         delay=0.0,
-                        stream_retry=not stream_retry or not _stream_transport_enabled(),
+                        stream_retry=not stream_retry,
                     )
-                    if streamed_retry is not None and _stream_transport_enabled():
+                    if transport.streamed is not None:
                         stream_retry = not stream_retry
                     continue
                 failed_attempts += 1
@@ -1407,9 +1270,9 @@ async def _acall_model_with_retries(
                     failed_attempts=failed_attempts,
                     policy=policy,
                     delay=0.0,
-                    stream_retry=not stream_retry or not _stream_transport_enabled(),
+                    stream_retry=not stream_retry,
                 )
-                if streamed_retry is not None and _stream_transport_enabled():
+                if transport.streamed is not None:
                     stream_retry = not stream_retry
                 continue
             failed_attempts += 1
@@ -1419,14 +1282,13 @@ async def _acall_model_with_retries(
             delay = _compute_retry_delay(policy, exc)
             next_stream = (
                 _is_connection_failure(exc)
-                and streamed_retry is not None
-                and _stream_transport_enabled()
+                and transport.streamed is not None
                 and not stream_retry
             )
             _log_model_retry(
                 exc, failed_attempts=failed_attempts, policy=policy, delay=delay, stream_retry=next_stream
             )
-            await _asleep(delay)
+            await _await_if_needed(sleeper(delay))
             if _is_connection_failure(exc):
                 # An empty stream proves the endpoint just answered with HTTP
                 # 200, so the reachability probe would only burn its wait;
@@ -1435,14 +1297,96 @@ async def _acall_model_with_retries(
                 # Only a connection-class failure is transport-suspicious:
                 # alternate. Any other retryable error keeps the current
                 # transport (a 5xx says nothing about stream vs plain).
-                if streamed_retry is not None and _stream_transport_enabled():
+                if transport.streamed is not None:
+                    if stream_retry:
+                        fallbacks.append(
+                            StreamFallback(
+                                reason=FALLBACK_CONNECTION_FAILURE, attempt=attempt_count
+                            )
+                        )
                     stream_retry = not stream_retry
             continue
         _reset_model_failures(endpoint_key)
-        _note_successful_attempt(
-            transport="streamed" if stream_retry else "plain", attempts=attempt_count
+        return ModelCallResult(
+            value=result,
+            outcome=ModelCallOutcome(
+                transport="streamed" if stream_retry else "plain",
+                attempts=attempt_count,
+                stream_fallbacks=tuple(fallbacks),
+            ),
         )
-        return result
+
+
+def call_model_with_retries(
+    transport: ModelTransport,
+    *,
+    api_mode: OpenAIAPIMode,
+    model: str,
+    base_url: str = "",
+    api_key: str = "",
+    stream_first: bool = False,
+    sleeper: Callable[[float], Any] | None = None,
+    prober: Callable[[str, str], Any] | None = None,
+) -> ModelCallResult:
+    """Sync thin adapter over :func:`acall_model_with_retries` — the only retry engine.
+
+    Blocks the calling thread until the engine coroutine finishes. Transport
+    callables may be sync: the engine awaits values as-is, so the sync model
+    classes plug their synchronous generate/stream helpers into the same
+    engine the async path uses.
+    """
+
+    return _run_engine_blocking(
+        acall_model_with_retries(
+            transport,
+            api_mode=api_mode,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            stream_first=stream_first,
+            sleeper=sleeper,
+            prober=prober,
+        )
+    )
+
+
+_SYNC_ENGINE_LOOP: asyncio.AbstractEventLoop | None = None
+_SYNC_ENGINE_LOOP_LOCK = threading.Lock()
+
+
+def _run_engine_blocking(coro: Coroutine[Any, Any, ModelCallResult]) -> ModelCallResult:
+    """Drive the async retry engine from sync code.
+
+    When the calling thread has no running event loop (the common case: CLI,
+    tests, executor threads) the engine runs on a fresh loop via
+    ``asyncio.run``. When a loop already owns this thread, blocking inside
+    ``asyncio.run`` would raise, so the coroutine is served by a dedicated
+    background loop instead — same semantics, one extra thread hop. Usage
+    recording happens in the caller's context (the model classes), never
+    inside the engine, so the loop hop cannot lose the llm_usage attribution
+    context.
+    """
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    return asyncio.run_coroutine_threadsafe(coro, _background_engine_loop()).result()
+
+
+def _background_engine_loop() -> asyncio.AbstractEventLoop:
+    """One lazily-created daemon loop for sync engine calls made from loop threads."""
+
+    global _SYNC_ENGINE_LOOP
+    with _SYNC_ENGINE_LOOP_LOCK:
+        loop = _SYNC_ENGINE_LOOP
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            threading.Thread(
+                target=loop.run_forever, name="arc-model-retry-engine", daemon=True
+            ).start()
+            _SYNC_ENGINE_LOOP = loop
+        return loop
 
 
 async def _await_if_needed(value: Any) -> Any:
@@ -1455,7 +1399,7 @@ def _should_retry_model_exception(
     exc: Exception,
     *,
     failed_attempts: int,
-    policy: _ModelRetryPolicy,
+    policy: ModelRetryPolicy,
 ) -> bool:
     if not _is_model_api_exception(exc):
         return False
@@ -1501,7 +1445,7 @@ def _provider_error_text(exc: Exception) -> str:
     return "\n".join(parts)
 
 
-def _compute_retry_delay(policy: _ModelRetryPolicy, exc: Exception) -> float:
+def _compute_retry_delay(policy: ModelRetryPolicy, exc: Exception) -> float:
     retry_after = _parse_retry_after_header(exc)
     if retry_after is not None:
         return min(retry_after, policy.max_delay)
@@ -1601,7 +1545,7 @@ def _check_consecutive_failure_budget(
 ) -> None:
     """Fail fast when the endpoint already exhausted its failure budget."""
 
-    policy = _resolve_retry_policy()
+    policy = resolve_retry_policy()
     if policy.max_consecutive_failures <= 0:
         return
     failures = _consecutive_failure_count(endpoint_key)
@@ -1698,17 +1642,12 @@ async def _aendpoint_reachable(base_url: str, api_key: str) -> bool:
     # asyncio.to_thread never touches the loop while the probe runs: it
     # schedules the sync call on a worker thread and awaits a future, so even
     # a probe that runs its full timeout leaves the loop serving other tasks.
-    # ``transport`` is therefore a sync-only injection point (offline tests
-    # cover the sync wrapper); the async path probes the real network, which
-    # is the production behaviour.
+    # This is the engine's default prober; offline tests inject a fake via the
+    # engine's ``prober`` parameter instead of swapping module state.
     return await asyncio.to_thread(probe_endpoint_reachable, base_url=base_url, api_key=api_key)
 
 
-def _endpoint_reachable(base_url: str, api_key: str) -> bool:
-    return probe_endpoint_reachable(base_url=base_url, api_key=api_key)
-
-
-def _log_unreachable_probe(*, probe_rounds: int, policy: _ModelRetryPolicy) -> None:
+def _log_unreachable_probe(*, probe_rounds: int, policy: ModelRetryPolicy) -> None:
     logger.warning(
         "Endpoint reachability probe failed (probe round %d of %d); "
         "waiting %.1fs before re-probing without consuming the retry budget.",
@@ -1737,7 +1676,7 @@ def _log_model_retry(
     exc: Exception,
     *,
     failed_attempts: int,
-    policy: _ModelRetryPolicy,
+    policy: ModelRetryPolicy,
     delay: float,
     stream_retry: bool = False,
 ) -> None:
@@ -1750,11 +1689,6 @@ def _log_model_retry(
         transport,
         _short_error_text(exc, limit=300),
     )
-
-
-def _sleep(seconds: float) -> None:
-    if seconds > 0:
-        time.sleep(seconds)
 
 
 async def _asleep(seconds: float) -> None:

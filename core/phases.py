@@ -27,8 +27,9 @@ from core.test_executor import (
 # Re-exported for the executor contract tests (canonical layer vocabulary).
 from core.test_types import canonical_test_type  # noqa: F401
 from core.visual_analysis import analyze_and_attach_visual_references
-from app_type_handler.test_results import classify_test_failure
-from agents.tools.test_manifest import is_test_file_path, normalize_coverage_scope
+from app_type_handler.test_results import TestRunResult
+from agents.runtime.capabilities import is_test_file_path
+from agents.tools.test_manifest import normalize_coverage_scope
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -677,7 +678,7 @@ class WorkflowPhaseRunner:
                 }
                 (green_evidence if scope == "owned" else exempt_green_evidence).append(evidence)
                 continue
-            baseline_env = classify_test_failure(baseline.output)
+            baseline_env = baseline.environment_failure
             file_state[path] = baseline.state
             if baseline_env:
                 # The file could not be verified either way (broken workspace,
@@ -907,7 +908,7 @@ class WorkflowPhaseRunner:
             "revised_tests": current_tests if manifest_revised else None,
         }
 
-    async def _run_test_group(self, test_type: str, file_paths: list[str]) -> str:
+    async def _run_test_group(self, test_type: str, file_paths: list[str]) -> TestRunResult:
         """Single choke point over the app handler's batch runner.
 
         Both executor instances (the TDD loop's and the DESIGN gate's
@@ -1014,7 +1015,7 @@ class WorkflowPhaseRunner:
                 # shared unverified state; this layer hands the env failure to
                 # the first session below, so its per-file state stays red).
                 executor.record_file_state(ordered_type, baseline_file, "red")
-                baseline_env = classify_test_failure(baseline_output)
+                baseline_env = baseline.environment_failure
                 if baseline_env:
                     # Broken workspace before any agent budget is spent: hand
                     # the failure to the first session instead of burning its
@@ -1185,7 +1186,7 @@ class WorkflowPhaseRunner:
                     if path and path not in modified_files_round:
                         modified_files_round.append(path)
 
-                latest_result = executor.layer_output(ordered_type)
+                latest_result = executor.layer_result(ordered_type)
                 # Three-part cross-session handoff: the structured per-test
                 # digest (locations + expected/received), a diff hint of what
                 # the previous session edited, and the pointer to the persisted
@@ -1196,7 +1197,7 @@ class WorkflowPhaseRunner:
                     self._build_session_handoff(
                         self.test_driven_developer.get_last_failure_digest()
                         or self.test_driven_developer.get_last_verifier_report()
-                        or summarize_batch_output(latest_result or output),
+                        or summarize_batch_output((latest_result.output if latest_result else "") or output),
                         modified_files=self.test_driven_developer.get_last_modified_files(),
                         fingerprint_history=executor.fingerprints(ordered_type),
                     )
@@ -1233,7 +1234,7 @@ class WorkflowPhaseRunner:
         failure_summaries: list[str] = []
         failed_types: list[str] = []
         for test_type in ordered_types:
-            latest_result = executor.layer_output(test_type)
+            latest_result = executor.layer_result(test_type)
             group_passed = executor.layer_passed(test_type)
             status_by_test_id = {
                 str(test.get("test_id", "")).strip(): group_passed
@@ -1260,7 +1261,7 @@ class WorkflowPhaseRunner:
                 )
             else:
                 failure_summary = (
-                    summarize_batch_output(latest_result)
+                    summarize_batch_output(latest_result.output)
                     if latest_result
                     else self.test_driven_developer.get_last_verifier_report()
                     or summarize_batch_output(output)

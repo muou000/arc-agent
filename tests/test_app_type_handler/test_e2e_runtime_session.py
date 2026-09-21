@@ -18,7 +18,6 @@ from pathlib import Path
 from unittest import mock
 
 from app_type_handler import web as web_handler
-from app_type_handler.test_results import parse_test_results
 
 
 class _FakeProcess:
@@ -41,14 +40,17 @@ class _CommandRecorder:
         timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
         web_port: int | None = None,
-    ) -> str:
+    ) -> web_handler._CommandResult:
         self.calls.append(command)
         code = 0
         for needle, value in self.exit_codes.items():
             if needle in command:
                 code = value
                 break
-        return f"Exit Code: {code}\nSTDOUT:\n{command} ran\n"
+        return web_handler._CommandResult(
+            exit_code=code,
+            text=f"Exit Code: {code}\nSTDOUT:\n{command} ran\n",
+        )
 
 
 def _make_workspace(tmp_path: Path) -> tuple[Path, str]:
@@ -93,11 +95,11 @@ def _make_session(db_path: str, fingerprint: str, port: int = 4321) -> web_handl
 
 
 def _patch_fresh_start(monkeypatch, recorder: _CommandRecorder, start_calls: list[str]) -> None:
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
-        return True, "build ok"
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+        return web_handler._FrontendBuildOutcome(ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0)
 
-    async def _fake_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, str]:
-        return True, "prepared"
+    async def _fake_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, int | None, str]:
+        return True, 0, "prepared"
 
     async def _fake_start(workspace_path: str, runtime_env: dict, web_port: int | None = None):
         start_calls.append("start")
@@ -138,7 +140,7 @@ def test_reuses_live_server_when_nothing_changed(tmp_path, monkeypatch) -> None:
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     assert start_calls == []
-    assert "Reused the live backend runtime" in result
+    assert "Reused the live backend runtime" in result.output
     assert "npm run db:seed" in recorder.calls
     # The database reset really ran: rows are gone, schema stays.
     connection = sqlite3.connect(env["ARC_E2E_DB_PATH"])
@@ -151,7 +153,7 @@ def test_reuses_live_server_when_nothing_changed(tmp_path, monkeypatch) -> None:
     assert tables
     # The runtime stays registered for the next attempt.
     assert handler._e2e_runtime_session is session
-    assert parse_test_results(result)["exit_code"] == 0
+    assert result.exit_code == 0
 
 
 def test_restarts_server_when_backend_source_changes(tmp_path, monkeypatch) -> None:
@@ -183,8 +185,8 @@ def test_restarts_server_when_backend_source_changes(tmp_path, monkeypatch) -> N
     assert terminated == [stale_session.process.pid]
     assert handler._e2e_runtime_session is not stale_session
     assert handler._e2e_runtime_session is not None
-    assert "Reused the live backend runtime" not in result
-    assert "Deferred: the backend runtime stays alive" in result
+    assert "Reused the live backend runtime" not in result.output
+    assert "Deferred: the backend runtime stays alive" in result.output
 
 
 def test_restarts_server_when_previous_process_died(tmp_path, monkeypatch) -> None:
@@ -262,10 +264,10 @@ def test_falls_back_to_fresh_start_when_reseeding_fails(tmp_path, monkeypatch) -
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     assert start_calls == ["start"]
-    assert "Reused the live backend runtime" not in result
+    assert "Reused the live backend runtime" not in result.output
     # The reset-failure reason must survive the fallback for debuggability.
-    assert "fell back to a fresh start" in result
-    assert "db:seed" in result
+    assert "fell back to a fresh start" in result.output
+    assert "db:seed" in result.output
 
 
 def test_runtime_session_is_strictly_per_instance(tmp_path, monkeypatch) -> None:
@@ -294,7 +296,7 @@ def test_runtime_session_is_strictly_per_instance(tmp_path, monkeypatch) -> None
     # Shutting down one instance leaves the other's session in place.
     asyncio.run(second.shutdown_e2e_runtime())
     assert first._e2e_runtime_session is session
-    assert "Exit Code: 0" in result
+    assert "Exit Code: 0" in result.output
 
 
 
@@ -341,7 +343,7 @@ def test_fresh_run_stores_session_and_defers_cleanup(tmp_path, monkeypatch) -> N
     assert terminated == []
     assert handler._e2e_runtime_session is not None
     assert handler._e2e_runtime_session.port == 4321
-    assert "Deferred: the backend runtime stays alive" in result
+    assert "Deferred: the backend runtime stays alive" in result.output
 
 
 def test_shutdown_e2e_runtime_terminates_the_session(tmp_path) -> None:
@@ -619,10 +621,10 @@ def test_e2e_result_contains_stage_timing_breakdown(tmp_path, monkeypatch) -> No
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
-    assert "=== Stage Timing ===" in result
+    assert "=== Stage Timing ===" in result.output
     # A fresh E2E run pays all four stages; each is reported as name=<n>s.
     for stage in ("frontend_build", "database_prepare", "backend_runtime", "playwright"):
-        assert stage + "=" in result
+        assert stage + "=" in result.output
 
 
 def test_e2e_stage_timing_reports_reused_stages(tmp_path, monkeypatch) -> None:
@@ -646,6 +648,187 @@ def test_e2e_stage_timing_reports_reused_stages(tmp_path, monkeypatch) -> None:
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
-    assert "=== Stage Timing ===" in result
-    assert "database_prepare=" in result
+    assert "=== Stage Timing ===" in result.output
+    assert "database_prepare=" in result.output
     assert start_calls == []  # reuse confirmed: no fresh backend start
+
+
+# --------------------------------------------------------------------------
+# The single E2E executor (issue #98)
+# --------------------------------------------------------------------------
+
+
+def test_e2e_failure_bodies_come_from_one_renderer(tmp_path, monkeypatch) -> None:
+    """Build, database and backend failures render through one body assembler.
+
+    The three premature exits of the E2E attempt used to hand-write their own
+    "Frontend Build / Runtime Env / Database Prepare / Backend Runtime Command /
+    Previous Cleanup" assemblies from slightly different subsets, so sections
+    drifted between paths (one forgot the runtime env, another the DB label).
+    All three now flow through `_render_e2e_failure_body`: each body carries
+    exactly the sections the attempt had gathered, in one fixed order, and the
+    pre-attempt cleanup note survives to the end.
+    """
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+    handler = _make_handler(workspace)
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+
+    async def _failing_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+        return web_handler._FrontendBuildOutcome(
+            ok=False, note="frontend build failed", output="vite: build error", exit_code=1
+        )
+
+    monkeypatch.setattr(web_handler, "_build_frontend_dist", _failing_build)
+    build_failed = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    assert build_failed.exit_code == 1
+    assert "Frontend build failed before E2E startup." in build_failed.output
+    assert "=== Frontend Build ===\nvite: build error" in build_failed.output
+    assert "Served index.html:" in build_failed.output
+    # The build never produced a runtime env, so no env/DB/backend sections.
+    assert "=== E2E Runtime Env ===" not in build_failed.output
+    assert "=== Database Prepare ===" not in build_failed.output
+    assert "=== Backend Runtime Command ===" not in build_failed.output
+
+    async def _failing_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, int | None, str]:
+        return False, 1, "db:prepare:e2e failed"
+
+    async def _ok_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+        return web_handler._FrontendBuildOutcome(
+            ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0
+        )
+
+    monkeypatch.setattr(web_handler, "_build_frontend_dist", _ok_build)
+    monkeypatch.setattr(web_handler, "_prepare_e2e_database", _failing_prepare)
+    db_failed = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    assert db_failed.exit_code == 1
+    assert "E2E database preparation failed before backend startup." in db_failed.output
+    assert "=== Frontend Build ===\nbuild ok" in db_failed.output
+    # The database failure knows the runtime env the attempt had built...
+    assert "=== E2E Runtime Env ===" in db_failed.output
+    assert "DB Path:" in db_failed.output
+    assert "=== Database Prepare ===\ndb:prepare:e2e failed" in db_failed.output
+    # ...but never started a backend, so no backend command section.
+    assert "=== Backend Runtime Command ===" not in db_failed.output
+
+    async def _failing_start(workspace_path: str, runtime_env: dict, web_port: int | None = None):
+        return None, "npm run start", "crashed on boot: ERR_MODULE_NOT_FOUND", "no-fingerprint"
+
+    async def _ok_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, int | None, str]:
+        return True, 0, "prepared"
+
+    monkeypatch.setattr(web_handler, "_start_backend_runtime", _failing_start)
+    monkeypatch.setattr(web_handler, "_prepare_e2e_database", _ok_prepare)
+    backend_failed = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    assert backend_failed.exit_code == 1
+    assert "=== Backend Runtime Command ===\nnpm run start" in backend_failed.output
+    assert "STDERR:\ncrashed on boot: ERR_MODULE_NOT_FOUND" in backend_failed.output
+    assert "=== Database Prepare ===\nprepared" in backend_failed.output
+    assert "=== E2E Runtime Env ===" in backend_failed.output
+
+
+def test_e2e_recovery_cleanup_note_survives_into_failure_bodies(tmp_path, monkeypatch) -> None:
+    """A prior-attempt cleanup note stays visible when the next attempt fails.
+
+    The recovery re-run hands the teardown evidence of the attempt before it
+    into `prior_cleanup_note`; the single renderer must keep surfacing it in
+    the "Previous Backend Runtime Cleanup" section no matter which stage the
+    new attempt dies on (here: the build, the earliest exit).
+    """
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+    handler = _make_handler(workspace)
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+
+    async def _failing_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+        return web_handler._FrontendBuildOutcome(
+            ok=False, note="frontend build failed", output="vite: build error", exit_code=1
+        )
+
+    monkeypatch.setattr(web_handler, "_build_frontend_dist", _failing_build)
+
+    stage_timer = web_handler._StageTimer()
+    result, _note = asyncio.run(
+        handler._run_e2e_group_attempt(
+            {
+                "resolved_targets": ["test-e2e/login.spec.ts"],
+                "working_directory": str(workspace / "backend"),
+            },
+            stage_timer,
+            4321,
+            force_rebuild=False,
+            prior_cleanup_note="released port 4321 from the previous attempt",
+        )
+    )
+
+    assert result.exit_code == 1
+    assert (
+        "=== Previous Backend Runtime Cleanup ===\nreleased port 4321 from the previous attempt"
+        in result.output
+    )
+
+
+def test_e2e_timeout_has_a_single_source(tmp_path, monkeypatch) -> None:
+    """The E2E runner command draws its timeout from one named constant.
+
+    The batch path used to pass a one-off ``120.0`` to the Playwright command
+    while the deleted single-file path rode the helper's 60s default. The
+    named constant is the single source; a path fork reintroducing a literal
+    (or dropping the override back to the default) changes the recorded value
+    and fails here.
+    """
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+    handler = _make_handler(workspace)
+
+    seen_timeouts: list[float | None] = []
+
+    async def _recording_command(command: str, cwd: str, timeout: float = 60.0, extra_env=None, web_port=None):
+        if "playwright" in command:
+            seen_timeouts.append(timeout)
+        return web_handler._CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
+
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+    # The fresh-start harness routes _execute_web_test_command through its
+    # own recorder; layer the timeout probe on top of it.
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", _recording_command)
+
+    asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    # The attempt reached the Playwright stage (fresh backend start happened)
+    # and its timeout is the one named constant.
+    assert start_calls == ["start"]
+    assert seen_timeouts == [web_handler.E2E_RUNNER_TIMEOUT_SECONDS]
+
+
+def test_single_file_e2e_request_routes_to_the_group_executor(tmp_path, monkeypatch) -> None:
+    """`run_test_file("e2e", ...)` is the grouped pipeline with one target.
+
+    E2E has exactly one executor; a single-file request must not fork a
+    second command path with a divergent timeout. The Vitest single-file path
+    keeps its direct execution.
+    """
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+    handler = _make_handler(workspace)
+    group_calls: list[tuple[str, list[str]]] = []
+
+    async def _fake_group(test_type: str, file_paths: list[str], web_port=None):
+        group_calls.append((test_type, list(file_paths)))
+        return web_handler.TestRunResult(exit_code=0, output="Exit Code: 0\n")
+
+    monkeypatch.setattr(handler, "run_test_group", _fake_group)
+
+    result = asyncio.run(handler.run_test_file("e2e", "backend/test-e2e/login.spec.ts", web_port=4321))
+
+    assert group_calls == [("e2e", ["backend/test-e2e/login.spec.ts"])]
+    assert result.exit_code == 0

@@ -14,12 +14,11 @@ from typing import Any
 
 import pytest
 
+from agents.runtime.capabilities import is_test_file_path, normalize_manifest_path
 from agents.tools.test_manifest import (
     DeclaredTestFile,
     TestManifestLock,
     build_declare_test_manifest_tool,
-    is_test_file_path,
-    normalize_manifest_path,
     reconcile_declared_manifest,
 )
 

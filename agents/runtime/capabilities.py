@@ -1,0 +1,263 @@
+"""Declarative capability table for ARC's staged agent workflow.
+
+"May stage X call tool Y on path P?" has exactly one authoritative answer:
+the table in this module. Three consumers read it so the judgment can never
+drift apart again:
+
+- ``StageDisciplineMiddleware`` blocks categorically-denied calls with the
+  table's message (dynamic state guards — write budgets, manifest locks,
+  session ownership — stay in the middleware; they are runtime conditions,
+  not static capabilities).
+- ``build_stage_agent`` mounts only tools the table allows for the stage and
+  derives the always-disabled builtin set from it.
+- Prompt restatements of tool availability are pinned to the table by
+  ``tests/test_agents/test_stage_capabilities.py`` (the messages stay
+  hand-written; a drift in either direction fails the consistency tests).
+
+The module is deliberately dependency-free inside ``agents``: it sits below
+``stage_discipline``, ``test_manifest`` and ``factory`` in the import graph
+and hosts the shared path-predicate vocabulary those modules used to
+duplicate.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Callable, Literal
+
+Stage = Literal["interface_design", "test_generation", "implementation"]
+
+#: Stages the capability table enumerates. Kept as a tuple so loops over the
+#: table (consistency tests, derived sets) stay deterministic.
+STAGES: tuple[Stage, ...] = ("interface_design", "test_generation", "implementation")
+
+# ---------------------------------------------------------------------------
+# Path predicates (the single implementation of each judgment)
+# ---------------------------------------------------------------------------
+
+
+def normalize_manifest_path(value: object) -> str:
+    """Canonicalize a tool-call or manifest path to workspace-relative form.
+
+    Accepts virtual (``/workspace/a/b.test.ts``), relative (``a/b.test.ts``,
+    ``./a/b.test.ts``) and absolute workspace-root-prefixed forms. Absolute
+    paths outside the workspace keep their ``/``-joined form (only used for
+    diagnostics; they never match a declared relative path).
+    """
+
+    path = re.sub(r"^\\\\\?\\", "", str(value or "").strip())
+    if not path:
+        return ""
+    path = path.replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    if path == "/workspace" or path == "/workspace/":
+        return ""
+    if path.startswith("/workspace/"):
+        return path[len("/workspace/") :].strip("/")
+    return path.strip("/")
+
+
+def is_test_asset(path: str) -> bool:
+    """Whether a path is a test *asset*: anything the TestGenerator may write.
+
+    Broader than :func:`is_test_file_path` — helpers and runner configs
+    (``setup-tests.ts``, ``playwright.config.js``) count, because the stage
+    must write them without a manifest entry.
+    """
+
+    normalized = path.replace("\\", "/").lower()
+    name = normalized.rsplit("/", 1)[-1]
+    # ``/test-e2e/`` is the web app type's E2E directory: its files may carry
+    # any JS/TS source name (the placement rule accepts plain names), so the
+    # segment must count as a test asset even without a `.test.`/`.spec.`
+    # marker — otherwise a declared `backend/test-e2e/login.js` would be
+    # rejected as "not a test asset" after passing the manifest declaration.
+    test_segments = ("/test/", "/tests/", "/__tests__/", "/e2e/", "/test-e2e/", "/__mocks__/")
+    test_names = (".test.", ".spec.", "playwright.config.", "vitest.config.", "jest.config.", "setup-tests.", "setuptests.")
+    return any(segment in normalized for segment in test_segments) or any(marker in name for marker in test_names)
+
+
+def is_not_test_asset(path: str) -> bool:
+    """Negation of :func:`is_test_asset`, usable as a table predicate."""
+
+    return not is_test_asset(path)
+
+
+def is_test_file_path(path: str) -> bool:
+    """Whether a path is a *test file* (not a helper/config).
+
+    The manifest predicate: it governs which paths the TestGenerator must
+    declare through ``declare_test_manifest`` before writing. Deliberately
+    narrower than :func:`is_test_asset` — helpers and runner configs are test
+    *assets* the stage may write freely, and locking them would only add
+    blocked-turn noise.
+
+    Files whose name marks them as tests — JavaScript-style ``.test.``/
+    ``.spec.`` names plus the Python unittest conventions
+    ``test_*.py``/``*_test.py`` (the CLI app type's layout) — plus the one
+    name-agnostic case: web E2E files under a ``test-e2e`` directory, where
+    the app-type rule accepts any JS/TS source name.
+    """
+
+    normalized = normalize_manifest_path(path).lower()
+    if "/test-e2e/" in f"/{normalized}/":
+        return True
+    name = normalized.rsplit("/", 1)[-1]
+    if ".test." in name or ".spec." in name:
+        return True
+    if not name.endswith(".py"):
+        return False
+    return name.startswith("test_") or name.endswith("_test.py")
+
+
+# ---------------------------------------------------------------------------
+# Verdicts and rules
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """The table's answer for one (stage, tool, path) cell.
+
+    ``message`` is the middleware's block text when ``allowed`` is False; a
+    ``{path}`` placeholder is replaced with the call's path. Empty when
+    allowed.
+    """
+
+    allowed: bool
+    message: str = field(default="")
+
+
+#: Shared answer for every uncategorized call. Default-open matches the
+#: historical middleware semantics: traceability queries, ``ls``/``glob``/
+#: ``grep`` and future tools pass through, and their containment is the
+#: filesystem permission layer's job, not this table's.
+ALLOW = Verdict(allowed=True)
+
+
+@dataclass(frozen=True)
+class CapabilityRule:
+    """One table row: a path predicate and the verdict it yields.
+
+    ``path_matches`` is a pure function of the call path (``None`` means the
+    rule matches regardless of path — a tool-level verdict). Rules are
+    evaluated in declaration order; the first match wins.
+    """
+
+    path_matches: Callable[[str], bool] | None
+    verdict: Verdict
+
+
+def _disabled(tool: str) -> Verdict:
+    return Verdict(allowed=False, message=f"`{tool}` is disabled in ARC's staged file workflow.")
+
+
+_APPEND_ONLY_IN_DESIGN = Verdict(
+    allowed=False,
+    message="append_file is only available during the interface_design stage.",
+)
+_NO_VALIDATION_IN_TESTGEN = Verdict(
+    allowed=False,
+    message="TestGenerator only creates tests and its manifest; it must not run validation.",
+)
+_NOT_A_TEST_ASSET = Verdict(
+    allowed=False,
+    message=(
+        "TestGenerator may write only test files, test helpers/configuration, "
+        "and the returned manifest; {path} is not a test asset."
+    ),
+)
+
+
+def _build_rules() -> dict[tuple[Stage, str], tuple[CapabilityRule, ...]]:
+    rules: dict[tuple[Stage, str], tuple[CapabilityRule, ...]] = {}
+
+    # Disabled builtins: denied in every stage, never mounted.
+    for stage in STAGES:
+        for tool in ("execute", "write_todos"):
+            rules[(stage, tool)] = (CapabilityRule(path_matches=None, verdict=_disabled(tool)),)
+
+    # delete: every stage denies it except the two declared channels.
+    # The channels themselves carry runtime conditions the table cannot see
+    # (manifest lock, rewrite budget, session ownership) — the middleware
+    # applies those after the table's static verdict allows the call.
+    rules[("interface_design", "delete")] = (CapabilityRule(path_matches=None, verdict=_disabled("delete")),)
+    for stage in ("test_generation", "implementation"):
+        rules[(stage, "delete")] = (
+            # test_generation: a green-baseline rejection may remove a test
+            # asset (duplicate or tautological coverage). implementation: the
+            # middleware narrows this to test files the session wrote itself.
+            CapabilityRule(path_matches=is_test_asset, verdict=ALLOW),
+            CapabilityRule(path_matches=None, verdict=_disabled("delete")),
+        )
+
+    # Validation tools: TestGenerator only creates tests and its manifest.
+    for tool in ("run_build", "run_tests"):
+        rules[("test_generation", tool)] = (
+            CapabilityRule(path_matches=None, verdict=_NO_VALIDATION_IN_TESTGEN),
+        )
+
+    # append_file: the DESIGN-only additive continuation tool.
+    for stage in ("test_generation", "implementation"):
+        rules[(stage, "append_file")] = (
+            CapabilityRule(path_matches=None, verdict=_APPEND_ONLY_IN_DESIGN),
+        )
+
+    # TestGenerator writes test assets only — via either whole-file write or
+    # anchor edit. Shared-surface blocking (template wiring) is applied by the
+    # middleware *before* this rule so its remediation message keeps
+    # precedence for product paths.
+    for tool in ("write_file", "edit_file"):
+        rules[("test_generation", tool)] = (
+            CapabilityRule(path_matches=is_not_test_asset, verdict=_NOT_A_TEST_ASSET),
+        )
+
+    return rules
+
+
+_RULES: dict[tuple[Stage, str], tuple[CapabilityRule, ...]] = _build_rules()
+
+
+def capability_for(stage: str, tool: str, path: str = "") -> Verdict:
+    """The verdict for calling ``tool`` on ``path`` during ``stage``.
+
+    First matching rule for ``(stage, tool)`` wins; no matching rule (or no
+    rules at all) means allowed. ``{path}`` placeholders in a denial message
+    are replaced with the call's path so callers can use the text verbatim.
+    """
+
+    for rule in _RULES.get((stage, tool), ()):
+        if rule.path_matches is None or rule.path_matches(path):
+            verdict = rule.verdict
+            if not verdict.allowed and "{path}" in verdict.message:
+                return Verdict(allowed=False, message=verdict.message.replace("{path}", path))
+            return verdict
+    return ALLOW
+
+
+#: Builtin tools the table denies in every stage regardless of path. Derived
+#: from the table's keys, not enumerated: a tool qualifies only when every
+#: stage has rules for it and every rule is an unconditional denial — any
+#: path-scoped rule anywhere means the tool has allowed cells (``delete`` on
+#: test assets, for one) and stays mountable. Consumed by the factory's
+#: harness exclusion + ``DisableToolsMiddleware``;
+#: ``tests/test_agents/test_stage_capabilities.py`` pins the derivation so the
+#: set and the table cannot drift apart.
+
+
+def _unconditionally_denied(tool: str) -> bool:
+    for stage in STAGES:
+        rules = _RULES.get((stage, tool))
+        if not rules:
+            return False
+        for rule in rules:
+            if rule.path_matches is not None or rule.verdict.allowed:
+                return False
+    return True
+
+
+DISABLED_BUILTIN_TOOLS: frozenset[str] = frozenset(
+    tool for (_, tool) in _RULES if _unconditionally_denied(tool)
+)

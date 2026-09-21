@@ -24,12 +24,11 @@ from typing import Any
 
 import pytest
 
-import agents.interface_designer as interface_designer_module
-import agents.test_driven_developer as test_driven_developer_module
-import agents.test_generator as test_generator_module
+import agents.runtime.stage_session as stage_session_module
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.interface_designer import InterfaceDesigner
-from agents.runtime.factory import _resolve_skill_instruction_paths
+from agents.runtime.factory import _resolve_skill_instruction_paths, StageAgentBuild
+from agents.runtime.stage_session import StageSession
 from agents.skills.selection import (
     SKILLS_SOURCE,
     available_skill_names,
@@ -145,28 +144,50 @@ def test_activation_policy_lists_required_skills_and_optional_selection():
 # -- adapters: skills source attached unconditionally --------------------------
 
 
-def _recording_build(monkeypatch: pytest.MonkeyPatch, module: Any) -> dict[str, Any]:
+def _recording_build(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Patch the stage session's build seam and capture its kwargs.
+
+    All three adapters construct their agents through ``StageSession``, so a
+    single patch target intercepts every stage build.
+    """
+
     captured: dict[str, Any] = {}
 
-    def fake_build_stage_agent(**kwargs: Any) -> object:
+    def fake_build_stage_agent(**kwargs: Any) -> StageAgentBuild:
         captured.update(kwargs)
-        return object()
+        return StageAgentBuild(agent=object(), stage_discipline=None)
 
-    monkeypatch.setattr(module, "build_stage_agent", fake_build_stage_agent)
+    monkeypatch.setattr(stage_session_module, "build_stage_agent", fake_build_stage_agent)
     return captured
 
 
-def test_designer_attaches_skills_source_without_floor_skills(monkeypatch: pytest.MonkeyPatch):
-    captured = _recording_build(monkeypatch, interface_designer_module)
-    designer = InterfaceDesigner()
+def _recording_invoke(monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any]) -> dict[str, Any]:
+    """Patch the stage session's invoke seam and capture its kwargs."""
 
-    designer._build_agent(
+    captured: dict[str, Any] = {}
+
+    async def fake_ainvoke(agent: Any, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return payload
+
+    monkeypatch.setattr(stage_session_module, "ainvoke_stage_agent", fake_ainvoke)
+    return captured
+
+
+def test_designer_attaches_skills_source_without_floor_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    captured = _recording_build(monkeypatch)
+    designer = InterfaceDesigner()
+    session = StageSession(
+        agent_name="InterfaceDesigner",
         node_id="REQ-SKILL-1",
-        workspace_root=str(SKILLS_ROOT.parent),
+        phase="DESIGN",
+        workspace_root=str(tmp_path),
         app_type="web",
-        required_skill_names=[],
-        response_format=None,
     )
+
+    designer._build_agent(session, required_skill_names=[], response_format=None)
 
     assert captured["skills"] == [SKILLS_SOURCE]
     assert "permitted_skill_names" not in captured
@@ -176,16 +197,21 @@ def test_designer_attaches_skills_source_without_floor_skills(monkeypatch: pytes
     assert "InterfaceDesigner" in captured["system_prompt"]
 
 
-def test_designer_activation_policy_included_with_floor_skills(monkeypatch: pytest.MonkeyPatch):
-    captured = _recording_build(monkeypatch, interface_designer_module)
+def test_designer_activation_policy_included_with_floor_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    captured = _recording_build(monkeypatch)
     designer = InterfaceDesigner()
+    session = StageSession(
+        agent_name="InterfaceDesigner",
+        node_id="REQ-SKILL-1",
+        phase="DESIGN",
+        workspace_root=str(tmp_path),
+        app_type="web",
+    )
 
     designer._build_agent(
-        node_id="REQ-SKILL-1",
-        workspace_root=str(SKILLS_ROOT.parent),
-        app_type="web",
-        required_skill_names=["auth-session-consistency"],
-        response_format=None,
+        session, required_skill_names=["auth-session-consistency"], response_format=None
     )
 
     assert "Stage Skill Activation" in captured["system_prompt"]
@@ -195,12 +221,10 @@ def test_designer_activation_policy_included_with_floor_skills(monkeypatch: pyte
 def test_generator_run_attaches_skills_source(
     tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured = _recording_build(monkeypatch, test_generator_module)
-
-    async def fake_invoke(agent: Any, **kwargs: Any) -> dict[str, Any]:
-        return {"summary": "ok", "tests": [], "files_written": []}
-
-    monkeypatch.setattr(test_generator_module, "ainvoke_stage_agent", fake_invoke)
+    captured = _recording_build(monkeypatch)
+    invoked = _recording_invoke(
+        monkeypatch, {"summary": "ok", "tests": [], "files_written": []}
+    )
     arc_runtime.traceability.store_requirement_tree(
         {"id": "REQ-SKILL-1", "name": "Counter", "description": "Add two numbers"}
     )
@@ -219,17 +243,20 @@ def test_generator_run_attaches_skills_source(
     assert captured["skills"] == [SKILLS_SOURCE]
     assert "permitted_skill_names" not in captured
     assert "Stage Skill Activation" not in captured["system_prompt"]
+    # The session owns thread identity: the run invoked on the canonical
+    # DESIGN thread with a DESIGN-phase runtime context.
+    assert invoked["thread_id"].endswith(":REQ-SKILL-1:DESIGN:TestGenerator")
+    assert invoked["context"].phase == "DESIGN"
+    assert invoked["context"].app_type == "web"
 
 
 def test_tdd_run_attaches_skills_source(
     tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured = _recording_build(monkeypatch, test_driven_developer_module)
-
-    async def fake_invoke(agent: Any, **kwargs: Any) -> dict[str, Any]:
-        return {"summary": "Wired the counter module to the store."}
-
-    monkeypatch.setattr(test_driven_developer_module, "ainvoke_stage_agent", fake_invoke)
+    captured = _recording_build(monkeypatch)
+    invoked = _recording_invoke(
+        monkeypatch, {"summary": "Wired the counter module to the store."}
+    )
     arc_runtime.traceability.store_requirement_tree(
         {"id": "REQ-SKILL-1", "name": "Counter", "description": "Add two numbers"}
     )
@@ -253,17 +280,17 @@ def test_tdd_run_attaches_skills_source(
     assert captured["skills"] == [SKILLS_SOURCE]
     assert "permitted_skill_names" not in captured
     assert "Stage Skill Activation" not in captured["system_prompt"]
+    # IMPLEMENT-phase thread carrying the test-layer suffix.
+    assert invoked["thread_id"].endswith(":REQ-SKILL-1:IMPLEMENT:TestDrivenDeveloper:Unit")
+    assert invoked["context"].phase == "IMPLEMENT"
+    assert invoked["context"].test_type == "Unit"
 
 
 def test_tdd_run_requires_repair_skill_after_failure(
     tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured = _recording_build(monkeypatch, test_driven_developer_module)
-
-    async def fake_invoke(agent: Any, **kwargs: Any) -> dict[str, Any]:
-        return {"summary": "still failing."}
-
-    monkeypatch.setattr(test_driven_developer_module, "ainvoke_stage_agent", fake_invoke)
+    captured = _recording_build(monkeypatch)
+    _recording_invoke(monkeypatch, {"summary": "still failing."})
     arc_runtime.traceability.store_requirement_tree(
         {"id": "REQ-SKILL-1", "name": "Counter", "description": "Add two numbers"}
     )

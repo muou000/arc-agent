@@ -3,32 +3,22 @@ from __future__ import annotations
 import inspect
 import json
 import os
-from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
-from agents.runtime.checkpointer import get_project_thread_namespace
-from agents.runtime.contracts import AgentRuntimeContext
-from agents.runtime.factory import build_stage_agent
-from agents.runtime.runners import ainvoke_stage_agent
+from agents.runtime.capabilities import normalize_manifest_path
+from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_install_dependencies_tool
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
-from agents.tools.test_manifest import normalize_manifest_path
 from agents.tools.test_failure_digest import (
     build_failure_digest,
-    extract_build_note,
-    extract_served_verdict,
     format_failure_digest,
 )
 from agents.tools.traceability import build_traceability_tools
-from app_type_handler.test_results import (
-    _extract_overall_exit_code,
-    classify_test_failure,
-    failure_fingerprint,
-)
+from app_type_handler.test_results import TestRunResult
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -51,7 +41,7 @@ class TestDrivenDeveloper:
         context_workspace_root: str | None = None,
     ) -> None:
         self.log_cb = log_cb
-        self.model = model or os.environ.get("MODEL", "openai:gpt-5.4")
+        self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
         self.workspace_root = workspace_root
         self.requirement_path = requirement_path or ""
         self.app_type = app_type
@@ -80,7 +70,7 @@ class TestDrivenDeveloper:
         run_tests_budget: int | None = None,
         run_tests_usage: dict[str, int] | None = None,
         stop_on_test_budget_exhausted: bool = True,
-        run_tests_executor: Callable[[str | None, list[str] | None], Awaitable[str]] | None = None,
+        run_tests_executor: Callable[[str | None, list[str] | None], Awaitable["TestRunResult"]] | None = None,
     ) -> str:
         self._last_run_tests_result = None
         self._last_run_tests_exit_code = None
@@ -91,13 +81,19 @@ class TestDrivenDeveloper:
         self._current_test_files = [str(path or "").strip() for path in test_files if str(path or "").strip()]
         self._current_test_type = test_type
         current_node_tests = [item for item in (node_tests or []) if isinstance(item, dict)]
-        workspace_root = str(Path(
-            self.workspace_root
-            or context_pipeline.config.workspace_dir
-            or os.environ.get("ARC_WORKSPACE_ROOT")
-            or os.getcwd()
-        ).expanduser().resolve())
-        app_type = (self.app_type or context_pipeline.config.app_type or os.environ.get("ARC_APP_TYPE") or "web").strip().lower()
+        session = StageSession(
+            agent_name=self.agent_name,
+            node_id=node_id,
+            phase="IMPLEMENT",
+            model=self.model,
+            log_cb=self.log_cb,
+            workspace_root=self.workspace_root,
+            requirement_path=self.requirement_path,
+            app_type=self.app_type,
+            context_workspace_root=self.context_workspace_root,
+            thread_suffix=self._current_test_type or "batch",
+            test_type=self._current_test_type,
+        )
 
         def normalize_requested_path(value: Any) -> str:
             path = str(value or "").strip().replace("\\", "/")
@@ -107,19 +103,11 @@ class TestDrivenDeveloper:
                 return ""
             return path.lstrip("./")
 
-        context_pipeline.configure(
-            workspace_dir=self.context_workspace_root or workspace_root,
-            app_type=app_type,
-        )
-        static_context, dynamic_context = context_pipeline.build_agent_context_split(
-            node_id=node_id,
-            agent_type=self.agent_name,
+        context_text = session.build_context(
             preloaded_source=preloaded_source,
             target_test_files=self._current_test_files,
-            map_workspace_dir=workspace_root,
         )
         interface_contract = context_pipeline.get_interface_contract_context(node_id)
-        context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
         required_skill_names = implementation_skills(
             interface_contract=interface_contract,
             previous_failure_summary=previous_failure_summary,
@@ -183,14 +171,21 @@ class TestDrivenDeveloper:
                         f"No current-node tests are registered for test_type={requested_type!r}.\n"
                     )
             result = (
-                "Exit Code: 1\n"
-                "STDERR:\n"
-                "System test runner is not configured for this TDD session.\n"
-            ) if run_tests_executor is None else await run_tests_executor(requested_type, requested_files or None)
-            self._last_run_tests_result = result
-            self._last_run_tests_exit_code = self._extract_exit_code(result)
+                TestRunResult(
+                    exit_code=1,
+                    output=(
+                        "Exit Code: 1\n"
+                        "STDERR:\n"
+                        "System test runner is not configured for this TDD session.\n"
+                    ),
+                )
+                if run_tests_executor is None
+                else await run_tests_executor(requested_type, requested_files or None)
+            )
+            self._last_run_tests_result = result.output
+            self._last_run_tests_exit_code = result.exit_code
             self._record_failure_state(result)
-            return result
+            return result.output
 
         if self.app_handler is None:
             async def run_build() -> str:
@@ -219,22 +214,15 @@ class TestDrivenDeveloper:
             )
 
         traceability_tools = build_traceability_tools(node_id=node_id, log_cb=self.log_cb)
-        agent = build_stage_agent(
+        built = session.build_agent(
             name="test_driven_developer",
             stage="implementation",
-            model=self.model,
             system_prompt="\n\n".join(
                 [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=None,
-            workspace_root=workspace_root,
-            writable_roots=[workspace_root],
-            skills=[SKILLS_SOURCE],
-            memory=[],
             tools=[run_tests, run_build, install_dependencies, *traceability_tools],
-            node_id=node_id,
-            claims_workspace_root=self.context_workspace_root or workspace_root,
-            app_type=app_type,
+            skills=[SKILLS_SOURCE],
         )
         message = get_user_prompt(
             node_id=node_id,
@@ -248,31 +236,15 @@ class TestDrivenDeveloper:
         )
         await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking TDD implementation.", node_id=node_id)
-        payload = await ainvoke_stage_agent(
-            agent,
-            message=message,
-            context=AgentRuntimeContext(
-                node_id=node_id,
-                phase="IMPLEMENT",
-                app_type=app_type,
-                workspace_root=workspace_root,
-                requirement_path=self.requirement_path,
-                test_type=self._current_test_type,
-            ),
-            thread_id=f"{get_project_thread_namespace()}:{node_id}:IMPLEMENT:TestDrivenDeveloper:{self._current_test_type or 'batch'}",
-            label=self.agent_name,
-            log_cb=self.log_cb,
-        )
+        payload = await session.invoke(built, message=message)
         final_text = self._payload_to_final_text(payload)
         # Capture the session's writes (discipline ground truth, virtual
         # /workspace/ paths) for the cross-session diff hint. Deleted-after-
         # write paths are excluded by the discipline itself.
-        discipline = getattr(agent, "arc_stage_discipline", None)
-        if discipline is not None:
-            self._last_modified_files = [
-                normalize_manifest_path(path)
-                for path in discipline.materialized_paths()
-            ]
+        self._last_modified_files = [
+            normalize_manifest_path(path)
+            for path in built.materialized_paths()
+        ]
         if self._test_budget_exhausted and stop_on_test_budget_exhausted:
             return "BUDGET_EXHAUSTED"
         if "IMPLEMENTED" in final_text.upper() and self._last_run_tests_exit_code != 0:
@@ -348,58 +320,40 @@ class TestDrivenDeveloper:
                 return value.strip()
         return json.dumps(payload, ensure_ascii=False, default=str)
 
-    def _record_failure_state(self, result: str) -> None:
-        exit_code = self._extract_exit_code(result)
-        if exit_code == 0:
+    def _record_failure_state(self, result: TestRunResult) -> None:
+        """Record the failure evidence of the latest run for the next session.
+
+        Reads the run's structured fields — the workflow already interpreted
+        the transcription once when producing the :class:`TestRunResult`, so
+        nothing here re-parses the rendered text.
+        """
+
+        if result.exit_code == 0:
             self._last_verifier_report_text = ""
             self._last_failure_digest_text = ""
             return
-        digest = build_failure_digest(result)
+        digest = build_failure_digest(result.output)
         self._last_failure_digest_text = format_failure_digest(
             digest,
             test_type=self._current_test_type,
-            raw_output_path=self._extract_run_log_path(result),
-            fingerprint=failure_fingerprint(result),
-            environment_failure=classify_test_failure(result),
-            build=extract_build_note(result),
-            served=extract_served_verdict(result),
+            raw_output_path=result.run_log_path or None,
+            fingerprint=result.fingerprint,
+            environment_failure=result.environment_failure,
+            build=result.build_note,
+            served=result.served_verdict,
         )
-        lines = [line for line in (result or "").splitlines() if line.strip()]
+        lines = [line for line in (result.output or "").splitlines() if line.strip()]
         excerpt = "\n".join(lines[-40:])
         # Same fingerprint source as the digest above: the inline keyword scan
         # this replaced keyed on the E2E preamble's informational "Note:" line
         # ("This is expected when ...") and mislabeled every E2E failure.
         self._last_verifier_report_text = (
             "<failure_analysis>\n"
-            f"fingerprint: {failure_fingerprint(result)}\n"
+            f"fingerprint: {result.fingerprint}\n"
             "latest_test_output_excerpt:\n"
             f"{excerpt}\n"
             "</failure_analysis>"
         )
-
-    @staticmethod
-    def _extract_exit_code(tool_result: str) -> int | None:
-        # Nested-aware extraction: an E2E result embeds several staged
-        # sections (frontend build "Exit Code: 0", database prepare, then the
-        # Playwright run), so the FIRST "Exit Code:" line can be a passing
-        # stage ahead of a failed test run. The shared parser already picks
-        # the first failing stage's code.
-        return _extract_overall_exit_code(tool_result)
-
-    @staticmethod
-    def _extract_run_log_path(tool_result: str) -> str | None:
-        """Pull the persisted raw-output path out of a run_tests result.
-
-        The workflow appends an ``ARC_RUN_OUTPUT_LOG: ... saved at `path`.``
-        line to every persisted run; re-reading it here keeps the digest
-        builder free of workflow knowledge.
-        """
-
-        for line in (tool_result or "").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("ARC_RUN_OUTPUT_LOG:") and "`" in stripped:
-                return stripped.split("`", 2)[1] if stripped.count("`") >= 2 else None
-        return None
 
     async def _log(self, message: str, status: str | None = None, node_id: str | None = None) -> None:
         if self.log_cb is None:

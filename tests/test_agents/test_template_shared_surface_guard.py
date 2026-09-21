@@ -200,7 +200,7 @@ def test_factory_maps_app_type_to_surfaces(tmp_path: Path) -> None:
         tools=[],
         app_type="web",
     )
-    assert wired.arc_stage_discipline._template_shared_surfaces == surfaces_for("web")
+    assert wired.stage_discipline._template_shared_surfaces == surfaces_for("web")
 
     unwired = build_stage_agent(
         name="probe",
@@ -214,7 +214,7 @@ def test_factory_maps_app_type_to_surfaces(tmp_path: Path) -> None:
         memory=[],
         tools=[],
     )
-    assert unwired.arc_stage_discipline._template_shared_surfaces == frozenset()
+    assert unwired.stage_discipline._template_shared_surfaces == frozenset()
 
 
 def test_factory_helper_resolution_semantics(tmp_path: Path) -> None:
