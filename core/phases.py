@@ -82,6 +82,10 @@ class WorkflowPhaseRunner:
     def traceability(self):
         return get_runtime().traceability
 
+    @property
+    def events(self):
+        return get_runtime().events
+
     async def run_design_phase(self, node_id: str, requirement_data: dict[str, Any]) -> bool:
         requirement_data = await analyze_and_attach_visual_references(
             workspace_path=self.context_workspace_path,
@@ -1234,6 +1238,12 @@ class WorkflowPhaseRunner:
         failure_summaries: list[str] = []
         failed_types: list[str] = []
         for test_type in ordered_types:
+            if not executor.layer_passed(test_type):
+                await self._reverify_budget_exhausted_layer(
+                    node_id=node_id,
+                    test_type=test_type,
+                    executor=executor,
+                )
             latest_result = executor.layer_result(test_type)
             group_passed = executor.layer_passed(test_type)
             status_by_test_id = {
@@ -1332,6 +1342,96 @@ class WorkflowPhaseRunner:
             )
 
         return True
+
+    async def _reverify_budget_exhausted_layer(
+        self,
+        *,
+        node_id: str,
+        test_type: str,
+        executor: TddTestExecutor,
+    ) -> None:
+        """Limited late-fix re-verification before a layer is failed (#116).
+
+        A layer can fail purely because its ``run_tests`` budget ran out while
+        the fix was still landing: the agent keeps editing shared code from
+        the next layer's session, so by the time a later layer passes, the
+        failed layer's tests may already be green. Without a re-run the
+        verdict lands between "fix landed" and "fix verified" and fails a
+        node whose code is correct.
+
+        A layer qualifies when its budget is spent (the condition the failure
+        detail reports as "budget exhausted") with no unresolved environment
+        failure at verdict time, and some later layer is green: a layer that
+        ran after this one closed went green, so the fix may have landed
+        after this layer's budget died. A still-red layer in between does not
+        block - the green run still proves late edits landed, and layer
+        verdicts stay independent, so nothing red is masked. (A budget spent
+        on a since-repaired environment failure qualifies the same way: the
+        repair was itself a late fix.) An unresolved environment failure
+        blocks the channel: the re-run would only re-hit the broken
+        workspace.
+
+        The re-run covers exactly the layer's manifest files, runs once,
+        after the agent sessions and outside the budget counters. A pass
+        closes the layer; a failure falls through to the ordinary failure
+        bookkeeping. Layer ordering, budgets and manifest lock semantics are
+        untouched.
+        """
+
+        used = executor.usage(test_type)
+        if executor.environment_failure or used < TDD_RUN_TESTS_BUDGET:
+            return
+        ordered_types = executor.ordered_layers
+        successor_index = ordered_types.index(test_type) + 1
+        if not any(executor.layer_passed(later) for later in ordered_types[successor_index:]):
+            return
+        layer_files = executor.layer_files(test_type)
+
+        def record_reverify(status: str, message: str | None = None) -> None:
+            self.events.record_layer_reverify(
+                node_id=node_id,
+                layer=test_type,
+                status=status,
+                files=layer_files,
+                used=used,
+                message=message,
+            )
+
+        await self._log(
+            "TestDrivenDeveloper",
+            (
+                f"`{test_type}` failed with its budget exhausted while a later layer is green; "
+                f"re-verifying the layer once against its {len(layer_files)} manifest file(s)."
+            ),
+            node_id=node_id,
+        )
+        record_reverify("triggered")
+        # The re-run goes through the executor's full-layer primitive: it
+        # records the result for the failure summaries below, closes the
+        # layer on a pass, and leaves budgets untouched.
+        reverify = await executor.run_full_layer(test_type)
+        if reverify.state == "green":
+            await self._log(
+                "TestDrivenDeveloper",
+                (
+                    f"Late-fix re-verification passed for `{test_type}` "
+                    f"(Exit Code: 0); treating the layer as passed."
+                ),
+                status="ok",
+                node_id=node_id,
+            )
+            record_reverify("passed")
+            return
+        await self._log(
+            "TestDrivenDeveloper",
+            (
+                f"Late-fix re-verification failed for `{test_type}` "
+                f"(Exit Code: {reverify.exit_code}); keeping the failure."
+            ),
+            status="error",
+            node_id=node_id,
+        )
+        record_reverify("failed", summarize_batch_output(reverify.output))
 
     def _prepare_interfaces(self, node_id: str, interfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         prepared: list[dict[str, Any]] = []
