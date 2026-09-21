@@ -226,6 +226,42 @@ class EventClient:
             },
         )
 
+    def record_layer_reverify(
+        self,
+        *,
+        node_id: str = "",
+        layer: str = "",
+        status: str = "",
+        files: list[str] | None = None,
+        used: int = 0,
+        message: str | None = None,
+    ) -> None:
+        """Append one ``layer_reverify`` event for the TDD late-fix channel.
+
+        Emitted twice per re-verification: once with ``status="triggered"``
+        when the system re-runs a budget-exhausted layer's manifest files (a
+        later layer already passed, so the fix may have landed late), and
+        once with ``status="passed"``/``"failed"`` carrying the outcome.
+        ``used`` is the ``run_tests`` budget the layer had already spent when
+        the re-verification fired; ``files`` records the manifest-scoped file
+        list that was executed. An empty ``node_id`` attributes the event to
+        the run as a whole.
+        """
+        normalized_files = [str(path or "").strip() for path in (files or [])]
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "layer_reverify",
+                "node_id": str(node_id or "").strip(),
+                "layer": str(layer or "").strip(),
+                "status": str(status or "").strip(),
+                "files": [path for path in normalized_files if path],
+                "used": _nonneg_int(used),
+                "message": message,
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def _emit_runner_state(self, state: str, message: str | None = None) -> None:
         append_jsonl(
             self.paths.runner_events_path,
