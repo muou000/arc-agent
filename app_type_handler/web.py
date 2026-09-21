@@ -1213,6 +1213,10 @@ async def _build_frontend_dist(workspace_path: str, *, force_rebuild: bool = Fal
 # Re-checking at result-assembly time reports what the backend can serve NOW,
 # and the digest-side regex parses this exact line shape.
 _SERVED_VERDICT_PREFIX = "Served index.html: "
+# Truncation shared by the verdict line and the digest-side regex that parses
+# it (agents/tools/test_failure_digest.py imports this constant): the two ends
+# must never drift, or the digest stops recognizing the handler's own line.
+SERVED_VERDICT_FINGERPRINT_CHARS = 12
 
 
 def _frontend_serving_verdict(workspace_path: str) -> str:
@@ -1234,8 +1238,12 @@ def _frontend_serving_verdict(workspace_path: str) -> str:
     else:
         state = "present"
         # Mirror the fingerprint truncation the build verdicts already use so
-        # the two lines cross-reference without a full hash.
-        detail = f", fingerprint {(fingerprint or '')[:12] or 'unavailable'}"
+        # the two lines cross-reference without a full hash. The digest-side
+        # regex accepts any hex length and echoes it, so this truncation is a
+        # display choice, not a parse contract.
+        detail = (
+            f", fingerprint {(fingerprint or '')[:SERVED_VERDICT_FINGERPRINT_CHARS] or 'unavailable'}"
+        )
     return f"{_SERVED_VERDICT_PREFIX}{dist_index_path} ({state}{detail})"
 
 
@@ -1245,17 +1253,18 @@ def _frontend_serving_verdict(workspace_path: str) -> str:
 # artifact — `NotFoundError: Not Found` raised from send's internals with a
 # `sendfile` frame from Express on the stack. The generated fallback handler's
 # own function/file names drift between agent edits, so the anchors are the
-# stable library frames plus the sendFile call. Each anchor is line-anchored
-# and the gaps between them are bounded (a few stack lines, not the whole
-# output), so the pattern cannot splice frames from two unrelated stacks.
+# stable library frames plus the sendFile call. Every anchor is line-anchored
+# and consecutive anchors may be separated by at most two NON-EMPTY lines of
+# the same stack block (a blank line separates Playwright error blocks, so the
+# pattern cannot splice frames from two different stacks in one output).
 _SPA_STATIC_HOST_FAILURE = re.compile(
     r"NotFoundError:\s*Not Found[^\r\n]*\r?\n"
-    r"(?:[^\r\n]*\r?\n){0,2}?"
+    r"(?:[^\r\n]+[^\r\n]*\r?\n){0,2}?"
     r"[^\r\n]*at\s+(?:createHttpError|SendStream\.pipe)\b[^\r\n]*\r?\n"
-    r"(?:[^\r\n]*\r?\n){0,2}?"
+    r"(?:[^\r\n]+[^\r\n]*\r?\n){0,2}?"
     r"[^\r\n]*at\s+sendfile\b[^\r\n]*\r?\n"
-    r"(?:[^\r\n]*\r?\n){0,2}?"
-    r"[^\r\n]*at\s+\S*sendFile\b[^\r\n]*",
+    r"(?:[^\r\n]+[^\r\n]*\r?\n){0,2}?"
+    r"[^\r\n]*at\s+\S*sendFile\b[^\r\n]*"
 )
 
 
@@ -2680,6 +2689,11 @@ class WebAppType(AppTypeHandler):
                     f"Failed to retry grouped E2E execution after SPA static-host recovery: {str(exc)}"
                     + stage_timer.render()
                 )
+            # Same self-check the non-recovery path applies below, on the
+            # retried attempt alone: a retried pass whose cleanup failed is
+            # still a failure for the agent.
+            if "Backend runtime cleanup failed:" in retried_body and "Exit Code: 0" in retried_body:
+                retried_body = retried_body.replace("Exit Code: 0", "Exit Code: 1", 1)
             # The retried attempt leads so exit-code parsing and the agent both
             # read the retried verdict first; the failed attempt survives as an
             # appendix for the failure evidence (the NotFoundError stack).

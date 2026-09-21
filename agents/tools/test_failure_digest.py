@@ -18,6 +18,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from app_type_handler.web import SERVED_VERDICT_FINGERPRINT_CHARS
+
 #: Cap on the excerpt lines kept per failed test in the digest text.
 _PER_TEST_EXCERPT_LINES = 8
 #: Cap on retained raw-output files per node before the oldest are pruned.
@@ -104,7 +106,10 @@ _BUILD_FAILED_MARKER = "Frontend build failed before E2E startup."
 # (``_frontend_serving_verdict``). It is the agent-facing statement of what the
 # backend's SPA fallback can stat *at result time* — the 2026-09-20 arc-output1
 # run had the builder reporting Built/Reused while every request-time stat
-# failed, and no output reconciled the two views.
+# failed, and no output reconciled the two views. The fingerprint group accepts
+# any hex length and echoes it verbatim: the handler's truncation
+# (``SERVED_VERDICT_FINGERPRINT_CHARS``, imported above) is a display choice,
+# and the round-trip test below locks the two ends against drift.
 _SERVED_VERDICT_LINE = re.compile(
     r"Served index\.html: (.+?) \((present(?:, fingerprint ([0-9a-f]+|unavailable))?|absent)\)"
 )

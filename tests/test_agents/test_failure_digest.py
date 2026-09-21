@@ -22,6 +22,10 @@ from agents.tools.test_failure_digest import (
     format_failure_digest,
     persist_run_output,
 )
+from app_type_handler.web import (
+    SERVED_VERDICT_FINGERPRINT_CHARS,
+    _frontend_serving_verdict,
+)
 
 
 VITEST_FAILURE = """Exit Code: 1
@@ -227,6 +231,40 @@ def test_extract_served_verdict_handles_unavailable_fingerprint() -> None:
         "frontend/dist/index.html present at result time (fingerprint unavailable) "
         "at /workspace/frontend/dist/index.html"
     )
+
+
+def test_handler_verdict_line_round_trips_through_digest_regex(tmp_path) -> None:
+    """The digest regex must parse the handler's own verdict line, both states.
+
+    The handler emits the line and the digest parses it; nothing else ties the
+    two ends together, so this round-trip pins them (including the shared
+    truncation constant) against silent drift.
+    """
+
+    frontend = tmp_path / "frontend"
+    dist_dir = frontend / "dist"
+    dist_dir.mkdir(parents=True)
+    (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
+
+    present_line = _frontend_serving_verdict(str(tmp_path))
+    assert f"fingerprint " in present_line
+    note = extract_served_verdict(f"=== Frontend Build ===\n{present_line}\n")
+    assert note.startswith("frontend/dist/index.html present at result time")
+    assert "(fingerprint " in note
+    # The truncated hash the handler prints is exactly what the digest echoes.
+    import re as _re
+    printed = _re.search(r"fingerprint ([0-9a-f]+)", present_line)
+    assert printed is not None
+    assert len(printed.group(1)) == SERVED_VERDICT_FINGERPRINT_CHARS
+    assert printed.group(1) in note
+
+    # Absent state: no index.html on disk.
+    (dist_dir / "index.html").unlink()
+    absent_line = _frontend_serving_verdict(str(tmp_path))
+    assert absent_line.endswith("(absent)")
+    assert extract_served_verdict(
+        f"=== Frontend Build ===\n{absent_line}\n"
+    ).startswith("frontend/dist/index.html absent at result time")
 
 
 def test_extract_served_verdict_is_empty_without_the_line() -> None:

@@ -211,6 +211,26 @@ def test_dead_static_host_signature_detected() -> None:
     assert not web_handler._is_spa_static_host_failure("Exit Code: 1\nSTDERR:\nboom\n")
 
 
+def test_signature_does_not_splice_two_error_blocks() -> None:
+    """Playwright separates error blocks with a blank line; frames must not
+    jump across it. A NotFoundError block without send frames followed by a
+    DIFFERENT error's block that happens to carry send/sendFile frames must
+    not trigger the recovery (the reviewer's cross-stack splice scenario)."""
+
+    two_blocks = (
+        "  1) spec.ts:10 › unrelated route 404\n\n"
+        "    NotFoundError: Not Found\n"
+        "        at fetch (node:internal)\n"
+        "\n"
+        "  2) spec.ts:20 › other failure\n\n"
+        "    TypeError: something else\n"
+        "        at createHttpError (D:\\ws\\node_modules\\send\\index.js:861:12)\n"
+        "        at sendfile (D:\\ws\\node_modules\\express\\lib\\response.js:1014:8)\n"
+        "        at ServerResponse.sendFile (D:\\ws\\node_modules\\express\\lib\\response.js:411:3)\n"
+    )
+    assert not web_handler._is_spa_static_host_failure(two_blocks)
+
+
 def test_dead_static_host_triggers_exactly_one_recovery(tmp_path, monkeypatch) -> None:
     """First failure with the signature: forced rebuild + restart + one re-run.
 
@@ -311,3 +331,53 @@ def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
     asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
     # The second run_test_group call: no further recovery, one playwright run.
     assert recorder.playwright_calls == 3
+
+
+def test_recovery_retried_pass_with_failed_cleanup_reports_failure(tmp_path, monkeypatch) -> None:
+    """A retried attempt that passes while its own cleanup failed is a failure.
+
+    The recovery path re-checks the retried body (not the first attempt's
+    appendix) for the cleanup-failure self-check, so a retried Exit Code: 0
+    with "Backend runtime cleanup failed:" in the RETRIED body must flip to
+    Exit Code: 1; a cleanup failure mentioned only in the superseded first
+    attempt must not poison the retried verdict.
+    """
+
+    workspace = _make_workspace(tmp_path)
+    handler = _make_handler(workspace)
+
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
+        dist_dir = Path(workspace_path) / "frontend" / "dist"
+        dist_dir.mkdir(parents=True, exist_ok=True)
+        (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
+        return True, "Built `frontend/dist` from the current sources (fingerprint abc123def456).\n"
+
+    monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
+
+    recorder = _RecoveryRecorder(_SPA_DEAD_HOST_OUTPUT)
+    start_calls = _patch_recovery_harness(monkeypatch, recorder)
+    terminate_calls: list[str] = []
+
+    async def _fake_terminate(process, port=None) -> str:
+        # Every teardown after the FIRST backend start fails; the recovery
+        # re-run's session teardown (second start's cleanup at the end of
+        # run_test_group... there is none - cleanup is deferred - so inject the
+        # failure via the session-reset path is not available. Instead the
+        # recovery block's own `_terminate_e2e_session` call carries it into
+        # the retried body's "Previous runtime cleanup" section.
+        terminate_calls.append("called")
+        return "Backend runtime cleanup failed: test injected"
+
+    monkeypatch.setattr(web_handler, "_terminate_process", _fake_terminate)
+
+    result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    # The recovery ran and its cleanup note failed.
+    assert "=== SPA Static-Host Recovery Retry ===" in result
+    assert "Backend runtime cleanup failed: test injected" in result
+    # The retried attempt passed but its cleanup failed: overall exit is 1.
+    assert "all green" in result
+    assert parse_test_results(result)["exit_code"] == 1
+    # Only one Exit Code line was rewritten to 1 (the retried leading one);
+    # the superseded first attempt keeps its labeled form.
+    assert "Exit Code (superseded by the recovery retry): 1" in result
