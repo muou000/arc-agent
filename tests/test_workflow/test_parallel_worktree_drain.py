@@ -427,6 +427,12 @@ def test_resumed_queue_without_dependency_map_still_drains(
 def test_merge_conflict_fails_only_the_conflicting_node(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A terminal IMPLEMENT merge conflict (the one-shot requeue budget
+    already burned by an earlier round, e.g. after a resume) fails exactly
+    the conflicting node and leaves the integration workspace (and the
+    other node) untouched."""
+    from core import sessions
+
     monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
     manager = _make_parallel_manager(tmp_path)
@@ -434,6 +440,10 @@ def test_merge_conflict_fails_only_the_conflicting_node(
     for task in queue_state["tasks"]:
         if task["phase"] == PHASE_DESIGN:
             task["status"] = TASK_COMPLETED
+    # Burn both leaves' one-shot conflict requeue budget so the first
+    # conflict below is terminal for whichever node loses the race.
+    for node_id in ("RA", "RB"):
+        sessions.merge_node_session(node_id, {"merge_conflict_retry_used": True})
 
     async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
         if ctx is not None and task["node_id"] in {"RA", "RB"}:
@@ -1282,6 +1292,265 @@ def test_manual_retry_restores_the_conflict_retry_budget(
     assert not session.get("merge_conflict_context"), "stale conflict paths are dropped"
     tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
     assert tasks["RA:DESIGN"] == TASK_PENDING and tasks["RA:IMPLEMENT"] == TASK_PENDING
+
+
+# ---------------------------------------------------------------------------
+# conflict-aware IMPLEMENT retry (non-additive conflicts on shared files)
+# ---------------------------------------------------------------------------
+
+
+def test_implement_merge_conflict_requeues_once_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An IMPLEMENT conflict re-queues the node's IMPLEMENT once; the retry
+    starts from the merged integration state (the sibling's files are visible
+    on disk) and must deliver disjoint work. The DESIGN phase is not re-run:
+    its artifacts are part of the integration HEAD the retry starts from."""
+    from core import sessions
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "3")
+    manager = _make_parallel_manager(tmp_path)
+    logs = _collect_logs(manager)
+    queue_state = _queue_state(manager, _requirement_tree())
+
+    sibling_wrote = asyncio.Event()
+    implement_runs: dict[str, int] = {}
+    design_phases: list[str] = []
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        node_id = task["node_id"]
+        if task["phase"] == PHASE_DESIGN:
+            design_phases.append(node_id)
+            return True
+        implement_runs[node_id] = implement_runs.get(node_id, 0) + 1
+        if ctx is not None and node_id == "RB":
+            # RB integrates first, so its shared.js owns the path.
+            Path(ctx.handle.path, "shared.js").write_text("from RB;\n", encoding="utf-8")
+            sibling_wrote.set()
+        elif ctx is not None and node_id == "RA":
+            await sibling_wrote.wait()
+            if implement_runs.get("RA", 0) == 1:
+                # Add/add on a brand-new path: non-additive, no resolver.
+                Path(ctx.handle.path, "shared.js").write_text("from RA;\n", encoding="utf-8")
+            else:
+                # The retry must stay off the sibling-owned path and must
+                # see the sibling's merged file in its worktree.
+                assert (Path(ctx.handle.path) / "shared.js").read_text(encoding="utf-8") == "from RB;\n"
+                Path(ctx.handle.path, "ra-owned.js").write_text("from RA retry;\n", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    states = queue_state["node_states"]
+    assert states["RB"] == NODE_PASSED, "the winning sibling passes"
+    assert states["RA"] == NODE_PASSED, "the conflicted node recovers on its one retry"
+    assert implement_runs.get("RA") == 2, "RA's IMPLEMENT ran exactly twice"
+    assert design_phases.count("RA") == 1, "DESIGN is not re-run for an implement-only requeue"
+    workspace = Path(manager.workspace_path)
+    assert (workspace / "shared.js").read_text(encoding="utf-8") == "from RB;\n"
+    assert (workspace / "ra-owned.js").read_text(encoding="utf-8") == "from RA retry;\n"
+    assert not list((workspace / ".arc" / "worktrees").iterdir()), "no worktree is left behind"
+
+    session = sessions.load_node_session("RA")
+    assert session.get("merge_conflict_retry_used") is True
+    assert session.get("merge_conflict_context") == {"paths": ["shared.js"], "phase": "implement"}
+    assert any("Re-queued RA IMPLEMENT once" in message for message in logs), logs
+    assert manager.runtime.traceability.cleared_design_artifacts == [], "design artifacts are kept"
+
+    tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
+    assert tasks["RA:DESIGN"] == TASK_COMPLETED and tasks["RA:IMPLEMENT"] == TASK_COMPLETED
+
+
+def test_second_implement_merge_conflict_fails_the_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the one-shot IMPLEMENT retry conflicts again - here against a
+    *new* file landed by a third sibling's IMPLEMENT while the retry was in
+    flight - the node fails for good: node FAILED, the node's tasks failed,
+    worktree preserved."""
+    from core import sessions
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "3")
+    manager = _make_parallel_manager(tmp_path)
+    logs = _collect_logs(manager)
+    tree = _requirement_tree()
+    tree["children"].append({"id": "RC", "name": "leaf c", "description": "c", "children": []})
+    manager.runtime.traceability.requirements["RC"] = {
+        "id": "RC", "name": "leaf c", "description": "c"
+    }
+    queue_state = _queue_state(manager, tree)
+
+    sibling_wrote = asyncio.Event()
+    ra_requeued = asyncio.Event()
+    rc_integrated = asyncio.Event()
+    implement_runs: dict[str, int] = {}
+
+    original_integrate = manager._integrate_task_workspace
+
+    async def integrate_and_signal(ctx: Any, node_id: str, phase: str, requirement_data: dict[str, Any]) -> Any:
+        result = await original_integrate(ctx, node_id, phase, requirement_data)
+        if node_id == "RC" and phase == PHASE_IMPLEMENT:
+            rc_integrated.set()
+        return result
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        node_id = task["node_id"]
+        if task["phase"] == PHASE_DESIGN:
+            return True
+        implement_runs[node_id] = implement_runs.get(node_id, 0) + 1
+        if ctx is not None and node_id == "RB":
+            Path(ctx.handle.path, "shared.js").write_text("from RB;\n", encoding="utf-8")
+            sibling_wrote.set()
+        elif ctx is not None and node_id == "RA":
+            if implement_runs.get("RA", 0) == 1:
+                await sibling_wrote.wait()
+                # Add/add on a brand-new path: non-additive, no resolver.
+                Path(ctx.handle.path, "shared.js").write_text("from RA;\n", encoding="utf-8")
+            else:
+                # The retry stays off shared.js but collides on a new file
+                # that RC's IMPLEMENT lands while the retry is in flight.
+                ra_requeued.set()
+                await rc_integrated.wait()
+                Path(ctx.handle.path, "late.js").write_text("from RA retry;\n", encoding="utf-8")
+        elif ctx is not None and node_id == "RC":
+            await ra_requeued.wait()
+            Path(ctx.handle.path, "late.js").write_text("from RC;\n", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(manager, "_integrate_task_workspace", integrate_and_signal)
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    states = queue_state["node_states"]
+    assert states["RB"] == NODE_PASSED
+    assert states["RC"] == NODE_PASSED
+    assert states["RA"] == NODE_FAILED, "the second conflict is terminal"
+    assert implement_runs.get("RA") == 2, "the retry happened exactly once"
+    workspace = Path(manager.workspace_path)
+    assert (workspace / "shared.js").read_text(encoding="utf-8") == "from RB;\n"
+    assert (workspace / "late.js").read_text(encoding="utf-8") == "from RC;\n"
+
+    session = sessions.load_node_session("RA")
+    assert session.get("merge_conflict_retry_used") is True
+    assert sum(1 for message in logs if "Re-queued RA IMPLEMENT once" in message) == 1
+
+    tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
+    assert tasks["RA:DESIGN"] == TASK_COMPLETED, "the settled DESIGN is not failed"
+    assert tasks["RA:IMPLEMENT"] == TASK_FAILED
+    # The terminal failure preserves the node's worktree for inspection.
+    preserved = list((workspace / ".arc" / "worktrees").iterdir())
+    assert len(preserved) == 1 and "RA" in preserved[0].name
+
+
+def test_implement_requeue_budget_is_independent_of_the_design_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-shot conflict requeue budget is per phase: a node that
+    consumed its DESIGN requeue (and recovered) still gets its first
+    IMPLEMENT conflict re-queued. A shared per-node flag would terminally
+    fail this node's very first IMPLEMENT conflict."""
+    from core import sessions
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "3")
+    manager = _make_parallel_manager(tmp_path)
+    queue_state = _queue_state(manager, _requirement_tree())
+
+    sibling_wrote = asyncio.Event()
+    sibling_implement_wrote = asyncio.Event()
+    design_runs: dict[str, int] = {}
+    implement_runs: dict[str, int] = {}
+
+    original_integrate = manager._integrate_task_workspace
+
+    async def integrate_and_signal(ctx: Any, node_id: str, phase: str, requirement_data: dict[str, Any]) -> Any:
+        result = await original_integrate(ctx, node_id, phase, requirement_data)
+        if node_id == "RB" and phase == PHASE_IMPLEMENT:
+            sibling_implement_wrote.set()
+        return result
+
+    async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
+        node_id = task["node_id"]
+        if task["phase"] == PHASE_DESIGN:
+            design_runs[node_id] = design_runs.get(node_id, 0) + 1
+            if ctx is not None and node_id == "RB":
+                Path(ctx.handle.path, "shared.js").write_text("from RB;\n", encoding="utf-8")
+                sibling_wrote.set()
+            elif ctx is not None and node_id == "RA":
+                await sibling_wrote.wait()
+                if design_runs.get("RA", 0) == 1:
+                    Path(ctx.handle.path, "shared.js").write_text("from RA;\n", encoding="utf-8")
+                else:
+                    # DESIGN retry stays off the sibling-owned path.
+                    Path(ctx.handle.path, "ra-design.js").write_text("from RA design;\n", encoding="utf-8")
+            return True
+        implement_runs[node_id] = implement_runs.get(node_id, 0) + 1
+        if ctx is not None and node_id == "RB":
+            Path(ctx.handle.path, "impl-shared.js").write_text("from RB;\n", encoding="utf-8")
+        elif ctx is not None and node_id == "RA":
+            await sibling_implement_wrote.wait()
+            if implement_runs.get("RA", 0) == 1:
+                # First IMPLEMENT conflict: must still re-queue despite the
+                # burned DESIGN budget.
+                Path(ctx.handle.path, "impl-shared.js").write_text("from RA;\n", encoding="utf-8")
+            else:
+                Path(ctx.handle.path, "ra-impl.js").write_text("from RA impl retry;\n", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(manager, "_integrate_task_workspace", integrate_and_signal)
+    monkeypatch.setattr(manager, "_run_task", fake_run_task)
+    asyncio.run(manager._drain_runnable_tasks(queue_state))
+
+    states = queue_state["node_states"]
+    assert states["RB"] == NODE_PASSED
+    assert states["RA"] == NODE_PASSED, "the implement requeue fires after the design budget burned"
+    assert design_runs.get("RA") == 2 and implement_runs.get("RA") == 2
+    workspace = Path(manager.workspace_path)
+    assert (workspace / "impl-shared.js").read_text(encoding="utf-8") == "from RB;\n"
+    assert (workspace / "ra-impl.js").read_text(encoding="utf-8") == "from RA impl retry;\n"
+
+    session = sessions.load_node_session("RA")
+    # The final record reflects the latest (implement) requeue.
+    assert session.get("merge_conflict_retry_used") is True
+    assert session.get("merge_conflict_context") == {"paths": ["impl-shared.js"], "phase": "implement"}
+
+    tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
+    assert tasks["RA:DESIGN"] == TASK_COMPLETED and tasks["RA:IMPLEMENT"] == TASK_COMPLETED
+
+
+def test_manual_implement_retry_restores_the_conflict_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual --retry of a node whose IMPLEMENT terminally conflicted takes
+    the implement-only reset path: the one-shot conflict retry budget must be
+    restored and the stale implement conflict paths dropped, mirroring the
+    DESIGN-side contract."""
+    from core import sessions
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    manager = _make_parallel_manager(tmp_path)
+    queue_state = _queue_state(manager, _requirement_tree())
+    tasks_by_id = {task["task_id"]: task for task in queue_state["tasks"]}
+    tasks_by_id["RA:DESIGN"]["status"] = TASK_COMPLETED
+    tasks_by_id["RA:IMPLEMENT"]["status"] = TASK_FAILED
+    sessions.merge_node_session(
+        "RA",
+        {
+            "merge_conflict_retry_used": True,
+            "merge_conflict_context": {"paths": ["shared.js"], "phase": "implement"},
+        },
+    )
+
+    manager._apply_retry_plan(queue_state, retry_node_ids=["RA"])
+
+    session = sessions.load_node_session("RA")
+    assert not session.get("merge_conflict_retry_used"), "the budget is restored"
+    assert not session.get("merge_conflict_context"), "stale conflict paths are dropped"
+    tasks = {task["task_id"]: task["status"] for task in queue_state["tasks"]}
+    assert tasks["RA:DESIGN"] == TASK_COMPLETED and tasks["RA:IMPLEMENT"] == TASK_PENDING
 
 
 # ---------------------------------------------------------------------------
