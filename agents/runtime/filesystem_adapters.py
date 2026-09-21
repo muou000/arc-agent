@@ -209,6 +209,20 @@ def _integrity_lines(content: str) -> "list[str]":
     ]
 
 
+def _success_text(tool_result: Any) -> "str | None":
+    """The receipt text of a successful ToolMessage, else ``None``.
+
+    Only string-content success receipts are trailer-eligible; anything else
+    (errors, non-text payloads) passes through untouched.
+    """
+
+    if isinstance(tool_result, ToolMessage) and tool_result.status == "success":
+        content = tool_result.content
+        if isinstance(content, str):
+            return content
+    return None
+
+
 def _with_receipt_trailer(tool_result: Any, lines: "list[str]") -> Any:
     """Append trailer lines to a *successful* receipt; pass everything else.
 
@@ -217,13 +231,8 @@ def _with_receipt_trailer(tool_result: Any, lines: "list[str]") -> Any:
     (or accompanied by) an error-shaped message.
     """
 
-    content = getattr(tool_result, "content", None)
-    if (
-        not isinstance(tool_result, ToolMessage)
-        or tool_result.status != "success"
-        or not isinstance(content, str)
-        or not lines
-    ):
+    content = _success_text(tool_result)
+    if content is None or not lines:
         return tool_result
     tool_result.content = content + "\n" + "\n".join(lines)
     return tool_result
@@ -507,18 +516,14 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
         successful edit must never produce a missing or lying receipt.
         """
 
-        content = getattr(tool_result, "content", None)
-        if (
-            not isinstance(tool_result, ToolMessage)
-            or tool_result.status != "success"
-            or not isinstance(content, str)
-        ):
+        if _success_text(tool_result) is None:
             return []
+        if read_back is None:
+            return [_WRITE_RECEIPT_NOTE]
         file_data = getattr(read_back, "file_data", None)
         body = file_data.get("content") if isinstance(file_data, dict) else None
         if (
-            read_back is None
-            or getattr(read_back, "error", None) is not None
+            getattr(read_back, "error", None) is not None
             or not isinstance(body, str)
             or (isinstance(file_data, dict) and file_data.get("encoding") != "utf-8")
             or getattr(read_back, "total_lines", None) is None
