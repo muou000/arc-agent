@@ -230,6 +230,10 @@ def drive_scripted_tool_call(
     from agents.runtime.factory import build_stage_agent
     from agents.runtime.runners import ainvoke_stage_agent
 
+    phase = {"implementation": "IMPLEMENT", "test_generation": "TEST_GENERATION"}.get(stage)
+    if phase is None:
+        raise ValueError(f"unsupported probe stage: {stage!r}")
+
     model = FauxChatModel(
         responses=[
             faux_tool_call(tool_name, tool_args, call_id=call_id),
@@ -255,7 +259,7 @@ def drive_scripted_tool_call(
             message="run the scripted tool call",
             context=AgentRuntimeContext(
                 node_id="REQ-FS-PROBE",
-                phase="IMPLEMENT" if stage == "implementation" else "TEST_GENERATION",
+                phase=phase,
                 app_type="web",
                 workspace_root=str(workspace_root),
                 requirement_path="",

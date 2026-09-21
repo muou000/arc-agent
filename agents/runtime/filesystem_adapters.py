@@ -34,13 +34,17 @@ from typing import TYPE_CHECKING, Any
 
 from deepagents import __version__ as _deepagents_version
 from deepagents.backends import FilesystemBackend
-from deepagents.backends.filesystem import _raise_if_symlink_loop
 from deepagents.backends.utils import validate_path
 from deepagents.middleware.filesystem import DeleteSchema, FilesystemMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
+
+# Unlike the delete deny-pattern helper below, this upstream import is
+# deliberately unguarded: it backs a containment hardening check, so an
+# upstream rename must fail the build loudly instead of silently dropping it.
+from deepagents.backends.filesystem import _raise_if_symlink_loop as _symlink_loop_guard
 
 from core.path_compat import (
     normalize_windows_extended_prefix_path,
@@ -215,15 +219,10 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
             try:
                 validated_path = validate_path(file_path)
             except ValueError as e:
-                return ToolMessage(
-                    content=f"Error: {e}",
-                    name="delete",
-                    tool_call_id=runtime.tool_call_id,
-                    status="error",
-                )
+                return self._path_error_message(e, runtime.tool_call_id)
             if not _confirmed_missing(self.backend, validated_path):
                 return upstream_delete.func(file_path=file_path, runtime=runtime)
-            return self._deny_or_delete_sync(validated_path, runtime.tool_call_id, resolve_deny_patterns)
+            return self._deny_or_delete(validated_path, runtime.tool_call_id, resolve_deny_patterns)
 
         return sync_delete
 
@@ -236,19 +235,54 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
             try:
                 validated_path = validate_path(file_path)
             except ValueError as e:
-                return ToolMessage(
-                    content=f"Error: {e}",
-                    name="delete",
-                    tool_call_id=runtime.tool_call_id,
-                    status="error",
-                )
+                return self._path_error_message(e, runtime.tool_call_id)
             if not await _aconfirmed_missing(self.backend, validated_path):
                 return await upstream_delete.coroutine(file_path=file_path, runtime=runtime)
-            return await self._deny_or_delete_async(validated_path, runtime.tool_call_id, resolve_deny_patterns)
+            return await self._adeny_or_delete(validated_path, runtime.tool_call_id, resolve_deny_patterns)
 
         return async_delete
 
-    def _deny_or_delete_sync(
+    @staticmethod
+    def _path_error_message(exc: ValueError, tool_call_id: Any) -> ToolMessage:
+        return ToolMessage(
+            content=f"Error: {exc}",
+            name="delete",
+            tool_call_id=tool_call_id,
+            status="error",
+        )
+
+    # The deny message replicates upstream's delete refusal format verbatim
+    # (deepagents.middleware.filesystem, sync_delete/async_delete inside
+    # _create_delete_tool); log scanners and tests match on this wording.
+    @staticmethod
+    def _deny_message(validated_path: str, denying_patterns: "list[str]", tool_call_id: Any) -> ToolMessage:
+        return ToolMessage(
+            content=(
+                f"Error: permission denied for write on {validated_path} "
+                f"(matches deny rule(s): {', '.join(denying_patterns)})"
+            ),
+            name="delete",
+            tool_call_id=tool_call_id,
+            status="error",
+        )
+
+    @staticmethod
+    def _delete_outcome_message(res: Any, tool_call_id: Any) -> ToolMessage:
+        if res.error:
+            return ToolMessage(
+                content=res.error,
+                name="delete",
+                tool_call_id=tool_call_id,
+                status="error",
+            )
+        return ToolMessage(
+            content=f"Deleted {res.path}",
+            name="delete",
+            tool_call_id=tool_call_id,
+            status="success",
+        )
+
+    def _deny_or_delete(
         self,
         validated_path: str,
         tool_call_id: Any,
@@ -258,31 +292,10 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
 
         denying_patterns = resolve_deny_patterns(self._permissions, validated_path, has_descendants=False)
         if denying_patterns:
-            return ToolMessage(
-                content=(
-                    f"Error: permission denied for write on {validated_path} "
-                    f"(matches deny rule(s): {', '.join(denying_patterns)})"
-                ),
-                name="delete",
-                tool_call_id=tool_call_id,
-                status="error",
-            )
-        res = self.backend.delete(validated_path)
-        if res.error:
-            return ToolMessage(
-                content=res.error,
-                name="delete",
-                tool_call_id=tool_call_id,
-                status="error",
-            )
-        return ToolMessage(
-            content=f"Deleted {res.path}",
-            name="delete",
-            tool_call_id=tool_call_id,
-            status="success",
-        )
+            return self._deny_message(validated_path, denying_patterns, tool_call_id)
+        return self._delete_outcome_message(self.backend.delete(validated_path), tool_call_id)
 
-    async def _deny_or_delete_async(
+    async def _adeny_or_delete(
         self,
         validated_path: str,
         tool_call_id: Any,
@@ -290,29 +303,8 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
     ) -> ToolMessage:
         denying_patterns = resolve_deny_patterns(self._permissions, validated_path, has_descendants=False)
         if denying_patterns:
-            return ToolMessage(
-                content=(
-                    f"Error: permission denied for write on {validated_path} "
-                    f"(matches deny rule(s): {', '.join(denying_patterns)})"
-                ),
-                name="delete",
-                tool_call_id=tool_call_id,
-                status="error",
-            )
-        res = await self.backend.adelete(validated_path)
-        if res.error:
-            return ToolMessage(
-                content=res.error,
-                name="delete",
-                tool_call_id=tool_call_id,
-                status="error",
-            )
-        return ToolMessage(
-            content=f"Deleted {res.path}",
-            name="delete",
-            tool_call_id=tool_call_id,
-            status="success",
-        )
+            return self._deny_message(validated_path, denying_patterns, tool_call_id)
+        return self._delete_outcome_message(await self.backend.adelete(validated_path), tool_call_id)
 
 
 class WindowsCompatFilesystemBackend(FilesystemBackend):
@@ -344,7 +336,7 @@ class WindowsCompatFilesystemBackend(FilesystemBackend):
         except ValueError:
             msg = f"Path:{full} outside root directory: {cwd}"
             raise ValueError(msg) from None
-        _raise_if_symlink_loop(full)
+        _symlink_loop_guard(full)
         return full
 
     def _to_virtual_path(self, path: Path) -> str:
