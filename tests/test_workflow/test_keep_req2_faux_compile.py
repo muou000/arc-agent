@@ -356,6 +356,10 @@ def test_keep_req2_faux_compile_end_to_end(
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "1")
     monkeypatch.setenv("ARC_AUTO_TDD_RETRY", "0")
     monkeypatch.setenv("ARC_VISUAL_PRECOMPUTE", "0")
+    # No arbitration in this run: the faux scripts never drift their anchors,
+    # and an inherited ARC_MERGE_ARBITRATION from the host environment must
+    # not activate the escalation path mid-e2e.
+    monkeypatch.delenv("ARC_MERGE_ARBITRATION", raising=False)
     workspace, runtime = keep_req2_runtime
 
     tree = load_requirements(KEEP_REQ2_YAML)
@@ -484,6 +488,8 @@ def test_keep_req2_pipeline_mode_starts_dependent_design_before_dependency_imple
     monkeypatch.setenv("ARC_AUTO_TDD_RETRY", "0")
     monkeypatch.setenv("ARC_VISUAL_PRECOMPUTE", "0")
     monkeypatch.setenv("ARC_DESIGN_GATE_PIPELINE", "1")
+    # Same isolation as the end-to-end test above: no arbitration here.
+    monkeypatch.delenv("ARC_MERGE_ARBITRATION", raising=False)
     workspace, runtime = keep_req2_runtime
 
     tree = load_requirements(KEEP_REQ2_YAML)

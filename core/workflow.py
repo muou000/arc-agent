@@ -1263,6 +1263,10 @@ class ARCWorkflowManager:
         )
         if remaining:
             return False
+        # An accepted arbitration whose rewrite is byte-identical to what is
+        # already on disk (the anchors were somehow already honored) leaves
+        # nothing to commit: that is a successful repair, not a failure, so a
+        # "nothing to commit" outcome counts as repaired.
         commit = self._worktree_manager._git(
             [
                 "commit",
@@ -1272,7 +1276,9 @@ class ARCWorkflowManager:
             cwd=self.workspace_path,
             check=False,
         )
-        return commit.returncode == 0
+        if commit.returncode == 0:
+            return True
+        return "nothing to commit" in (commit.stdout + commit.stderr).lower()
 
     async def _emit_contract_drift_event(self, payload: dict[str, Any]) -> None:
         """Persist one contract-drift audit record (best effort)."""

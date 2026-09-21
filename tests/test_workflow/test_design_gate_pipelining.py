@@ -468,6 +468,17 @@ class _Events:
 
 
 def _make_drain_manager(tmp_path: Path, node_ids: list[str], with_events_file: bool = False) -> ARCWorkflowManager:
+    """Manager over a real git workspace with a stubbed runtime.
+
+    Stub boundary (same shape as test_parallel_worktree_drain's helper): the
+    drain, scheduler, worktrees and merges are real; ``runtime.traceability``
+    and ``runtime.events`` are stubs, so anything reading through them (drift
+    checks, event emission) needs either the stub to carry that surface
+    (``_Traceability.interfaces``) or ``with_events_file=True`` for a real
+    ``runner_events.jsonl`` at ``runtime.paths``. The full real-runtime path
+    is covered by the keep-req2 faux e2e; anything beyond these two surfaces
+    belongs there, not here.
+    """
     from types import SimpleNamespace
 
     workspace = tmp_path / "workspace"
@@ -808,6 +819,72 @@ def test_pipeline_mode_arbitration_repair_commits_restored_anchors(
     assert "export const auth" in landed.read_text(encoding="utf-8")
     assert sessions.load_node_session("RA").get(merge_arbitration_budget_key()) is True
     assert queue_state["node_states"]["RA"] == NODE_PASSED
+
+
+def test_pipeline_mode_arbitration_idempotent_repair_reports_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An accepted arbitration whose rewrite is byte-identical to the tree
+    (the anchors were already honored, e.g. a sibling's merge restored them)
+    has nothing to commit: that is a repaired outcome, not a failure - the
+    review follow-up for the empty-commit/no-change misreport."""
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_DESIGN_GATE_PIPELINE", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "1")
+    monkeypatch.setenv("ARC_MERGE_ARBITRATION", "1")
+    manager = _make_drain_manager(tmp_path, ["R", "RA", "RB"], with_events_file=True)
+    queue_state = manager._load_or_create_processing_queue(_dependency_tree())
+    # The registered anchor IS on disk already (no actual drift), but the
+    # drift detector fired before the sibling's content landed through the
+    # merge - simulate by pointing the detector at a contract whose anchor
+    # exists, then having the arbiter rewrite it with identical bytes.
+    manager.runtime.traceability.interfaces = [
+        {
+            "interface_id": "RA-FUNC-Auth",
+            "req_ids": ["RA"],
+            "type": "FUNC",
+            "file_path": "backend/src/features/auth.js",
+            "first_line": "export const auth",
+            "implemented": False,
+        }
+    ]
+    landed = Path(manager.workspace_path) / "backend" / "src" / "features" / "auth.js"
+    landed.parent.mkdir(parents=True, exist_ok=True)
+    landed.write_text("export const auth = { done: true };\n", encoding="utf-8")
+
+    # The anchor check passes on disk, so _check_contract_drift would not
+    # escalate; exercise the commit tail of _arbitrate_contract_drift
+    # directly with an accepted-but-identical rewrite.
+    from core.contract_drift import ContractDrift as _Drift
+
+    drift_item = _Drift(
+        interface_id="RA-FUNC-Auth",
+        file_path="backend/src/features/auth.js",
+        first_line="export const auth",
+        reason="anchor-line-missing",
+    )
+
+    class _IdentityModel:
+        async def ainvoke(self, messages: Any) -> Any:
+            from langchain_core.messages import AIMessage
+
+            return AIMessage(
+                content=json.dumps(
+                    {"backend/src/features/auth.js": "export const auth = { done: true };\n"}
+                )
+            )
+
+    monkeypatch.setattr(manager, "_build_arbitration_model", lambda: _IdentityModel())
+
+    repaired = asyncio.run(
+        manager._arbitrate_contract_drift(
+            "RA", [drift_item], ["backend/src/features/auth.js"]
+        )
+    )
+
+    assert repaired is True, (
+        "an accepted arbitration with nothing left to change is a successful repair"
+    )
 
 
 def test_pipeline_mode_implemented_flags_reach_the_dependent_context(
