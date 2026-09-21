@@ -1054,11 +1054,12 @@ def test_integrate_waits_for_in_flight_prepare(tmp_path: Path) -> None:
     assert (repo / "backend" / "feature.js").exists(), "merge must land after waiting"
 
 
-def test_reset_branch_to_integration_waits_for_in_flight_integration(
+def test_retry_reset_settle_waits_for_in_flight_integration(
     tmp_path: Path,
 ) -> None:
-    """The conflict-requeue reset checks out the integration tree too, so it
-    holds the same exclusion against an in-flight integrate."""
+    """The conflict-requeue reset checks out the integration tree too, so the
+    manager's settle for ``RESET_FOR_RETRY`` holds the same exclusion against
+    an in-flight integrate (issue #91, exercised through the #105 seam)."""
 
     repo, manager = _init_repo(tmp_path)
     handle = manager.prepare("REQ-2.1")
@@ -1068,22 +1069,24 @@ def test_reset_branch_to_integration_waits_for_in_flight_integration(
 
     outcome: dict[str, Any] = {}
 
-    def run_reset() -> None:
+    def run_settle() -> None:
         try:
-            manager.reset_branch_to_integration(handle)
-            outcome["done"] = True
+            outcome["result"] = manager.settle(
+                handle, result=WorktreeTaskResult.RESET_FOR_RETRY
+            )
         except Exception as exc:  # pragma: no cover - failure is the signal
             outcome["error"] = exc
 
-    reset_thread = threading.Thread(target=run_reset, daemon=True)
+    reset_thread = threading.Thread(target=run_settle, daemon=True)
     reset_thread.start()
     try:
         reset_thread.join(0.5)
-        assert not outcome, "reset ran while the integration gate was held as writer"
+        assert not outcome, "settle ran while the integration gate was held as writer"
     finally:
         release.set()
     reset_thread.join(10)
-    assert outcome.get("done"), f"reset never completed: {outcome.get('error')}"
+    assert "result" in outcome, f"settle never completed: {outcome.get('error')}"
+    assert outcome["result"] is WorktreeOutcome.DELETED
 
 
 def test_prepare_raises_when_the_checkout_fails(
