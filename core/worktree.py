@@ -27,15 +27,25 @@ disjoint files in the common case, so merges are clean. Two guards cover the
 overlapping cases: ``core.file_claims`` blocks a stage agent from creating a
 new file a parallel sibling already created (the add/add case no resolver
 can fix), and the workflow re-queues a node once per phase after a merge
-conflict (``reset_branch_to_integration`` puts the retry back at the merged
-integration HEAD, so the winning sibling's files are visible to it). A
-conflict that survives both guards fails the node with an explicit reason
-and keeps the worktree on disk for inspection and ``--retry``. One narrow
-conflict class is resolved mechanically instead: when every side of a
-conflict only *appends* lines to an existing file (the shared glue-file
-registration pattern, e.g. ``app.js`` route blocks), the additions are
-replayed onto the common base and the caller may run a health check on the
-resolved tree before the merge is committed.
+conflict (the manager's ``settle`` with ``RESET_FOR_RETRY`` puts the retry
+back at the merged integration HEAD, so the winning sibling's files are
+visible to it). A conflict that survives both guards fails the node with an
+explicit reason and keeps the worktree on disk for inspection and
+``--retry``. One narrow conflict class is resolved mechanically instead:
+when every side of a conflict only *appends* lines to an existing file (the
+shared glue-file registration pattern, e.g. ``app.js`` route blocks), the
+additions are replayed onto the common base and the caller may run a health
+check on the resolved tree before the merge is committed.
+
+Lifecycle ownership (issue #105): the reuse / quarantine / preserve /
+delete decisions live entirely in this module. The scheduler reports what
+happened to a task (``WorktreeTaskResult``) and receives one outcome per
+task (``WorktreeOutcome``) from ``settle``; the quarantine set is private
+manager state, written when a merge fails inside ``integrate`` and cleared
+by the manager's own retry reset - never touched across the seam. What the
+merge-arbitration paths need from the integration workspace (conflict
+stages, staging, a follow-up commit) is exposed as manager methods too, so
+no caller reaches for the manager's git handle.
 
 Tasks may share one worktree *directory* per subtree (``group_key`` in
 ``prepare``): consecutive tasks of a subtree run sequentially in the same
@@ -74,10 +84,15 @@ import subprocess
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from core.merge_arbitration import TRIGGER_CONFLICT, TRIGGER_HEALTH_GATE
+from core.merge_arbitration import (
+    TRIGGER_CONFLICT,
+    TRIGGER_HEALTH_GATE,
+    read_conflict_stages as _read_conflict_stages,
+)
 
 
 BRANCH_PREFIX = "arc-node"
@@ -117,6 +132,38 @@ class MergeArbitrationError(MergeConflictError):
     distinguish "arbitration was tried and its output failed the gate" from
     "mechanical resolution failed the gate".
     """
+
+
+class WorktreeTaskResult(str, Enum):
+    """What the scheduler reports about a finished task: facts, not decisions.
+
+    The scheduler knows whether the task's work merged, failed, or was
+    re-queued after a merge conflict; every consequence for the worktree is
+    the manager's to decide (``settle`` maps these onto ``WorktreeOutcome``).
+    """
+
+    MERGED = "merged"
+    FAILED = "failed"
+    RESET_FOR_RETRY = "reset_for_retry"
+
+
+class WorktreeOutcome(str, Enum):
+    """The one lifecycle outcome the manager returns per finished task.
+
+    - ``PRESERVED``: the directory stays on disk exactly as the task left it
+      (including any quarantine ``integrate`` recorded) for inspection and
+      ``--retry``; the node_modules link stays connected so a retry can run
+      tests immediately.
+    - ``REUSED``: a reusable group directory survives its task for the
+      subtree's next task; the end-of-drain cleanup removes it once the run
+      no longer needs it.
+    - ``DELETED``: the directory is removed; the branch is always kept for
+      audit and retry.
+    """
+
+    PRESERVED = "preserved"
+    REUSED = "reused"
+    DELETED = "deleted"
 
 
 @dataclass
@@ -681,16 +728,66 @@ class NodeWorktreeManager:
                 merged.append(base_lines[position])
         return merged
 
-    def discard(self, handle: WorktreeHandle, *, preserve: bool = False) -> None:
-        """Remove the worktree directory, keeping the branch for audit.
+    def settle(self, handle: WorktreeHandle, *, result: WorktreeTaskResult) -> WorktreeOutcome:
+        """Settle a finished task's worktree: one outcome per task.
 
-        A preserved worktree keeps its node_modules link so a retry can run
-        tests immediately; a deleted one must have the link disconnected first
-        (see ``_unlink_node_modules``).
+        The manager owns the reuse / quarantine / preserve / delete decision;
+        the scheduler only reports the task's result:
+
+        - ``FAILED`` → ``PRESERVED``: the worktree keeps its state for
+          inspection and ``--retry`` exactly as the task left it - whatever
+          quarantine ``integrate`` recorded stays in force (a conflicted
+          merge keeps the directory out of other nodes' hands); a plain
+          failure stays un-quarantined and the next ``prepare``'s dirty
+          check falls back exactly as before.
+        - ``RESET_FOR_RETRY`` → the branch is reset to the current integration
+          HEAD and the directory un-quarantined first (the conflict-aware
+          requeue re-runs the node against the winning sibling's merged
+          files), then the same decision as a merged task: a reusable group
+          directory survives (``REUSED``), a node-keyed directory is removed
+          (``DELETED``) and the retry's ``prepare`` recreates it from the
+          branch - which now sits at the integration HEAD. Once the reset
+          has succeeded a failed removal must not fail the requeue (the
+          conflicted commits are already reset away), so the directory is
+          kept in its now-clean, reusable state and reported as ``REUSED``.
+        - ``MERGED`` → ``REUSED`` for a reusable group directory,
+          ``DELETED`` otherwise (branch kept).
+
+        The end-of-drain bulk cleanup (``cleanup_reusable_worktrees``) maps
+        onto the same outcomes per worktree: clean reusable directories are
+        deleted once the run no longer needs them; dirty and quarantined
+        directories are preserved for inspection and ``--retry``.
         """
 
-        if preserve:
-            return
+        if result is WorktreeTaskResult.FAILED:
+            return WorktreeOutcome.PRESERVED
+        if result is WorktreeTaskResult.RESET_FOR_RETRY:
+            self._reset_branch_to_integration(handle)
+            if handle.reusable:
+                return WorktreeOutcome.REUSED
+            try:
+                self._remove_worktree(handle)
+            except WorktreeError:
+                # The reset already succeeded, so the requeue must proceed:
+                # the directory is clean at the integration HEAD - keep it as
+                # genuinely reusable instead of failing the requeue over a
+                # removal.
+                return WorktreeOutcome.REUSED
+            return WorktreeOutcome.DELETED
+        if handle.reusable:
+            return WorktreeOutcome.REUSED
+        self._remove_worktree(handle)
+        return WorktreeOutcome.DELETED
+
+    def _remove_worktree(self, handle: WorktreeHandle) -> None:
+        """Remove the worktree directory, keeping the branch for audit.
+
+        The shared node_modules link must be disconnected first (see
+        ``_unlink_node_modules``); a link that cannot be disconnected keeps
+        the worktree registered instead of risking the shared install
+        directory.
+        """
+
         self._unlink_node_modules(handle)
         if self._is_registered(Path(handle.path)):
             self._git(["worktree", "remove", "--force", handle.path], cwd=self.main_workspace, check=False)
@@ -702,15 +799,16 @@ class NodeWorktreeManager:
 
         self._git(["worktree", "prune"], cwd=self.main_workspace, check=False)
 
-    def reset_branch_to_integration(self, handle: WorktreeHandle) -> None:
+    def _reset_branch_to_integration(self, handle: WorktreeHandle) -> None:
         """Reset a conflicted node's branch to the current integration HEAD.
 
         After a merge conflict the node branch holds the losing (conflicting)
         commits. A conflict-aware DESIGN or IMPLEMENT retry re-runs the node
         from the current integration state - which already contains the
-        winning sibling's files - so its branch is reset here and the
-        worktree directory is un-quarantined for reuse. The discarded
-        commits stay reachable through git's reflog for inspection.
+        winning sibling's files - so its branch is reset here (the manager's
+        own ``settle`` for ``RESET_FOR_RETRY``) and the worktree directory is
+        un-quarantined for reuse. The discarded commits stay reachable through
+        git's reflog for inspection.
 
         Runs under ``integration_gate`` as a reader like ``prepare``: the
         reset checks out the integration branch's tree into this worktree
@@ -776,6 +874,52 @@ class NodeWorktreeManager:
             if not Path(path).exists():
                 removed.append(path)
         return removed
+
+    # ------------------------------------------------------------------
+    # integration-workspace services (merge-arbitration hand-off)
+    # ------------------------------------------------------------------
+
+    def read_conflict_stages(self, paths: list[str]) -> dict[str, dict[str, str | None]]:
+        """The mid-merge index stages for the conflict paths.
+
+        Reads ``base``/``ours``/``theirs`` from the integration workspace's
+        merge index - the arbitration input's three-way content. Exposing it
+        here keeps the index plumbing behind the manager's public interface
+        instead of callers reaching for its git handle.
+        """
+
+        return _read_conflict_stages(lambda args: self._git(args, check=False), paths)
+
+    def stage_paths(self, paths: list[str]) -> None:
+        """Stage rewritten conflict/drift files in the integration workspace.
+
+        Stage failures are ignored, matching the arbitration hand-off
+        contract: the merge's own verification - the plain conflict check or
+        the health gate - rejects an unstaged or broken tree.
+        """
+
+        for path in paths:
+            self._git(["add", "--", path], check=False)
+
+    def commit_integration(self, message: str) -> bool:
+        """Commit the staged changes on the integration branch.
+
+        Returns ``True`` when a commit was created and ``False`` when there
+        was nothing to commit (the staged tree already matches HEAD - an
+        accepted repair can be byte-identical to what landed). A real failure
+        raises ``WorktreeError``.
+        """
+
+        result = self._git(["commit", "-m", message], check=False)
+        if result.returncode == 0:
+            return True
+        output = (result.stdout + result.stderr).lower()
+        if "nothing to commit" in output:
+            return False
+        raise WorktreeError(
+            "git commit failed in the integration workspace: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
 
     # ------------------------------------------------------------------
     # queries

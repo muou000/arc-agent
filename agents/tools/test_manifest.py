@@ -142,8 +142,12 @@ def build_declare_test_manifest_tool(
                 continue
             file_path = normalize_manifest_path(item.get("file_path"))
             raw_type = str(item.get("type", "") or "").strip()
+            raw_interface_ids = item.get("interface_ids")
+            unwrapped_ids = _unwrap_interface_id_shapes(raw_interface_ids)
             interface_ids = [
-                str(value).strip() for value in item.get("interface_ids") or [] if str(value or "").strip()
+                str(value).strip()
+                for value in (unwrapped_ids if unwrapped_ids is not None else raw_interface_ids or [])
+                if str(value or "").strip()
             ]
             coverage_scope = normalize_coverage_scope(item.get("coverage_scope"))
             if not file_path:
@@ -214,6 +218,7 @@ def build_declare_test_manifest_tool(
                 "Unknown interface id(s) not present in the traceability DB: "
                 + ", ".join(sorted(unknown_interfaces))
                 + f".{hint} Use ids returned by InterfaceDesigner or the traceability tools."
+                + _MANIFEST_SHAPE_EXAMPLE
             )
 
         if errors:
@@ -303,6 +308,68 @@ def _unknown_interface_ids(
 #: current-node ids come first (the ones the model should be mapping to); the
 #: tail is cut, not the head, so oversized DBs never bury the actionable ids.
 _MANIFEST_HINT_MAX_IDS = 12
+
+
+#: Appended to the unknown-interface-id rejection. The run that motivated the
+#: unwrap (29 consecutive redeclarations) showed that listing valid ids is
+#: not enough — without the expected parameter shape the model blind-tries
+#: wrapper objects one key at a time.
+_MANIFEST_SHAPE_EXAMPLE = (
+    " Expected shape: `interface_ids` is a flat JSON array of id strings — "
+    'e.g. "interface_ids": ["IF-AUTH-SERVICE"] — never a wrapper object '
+    '({"item": ...}, {"id": ...}, {"value": ...}, {"interface_id": ...}, '
+    '{"entries": {"entry": ...}}) or a bare string.'
+)
+
+
+#: Wrapper keys that ToolStrategy XML serialization has been observed to wrap
+#: the ``interface_ids`` array in (easy-ticketbooking run 2026-09-21, REQ-2
+#: DESIGN: 29 declarations across 8 shapes before the model produced the flat
+#: array). ``item``/``id``/``value``/``interface_id`` are the wrappers named
+#: by issue #113; ``entries``/``entry`` is the doubly-nested list form seen in
+#: the same run.
+_INTERFACE_ID_WRAPPER_KEYS = frozenset(
+    {"item", "id", "value", "interface_id", "entries", "entry"}
+)
+
+#: Depth cap on wrapper unwrapping. Observed wrappers nest at most two
+#: single-key dicts deep; the cap is generous headroom (a deeper nest still
+#: falls through to rejection) and exists to bound the recursion, not to
+#: match the evidence exactly.
+_INTERFACE_ID_UNWRAP_MAX_DEPTH = 5
+
+
+def _unwrap_interface_id_shapes(value: Any, *, depth: int = 0) -> list[str] | None:
+    """Mechanically unwrap known wrapper shapes around ``interface_ids``.
+
+    ToolStrategy structured output occasionally serializes the flat id array
+    as a wrapper object (``{"item": id}``, ``{"id": id}``, ``{"entries":
+    {"entry": id}}``, ...) or a bare string; the validator then read the
+    wrapper key — or every character of the string — as an interface id and
+    rejected, and the model burned ~25 declarations blind-trying shapes.
+    Known wrappers are unwrapped here so validation sees the ids the model
+    meant; id validity and coverage checks run on the unwrapped list
+    unchanged.
+
+    Returns the unwrapped id list, or ``None`` when the value is not a known
+    wrapper shape: the caller then applies the legacy per-element handling,
+    which covers proper arrays and keeps unknown-key wrappers rejected.
+    """
+
+    if depth > _INTERFACE_ID_UNWRAP_MAX_DEPTH:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, dict) and len(value) == 1:
+        key, inner = next(iter(value.items()))
+        if key not in _INTERFACE_ID_WRAPPER_KEYS:
+            return None
+        if isinstance(inner, list):
+            return inner
+        if isinstance(inner, (str, dict)):
+            return _unwrap_interface_id_shapes(inner, depth=depth + 1)
+    return None
 
 
 def _valid_interface_ids(

@@ -27,6 +27,8 @@ from core.worktree import (
     MergeVerificationError,
     NodeWorktreeManager,
     WorktreeError,
+    WorktreeOutcome,
+    WorktreeTaskResult,
 )
 from tests.helpers.faux import FauxChatModel, faux_text
 
@@ -132,7 +134,7 @@ def test_merge_conflict_aborts_and_preserves_worktree(tmp_path: Path) -> None:
     assert not (repo / ".git" / "MERGE_HEAD").exists()
 
 
-def test_discard_removes_worktree_keeps_branch_and_shared_node_modules(tmp_path: Path) -> None:
+def test_settle_merged_node_worktree_is_deleted(tmp_path: Path) -> None:
     repo, manager = _init_repo(tmp_path)
     shared = repo / "frontend" / "node_modules"
     (shared / "pkg").mkdir(parents=True)
@@ -141,19 +143,20 @@ def test_discard_removes_worktree_keeps_branch_and_shared_node_modules(tmp_path:
     worktree_node_modules = Path(handle.path) / "frontend" / "node_modules"
     assert (worktree_node_modules / "pkg" / "index.js").exists(), "junction must expose shared modules"
 
-    manager.discard(handle)
+    outcome = manager.settle(handle, result=WorktreeTaskResult.MERGED)
 
+    assert outcome is WorktreeOutcome.DELETED
     assert not Path(handle.path).exists(), "worktree directory removed"
     assert manager._branch_exists(handle.branch), "branch kept for audit"
     assert (shared / "pkg" / "index.js").exists(), "shared node_modules must survive junction cleanup"
 
 
-def test_discard_refuses_when_the_junction_cannot_be_disconnected(
+def test_settle_refuses_to_delete_when_the_junction_cannot_be_disconnected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """git worktree remove --force recurses through junctions and destroys the
-    shared node_modules (verified empirically), so discard() must never reach
-    it while a junction survives (PR #8 review)."""
+    shared node_modules (verified empirically), so a settling that deletes must
+    never reach it while a junction survives (PR #8 review)."""
     repo, manager = _init_repo(tmp_path)
     shared = repo / "frontend" / "node_modules"
     (shared / "pkg").mkdir(parents=True)
@@ -166,10 +169,147 @@ def test_discard_refuses_when_the_junction_cannot_be_disconnected(
     monkeypatch.setattr("core.worktree._remove_link", broken_remove_link)
 
     with pytest.raises(WorktreeError, match="refusing to delete the worktree"):
-        manager.discard(handle)
+        manager.settle(handle, result=WorktreeTaskResult.MERGED)
 
     assert (shared / "pkg" / "index.js").exists(), "shared node_modules untouched"
     assert manager._is_registered(Path(handle.path)), "worktree kept, git removal skipped"
+
+
+def test_settle_failed_task_preserves_the_worktree(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-1.1")
+    (Path(handle.path) / "scratch.txt").write_text("in-flight diagnostics", encoding="utf-8")
+
+    outcome = manager.settle(handle, result=WorktreeTaskResult.FAILED)
+
+    assert outcome is WorktreeOutcome.PRESERVED
+    assert manager._is_registered(Path(handle.path)), "the worktree stays for inspection/retry"
+    assert (Path(handle.path) / "scratch.txt").read_text(encoding="utf-8") == "in-flight diagnostics"
+
+
+def test_settle_merged_reusable_group_worktree_survives(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(handle.path) / "backend" / "sibling.js").write_text("one;\n", encoding="utf-8")
+    manager.integrate(handle, "REQ-2.1 design")
+
+    outcome = manager.settle(handle, result=WorktreeTaskResult.MERGED)
+
+    assert outcome is WorktreeOutcome.REUSED
+    assert manager._is_registered(Path(handle.path)), "the group directory survives for the next task"
+
+
+def test_settle_failed_reusable_group_worktree_is_preserved(tmp_path: Path) -> None:
+    """A failed task's group directory is preserved like any failed task's:
+    the next prepare's dirty check decides reuse vs fallback (unchanged)."""
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(handle.path) / "scratch.txt").write_text("failed state", encoding="utf-8")
+
+    outcome = manager.settle(handle, result=WorktreeTaskResult.FAILED)
+
+    assert outcome is WorktreeOutcome.PRESERVED
+    assert manager._is_registered(Path(handle.path))
+    assert (Path(handle.path) / "scratch.txt").read_text(encoding="utf-8") == "failed state"
+
+
+def test_settle_retry_reset_restores_a_quarantined_group_worktree(tmp_path: Path) -> None:
+    """A conflict quarantines the group directory; the requeue's reset (via
+    settle with RESET_FOR_RETRY) un-quarantines it, resets the branch to the
+    integration HEAD, and the directory survives for the subtree's next task."""
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(handle.path) / "backend" / "src.js").write_text("from worktree;\n", encoding="utf-8")
+    manager.commit(handle, "wip")
+    (repo / "backend" / "src.js").write_text("from integration;\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "integration edit"], repo)
+    with pytest.raises(MergeConflictError):
+        manager.integrate(handle, "REQ-2.1 conflict")
+
+    outcome = manager.settle(handle, result=WorktreeTaskResult.RESET_FOR_RETRY)
+
+    assert outcome is WorktreeOutcome.REUSED
+    assert manager._is_registered(Path(handle.path))
+    assert not manager._worktree_dirty(handle.path), "the reset leaves the directory clean"
+    head = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    branch_head = _git(["rev-parse", handle.branch], repo).stdout.strip()
+    assert branch_head == head, "the retried branch starts at the integration HEAD"
+    other = manager.prepare("REQ-2.2", group_key="REQ-2")
+    assert Path(other.path) == Path(handle.path), "the un-quarantined group dir is handed out again"
+
+
+def test_settle_retry_reset_deletes_the_node_worktree_keeps_the_reset_branch(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-1.1")
+    (Path(handle.path) / "backend" / "src.js").write_text("from worktree;\n", encoding="utf-8")
+    manager.commit(handle, "wip")
+    (repo / "backend" / "src.js").write_text("from integration;\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "integration edit"], repo)
+    with pytest.raises(MergeConflictError):
+        manager.integrate(handle, "REQ-1.1 conflict")
+
+    outcome = manager.settle(handle, result=WorktreeTaskResult.RESET_FOR_RETRY)
+
+    assert outcome is WorktreeOutcome.DELETED
+    assert not Path(handle.path).exists(), "the node-keyed directory is removed"
+    head = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    branch_head = _git(["rev-parse", handle.branch], repo).stdout.strip()
+    assert branch_head == head, "the branch was reset to the integration HEAD before removal"
+    assert manager._branch_exists(handle.branch), "the branch stays for the retry's prepare"
+
+
+def test_settle_retry_reset_survives_a_failed_removal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once the retry reset has succeeded, a failed directory removal must not
+    fail the settle: the conflicted commits are already reset away, so the
+    requeue has to proceed - the directory is kept in its now-clean, reusable
+    state and reported as REUSED."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-1.1")
+    (Path(handle.path) / "backend" / "src.js").write_text("from worktree;\n", encoding="utf-8")
+    manager.commit(handle, "wip")
+    (repo / "backend" / "src.js").write_text("from integration;\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "integration edit"], repo)
+    with pytest.raises(MergeConflictError):
+        manager.integrate(handle, "REQ-1.1 conflict")
+
+    def broken_remove(_handle: object) -> None:
+        raise WorktreeError("refusing to delete the worktree")
+
+    monkeypatch.setattr(manager, "_remove_worktree", broken_remove)
+
+    outcome = manager.settle(handle, result=WorktreeTaskResult.RESET_FOR_RETRY)
+
+    assert outcome is WorktreeOutcome.REUSED
+    assert manager._is_registered(Path(handle.path)), "the directory survives the failed removal"
+    head = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    branch_head = _git(["rev-parse", handle.branch], repo).stdout.strip()
+    assert branch_head == head, "the reset still took effect"
+    assert not manager._worktree_dirty(handle.path), "the kept directory is clean for reuse"
+
+
+def test_settle_failed_task_keeps_an_in_force_quarantine(tmp_path: Path) -> None:
+    """A worktree quarantined by a conflicted merge stays quarantined when its
+    task settles as FAILED: the directory must not be handed to another node."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(handle.path) / "backend" / "src.js").write_text("from worktree;\n", encoding="utf-8")
+    manager.commit(handle, "wip")
+    (repo / "backend" / "src.js").write_text("from integration;\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "integration edit"], repo)
+    with pytest.raises(MergeConflictError):
+        manager.integrate(handle, "REQ-2.1 conflict")
+
+    outcome = manager.settle(handle, result=WorktreeTaskResult.FAILED)
+
+    assert outcome is WorktreeOutcome.PRESERVED
+    other = manager.prepare("REQ-2.2", group_key="REQ-2")
+    assert Path(other.path).name == "REQ-2.2", "the quarantined group dir is not handed out again"
 
 
 def test_integrate_commit_failure_names_the_branch(tmp_path: Path) -> None:
@@ -422,6 +562,29 @@ def test_integrate_does_not_union_new_file_conflicts(tmp_path: Path) -> None:
 
 
 # ----------------------------------------------------------------------
+# integration-workspace services (merge-arbitration hand-off)
+# ----------------------------------------------------------------------
+
+
+def test_stage_paths_and_commit_integration_follow_up_commit(tmp_path: Path) -> None:
+    """The post-merge arbitration repair lands as its own follow-up commit on
+    the integration branch; a byte-identical repair reports nothing to commit."""
+    repo, manager = _init_repo(tmp_path)
+    (repo / "backend" / "drift.js").write_text("repaired;\n", encoding="utf-8")
+
+    manager.stage_paths(["backend/drift.js"])
+    assert manager.commit_integration("repair anchors") is True
+    head = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    assert (repo / "backend" / "drift.js").exists()
+
+    manager.stage_paths(["backend/drift.js"])
+    assert manager.commit_integration("repair anchors") is False, (
+        "an already-landed tree has nothing to commit"
+    )
+    assert _git(["rev-parse", "HEAD"], repo).stdout.strip() == head
+
+
+# ----------------------------------------------------------------------
 # LLM merge arbitration (issue #81)
 # ----------------------------------------------------------------------
 
@@ -433,15 +596,14 @@ def _real_arbitration_hooks(
     *,
     budget_spent: bool = False,
 ) -> tuple[ArbitrationHooks, dict[str, Any]]:
-    """Production-shaped hooks: real index reads via the manager's git, real
-    contract-card collection, one shared budget flag."""
+    """Production-shaped hooks: real index reads through the manager's public
+    interface, real contract-card collection, one shared budget flag."""
 
     from core.merge_arbitration import (
         ArbitrationInput,
         MergeArbiter,
         TRIGGER_HEALTH_GATE,
         collect_contract_cards,
-        read_conflict_stages,
         read_workspace_file,
     )
 
@@ -451,10 +613,7 @@ def _real_arbitration_hooks(
     def collect_input(conflict_paths: list[str], trigger: str, gate_failure: str = "") -> Any:
         if state["budget_spent"]:
             return None
-        stages = read_conflict_stages(
-            lambda args: manager._git(args, cwd=manager.main_workspace, check=False),
-            conflict_paths,
-        )
+        stages = manager.read_conflict_stages(conflict_paths)
         if trigger == TRIGGER_HEALTH_GATE:
             # Mirror the workflow's collect hook: the mechanical resolution
             # already staged the files, so the arbiter repairs the resolved
@@ -482,8 +641,7 @@ def _real_arbitration_hooks(
         )
         if not result.accepted:
             return result.detail
-        for path in result.applied:
-            manager._git(["add", "--", path], cwd=manager.main_workspace, check=False)
+        manager.stage_paths(result.applied)
         return None
 
     hooks = ArbitrationHooks(collect_input=collect_input, run=run)
@@ -948,11 +1106,12 @@ def test_integrate_waits_for_in_flight_prepare(tmp_path: Path) -> None:
     assert (repo / "backend" / "feature.js").exists(), "merge must land after waiting"
 
 
-def test_reset_branch_to_integration_waits_for_in_flight_integration(
+def test_retry_reset_settle_waits_for_in_flight_integration(
     tmp_path: Path,
 ) -> None:
-    """The conflict-requeue reset checks out the integration tree too, so it
-    holds the same exclusion against an in-flight integrate."""
+    """The conflict-requeue reset checks out the integration tree too, so the
+    manager's settle for ``RESET_FOR_RETRY`` holds the same exclusion against
+    an in-flight integrate (issue #91, exercised through the #105 seam)."""
 
     repo, manager = _init_repo(tmp_path)
     handle = manager.prepare("REQ-2.1")
@@ -962,22 +1121,24 @@ def test_reset_branch_to_integration_waits_for_in_flight_integration(
 
     outcome: dict[str, Any] = {}
 
-    def run_reset() -> None:
+    def run_settle() -> None:
         try:
-            manager.reset_branch_to_integration(handle)
-            outcome["done"] = True
+            outcome["result"] = manager.settle(
+                handle, result=WorktreeTaskResult.RESET_FOR_RETRY
+            )
         except Exception as exc:  # pragma: no cover - failure is the signal
             outcome["error"] = exc
 
-    reset_thread = threading.Thread(target=run_reset, daemon=True)
+    reset_thread = threading.Thread(target=run_settle, daemon=True)
     reset_thread.start()
     try:
         reset_thread.join(0.5)
-        assert not outcome, "reset ran while the integration gate was held as writer"
+        assert not outcome, "settle ran while the integration gate was held as writer"
     finally:
         release.set()
     reset_thread.join(10)
-    assert outcome.get("done"), f"reset never completed: {outcome.get('error')}"
+    assert "result" in outcome, f"settle never completed: {outcome.get('error')}"
+    assert outcome["result"] is WorktreeOutcome.DELETED
 
 
 def test_prepare_raises_when_the_checkout_fails(
