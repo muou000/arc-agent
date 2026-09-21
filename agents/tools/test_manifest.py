@@ -332,12 +332,14 @@ _INTERFACE_ID_WRAPPER_KEYS = frozenset(
     {"item", "id", "value", "interface_id", "entries", "entry"}
 )
 
-#: Depth cap on wrapper unwrapping: the observed shapes nest at most two
-#: single-key dicts deep, so anything deeper is not a serialization accident.
+#: Depth cap on wrapper unwrapping. Observed wrappers nest at most two
+#: single-key dicts deep; the cap is generous headroom (a deeper nest still
+#: falls through to rejection) and exists to bound the recursion, not to
+#: match the evidence exactly.
 _INTERFACE_ID_UNWRAP_MAX_DEPTH = 5
 
 
-def _unwrap_interface_id_shapes(value: Any) -> list[str] | None:
+def _unwrap_interface_id_shapes(value: Any, *, depth: int = 0) -> list[str] | None:
     """Mechanically unwrap known wrapper shapes around ``interface_ids``.
 
     ToolStrategy structured output occasionally serializes the flat id array
@@ -354,10 +356,6 @@ def _unwrap_interface_id_shapes(value: Any) -> list[str] | None:
     which covers proper arrays and keeps unknown-key wrappers rejected.
     """
 
-    return _unwrap_interface_id_value(value, depth=0)
-
-
-def _unwrap_interface_id_value(value: Any, *, depth: int) -> list[str] | None:
     if depth > _INTERFACE_ID_UNWRAP_MAX_DEPTH:
         return None
     if isinstance(value, str):
@@ -370,7 +368,7 @@ def _unwrap_interface_id_value(value: Any, *, depth: int) -> list[str] | None:
         if isinstance(inner, list):
             return inner
         if isinstance(inner, (str, dict)):
-            return _unwrap_interface_id_value(inner, depth=depth + 1)
+            return _unwrap_interface_id_shapes(inner, depth=depth + 1)
     return None
 
 

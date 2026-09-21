@@ -713,3 +713,24 @@ def test_unwrap_recursion_is_depth_bounded() -> None:
         deep = {"item": deep}
     content = _declare_ids_wrapped(deep)
     assert "Unknown interface id(s)" in _parse(content)["error"]
+
+
+def test_shape_example_names_every_wrapper_key() -> None:
+    """The rejection's shape example and the unwrap key set must not drift
+    apart: every key the validator unwraps is named in the message, so the
+    model is never told one thing and forgiven another."""
+
+    import agents.tools.test_manifest as test_manifest_module
+
+    for key in test_manifest_module._INTERFACE_ID_WRAPPER_KEYS:
+        assert key in test_manifest_module._MANIFEST_SHAPE_EXAMPLE, key
+
+
+def test_unwrapped_empty_wrapper_matches_empty_array_semantics() -> None:
+    # With the coverage gate off, a wrapper that unwraps to nothing declares
+    # exactly like the flat empty array always has (gate-on path is pinned
+    # by test_unwrap_does_not_bypass_coverage_requirement).
+    content = _declare_ids_wrapped({"item": []})
+    result = _parse(content)
+    assert result["status"] == "locked"
+    assert result["manifest"][0]["interface_ids"] == []
