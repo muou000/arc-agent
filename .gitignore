@@ -64,3 +64,6 @@ frontend/dist-ssr/
 !.arc/traceability/
 !.arc/traceability/**
 # <<< arcbench-agent-runtime <<<
+arc-bench-test/
+!arc-bench-test/**/requirements/**
+!arc-bench-test/**/tests/**
