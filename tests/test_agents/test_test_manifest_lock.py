@@ -424,6 +424,7 @@ def _declare_with_store(
     *,
     store_interfaces: dict[str, dict[str, Any]],
     current_interface_ids: list[str] | None = None,
+    require_interface_coverage: bool = False,
 ) -> str:
     import agents.tools.test_manifest as test_manifest_module
 
@@ -432,6 +433,7 @@ def _declare_with_store(
         node_id="REQ-X",
         manifest_lock=lock,
         current_interface_ids=current_interface_ids,
+        require_interface_coverage=require_interface_coverage,
     )
     original_get_runtime = test_manifest_module.__dict__.get("get_runtime")
     # Both the unknown-id check and the hint resolve the runtime lazily via
@@ -539,3 +541,175 @@ def test_unknown_interface_hint_caps_long_id_lists() -> None:
     assert "valid id(s)" in content
     assert "+8 more" in content
     assert "traceability tools" in content
+
+
+# ---------------------------------------------------------------------------
+# Wrapper-shape unwrap: ToolStrategy structured output occasionally serializes
+# the interface_ids array as a wrapper object or bare string instead of the
+# flat array (easy-ticketbooking run 2026-09-21, REQ-2 DESIGN: 29 declarations
+# across 8 shapes before the model locked). Known wrappers are unwrapped
+# mechanically before validation; id validity and coverage semantics are
+# unchanged, unknown-key wrappers are still rejected, and the rejection now
+# shows the expected shape.
+# ---------------------------------------------------------------------------
+
+_STORE_IDS = {
+    "REQ-2-FUNC-AuthLoginService": {"req_ids": ["REQ-2"]},
+    "REQ-2-UI-LoginPage": {"req_ids": ["REQ-2"]},
+    "REQ-2-API-AuthLogin": {"req_ids": ["REQ-2"]},
+}
+
+
+def _declare_ids_wrapped(raw_interface_ids: Any) -> str:
+    """Declare one file whose `interface_ids` is the raw (wrapped) value."""
+
+    return _declare_with_store(
+        [
+            {
+                "file_path": "backend/tests/authLoginService.test.js",
+                "type": "Unit",
+                "coverage_scope": "owned",
+                "interface_ids": raw_interface_ids,
+            }
+        ],
+        store_interfaces=_STORE_IDS,
+        current_interface_ids=["REQ-2-FUNC-AuthLoginService"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_interface_ids", "expected_ids"),
+    [
+        pytest.param(
+            {"item": "REQ-2-FUNC-AuthLoginService"},
+            ["REQ-2-FUNC-AuthLoginService"],
+            id="item-str",
+        ),
+        pytest.param(
+            {"item": ["REQ-2-UI-LoginPage", "REQ-2-API-AuthLogin"]},
+            ["REQ-2-UI-LoginPage", "REQ-2-API-AuthLogin"],
+            id="item-list",
+        ),
+        pytest.param(
+            "REQ-2-FUNC-AuthLoginService",
+            ["REQ-2-FUNC-AuthLoginService"],
+            id="bare-string",
+        ),
+        pytest.param(
+            {"id": "REQ-2-FUNC-AuthLoginService"},
+            ["REQ-2-FUNC-AuthLoginService"],
+            id="id",
+        ),
+        pytest.param(
+            {"interface_id": "REQ-2-FUNC-AuthLoginService"},
+            ["REQ-2-FUNC-AuthLoginService"],
+            id="interface-id",
+        ),
+        pytest.param(
+            {"value": "REQ-2-FUNC-AuthLoginService"},
+            ["REQ-2-FUNC-AuthLoginService"],
+            id="value",
+        ),
+        pytest.param(
+            {"entries": {"entry": "REQ-2-FUNC-AuthLoginService"}},
+            ["REQ-2-FUNC-AuthLoginService"],
+            id="entries-entry",
+        ),
+        pytest.param(
+            {"item": {"interface_id": "REQ-2-FUNC-AuthLoginService"}},
+            ["REQ-2-FUNC-AuthLoginService"],
+            id="item-interface-id",
+        ),
+        pytest.param(
+            {"item": {"value": "REQ-2-FUNC-AuthLoginService"}},
+            ["REQ-2-FUNC-AuthLoginService"],
+            id="item-value",
+        ),
+        pytest.param(
+            {"item": {"id": "REQ-2-FUNC-AuthLoginService"}},
+            ["REQ-2-FUNC-AuthLoginService"],
+            id="item-id",
+        ),
+    ],
+)
+def test_declare_unwraps_observed_wrapper_shapes(
+    raw_interface_ids: Any, expected_ids: list[str]
+) -> None:
+    """Every wrapper shape observed in the run evidence unwraps to the flat
+    id array and locks in one declaration instead of triggering the
+    29-declaration shape fight."""
+
+    result = _parse(_declare_ids_wrapped(raw_interface_ids))
+    assert result["status"] == "locked"
+    assert result["manifest"][0]["interface_ids"] == expected_ids
+
+
+def test_declare_still_rejects_unknown_key_wrapper() -> None:
+    """A wrapper under an unrecognized key is not unwrapped; the rejection
+    now also shows the expected shape so the model stops blind-trying."""
+
+    content = _declare_ids_wrapped({"wrapper": "REQ-2-FUNC-AuthLoginService"})
+    result = _parse(content)
+    assert result["status"] == "error"
+    assert "Unknown interface id(s)" in result["error"]
+    assert '"interface_ids": ["IF-AUTH-SERVICE"]' in result["error"]
+
+
+def test_declare_still_rejects_multi_key_wrapper() -> None:
+    # A dict with several keys is ambiguous serialization, not a known
+    # wrapper: rejected via the same unknown-id path as before.
+    content = _declare_ids_wrapped(
+        {"item": "REQ-2-FUNC-AuthLoginService", "id": "REQ-2-UI-LoginPage"}
+    )
+    assert "Unknown interface id(s)" in _parse(content)["error"]
+
+
+def test_unwrap_does_not_bypass_id_validation() -> None:
+    # Unwrapping recovers the shape, not the ids: an unknown id inside a
+    # known wrapper is still rejected.
+    content = _declare_ids_wrapped({"item": "IF-GHOST"})
+    result = _parse(content)
+    assert result["status"] == "error"
+    assert "IF-GHOST" in result["error"]
+
+
+def test_unwrap_does_not_bypass_coverage_requirement() -> None:
+    # A known wrapper that unwraps to nothing still trips the coverage gate.
+    content = _declare_with_store(
+        [
+            {
+                "file_path": "backend/tests/authLoginService.test.js",
+                "type": "Unit",
+                "coverage_scope": "owned",
+                "interface_ids": {"item": []},
+            }
+        ],
+        store_interfaces=_STORE_IDS,
+        current_interface_ids=["REQ-2-FUNC-AuthLoginService"],
+        require_interface_coverage=True,
+    )
+    result = _parse(content)
+    assert result["status"] == "error"
+    assert "empty `interface_ids`" in result["error"]
+
+
+def test_declare_preserves_legacy_non_wrapper_outcomes() -> None:
+    """Non-wrapper values keep their exact legacy behavior: a proper array
+    still declares, and the id-as-key dict (the shape the run finally locked
+    with) still resolves through dict-key iteration."""
+
+    content = _declare_ids_wrapped(["REQ-2-FUNC-AuthLoginService"])
+    assert _parse(content)["status"] == "locked"
+
+    content = _declare_ids_wrapped({"REQ-2-FUNC-AuthLoginService": "x"})
+    assert _parse(content)["status"] == "locked"
+
+
+def test_unwrap_recursion_is_depth_bounded() -> None:
+    # Observed wrappers nest at most two single-key dicts deep; a deeper
+    # nest is not a serialization accident and stays rejected.
+    deep: Any = "REQ-2-FUNC-AuthLoginService"
+    for _ in range(8):
+        deep = {"item": deep}
+    content = _declare_ids_wrapped(deep)
+    assert "Unknown interface id(s)" in _parse(content)["error"]
