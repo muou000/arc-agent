@@ -21,7 +21,6 @@ import re
 from pathlib import Path
 
 from app_type_handler import web as web_handler
-from app_type_handler.test_results import parse_test_results
 
 
 # The exact stack shape from the 2026-09-20 run (paths shortened).
@@ -78,12 +77,12 @@ class _RecoveryRecorder:
         timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
         web_port: int | None = None,
-    ) -> str:
+    ) -> web_handler._CommandResult:
         if "playwright" in command:
             self.playwright_calls += 1
             if self.playwright_calls == 1:
-                return self.failure_output
-            return "Exit Code: 0\nSTDOUT:\nall green\n"
+                return web_handler._CommandResult(exit_code=1, text=self.failure_output)
+            return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nall green\n")
         if "npm run build" in command:
             # `_build_frontend_dist` passes force_rebuild only when bypassing
             # the cache; the reuse path never reaches the command.
@@ -91,8 +90,8 @@ class _RecoveryRecorder:
             dist_dir = Path(cwd) / "dist"
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-            return "Exit Code: 0\nSTDOUT:\nvite build\n"
-        return f"Exit Code: 0\nSTDOUT:\n{command} ran\n"
+            return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nvite build\n")
+        return web_handler._CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
 
 
 def _make_workspace(tmp_path: Path) -> Path:
@@ -126,8 +125,8 @@ def _patch_recovery_harness(monkeypatch, recorder: _RecoveryRecorder) -> list[st
 
     start_calls: list[str] = []
 
-    async def _fake_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, str]:
-        return True, "prepared"
+    async def _fake_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, int | None, str]:
+        return True, 0, "prepared"
 
     async def _fake_start(workspace_path: str, runtime_env: dict, web_port: int | None = None):
         start_calls.append("start")
@@ -169,9 +168,9 @@ def test_e2e_result_carries_serving_verdict_present(tmp_path, monkeypatch) -> No
     expected = (
         f"Served index.html: {dist_dir / 'index.html'} (present, fingerprint {fingerprint[:12]})"
     )
-    assert expected in result
+    assert expected in result.output
     # The verdict sits with the build section, before the runtime env section.
-    assert result.index("=== Frontend Build ===") < result.index(expected) < result.index(
+    assert result.output.index("=== Frontend Build ===") < result.output.index(expected) < result.output.index(
         "=== E2E Runtime Env ==="
     )
 
@@ -188,11 +187,16 @@ def test_e2e_result_carries_serving_verdict_absent(tmp_path, monkeypatch) -> Non
 
     handler = _make_handler(workspace)
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
         # Build "succeeds" but the artifact vanishes right after: this is the
         # exact race the verdict exists to expose (builder says OK, disk says
         # no). The verdict is checked at result-assembly time, after this.
-        return True, "Built `frontend/dist` from the current sources (fingerprint abc123def456).\n"
+        return web_handler._FrontendBuildOutcome(
+            ok=True,
+            note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
+            output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
+            exit_code=0,
+        )
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
     recorder = _RecoveryRecorder("Exit Code: 1\nSTDOUT:\nunrelated\n")
@@ -201,7 +205,7 @@ def test_e2e_result_carries_serving_verdict_absent(tmp_path, monkeypatch) -> Non
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     expected = f"Served index.html: {workspace / 'frontend' / 'dist' / 'index.html'} (absent)"
-    assert expected in result
+    assert expected in result.output
 
 
 def test_dead_static_host_signature_detected() -> None:
@@ -243,14 +247,19 @@ def test_dead_static_host_triggers_exactly_one_recovery(tmp_path, monkeypatch) -
 
     build_calls: list[bool] = []
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
         build_calls.append(force_rebuild)
         # Second (forced) build produces the artifact.
         if force_rebuild:
             dist_dir = Path(workspace_path) / "frontend" / "dist"
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / "index.html").write_text("<html>rebuilt</html>\n", encoding="utf-8")
-        return True, "Built `frontend/dist` from the current sources (fingerprint abc123def456).\n"
+        return web_handler._FrontendBuildOutcome(
+            ok=True,
+            note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
+            output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
+            exit_code=0,
+        )
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
     recorder = _RecoveryRecorder(_SPA_DEAD_HOST_OUTPUT)
@@ -264,12 +273,12 @@ def test_dead_static_host_triggers_exactly_one_recovery(tmp_path, monkeypatch) -
     assert build_calls == [False, True]
     # The recovery is visible; the retried attempt leads and the failed one
     # survives as the superseded appendix.
-    assert "=== SPA Static-Host Recovery Retry ===" in result
-    assert "First attempt (superseded, kept for the failure evidence):" in result
-    assert "Exit Code (superseded by the recovery retry): 1" in result
+    assert "=== SPA Static-Host Recovery Retry ===" in result.output
+    assert "First attempt (superseded, kept for the failure evidence):" in result.output
+    assert "Exit Code (superseded by the recovery retry): 1" in result.output
     # The overall exit code comes from the retried (passing) attempt.
-    assert parse_test_results(result)["exit_code"] == 0
-    assert "all green" in result
+    assert result.exit_code == 0
+    assert "all green" in result.output
     # The one-shot budget is spent for this handler instance.
     assert handler._spa_static_host_recovery_used is True
 
@@ -280,11 +289,16 @@ def test_plain_not_found_failure_gets_no_recovery(tmp_path, monkeypatch) -> None
     workspace = _make_workspace(tmp_path)
     handler = _make_handler(workspace)
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
         dist_dir = Path(workspace_path) / "frontend" / "dist"
         dist_dir.mkdir(parents=True, exist_ok=True)
         (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-        return True, "Built `frontend/dist` from the current sources (fingerprint abc123def456).\n"
+        return web_handler._FrontendBuildOutcome(
+            ok=True,
+            note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
+            output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
+            exit_code=0,
+        )
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
     recorder = _RecoveryRecorder(_PLAIN_NOT_FOUND_OUTPUT)
@@ -294,9 +308,9 @@ def test_plain_not_found_failure_gets_no_recovery(tmp_path, monkeypatch) -> None
 
     assert recorder.playwright_calls == 1
     assert start_calls == ["start"]
-    assert "SPA Static-Host Recovery Retry" not in result
+    assert "SPA Static-Host Recovery Retry" not in result.output
     assert handler._spa_static_host_recovery_used is False
-    assert parse_test_results(result)["exit_code"] == 1
+    assert result.exit_code == 1
 
 
 def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
@@ -305,11 +319,16 @@ def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     handler = _make_handler(workspace)
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
         dist_dir = Path(workspace_path) / "frontend" / "dist"
         dist_dir.mkdir(parents=True, exist_ok=True)
         (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-        return True, "Built `frontend/dist` from the current sources (fingerprint abc123def456).\n"
+        return web_handler._FrontendBuildOutcome(
+            ok=True,
+            note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
+            output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
+            exit_code=0,
+        )
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
 
@@ -318,7 +337,7 @@ def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
             result = await super().__call__(command, cwd, timeout, extra_env, web_port)
             if "playwright" in command:
                 # Every playwright run fails with the signature.
-                return self.failure_output
+                return web_handler._CommandResult(exit_code=1, text=self.failure_output)
             return result
 
     recorder = _AlwaysDeadHost(_SPA_DEAD_HOST_OUTPUT)
@@ -346,11 +365,16 @@ def test_recovery_retried_pass_with_failed_cleanup_reports_failure(tmp_path, mon
     workspace = _make_workspace(tmp_path)
     handler = _make_handler(workspace)
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> tuple[bool, str]:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
         dist_dir = Path(workspace_path) / "frontend" / "dist"
         dist_dir.mkdir(parents=True, exist_ok=True)
         (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-        return True, "Built `frontend/dist` from the current sources (fingerprint abc123def456).\n"
+        return web_handler._FrontendBuildOutcome(
+            ok=True,
+            note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
+            output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
+            exit_code=0,
+        )
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
 
@@ -373,11 +397,11 @@ def test_recovery_retried_pass_with_failed_cleanup_reports_failure(tmp_path, mon
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     # The recovery ran and its cleanup note failed.
-    assert "=== SPA Static-Host Recovery Retry ===" in result
-    assert "Backend runtime cleanup failed: test injected" in result
+    assert "=== SPA Static-Host Recovery Retry ===" in result.output
+    assert "Backend runtime cleanup failed: test injected" in result.output
     # The retried attempt passed but its cleanup failed: overall exit is 1.
-    assert "all green" in result
-    assert parse_test_results(result)["exit_code"] == 1
+    assert "all green" in result.output
+    assert result.exit_code == 1
     # Only one Exit Code line was rewritten to 1 (the retried leading one);
     # the superseded first attempt keeps its labeled form.
-    assert "Exit Code (superseded by the recovery retry): 1" in result
+    assert "Exit Code (superseded by the recovery retry): 1" in result.output

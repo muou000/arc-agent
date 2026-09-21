@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .base import AppTypeHandler
 from .path_validation import normalize_safe_relative_path
+from .test_results import TestRunResult, parse_test_run
 
 
 def _normalize_cli_test_path(file_path: str) -> str:
@@ -164,20 +165,22 @@ class CliAppType(AppTypeHandler):
             )
         return None
 
-    async def run_test_file(self, test_type: str, file_path: str) -> str:
+    async def run_test_file(self, test_type: str, file_path: str) -> TestRunResult:
         await self._log("System", f"System test execution ({test_type}): {file_path}")
         validation_error = self.validate_test_path(test_type, file_path)
         if validation_error:
-            return f"Exit Code: 1\nSTDERR:\n{validation_error}\n"
+            return parse_test_run(f"Exit Code: 1\nSTDERR:\n{validation_error}\n")
         module_name = _cli_test_module(file_path)
-        return await _run_python_command(
-            [sys.executable, "-m", "unittest", "-v", module_name],
-            cwd=self.workspace_path,
+        return parse_test_run(
+            await _run_python_command(
+                [sys.executable, "-m", "unittest", "-v", module_name],
+                cwd=self.workspace_path,
+            )
         )
 
-    async def run_test_group(self, test_type: str, file_paths: list[str]) -> str:
+    async def run_test_group(self, test_type: str, file_paths: list[str]) -> TestRunResult:
         if not file_paths:
-            return (
+            return parse_test_run(
                 "Exit Code: 1\n"
                 "STDERR:\n"
                 f"No test files were configured for the current {test_type} batch.\n"
@@ -187,12 +190,14 @@ class CliAppType(AppTypeHandler):
         if invalid_errors:
             error_lines = ["Exit Code: 1", "STDERR:"]
             error_lines.extend(invalid_errors)
-            return "\n".join(error_lines) + "\n"
+            return parse_test_run("\n".join(error_lines) + "\n")
         await self._log("System", f"System test execution ({test_type}) batch: {', '.join(file_paths)}")
         modules = [_cli_test_module(path) for path in file_paths]
-        return await _run_python_command(
-            [sys.executable, "-m", "unittest", "-v", *modules],
-            cwd=self.workspace_path,
+        return parse_test_run(
+            await _run_python_command(
+                [sys.executable, "-m", "unittest", "-v", *modules],
+                cwd=self.workspace_path,
+            )
         )
 
     async def run_build(self) -> str:

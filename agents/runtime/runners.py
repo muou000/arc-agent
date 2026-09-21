@@ -372,19 +372,6 @@ async def _try_astream_stage_agent(
     log_cb: LogCallback | None,
     logger: Any | None,
 ) -> dict[str, Any] | None:
-    if _should_use_sync_stream_v3():
-        sync_payload = _try_stream_stage_agent_sync(
-            agent,
-            message=message,
-            context=context,
-            thread_id=thread_id,
-            run_label=run_label,
-            log_cb=log_cb,
-            logger=logger,
-        )
-        if sync_payload is not None:
-            return sync_payload
-
     if not hasattr(agent, "astream_events"):
         await _emit_log(log_cb, run_label, "agent streaming is unavailable; falling back to ainvoke.", node_id=context.node_id)
         return None
@@ -466,95 +453,6 @@ async def _try_astream_stage_agent(
 
     await _log_agent_trace(log_cb, final_state, label=run_label, thread_id=thread_id, node_id=context.node_id)
     return extract_payload(final_state)
-
-
-def _try_stream_stage_agent_sync(
-    agent: Any,
-    *,
-    message: str,
-    context: AgentRuntimeContext,
-    thread_id: str,
-    run_label: str,
-    log_cb: LogCallback | None,
-    logger: Any | None,
-) -> dict[str, Any] | None:
-    if not hasattr(agent, "stream_events"):
-        return None
-    try:
-        stream = agent.stream_events(
-            {"messages": [{"role": "user", "content": message}]},
-            context=context,
-            config=build_agent_config(thread_id),
-            version=os.environ.get("ARC_AGENT_STREAM_VERSION", "v3"),
-        )
-        extensions = getattr(stream, "extensions", {}) or {}
-        stream_names = [name for name in ("messages", "values", "subagents") if name in extensions]
-        if not stream_names or not hasattr(stream, "interleave"):
-            return None
-
-        _emit_log_sync(log_cb, run_label, "agent stream start.", node_id=context.node_id)
-        final_state: dict[str, Any] | None = None
-        seen_message_count = 0
-        for stream_name, item in stream.interleave(*stream_names):
-            if stream_name == "messages":
-                text = _typed_stream_item_text(item)
-                if text:
-                    _emit_log_sync(
-                        log_cb,
-                        run_label,
-                        f"model> {_truncate_text(text, max_chars=1200)}",
-                        node_id=context.node_id,
-                    )
-                continue
-
-            if stream_name == "subagents":
-                _log_subagent_stream_item_sync(log_cb, item, label=run_label, node_id=context.node_id)
-                continue
-
-            if stream_name == "values" and isinstance(item, dict):
-                messages = item.get("messages")
-                if isinstance(messages, list) and len(messages) > seen_message_count:
-                    new_messages = messages[seen_message_count:]
-                    seen_message_count = len(messages)
-                    formatted = _format_message_trace(new_messages)
-                    if formatted:
-                        _emit_log_sync(
-                            log_cb,
-                            run_label,
-                            f"stream messages:\n{formatted}",
-                            node_id=context.node_id,
-                        )
-                if _is_agent_state_with_payload(item):
-                    final_state = item
-
-        latest = getattr(stream, "output", None)
-        if isinstance(latest, dict) and _is_agent_state_with_payload(latest):
-            final_state = latest
-        if final_state is None:
-            _emit_log_sync(
-                log_cb,
-                run_label,
-                "agent stream ended without final state; falling back to ainvoke.",
-                status="warning",
-                node_id=context.node_id,
-            )
-            return None
-        _log_agent_trace_sync(log_cb, final_state, label=run_label, thread_id=thread_id, node_id=context.node_id)
-        return extract_payload(final_state)
-    except GraphRecursionError:
-        # Same as the async stream path: a budget exhaustion must not trigger
-        # a full ainvoke retry on a fresh session.
-        raise
-    except Exception as exc:
-        _emit_log_sync(
-            log_cb,
-            run_label,
-            f"agent stream failed; falling back to ainvoke. error={exc}",
-            status="warning",
-            node_id=context.node_id,
-        )
-        log_to_logger(logger, "AGENT_STREAM_FALLBACK", label=run_label, thread_id=thread_id, body=str(exc))
-        return None
 
 
 async def _log_stream_event(
@@ -709,22 +607,6 @@ async def _emit_tool_batch(
     await _emit_log(log_cb, label, f"tool-batch> {json.dumps(payload, ensure_ascii=False)}", node_id=node_id)
 
 
-def _log_agent_trace_sync(
-    log_cb: LogCallback | None,
-    result: dict[str, Any],
-    *,
-    label: str,
-    thread_id: str,
-    node_id: str,
-) -> None:
-    if not _should_log_full_agent_trace():
-        return
-    formatted = _format_message_trace(result.get("messages", []) if isinstance(result, dict) else [])
-    if not formatted:
-        return
-    _emit_log_sync(log_cb, label, f"agent trace: thread_id={thread_id}\n{formatted}", node_id=node_id)
-
-
 def _should_log_full_agent_trace() -> bool:
     return str(os.environ.get("ARC_DEBUG_AGENT_TRACE", "")).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -866,31 +748,6 @@ def _typed_stream_item_text(item: Any) -> str:
     return ""
 
 
-def _log_subagent_stream_item_sync(
-    log_cb: LogCallback | None,
-    item: Any,
-    *,
-    label: str,
-    node_id: str,
-) -> None:
-    name = getattr(item, "name", "") or "subagent"
-    status = getattr(item, "status", "") or ""
-    _emit_log_sync(log_cb, label, f"subagent> {name} status={status or '-'}", node_id=node_id)
-    messages = getattr(item, "messages", None)
-    if messages:
-        formatted = _format_message_trace(list(messages))
-        if formatted:
-            _emit_log_sync(log_cb, label, f"subagent messages ({name}):\n{formatted}", node_id=node_id)
-    output = getattr(item, "output", None)
-    if output:
-        _emit_log_sync(
-            log_cb,
-            label,
-            f"subagent output ({name}): {_truncate_text(_stringify_tool_args(output), max_chars=2000)}",
-            node_id=node_id,
-        )
-
-
 def _stringify_tool_args(value: Any) -> str:
     if value is None:
         return ""
@@ -928,45 +785,10 @@ async def _emit_log(
         await result
 
 
-def _emit_log_sync(
-    log_cb: LogCallback | None,
-    agent_name: str,
-    message: str,
-    *,
-    status: str | None = None,
-    node_id: str | None = None,
-) -> None:
-    if log_cb is None:
-        return
-    result = log_cb(agent_name, message, status, node_id)
-    if not inspect.isawaitable(result):
-        return
-    try:
-        loop = None
-        try:
-            import asyncio
-
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None and loop.is_running():
-            loop.create_task(result)
-            return
-        close = getattr(result, "close", None)
-        if callable(close):
-            close()
-    except Exception:
-        return
-
-
 def _should_stream(stream: bool | None) -> bool:
     if stream is not None:
         return stream
     return True
-
-
-def _should_use_sync_stream_v3() -> bool:
-    return False
 
 
 def _resolve_recursion_limit() -> int:
