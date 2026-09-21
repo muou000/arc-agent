@@ -232,7 +232,10 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return self._validate_delete_rewrite_budget(args)
         if path in self._written_paths:
             return self._validate_delete_rewrite_budget(args)
-        return "`delete` is disabled in ARC's staged file workflow."
+        # Not a session-owned path: reuse the table's own disabled verdict
+        # (an empty path never matches the test-asset rule, so this is the
+        # unconditional disabled message) to keep the text single-sourced.
+        return capability_for(self._stage, "delete", "").message
 
     def _validate_shared_surface(self, args: dict[str, Any]) -> str | None:
         """Reject whole-file rewrites of the template's shared runtime surfaces.
@@ -461,6 +464,21 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         return None
 
     def _validate_write(self, args: dict[str, Any]) -> str | None:
+        """Runtime gates on the writes the capability table already allowed.
+
+        One deliberate, behavior-preserving check-order change from the
+        pre-table middleware: the test_generation asset verdict moved out of
+        this validator's interior (it used to sit between the repeated-write
+        block and the manifest gate) into the table's pre-flight check in
+        ``_validate_tool_call``. The swap cannot change outcomes — only test
+        assets can enter ``_written_paths`` in test_generation (product
+        writes and non-test-asset deletes were always denied), so an asset
+        verdict firing before the repeated-write check never redirects a
+        call the repeated-write check would have caught. The remaining order
+        here is the runtime-state ladder: repeated-write lock, manifest
+        declaration, DESIGN content/budget, file-claim gate.
+        """
+
         path = _discipline_path(args)
         if not path:
             return None

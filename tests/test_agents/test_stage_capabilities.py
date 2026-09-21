@@ -16,6 +16,7 @@ from langchain_core.messages import ToolMessage
 
 from agents.context.prompts import common as common_prompts
 from agents.context.prompts import interface_designer as interface_designer_prompts
+from agents.context.prompts import test_driven_developer as test_driven_developer_prompts
 from agents.context.prompts import test_generator as test_generator_prompts
 from agents.runtime.capabilities import (
     DISABLED_BUILTIN_TOOLS,
@@ -59,11 +60,18 @@ def test_disabled_builtins_are_denied_in_every_stage() -> None:
 
 
 def test_derived_disabled_builtin_set_matches_the_table() -> None:
-    # DISABLED_BUILTIN_TOOLS is derived from the table (every stage denies);
-    # this pin keeps the derivation honest if the builtin list changes.
+    # DISABLED_BUILTIN_TOOLS is derived from the table (every stage denies
+    # regardless of path); the exact-equality pin keeps the derivation honest
+    # if the builtin list or the derivation's semantics change.
+    assert DISABLED_BUILTIN_TOOLS == frozenset({"execute", "write_todos"})
     for tool in ("execute", "write_todos"):
-        assert tool in DISABLED_BUILTIN_TOOLS
         assert all(not capability_for(stage, tool).allowed for stage in STAGES)
+    # Tools with path-scoped allowances must never land in the set even
+    # though an empty path misses their predicate (the regression the
+    # derivation once had: `delete` was misderived from its empty-path
+    # verdict and stopped being mounted).
+    for tool in ("delete", "write_file", "edit_file", "append_file", "run_build", "run_tests"):
+        assert tool not in DISABLED_BUILTIN_TOOLS
 
 
 def test_delete_is_denied_in_interface_design_regardless_of_path() -> None:
@@ -249,3 +257,42 @@ def test_interface_designer_prompt_append_file_statement_matches_table() -> None
         for stage in STAGES
         if stage != "interface_design"
     )
+
+
+def test_tdd_prompt_delete_channel_statement_matches_table() -> None:
+    prompt = test_driven_developer_prompts.get_system_prompt()
+    assert "delete it with the `delete` tool once it has served its purpose" in prompt
+    # The diagnostic-cleanup channel the prompt describes is exactly the
+    # table's implementation-stage delete verdict: test assets allowed
+    # (narrowed by session ownership), product paths denied.
+    assert capability_for("implementation", "delete", "/workspace/frontend/tests/diag.test.tsx").allowed
+    assert not capability_for("implementation", "delete", "/workspace/frontend/src/App.jsx").allowed
+
+
+def test_test_generator_prompt_manifest_lock_and_delete_statements_match_table() -> None:
+    prompt = test_generator_prompts.get_system_prompt()
+    assert (
+        "then LOCKED for the rest of this stage: `write_file`, `edit_file`, and `delete` "
+        "on a test-file path outside the declared manifest are rejected by the system."
+    ) in prompt
+    assert "delete a rejected file (`delete` tool) when its coverage is duplicated" in prompt
+    # The delete channel the prompt promises: table-denied for product paths,
+    # allowed for test assets (the lock itself is runtime state the middleware
+    # adds on top of the table).
+    assert not capability_for("test_generation", "delete", "/workspace/src/calc.py").allowed
+    assert capability_for("test_generation", "delete", "/workspace/tests/unit/test_calc.py").allowed
+
+
+def test_interface_designer_prompt_shared_surface_statement_matches_table() -> None:
+    prompt = interface_designer_prompts.get_user_prompt(
+        node_id="REQ-1",
+        requirement_data={"name": "Example", "description": "Example requirement"},
+        dynamic_context="",
+    )
+    assert "whole-file `write_file` on the template's runtime wiring" in prompt
+    assert "is rejected" in prompt
+    # The rejection is the middleware's shared-surface guard — runtime state
+    # deliberately checked ahead of the table for write_file so its
+    # remediation message keeps precedence; the table's own DESIGN verdict
+    # for those paths stays allow.
+    assert capability_for("interface_design", "write_file", "/workspace/frontend/src/App.tsx").allowed

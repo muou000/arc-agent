@@ -170,11 +170,6 @@ _NOT_A_TEST_ASSET = Verdict(
     ),
 )
 
-_APPEND_FILE_CHANNEL = (
-    # DESIGN owns the additive continuation tool; other stages never see it.
-    CapabilityRule(path_matches=None, verdict=_APPEND_ONLY_IN_DESIGN),
-)
-
 
 def _build_rules() -> dict[tuple[Stage, str], tuple[CapabilityRule, ...]]:
     rules: dict[tuple[Stage, str], tuple[CapabilityRule, ...]] = {}
@@ -206,7 +201,9 @@ def _build_rules() -> dict[tuple[Stage, str], tuple[CapabilityRule, ...]]:
 
     # append_file: the DESIGN-only additive continuation tool.
     for stage in ("test_generation", "implementation"):
-        rules[(stage, "append_file")] = _APPEND_FILE_CHANNEL
+        rules[(stage, "append_file")] = (
+            CapabilityRule(path_matches=None, verdict=_APPEND_ONLY_IN_DESIGN),
+        )
 
     # TestGenerator writes test assets only — via either whole-file write or
     # anchor edit. Shared-surface blocking (template wiring) is applied by the
@@ -240,12 +237,27 @@ def capability_for(stage: str, tool: str, path: str = "") -> Verdict:
     return ALLOW
 
 
-#: Builtin tools denied for every stage. Derived from the table and consumed
-#: by the factory's harness exclusion + ``DisableToolsMiddleware``;
+#: Builtin tools the table denies in every stage regardless of path. Derived
+#: from the table's keys, not enumerated: a tool qualifies only when every
+#: stage has rules for it and every rule is an unconditional denial — any
+#: path-scoped rule anywhere means the tool has allowed cells (``delete`` on
+#: test assets, for one) and stays mountable. Consumed by the factory's
+#: harness exclusion + ``DisableToolsMiddleware``;
 #: ``tests/test_agents/test_stage_capabilities.py`` pins the derivation so the
 #: set and the table cannot drift apart.
+
+
+def _unconditionally_denied(tool: str) -> bool:
+    for stage in STAGES:
+        rules = _RULES.get((stage, tool))
+        if not rules:
+            return False
+        for rule in rules:
+            if rule.path_matches is not None or rule.verdict.allowed:
+                return False
+    return True
+
+
 DISABLED_BUILTIN_TOOLS: frozenset[str] = frozenset(
-    tool
-    for tool in ("execute", "write_todos")
-    if all(not capability_for(stage, tool).allowed for stage in STAGES)
+    tool for (_, tool) in _RULES if _unconditionally_denied(tool)
 )

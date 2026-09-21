@@ -7,6 +7,7 @@
 生成应用时的行为以以下源码为准：
 
 - `agents/context/prompts/`：各阶段 agent 的系统提示词和任务协议；
+- `agents/runtime/capabilities.py`：声明式阶段工具能力表（`(stage, tool, path)` 判定与共享路径谓词，工厂挂载与中间件拦截的共同来源）；
 - `agents/runtime/stage_discipline.py`：工具调用、阶段边界和文件操作限制；
 - `skills/`：全量目录注入各阶段 agent 系统提示词、由模型按需读取的生成阶段指导（认证/失败修复底线确定性注入，`agents/skills/selection.py`）。
 
