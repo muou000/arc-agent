@@ -12,6 +12,7 @@ from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_generator import get_system_prompt, get_user_prompt
 from agents.results import normalize_test_manifest_payload
+from agents.runtime.capabilities import normalize_manifest_path
 from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.skills.selection import SKILLS_SOURCE, test_generation_skills
@@ -21,7 +22,6 @@ from agents.tools.test_manifest import (
     build_declare_test_manifest_tool,
     canonical_test_type,
     normalize_coverage_scope,
-    normalize_manifest_path,
     reconcile_declared_manifest,
 )
 from agents.tools.traceability import build_traceability_tools

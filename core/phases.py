@@ -16,8 +16,6 @@ from agents.tools.test_contract_check import (
 )
 from agents.tools.test_failure_digest import (
     build_failure_digest,
-    extract_build_note,
-    extract_served_verdict,
     format_failure_digest,
     persist_run_output,
 )
@@ -26,8 +24,9 @@ from core.service import get_runtime
 from core.path_compat import normalize_windows_extended_prefix_text
 from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 from core.visual_analysis import analyze_and_attach_visual_references
-from app_type_handler.test_results import classify_test_failure, failure_fingerprint, parse_test_results
-from agents.tools.test_manifest import is_test_file_path, normalize_coverage_scope
+from app_type_handler.test_results import TestRunResult
+from agents.runtime.capabilities import is_test_file_path
+from agents.tools.test_manifest import normalize_coverage_scope
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -660,19 +659,19 @@ class WorkflowPhaseRunner:
         }
 
         for test_type, path, scope in layer_files:
-            baseline_output = await self._run_design_baseline_file(test_type, path)
-            exit_code = int(parse_test_results(baseline_output).get("exit_code", -1))
+            baseline_result = await self._run_design_baseline_file(test_type, path)
+            exit_code = baseline_result.exit_code
             if exit_code == 0:
                 file_state[path] = "green"
                 evidence = {
                     "file_path": path,
                     "type": test_type,
                     "coverage_scope": scope,
-                    "output_summary": summarize_batch_output(baseline_output, max_lines=4),
+                    "output_summary": summarize_batch_output(baseline_result.output, max_lines=4),
                 }
                 (green_evidence if scope == "owned" else exempt_green_evidence).append(evidence)
                 continue
-            baseline_env = classify_test_failure(baseline_output)
+            baseline_env = baseline_result.environment_failure
             file_state[path] = "red" if not baseline_env else None
             if baseline_env:
                 # The file could not be verified either way (broken workspace,
@@ -850,22 +849,22 @@ class WorkflowPhaseRunner:
                     for item in current_tests
                     if item.get("file_path") == path
                 )
-                baseline_output = await self._run_design_baseline_file(test_type, path)
-                exit_code = int(parse_test_results(baseline_output).get("exit_code", -1))
+                baseline_result = await self._run_design_baseline_file(test_type, path)
+                exit_code = baseline_result.exit_code
                 if exit_code == 0:
                     file_state[path] = "green"
                     evidence = {
                         "file_path": path,
                         "type": test_type,
                         "coverage_scope": scope,
-                        "output_summary": summarize_batch_output(baseline_output, max_lines=4),
+                        "output_summary": summarize_batch_output(baseline_result.output, max_lines=4),
                     }
                     (green_evidence if scope == "owned" else exempt_green_evidence).append(evidence)
                 else:
                     # Same semantics as the first pass: an environmental
                     # failure leaves the file unverified for IMPLEMENT's
                     # baseline instead of asserting a RED it cannot prove.
-                    file_state[path] = "red" if not classify_test_failure(baseline_output) else None
+                    file_state[path] = "red" if not baseline_result.environment_failure else None
 
         # Drop states for files a repair round removed from the manifest;
         # they are no longer this node's tests, and a stale "green" would
@@ -903,7 +902,7 @@ class WorkflowPhaseRunner:
             "revised_tests": current_tests if manifest_revised else None,
         }
 
-    async def _run_design_baseline_file(self, test_type: str, file_path: str) -> str:
+    async def _run_design_baseline_file(self, test_type: str, file_path: str) -> TestRunResult:
         return await self.app_handler.run_test_group(
             test_type,
             [file_path],
@@ -972,32 +971,44 @@ class WorkflowPhaseRunner:
         )
         active_test_type: str | None = None
 
-        async def run_requested_tests(requested_type: str | None = None, requested_files: list[str] | None = None) -> str:
+        async def run_requested_tests(
+            requested_type: str | None = None,
+            requested_files: list[str] | None = None,
+        ) -> TestRunResult:
             nonlocal environment_failure, active_test_type
             requested = str(requested_type or "").strip()
             if active_test_type is None:
-                return (
-                    "Exit Code: 1\n"
-                    "STDERR:\n"
-                    "No active TDD test layer is currently scheduled.\n"
+                return TestRunResult(
+                    exit_code=1,
+                    output=(
+                        "Exit Code: 1\n"
+                        "STDERR:\n"
+                        "No active TDD test layer is currently scheduled.\n"
+                    ),
                 )
             if requested.lower() in {"", "all", "current", "next"}:
                 selected_type = active_test_type
             else:
                 selected_type = canonical_test_type(requested)
                 if selected_type is None or selected_type not in ordered_types:
-                    return (
-                        "Exit Code: 1\n"
-                        "STDERR:\n"
-                        f"Unsupported current-node test_type={requested!r}. "
-                        f"Available ordered layers: {', '.join(ordered_types)}.\n"
+                    return TestRunResult(
+                        exit_code=1,
+                        output=(
+                            "Exit Code: 1\n"
+                            "STDERR:\n"
+                            f"Unsupported current-node test_type={requested!r}. "
+                            f"Available ordered layers: {', '.join(ordered_types)}.\n"
+                        ),
                     )
                 if selected_type != active_test_type:
-                    return (
-                        "Exit Code: 1\n"
-                        "STDERR:\n"
-                        f"The active TDD layer is `{active_test_type}`, but run_tests requested `{selected_type}`. "
-                        "The system attempts layers in Unit -> Integration -> E2E order with independent budgets.\n"
+                    return TestRunResult(
+                        exit_code=1,
+                        output=(
+                            "Exit Code: 1\n"
+                            "STDERR:\n"
+                            f"The active TDD layer is `{active_test_type}`, but run_tests requested `{selected_type}`. "
+                            "The system attempts layers in Unit -> Integration -> E2E order with independent budgets.\n"
+                        ),
                     )
 
             selected_files = [
@@ -1012,11 +1023,14 @@ class WorkflowPhaseRunner:
             }
             unknown = [path for path in selected_files if path not in registered_files]
             if unknown:
-                return (
-                    "Exit Code: 1\n"
-                    "STDERR:\n"
-                    f"run_tests({selected_type}) may only execute registered {selected_type} tests for the current node. "
-                    f"Unknown files: {', '.join(unknown)}\n"
+                return TestRunResult(
+                    exit_code=1,
+                    output=(
+                        "Exit Code: 1\n"
+                        "STDERR:\n"
+                        f"run_tests({selected_type}) may only execute registered {selected_type} tests for the current node. "
+                        f"Unknown files: {', '.join(unknown)}\n"
+                    ),
                 )
             used = usage_by_type[selected_type]
             if used >= TDD_RUN_TESTS_BUDGET:
@@ -1027,12 +1041,15 @@ class WorkflowPhaseRunner:
                     node_id=node_id,
                 )
                 if environment_failure is not None:
-                    return (
-                        "Exit Code: 1\n"
-                        "STDERR:\n"
-                        f"run_tests budget exhausted for {selected_type}: {used}/{TDD_RUN_TESTS_BUDGET}.\n"
-                        "The workspace failed for an environmental reason. Do not call run_tests again; "
-                        "return your report now.\n"
+                    return TestRunResult(
+                        exit_code=1,
+                        output=(
+                            "Exit Code: 1\n"
+                            "STDERR:\n"
+                            f"run_tests budget exhausted for {selected_type}: {used}/{TDD_RUN_TESTS_BUDGET}.\n"
+                            "The workspace failed for an environmental reason. Do not call run_tests again; "
+                            "return your report now.\n"
+                        ),
                     )
                 closed_next_index = ordered_types.index(selected_type) + 1
                 closed_next_type = ordered_types[closed_next_index] if closed_next_index < len(ordered_types) else None
@@ -1048,23 +1065,29 @@ class WorkflowPhaseRunner:
                     # it visits each layer once and its session loop breaks on
                     # the budget check, so a closed layer never runs again.
                     active_test_type = closed_next_type
-                    return (
+                    return TestRunResult(
+                        exit_code=1,
+                        output=(
+                            "Exit Code: 1\n"
+                            "STDERR:\n"
+                            f"The {selected_type} layer is closed: run_tests budget exhausted at "
+                            f"{used}/{TDD_RUN_TESTS_BUDGET}.\n"
+                            f"The system has advanced the active layer to `{closed_next_type}`; "
+                            f"`run_tests(test_type='{closed_next_type}')` now targets it.\n"
+                            f"Apply a concrete repair before spending the {closed_next_type} budget, or end your turn "
+                            f"with a concise summary of the failing {selected_type} tests and the next edit target.\n"
+                        ),
+                    )
+                return TestRunResult(
+                    exit_code=1,
+                    output=(
                         "Exit Code: 1\n"
                         "STDERR:\n"
                         f"The {selected_type} layer is closed: run_tests budget exhausted at "
-                        f"{used}/{TDD_RUN_TESTS_BUDGET}.\n"
-                        f"The system has advanced the active layer to `{closed_next_type}`; "
-                        f"`run_tests(test_type='{closed_next_type}')` now targets it.\n"
-                        f"Apply a concrete repair before spending the {closed_next_type} budget, or end your turn "
-                        f"with a concise summary of the failing {selected_type} tests and the next edit target.\n"
-                    )
-                return (
-                    "Exit Code: 1\n"
-                    "STDERR:\n"
-                    f"The {selected_type} layer is closed: run_tests budget exhausted at "
-                    f"{used}/{TDD_RUN_TESTS_BUDGET}. This was the last scheduled layer.\n"
-                    "End your turn now with a concise summary of the failing tests and the next edit target. "
-                    "Do not call run_tests again.\n"
+                        f"{used}/{TDD_RUN_TESTS_BUDGET}. This was the last scheduled layer.\n"
+                        "End your turn now with a concise summary of the failing tests and the next edit target. "
+                        "Do not call run_tests again.\n"
+                    ),
                 )
             usage_by_type[selected_type] = used + 1
             await self._log(
@@ -1072,14 +1095,13 @@ class WorkflowPhaseRunner:
                 f"`run_tests` {selected_type} usage {usage_by_type[selected_type]}/{TDD_RUN_TESTS_BUDGET}.",
                 node_id=node_id,
             )
-            output = await self.app_handler.run_test_group(
+            run_result = await self.app_handler.run_test_group(
                 selected_type,
                 selected_files,
                 web_port=self.web_port,
             )
-            parsed_result = parse_test_results(output)
-            exit_code = int(parsed_result.get("exit_code", -1))
-            passed = exit_code == 0
+            exit_code = run_result.exit_code
+            passed = run_result.passed_run
             # Persist every run's raw output under .arc/tdd_runs (ignored by
             # Git checkpoints/merges) and expose it to the agent: in-session
             # via a pointer line, cross-session via the structured digest in
@@ -1093,7 +1115,7 @@ class WorkflowPhaseRunner:
                     node_id,
                     selected_type,
                     used + 1,
-                    output,
+                    run_result.output,
                 )
             except OSError as exc:
                 await self._log(
@@ -1103,7 +1125,8 @@ class WorkflowPhaseRunner:
                     node_id=node_id,
                 )
             if run_log_path:
-                output += (
+                run_result.run_log_path = run_log_path
+                run_result.output += (
                     f"\n\nARC_RUN_OUTPUT_LOG: the complete raw output of this run is saved at "
                     f"`{run_log_path}`. Read that file for the full output of this attempt "
                     "instead of re-running the tests.\n"
@@ -1112,19 +1135,20 @@ class WorkflowPhaseRunner:
                 # Structured per-test digest appended to the tool result: the
                 # model sees each failed test's location and expected/received
                 # up front instead of mining the long raw output for them.
-                output += (
+                run_result.output += (
                     "\n\n"
                     + format_failure_digest(
-                        build_failure_digest(output),
+                        build_failure_digest(run_result.output),
                         test_type=selected_type,
                         raw_output_path=run_log_path or None,
-                        fingerprint=failure_fingerprint(output),
-                        environment_failure=classify_test_failure(output),
-                        build=extract_build_note(output),
-                        served=extract_served_verdict(output),
+                        fingerprint=run_result.fingerprint,
+                        environment_failure=run_result.environment_failure,
+                        build=run_result.build_note,
+                        served=run_result.served_verdict,
                     )
                     + "\n"
                 )
+            output = run_result.output
             await self._log(
                 "TestDrivenDeveloper",
                 (
@@ -1150,7 +1174,7 @@ class WorkflowPhaseRunner:
                 status="ok" if passed else "error",
                 node_id=node_id,
             )
-            result_by_type[selected_type] = output
+            result_by_type[selected_type] = run_result
             if passed:
                 for path in selected_files:
                     file_state_by_type[selected_type][path] = "green"
@@ -1180,8 +1204,8 @@ class WorkflowPhaseRunner:
                 for path in selected_files:
                     if file_state_by_type[selected_type].get(path) != "green":
                         file_state_by_type[selected_type][path] = "red"
-                fingerprint_history[selected_type].append(failure_fingerprint(output))
-                failure_now = classify_test_failure(output) or None
+                fingerprint_history[selected_type].append(run_result.fingerprint)
+                failure_now = run_result.environment_failure or None
                 if environment_failure is None:
                     if failure_now:
                         environment_failure = failure_now
@@ -1349,7 +1373,8 @@ class WorkflowPhaseRunner:
                     "mid-run: end your turn with a short report naming the missing dependency "
                     "and do not call run_tests again.\n"
                 )
-            return output
+            run_result.output = output
+            return run_result
 
         output = ""
         session_count = 0
@@ -1388,12 +1413,12 @@ class WorkflowPhaseRunner:
             baseline_red_evidence: list[str] = []
             baseline_env_failure: str | None = None
             for baseline_file in unverified_files:
-                baseline_output = await self.app_handler.run_test_group(
+                baseline_result = await self.app_handler.run_test_group(
                     ordered_type,
                     [baseline_file],
                     web_port=self.web_port,
                 )
-                baseline_exit = int(parse_test_results(baseline_output).get("exit_code", -1))
+                baseline_exit = baseline_result.exit_code
                 await self._log(
                     "TestDrivenDeveloper",
                     (
@@ -1408,7 +1433,7 @@ class WorkflowPhaseRunner:
                     file_state_by_type[ordered_type][baseline_file] = "green"
                     continue
                 file_state_by_type[ordered_type][baseline_file] = "red"
-                baseline_env = classify_test_failure(baseline_output)
+                baseline_env = baseline_result.environment_failure
                 if baseline_env:
                     # Broken workspace before any agent budget is spent: hand
                     # the failure to the first session instead of burning its
@@ -1426,7 +1451,7 @@ class WorkflowPhaseRunner:
                     )
                     break
                 baseline_red_evidence.append(
-                    f"{baseline_file}:\n{summarize_batch_output(baseline_output, max_lines=12)}"
+                    f"{baseline_file}:\n{summarize_batch_output(baseline_result.output, max_lines=12)}"
                 )
             baseline_red_summary = ""
             if baseline_red_evidence:
@@ -1453,13 +1478,13 @@ class WorkflowPhaseRunner:
                 # either its baseline run or an in-session run. The system runs
                 # one full-layer regression itself - an agent session that only
                 # re-runs passing tests buys nothing.
-                regression_output = await self.app_handler.run_test_group(
+                regression_result = await self.app_handler.run_test_group(
                     ordered_type,
                     layer_files,
                     web_port=self.web_port,
                 )
-                result_by_type[ordered_type] = regression_output
-                if int(parse_test_results(regression_output).get("exit_code", -1)) == 0:
+                result_by_type[ordered_type] = regression_result
+                if regression_result.exit_code == 0:
                     full_layer_passed[ordered_type] = True
                     await self._log(
                         "TestDrivenDeveloper",
@@ -1486,7 +1511,7 @@ class WorkflowPhaseRunner:
                     "### Baseline RED Evidence (system-verified before this session)\n"
                     "Every test file in this layer passed its individual run, but the full-layer run "
                     "failed when the files execute together. The combined failure output:\n"
-                    f"{summarize_batch_output(regression_output, max_lines=20)}"
+                    f"{summarize_batch_output(regression_result.output, max_lines=20)}"
                 )
             # Between sessions the outer loop owns the layer transitions: it
             # re-pins the active layer and visits each layer exactly once, so
@@ -1504,13 +1529,13 @@ class WorkflowPhaseRunner:
                 # opening a fresh agent session just to run one command.
                 layer_states = file_state_by_type[ordered_type]
                 if layer_states and all(state == "green" for state in layer_states.values()):
-                    regression_output = await self.app_handler.run_test_group(
+                    regression_result = await self.app_handler.run_test_group(
                         ordered_type,
                         collect_test_files(groups[ordered_type.lower()]),
                         web_port=self.web_port,
                     )
-                    result_by_type[ordered_type] = regression_output
-                    if int(parse_test_results(regression_output).get("exit_code", -1)) == 0:
+                    result_by_type[ordered_type] = regression_result
+                    if regression_result.exit_code == 0:
                         full_layer_passed[ordered_type] = True
                         await self._log(
                             "TestDrivenDeveloper",
@@ -1536,7 +1561,7 @@ class WorkflowPhaseRunner:
                         "### Baseline RED Evidence (system-verified before this session)\n"
                         "Every test file in this layer passed its individual run, but the full-layer run "
                         "failed when the files execute together. The combined failure output:\n"
-                        f"{summarize_batch_output(regression_output, max_lines=20)}"
+                        f"{summarize_batch_output(regression_result.output, max_lines=20)}"
                     )
                 used_before = usage_by_type.get(ordered_type, 0)
                 if used_before >= TDD_RUN_TESTS_BUDGET:
@@ -1596,7 +1621,7 @@ class WorkflowPhaseRunner:
                     if path and path not in modified_files_round:
                         modified_files_round.append(path)
 
-                latest_result = result_by_type.get(ordered_type, "")
+                latest_result = result_by_type.get(ordered_type)
                 # Three-part cross-session handoff: the structured per-test
                 # digest (locations + expected/received), a diff hint of what
                 # the previous session edited, and the pointer to the persisted
@@ -1607,7 +1632,7 @@ class WorkflowPhaseRunner:
                     self._build_session_handoff(
                         self.test_driven_developer.get_last_failure_digest()
                         or self.test_driven_developer.get_last_verifier_report()
-                        or summarize_batch_output(latest_result or output),
+                        or summarize_batch_output((latest_result.output if latest_result else "") or output),
                         modified_files=self.test_driven_developer.get_last_modified_files(),
                         fingerprint_history=fingerprint_history[ordered_type],
                     )
@@ -1644,7 +1669,7 @@ class WorkflowPhaseRunner:
         failure_summaries: list[str] = []
         failed_types: list[str] = []
         for test_type in ordered_types:
-            latest_result = result_by_type.get(test_type, "")
+            latest_result = result_by_type.get(test_type)
             group_passed = full_layer_passed[test_type]
             status_by_test_id = {
                 str(test.get("test_id", "")).strip(): group_passed
@@ -1671,7 +1696,7 @@ class WorkflowPhaseRunner:
                 )
             else:
                 failure_summary = (
-                    summarize_batch_output(latest_result)
+                    summarize_batch_output(latest_result.output)
                     if latest_result
                     else self.test_driven_developer.get_last_verifier_report()
                     or summarize_batch_output(output)

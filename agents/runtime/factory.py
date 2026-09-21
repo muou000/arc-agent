@@ -1,27 +1,29 @@
 from __future__ import annotations
 
-import os
-import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from deepagents import GeneralPurposeSubagentProfile, FilesystemPermission, HarnessProfile, create_deep_agent, register_harness_profile
-from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+from deepagents.backends import CompositeBackend, StateBackend
 from deepagents._models import get_model_provider
-from deepagents.backends.filesystem import _raise_if_symlink_loop
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel, Field, create_model
 
 from agents.model.factory import create_arc_chat_model, split_model_name
 from agents.model.openai_api_adapter import structured_output_supported
+from agents.runtime.capabilities import DISABLED_BUILTIN_TOOLS, capability_for
 from agents.runtime.checkpointer import get_checkpointer
 from agents.runtime.contracts import AgentRuntimeContext
+from agents.runtime.filesystem_adapters import (
+    ARCFilesystemMiddleware,
+    PermissionDeniedHintMiddleware,
+    workspace_filesystem_backend,
+)
 from agents.runtime.stage_discipline import StageDisciplineMiddleware
 from agents.runtime.tool_usage import ToolUsageMiddleware
 from agents.tools.file_append import build_append_file_tool
-from core.path_compat import normalize_windows_extended_prefix_path, normalize_windows_extended_prefix_text
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -32,12 +34,6 @@ if TYPE_CHECKING:
 
 WORKSPACE_PREFIX = "/workspace"
 SKILLS_PREFIX = "/skills"
-DISABLED_BUILTIN_TOOLS = frozenset({"execute", "write_todos"})
-_WINDOWS_PATH_COMPAT_APPLIED = False
-_READ_FILE_FORMAT_PATCHED = False
-_PERMISSION_HINT_PATCHED = False
-_PERMISSION_HINT_PATCH_LOCK = threading.Lock()
-_DELETE_NOT_FOUND_PATCHED = False
 
 # Sentinel so callers can explicitly pass ``checkpointer=None`` (cold start)
 # while omitting the argument still resolves the process-wide shared saver.
@@ -413,26 +409,21 @@ def build_stage_agent(
     ``max_design_writes`` overrides the interface_design stage's write budget
     (distinct-file cap; see ``StageDisciplineMiddleware``); other stages
     ignore it and ``None`` keeps the default leaf ceiling.
+
+    Filesystem behaviors (delete not-found precedence, permission-denied
+    hints, Windows extended-path compatibility) are wired as build-time
+    adapters from ``agents.runtime.filesystem_adapters`` — the build path
+    never rewrites upstream classes or module attributes.
     """
 
-    _apply_windows_filesystem_path_compat()
-    _apply_unambiguous_read_file_format()
-    _apply_delete_not_found_precedence()
-    _apply_permission_denied_hint()
     resolved_checkpointer = get_checkpointer() if checkpointer is _UNSET else checkpointer
     root = Path(workspace_root).expanduser().resolve()
     routes = {
-        f"{WORKSPACE_PREFIX}/": FilesystemBackend(
-            root_dir=str(root),
-            virtual_mode=True,
-        ),
+        f"{WORKSPACE_PREFIX}/": workspace_filesystem_backend(str(root)),
     }
     skills_root = _compiler_skills_root()
     if skills_root.exists():
-        routes[f"{SKILLS_PREFIX}/"] = FilesystemBackend(
-            root_dir=str(skills_root),
-            virtual_mode=True,
-        )
+        routes[f"{SKILLS_PREFIX}/"] = workspace_filesystem_backend(str(skills_root))
     backend = CompositeBackend(default=StateBackend(), routes=routes)
 
     resolved_model = create_arc_chat_model(model)
@@ -477,8 +468,15 @@ def build_stage_agent(
             skills_root,
         ),
     )
-    stage_tools = list(tools or [])
-    if stage == "interface_design":
+    # Mount-time capability filter: the same table the middleware enforces
+    # at call time keeps a stage from ever seeing a tool it may not call
+    # (e.g. validation tools in test_generation, append_file outside DESIGN).
+    stage_tools = [
+        tool
+        for tool in (tools or [])
+        if capability_for(stage, _tool_name(tool) or "").allowed
+    ]
+    if capability_for(stage, "append_file").allowed:
         stage_tools.append(build_append_file_tool(workspace_root=str(root), permissions=permissions))
 
     agent = create_deep_agent(
@@ -492,6 +490,11 @@ def build_stage_agent(
             ToolArgumentSanitizerMiddleware(),
             stage_discipline,
             DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
+            # Replaces deepagents' stock FilesystemMiddleware by name inside
+            # create_deep_agent (delete not-found precedence); the hint
+            # middleware rewrites permission-denied results afterwards.
+            ARCFilesystemMiddleware(backend=backend, _permissions=permissions),
+            PermissionDeniedHintMiddleware(),
         ],
         tools=stage_tools,
         skills=resolved_skills,
@@ -502,191 +505,6 @@ def build_stage_agent(
         checkpointer=resolved_checkpointer,
     )
     return StageAgentBuild(agent=agent, stage_discipline=stage_discipline)
-
-
-def _apply_unambiguous_read_file_format() -> None:
-    """Remove line-number padding from read_file output before agents copy it.
-
-    The upstream filesystem middleware renders each line as a six-character
-    line number plus a tab. Models can mistake that separator for indentation
-    and then submit an `edit_file` anchor that cannot match the source.
-    """
-    global _READ_FILE_FORMAT_PATCHED
-    if _READ_FILE_FORMAT_PATCHED:
-        return
-
-    import deepagents.middleware.filesystem as filesystem_middleware
-
-    def format_without_line_numbers(content: str | list[str], start_line: int = 1) -> str:
-        del start_line
-        if isinstance(content, str):
-            lines = content.split("\n")
-            if lines and lines[-1] == "":
-                lines = lines[:-1]
-            return "\n".join(lines)
-        return "\n".join(content)
-
-    filesystem_middleware.format_content_with_line_numbers = format_without_line_numbers
-    _READ_FILE_FORMAT_PATCHED = True
-
-
-_PERMISSION_DENIED_PREFIX = "Error: permission denied for "
-# One-line remediation appended to permission-denied tool results. The raw
-# upstream message names only the denied virtual path, so a model that used a
-# host-style ("/frontend/src/...") or relative ("backend/x.py") path has to
-# guess the valid root from the system prompt — observed online as repeated
-# retries against the same denied path before the correction lands.
-_PERMISSION_DENIED_HINT = (
-    " (ARC virtual filesystem: address files as /workspace/<path> for the "
-    "generated app and /skills/<name>/SKILL.md for attached skills; host or "
-    "relative paths are not valid tool paths.)"
-)
-
-
-def _apply_permission_denied_hint() -> None:
-    """Append the valid virtual roots to permission-denied tool results.
-
-    Wraps ``FilesystemMiddleware.awrap_tool_call`` (the async path every ARC
-    stage agent takes) and rewrites permission-denied ToolMessage contents in
-    place: the message keeps its upstream prefix — tests and log scanners
-    match on "permission denied" — and only gains the remediation suffix.
-    Denied paths stay denied; the hint names roots that already exist in the
-    system prompt's tool policy, so it leaks nothing about protected files.
-    """
-
-    global _PERMISSION_HINT_PATCHED
-    if _PERMISSION_HINT_PATCHED:
-        return
-
-    with _PERMISSION_HINT_PATCH_LOCK:
-        if _PERMISSION_HINT_PATCHED:
-            return
-
-        from deepagents.middleware.filesystem import FilesystemMiddleware
-
-        original_awrap = FilesystemMiddleware.awrap_tool_call
-        if not callable(original_awrap) or getattr(original_awrap, "_arc_permission_hint", False):
-            return
-
-        async def awrap_tool_call_with_hint(self, request, handler):
-            tool_result = await original_awrap(self, request, handler)
-            content = getattr(tool_result, "content", None)
-            if isinstance(content, str) and content.startswith(_PERMISSION_DENIED_PREFIX):
-                if _PERMISSION_DENIED_HINT not in content:
-                    tool_result.content = content + _PERMISSION_DENIED_HINT
-            return tool_result
-
-        # Sentinel so a second patch application (or another monkey patch that
-        # captured the un-wrapped method) can detect the wrapper instead of
-        # stacking a second hint layer on every denied result.
-        awrap_tool_call_with_hint._arc_permission_hint = True  # type: ignore[attr-defined]
-        FilesystemMiddleware.awrap_tool_call = awrap_tool_call_with_hint
-        _PERMISSION_HINT_PATCHED = True
-
-
-def _apply_delete_not_found_precedence() -> None:
-    """Report `not found` for deletes of missing paths instead of deny-rule spam.
-
-    Upstream's delete tool decides *before* the permission check whether the
-    target "may have descendants" (a recursive delete must scan every deny rule
-    for subtree overlap). ``ls`` answering ``path_not_found`` is not on its
-    leaf whitelist, so a missing path is treated as a possibly-populated
-    directory: every ``**`` deny pattern (``/**``, ``/workspace/**/node_modules``,
-    ...) overlaps, and the model is told "permission denied" with the full deny
-    rule list — for a file that does not exist. Observed on the 12306 benchmark
-    as 3-4 retries against the same missing path.
-
-    The patch recognizes the backend's explicit ``path_not_found`` answer as
-    "nothing to protect": permission resolution then follows the ordinary
-    first-matching-rule path (same as ``write_file``). A missing path inside a
-    writable root reaches the backend, whose own ``delete`` reports the honest
-    ``not found``; a denied path is still refused before the backend runs
-    (first matching deny rule), so delete cannot be used to probe which
-    protected files exist. Any other ``ls`` outcome keeps upstream's
-    conservative descendant check.
-    """
-
-    global _DELETE_NOT_FOUND_PATCHED
-    if _DELETE_NOT_FOUND_PATCHED:
-        return
-
-    import logging
-
-    import deepagents
-    import deepagents.middleware.filesystem as filesystem_middleware
-
-    # These helpers are upstream implementation details, not public contract.
-    # A deepagents upgrade that renames or removes them must degrade to the
-    # old (spammier but harmless) error message, not crash build_stage_agent.
-    original_has_descendants = getattr(
-        filesystem_middleware, "_delete_target_may_have_descendants", None
-    )
-    original_ahas_descendants = getattr(
-        filesystem_middleware, "_adelete_target_may_have_descendants", None
-    )
-    if not callable(original_has_descendants) or not callable(original_ahas_descendants):
-        logging.getLogger(__name__).warning(
-            "deepagents %s no longer exposes the delete descendant helpers; "
-            "keeping upstream delete permission behavior",
-            getattr(deepagents, "__version__", "unknown"),
-        )
-        return
-
-    _NOT_FOUND_SUFFIX = ": path_not_found"
-
-    def _missing_by_ls_error(ls_result: Any) -> bool:
-        """Whether an ls result is the backends' explicit ``path_not_found``.
-
-        Both shipped producers format the sentinel as exactly
-        ``"Path '<path>': path_not_found"`` (FilesystemBackend directly,
-        SandboxBackend via its JSON error passthrough), so anchor the match
-        to that suffix. A bare substring check would also fire when the
-        *path itself* contains the token (e.g. deleting a
-        ``/workspace/path_not_found`` directory whose ls fails some other
-        way) and wrongly relax the descendant check.
-        """
-
-        error = getattr(ls_result, "error", None)
-        return error is not None and str(error).endswith(_NOT_FOUND_SUFFIX)
-
-    def _confirmed_missing(backend: Any, target: str) -> bool:
-        """Whether ``backend.ls(target)`` explicitly reports ``path_not_found``.
-
-        Any probe failure (unsupported ``ls``, transient I/O error) counts as
-        "not confirmed": the caller keeps upstream's conservative answer
-        instead of letting the exception escape into the delete tool.
-        """
-
-        try:
-            ls_result = backend.ls(target)
-        except Exception:
-            return False
-        return _missing_by_ls_error(ls_result)
-
-    async def _aconfirmed_missing(backend: Any, target: str) -> bool:
-        try:
-            ls_result = await backend.als(target)
-        except Exception:
-            return False
-        return _missing_by_ls_error(ls_result)
-
-    def _delete_target_may_have_descendants(
-        backend: Any, target: str, *, permissions_configured: bool
-    ) -> bool:
-        if original_has_descendants(backend, target, permissions_configured=permissions_configured):
-            return not _confirmed_missing(backend, target)
-        return False
-
-    async def _adelete_target_may_have_descendants(
-        backend: Any, target: str, *, permissions_configured: bool
-    ) -> bool:
-        if await original_ahas_descendants(backend, target, permissions_configured=permissions_configured):
-            return not await _aconfirmed_missing(backend, target)
-        return False
-
-    filesystem_middleware._delete_target_may_have_descendants = _delete_target_may_have_descendants
-    filesystem_middleware._adelete_target_may_have_descendants = _adelete_target_may_have_descendants
-    _DELETE_NOT_FOUND_PATCHED = True
 
 
 def _build_filesystem_permissions(
@@ -848,48 +666,6 @@ def _resolve_response_format(response_format: object | None, *, model: str | obj
     if response_format is None:
         return None
     return response_format if structured_output_supported(model) else None
-
-
-def _apply_windows_filesystem_path_compat() -> None:
-    """Normalize Windows extended-length paths before agent containment checks."""
-
-    global _WINDOWS_PATH_COMPAT_APPLIED
-    if _WINDOWS_PATH_COMPAT_APPLIED or os.name != "nt":
-        return
-
-    original_resolve_path = FilesystemBackend._resolve_path
-    original_to_virtual_path = FilesystemBackend._to_virtual_path
-
-    def _resolve_path_with_windows_compat(self: FilesystemBackend, key: str) -> Path:
-        if not getattr(self, "virtual_mode", False):
-            return original_resolve_path(self, key)
-
-        raw_key = normalize_windows_extended_prefix_text(key)
-        vpath = raw_key if raw_key.startswith("/") else "/" + raw_key
-        if ".." in vpath or vpath.startswith("~"):
-            raise ValueError("Path traversal not allowed")
-
-        full = normalize_windows_extended_prefix_path((self.cwd / vpath.lstrip("/")).resolve())
-        cwd = normalize_windows_extended_prefix_path(self.cwd)
-        try:
-            full.relative_to(cwd)
-        except ValueError:
-            msg = f"Path:{full} outside root directory: {cwd}"
-            raise ValueError(msg) from None
-        _raise_if_symlink_loop(full)
-        return full
-
-    def _to_virtual_path_with_windows_compat(self: FilesystemBackend, path: Path) -> str:
-        if not getattr(self, "virtual_mode", False):
-            return original_to_virtual_path(self, path)
-
-        full = normalize_windows_extended_prefix_path(path.resolve())
-        cwd = normalize_windows_extended_prefix_path(self.cwd)
-        return "/" + full.relative_to(cwd).as_posix()
-
-    FilesystemBackend._resolve_path = _resolve_path_with_windows_compat  # type: ignore[method-assign]
-    FilesystemBackend._to_virtual_path = _to_virtual_path_with_windows_compat  # type: ignore[method-assign]
-    _WINDOWS_PATH_COMPAT_APPLIED = True
 
 
 def _resolve_source_paths(paths: list[str], root: Path, skills_root: Path, *, default: list[str]) -> list[str]:

@@ -1,55 +1,95 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from typing import Any
 
 
-def parse_test_results(test_output: str) -> dict[str, Any]:
-    """Parse ARC test-run output into a compact status structure."""
+@dataclass
+class TestRunResult:
+    """Structured outcome of one system-side test run.
 
-    result: dict[str, Any] = {"passed": [], "failed": [], "exit_code": -1, "sub_batches": []}
+    This object is the seam between the app-type handlers (producers) and the
+    stage callers (consumers): handlers fill the fields while they still know
+    the facts structurally, and callers read fields instead of re-parsing the
+    rendered text. ``output`` is the model-facing transcription — rendered
+    once by the handler, never re-interpreted downstream.
+    """
+
+    #: Overall verdict. ``-1`` means the run never produced a code (timeout,
+    #: spawn failure); ``0`` is the only passing value.
+    exit_code: int = -1
+    #: Model-facing transcription of the run (handler-rendered once).
+    output: str = ""
+    #: Reporter lines partitioned by outcome (``PASS ...`` vs ``FAIL ...``).
+    passed: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    #: Environmental verdict from :func:`classify_test_failure` ("" when the
+    #: failure is the implementation's own).
+    environment_failure: str = ""
+    #: Frontend build verdict in the failure-digest phrasing ("" for runs
+    #: without a frontend build). Filled structurally by the web handler.
+    build_note: str = ""
+    #: Served-artifact verdict in the failure-digest phrasing ("" for runs
+    #: without a static host). Filled structurally by the web handler.
+    served_verdict: str = ""
+    #: Stall-governance fingerprint from :func:`failure_fingerprint`.
+    fingerprint: str = ""
+    #: Workspace-relative path of the persisted raw output; set by the TDD
+    #: phase after persisting (the handler cannot know it).
+    run_log_path: str = ""
+
+    @property
+    def passed_run(self) -> bool:
+        return self.exit_code == 0
+
+
+def parse_test_run(
+    test_output: str,
+    *,
+    exit_code: int | None = None,
+    build_note: str = "",
+    served_verdict: str = "",
+) -> TestRunResult:
+    """Build the structured :class:`TestRunResult` for one run.
+
+    The single interpretation point for a run's transcription: exit code
+    (unless the producer passes the structural value it already knows),
+    outcome partitions, environmental verdict and stall fingerprint. Handlers
+    that know facts before rendering (frontend build / served-artifact
+    verdicts) pass them in instead of letting anything re-parse the text.
+    """
+
     output = test_output or ""
-    result["exit_code"] = _extract_overall_exit_code(output)
-
-    test_file_sections = re.findall(
-        r"Test File:\s*(.+?)\r?\nTest Results:\r?\n(.*?)(?=\r?\nTest File: |\Z)",
-        output,
-        re.DOTALL,
+    passed, failed = _partition_lines(output)
+    return TestRunResult(
+        exit_code=_extract_overall_exit_code(output) if exit_code is None else exit_code,
+        output=output,
+        passed=passed,
+        failed=failed,
+        environment_failure=classify_test_failure(output),
+        build_note=build_note,
+        served_verdict=served_verdict,
+        fingerprint=failure_fingerprint(output),
     )
-    for file_path, raw_section in test_file_sections:
-        result["sub_batches"].append(
-            {
-                "requested_files": [file_path.strip().replace("\\", "/")],
-                "exit_code": _extract_exit_code(raw_section),
-                "raw_output": raw_section.strip(),
-            }
-        )
 
-    if not result["sub_batches"]:
-        requested_files = [
-            line.split("-", 1)[1].strip().replace("\\", "/")
-            for line in output.splitlines()
-            if line.startswith("- ")
-        ]
-        for label in ("Backend Vitest Batch", "Frontend Vitest Batch", "Playwright E2E Batch"):
-            section = _extract_labeled_section(output, label)
-            if not section:
-                continue
-            result["sub_batches"].append(
-                {
-                    "requested_files": requested_files,
-                    "exit_code": _extract_exit_code(section),
-                    "raw_output": section.strip(),
-                }
-            )
 
+_PASS_LINE_PREFIXES = ("PASS ", "✓", "√", "✔")
+_FAIL_LINE_PREFIXES = ("FAIL ", "✗", "×", "✕")
+
+
+def _partition_lines(output: str) -> tuple[list[str], list[str]]:
+    """Split reporter lines into passed/failed partitions."""
+
+    passed: list[str] = []
+    failed: list[str] = []
     for line in output.splitlines():
         stripped = line.strip()
-        if stripped.startswith(("PASS ", "✓", "√", "✔")):
-            result["passed"].append(stripped)
-        elif stripped.startswith(("FAIL ", "✗", "×", "✕")) or " FAILED" in stripped:
-            result["failed"].append(stripped)
-    return result
+        if stripped.startswith(_PASS_LINE_PREFIXES):
+            passed.append(stripped)
+        elif stripped.startswith(_FAIL_LINE_PREFIXES) or " FAILED" in stripped:
+            failed.append(stripped)
+    return passed, failed
 
 
 def _extract_overall_exit_code(output: str) -> int:
@@ -88,14 +128,6 @@ def _extract_overall_exit_code(output: str) -> int:
     )
 
 
-def _extract_exit_code(output: str) -> int:
-    for line in (output or "").splitlines():
-        exit_code = _parse_exit_code_line(line)
-        if exit_code is not None:
-            return exit_code
-    return -1
-
-
 def _parse_exit_code_line(line: str) -> int | None:
     stripped = (line or "").strip()
     if not stripped.startswith("Exit Code:"):
@@ -104,12 +136,6 @@ def _parse_exit_code_line(line: str) -> int | None:
         return int(stripped.split("Exit Code:", 1)[1].strip())
     except ValueError:
         return None
-
-
-def _extract_labeled_section(output: str, label: str) -> str:
-    pattern = rf"=== {re.escape(label)} ===\r?\n(.*?)(?=\r?\n=== |\Z)"
-    match = re.search(pattern, output or "", re.DOTALL)
-    return match.group(1).strip() if match else ""
 
 
 # --------------------------------------------------------------------------
@@ -192,7 +218,7 @@ _DETAIL_LIMIT = 120
 _FINGERPRINT_LINE_LIMIT = 160
 
 #: Lines that mention error-ish keywords but are not the failure itself:
-#: success markers (mirroring parse_test_results), jest/vitest diff rows, and
+#: success markers (mirroring the outcome partitions), jest/vitest diff rows, and
 #: zero-failure summary rows. Selecting one of these as the key line would
 #: either fabricate a fingerprint for a healthy section of the output or give
 #: every distinct failure in a run the same generic fingerprint.

@@ -15,7 +15,14 @@ branched from the integration HEAD so those three hazards disappear:
   ever stages that node's changes.
 
 When the task finishes, the worktree's branch is merged back into the
-integration branch under the workflow's merge lock. Sibling nodes touch
+integration branch under the workflow's merge lock. Every operation that
+reads the integration branch's tree into a worktree (``prepare``'s
+checkouts, the conflict-requeue reset) shares the manager's
+``integration_gate`` as a reader, while the operations that move it
+(``integrate``'s merge) hold it as the writer: a checkout that raced a
+concurrent merge could materialize its index without its files, and the
+task's ``git add -A .`` then staged sibling-owned files as deletions
+(issue #91). Sibling nodes touch
 disjoint files in the common case, so merges are clean. Two guards cover the
 overlapping cases: ``core.file_claims`` blocks a stage agent from creating a
 new file a parallel sibling already created (the add/add case no resolver
@@ -64,9 +71,11 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from core.merge_arbitration import TRIGGER_CONFLICT, TRIGGER_HEALTH_GATE
 
@@ -180,6 +189,55 @@ def sanitize_node_id(node_id: str) -> str:
     return normalized or "node"
 
 
+class _IntegrationGate:
+    """Reader/writer exclusion over the integration branch (issue #91).
+
+    Readers materialize the integration tree into their own worktree
+    (``prepare``'s checkouts, the conflict-requeue reset): they write only
+    their own worktree and their own node branch, and they read a branch that
+    no other reader moves, so concurrent readers are safe and must stay
+    concurrent - serializing them would serialize sibling task starts. The
+    single writer (``integrate``'s merge) moves the integration branch and
+    excludes every reader. Writers are preferred so continuous task churn
+    cannot starve a merge.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    @contextmanager
+    def reader(self) -> Iterator[None]:
+        with self._condition:
+            while self._writer or self._writers_waiting:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def writer(self) -> Iterator[None]:
+        with self._condition:
+            self._writers_waiting += 1
+            while self._writer or self._readers:
+                self._condition.wait()
+            self._writers_waiting -= 1
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer = False
+                self._condition.notify_all()
+
+
 class NodeWorktreeManager:
     """Create, integrate, and dispose per-node worktrees for one workspace."""
 
@@ -189,6 +247,16 @@ class NodeWorktreeManager:
         # Worktree directories that must not be handed to another node: they
         # hold a conflicting or crashed task's state for inspection/retry.
         self._quarantined: set[str] = set()
+        # Issue #91: ``prepare`` (and the conflict-requeue reset) materialize
+        # the integration branch's tree into a group worktree while another
+        # group's ``integrate`` may be moving that same branch. A checkout
+        # losing that race left the index holding files the disk never got,
+        # and the task's ``git add -A .`` staged them as deletions of
+        # sibling-owned files. Readers share the gate (concurrent prepares
+        # touch disjoint worktrees and read a stable branch); the merge
+        # excludes them. The workflow's asyncio merge lock keeps running for
+        # its own bookkeeping on top of this gate.
+        self.integration_gate = _IntegrationGate()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -204,38 +272,44 @@ class NodeWorktreeManager:
         starts each new node's branch at the latest integration HEAD, which is
         also the per-task sync; a dirty or quarantined group directory falls
         back to a node-keyed directory instead of mixing states.
+
+        The git section runs under ``integration_gate`` as a reader: every
+        checkout here reads the integration branch's tree, which must not
+        change underneath it (issue #91). A failed checkout raises instead of
+        being swallowed - a swallowed failure is how the index ended up
+        holding files the disk never materialized.
         """
 
         safe_id = sanitize_node_id(node_id)
         branch = f"{BRANCH_PREFIX}/{safe_id}"
         self.worktrees_root.mkdir(parents=True, exist_ok=True)
-        worktree_path = self._select_worktree_path(safe_id, branch, group_key)
-        reusable = worktree_path != self.worktrees_root / safe_id
+        with self.integration_gate.reader():
+            worktree_path = self._select_worktree_path(safe_id, branch, group_key)
+            reusable = worktree_path != self.worktrees_root / safe_id
 
-        if worktree_path.exists() and not self._is_registered(worktree_path):
-            # Leftover directory from an unregistered worktree (crash between
-            # directory creation and registration): start clean.
-            shutil.rmtree(worktree_path, ignore_errors=True)
+            if worktree_path.exists() and not self._is_registered(worktree_path):
+                # Leftover directory from an unregistered worktree (crash between
+                # directory creation and registration): start clean.
+                shutil.rmtree(worktree_path, ignore_errors=True)
 
-        if self._is_registered(worktree_path):
-            if self._branch_exists(branch):
-                # Reuse after an interrupted run so the agent keeps its
-                # artifacts and committed work.
-                self._git(["checkout", branch], cwd=str(worktree_path), check=False)
+            if self._is_registered(worktree_path):
+                if self._branch_exists(branch):
+                    # Reuse after an interrupted run so the agent keeps its
+                    # artifacts and committed work.
+                    self._git(["checkout", branch], cwd=str(worktree_path))
+                else:
+                    # A clean reusable directory starts the new node's branch from
+                    # the latest integration HEAD.
+                    integration = self._integration_branch()
+                    self._git(
+                        ["checkout", "-B", branch, integration],
+                        cwd=str(worktree_path),
+                    )
+            elif self._branch_exists(branch):
+                self._detach_branch_elsewhere(branch, keep_path=worktree_path)
+                self._git(["worktree", "add", str(worktree_path), branch])
             else:
-                # A clean reusable directory starts the new node's branch from
-                # the latest integration HEAD.
-                integration = self._integration_branch()
-                self._git(
-                    ["checkout", "-B", branch, integration],
-                    cwd=str(worktree_path),
-                    check=False,
-                )
-        elif self._branch_exists(branch):
-            self._detach_branch_elsewhere(branch, keep_path=worktree_path)
-            self._git(["worktree", "add", str(worktree_path), branch])
-        else:
-            self._git(["worktree", "add", "-b", branch, str(worktree_path)])
+                self._git(["worktree", "add", "-b", branch, str(worktree_path)])
 
         handle = WorktreeHandle(
             node_id=node_id,
@@ -323,8 +397,24 @@ class NodeWorktreeManager:
         only the conflict files, and the result must pass ``verify`` (or the
         plain conflict check when ``verify`` is None) before the merge commit;
         otherwise the merge aborts with ``MergeArbitrationError``.
+
+        The whole sequence runs under ``integration_gate`` as the writer: the
+        merge moves the integration branch while another group's
+        ``prepare``/reset may be materializing that same branch into a
+        worktree (issue #91).
         """
 
+        with self.integration_gate.writer():
+            return self._integrate(handle, message, verify=verify, arbiter=arbiter)
+
+    def _integrate(
+        self,
+        handle: WorktreeHandle,
+        message: str,
+        *,
+        verify: Callable[[], str | None] | None = None,
+        arbiter: ArbitrationHooks | None = None,
+    ) -> tuple[bool, str]:
         try:
             committed = self.commit(handle, message)
         except WorktreeError as exc:
@@ -621,20 +711,25 @@ class NodeWorktreeManager:
         winning sibling's files - so its branch is reset here and the
         worktree directory is un-quarantined for reuse. The discarded
         commits stay reachable through git's reflog for inspection.
+
+        Runs under ``integration_gate`` as a reader like ``prepare``: the
+        reset checks out the integration branch's tree into this worktree
+        (issue #91).
         """
 
-        self._quarantined.discard(str(Path(handle.path)))
-        integration = self._integration_branch()
-        reset = self._git(
-            ["checkout", "-B", handle.branch, integration],
-            cwd=handle.path,
-            check=False,
-        )
-        if reset.returncode != 0:
-            raise WorktreeError(
-                f"resetting branch {handle.branch} to {integration} failed: "
-                f"{reset.stderr.strip() or reset.stdout.strip()}"
+        with self.integration_gate.reader():
+            self._quarantined.discard(str(Path(handle.path)))
+            integration = self._integration_branch()
+            reset = self._git(
+                ["checkout", "-B", handle.branch, integration],
+                cwd=handle.path,
+                check=False,
             )
+            if reset.returncode != 0:
+                raise WorktreeError(
+                    f"resetting branch {handle.branch} to {integration} failed: "
+                    f"{reset.stderr.strip() or reset.stdout.strip()}"
+                )
 
     def cleanup_reusable_worktrees(self) -> list[str]:
         """Remove reusable worktree directories left over after a run.
