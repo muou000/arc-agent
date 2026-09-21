@@ -39,12 +39,13 @@ GitHub 的 issue 和 PR 共用一个编号空间，裸 `#42` 可能是两者之�
 
 - **地图**：单一 issue，标签 `wayfinder:map`，正文承载 Notes / Decisions-so-far / Fog。`gh issue create --label wayfinder:map`。
 - **子 ticket**：以 GitHub sub-issue 形式挂到地图上（对 sub-issues 端点调 `gh api`）。sub-issue 不可用时，在地图正文加 task list 并在子 ticket 正文顶部写 `Part of #<map>`。标签：`wayfinder:<type>`（`research`/`prototype`/`grilling`/`task`）。被认领后 assign 给驱动的 dev。
-- **阻塞关系**：GitHub **原生 issue dependencies**，这是 UI 可见的权威表示。加边：`gh api --method POST repos/<owner>/<repo>/issues/<child>/dependencies/blocked_by -F issue_id=<blocker-db-id>`，其中 `<blocker-db-id>` 是阻塞方的数字 **database id**（`gh api repos/<owner>/<repo>/issues/<n> --jq .id`，_不是_ `#number` 也不是 `node_id`）。GitHub 通过 `issue_dependencies_summary.blocked_by` 报告（只算 open blocker，是实时门禁）。dependencies 不可用时退化为子 ticket 正文顶部的 `Blocked by: #<n>, #<n>` 行。所有 blocker 关闭即解除阻塞。
+- **阻塞关系**：GitHub **原生 issue dependencies**，这是 UI 可见的权威表示。加边：`gh api --method POST repos/<owner>/<repo>/issues/<child>/dependencies/blocked_by -F issue_id=<blocker-db-id>`，其中 `<blocker-db-id>` 是阻塞方的数字 **database id**（`gh api repos/<owner>/<repo>/issues/<n> --jq .id`，_不是_ `#number` 也不是 `node_id`）。GitHub 通过 `issue_dependencies_summary.blocked_by` 报告（只算 open blocker，是实时门禁）。dependencies 不可用时退化为子 ticket 正文顶部的 `Blocked by: #<n>, #<n>` 行。所有 blocker 关闭即解除阻塞。（加边后立刻读 `issue_dependencies_summary` 可能仍显示 0，稍后再读即为 1。）
 - **前沿查询（frontier）**：列出地图的 open children（`gh issue list --state open`，按地图的 sub-issues / task list 范围过滤），去掉有 open blocker（`issue_dependencies_summary.blocked_by > 0`，或 `Blocked by` 行里有 open issue）或已有 assignee 的；按地图顺序取第一个。
 - **认领**：`gh issue edit <n> --add-assignee @me`，这是会话的第一次写操作。
 - **解决**：`gh issue comment <n> --body "<answer>"`，然后 `gh issue close <n>`，最后把上下文指针（gist + 链接）追加到地图的 Decisions-so-far。
 
 ## 本仓库补充
 
-- 仓库目前没有在用 issue：标签只有 GitHub 默认集，历史上 issue 数为 0。首次使用时需要创建自定义标签（`gh label create`）：五个 triage 标签（见 `docs/agents/triage-labels.md`）和 wayfinder 系列（`wayfinder:map`、`wayfinder:research`、`wayfinder:prototype`、`wayfinder:grilling`、`wayfinder:task`）。
+- 自定义标签现状（2026-09-21 更新）：triage 标签中除 GitHub 默认的 `wontfix` 外均已创建（`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`，见 `docs/agents/triage-labels.md`）；`architecture` 用于架构评审产出的深化机会。wayfinder 系列（`wayfinder:map`、`wayfinder:research`、`wayfinder:prototype`、`wayfinder:grilling`、`wayfinder:task`）尚未创建，首次使用 `/wayfinder` 时用 `gh label create` 补上。
+- issue 正文沿用 `to-tickets` 的模板：`## Parent`（无父 issue 时省略该节）/ `## What to build` / `## Acceptance criteria` / `## Blocked by`。阻塞边以原生 issue dependencies 为权威表示，正文同时保留 `Blocked by: #<n>` 行，便于在 UI 之外阅读。
 - 开发任务一律在独立 git worktree 中进行，通过 push 任务分支 + PR 合并回 `main`（见根 `AGENTS.md`）。「发布到 issue tracker」创建 issue 不受此限制，但任何代码落地仍走 worktree + PR。
