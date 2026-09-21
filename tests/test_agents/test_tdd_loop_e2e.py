@@ -20,6 +20,7 @@ from agents.test_driven_developer import TestDrivenDeveloper
 from core import sessions
 from core.phases import TDD_RUN_TESTS_BUDGET, TDD_STALL_THRESHOLD, WorkflowPhaseRunner
 from agents.tools.build import build_install_dependencies_tool
+from app_type_handler.test_results import parse_test_run
 from tests.helpers.faux import (
     FakeAppHandler,
     FauxChatModel,
@@ -369,7 +370,7 @@ def test_tdd_run_rejects_implemented_without_passing_run_tests(tmp_project_dir: 
 
     async def executor(test_type, test_files):  # pragma: no cover - must not run
         executor_calls.append((test_type, test_files))
-        return failing_test_output()
+        return parse_test_run(failing_test_output())
 
     final_text = asyncio.run(
         tdd.run(
@@ -1177,7 +1178,7 @@ def test_note_preamble_never_becomes_the_failure_headline(tmp_project_dir: Path,
     )
 
     async def executor(test_type, test_files):
-        return E2E_FAILURE_OUTPUT_WITH_NOTE_PREAMBLE
+        return parse_test_run(E2E_FAILURE_OUTPUT_WITH_NOTE_PREAMBLE)
 
     tdd = make_tdd(tmp_project_dir, model, FakeAppHandler())
     asyncio.run(

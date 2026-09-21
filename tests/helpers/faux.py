@@ -27,6 +27,8 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field, PrivateAttr
 
+from app_type_handler.test_results import TestRunResult, parse_test_run
+
 
 def faux_text(text: str) -> AIMessage:
     """A scripted assistant turn that ends the loop (no tool calls)."""
@@ -132,7 +134,12 @@ class FauxChatModel(BaseChatModel):
 
 
 class FakeAppHandler:
-    """Stand-in for ``AppTypeHandler`` with scripted ``run_test_group`` outputs."""
+    """Stand-in for ``AppTypeHandler`` with scripted ``run_test_group`` outputs.
+
+    Scripts are plain runner texts (the shape real handlers render); each is
+    converted through the single parser into the :class:`TestRunResult` the
+    phase side consumes.
+    """
 
     def __init__(self, results: list[str] | None = None) -> None:
         self._results: deque[str] = deque(results or [])
@@ -154,14 +161,14 @@ class FakeAppHandler:
         test_type: str,
         file_paths: list[str],
         web_port: int | None = None,
-    ) -> str:
+    ) -> TestRunResult:
         del web_port  # per-task port override; the fake records the call only
         self.calls.append((test_type, list(file_paths)))
         if not self._results:
             raise RuntimeError(
                 f"FakeAppHandler ran out of scripted results after {len(self.calls)} call(s)."
             )
-        return self._results.popleft()
+        return parse_test_run(self._results.popleft())
 
     async def shutdown_e2e_runtime(self) -> None:
         self.shutdown_calls += 1

@@ -63,6 +63,7 @@ from tests.helpers.faux import (
     faux_text,
     faux_tool_call,
 )
+from app_type_handler.test_results import parse_test_run
 from tests.test_workflow.test_keep_req2_fixture import (
     FEATURE_SUBTREES,
     KEEP_REQ2_YAML,
@@ -282,12 +283,12 @@ class _BaselineRedHandler(FakeAppHandler):
         test_type: str,
         file_paths: list[str],
         web_port: int | None = None,
-    ) -> str:
+    ) -> TestRunResult:
         key = "|".join(file_paths)
         first_run = key not in self._run_files
         self._run_files.add(key)
         self.calls.append((test_type, list(file_paths)))
-        return failing_test_output() if first_run else passing_test_output()
+        return parse_test_run(failing_test_output() if first_run else passing_test_output())
 
 
 # ---------------------------------------------------------------------------

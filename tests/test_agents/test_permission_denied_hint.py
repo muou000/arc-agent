@@ -127,7 +127,10 @@ def test_successful_reads_are_untouched(tmp_project_dir: Path) -> None:
     middleware = _make_middleware(tmp_project_dir)
     content = _run_read(middleware, "/workspace/notes.txt")
 
-    assert content.strip() == "hello"
+    # Upstream deepagents may prefix read output with an `@@ lines X-Y of Z @@`
+    # header; the patch's contract is only that the file content survives and
+    # no permission-denied hint is appended to a successful read.
+    assert "hello" in content
     assert "permission denied" not in content
 
 
