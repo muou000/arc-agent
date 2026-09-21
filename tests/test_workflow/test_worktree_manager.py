@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -844,3 +845,149 @@ def test_integrate_arbitration_reports_failed_reverify_result(tmp_path: Path) ->
         )
 
     assert reverify_results == ["backend unhealthy"]
+
+
+# ----------------------------------------------------------------------
+# Issue #91: prepare/reset must exclude integrate on the integration lock
+# ----------------------------------------------------------------------
+
+
+def _prepare_in_thread(manager: NodeWorktreeManager, node_id: str, group_key: str):
+    """Run manager.prepare on a worker thread; return (thread, result box)."""
+
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["handle"] = manager.prepare(node_id, group_key=group_key)
+        except Exception as exc:  # pragma: no cover - failure is the signal
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def test_prepare_waits_for_in_flight_integration(tmp_path: Path) -> None:
+    """Issue #91's window, pinned as a mutual-exclusion contract.
+
+    A group worktree's prepare checks out the integration branch into the
+    worktree while another group's integrate may be moving that branch. A
+    checkout that lost that race materialized its index without its files and
+    the task's ``git add -A .`` staged sibling-owned files as deletions. The
+    integration lock must keep prepare out of integrate's critical section.
+    """
+
+    repo, manager = _init_repo(tmp_path)
+    first = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(first.path) / "backend" / "one.js").write_text("one;\n", encoding="utf-8")
+    manager.integrate(first, "REQ-2.1 (implement): one")
+
+    release = threading.Event()
+    lock_held = threading.Event()
+
+    def hold_lock() -> None:
+        with manager.integration_gate.writer():
+            lock_held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert lock_held.wait(10)
+
+    # REQ-2.2 has no branch yet, so prepare takes the checkout -B path that
+    # lost the race in issue #91.
+    thread, outcome = _prepare_in_thread(manager, "REQ-2.2", "REQ-2")
+    try:
+        thread.join(0.5)
+        assert not outcome, "prepare ran while the integration lock was held"
+    finally:
+        release.set()
+    thread.join(10)
+    assert "handle" in outcome, f"prepare never completed: {outcome.get('error')}"
+    holder.join(10)
+    # The checkout -B started from the integration HEAD that already holds the
+    # merged sibling file.
+    assert (Path(outcome["handle"].path) / "backend" / "one.js").exists()
+
+
+def test_reset_branch_to_integration_waits_for_in_flight_integration(
+    tmp_path: Path,
+) -> None:
+    """The conflict-requeue reset checks out the integration tree too, so it
+    holds the same exclusion against an in-flight integrate."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-2.1")
+
+    release = threading.Event()
+    lock_held = threading.Event()
+
+    def hold_lock() -> None:
+        with manager.integration_gate.writer():
+            lock_held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert lock_held.wait(10)
+
+    outcome: dict[str, Any] = {}
+
+    def run_reset() -> None:
+        try:
+            manager.reset_branch_to_integration(handle)
+            outcome["done"] = True
+        except Exception as exc:  # pragma: no cover - failure is the signal
+            outcome["error"] = exc
+
+    reset_thread = threading.Thread(target=run_reset, daemon=True)
+    reset_thread.start()
+    try:
+        reset_thread.join(0.5)
+        assert not outcome, "reset ran while the integration lock was held"
+    finally:
+        release.set()
+    reset_thread.join(10)
+    assert outcome.get("done"), f"reset never completed: {outcome.get('error')}"
+    holder.join(10)
+
+
+def test_prepare_raises_when_the_checkout_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A swallowed checkout failure is what let the index hold files the disk
+    never materialized (issue #91's corruption precondition); it must raise."""
+
+    repo, manager = _init_repo(tmp_path)
+    first = manager.prepare("REQ-2.1", group_key="REQ-2")
+    (Path(first.path) / "backend" / "one.js").write_text("one;\n", encoding="utf-8")
+    manager.integrate(first, "REQ-2.1 (implement): one")
+
+    # A new node in the registered group directory takes the checkout -B
+    # path; point it at a ref that cannot exist so the checkout fails.
+    monkeypatch.setattr(manager, "_integration_branch", lambda: "no-such-integration-ref")
+    with pytest.raises(WorktreeError):
+        manager.prepare("REQ-2.2", group_key="REQ-2")
+
+
+def test_concurrent_prepares_share_the_integration_gate(tmp_path: Path) -> None:
+    """The reader side of the gate: concurrent prepares must NOT serialize.
+
+    Sibling tasks of different subtrees start concurrently, each preparing
+    its worktree with a checkout from the integration branch. Readers touch
+    disjoint worktrees and read a branch no reader moves, so one prepare
+    holding the gate as a reader must not block another (serializing them
+    broke the sibling-overlap contract the drain tests pin).
+    """
+
+    repo, manager = _init_repo(tmp_path)
+    first = manager.prepare("REQ-2.1", group_key="REQ-2")
+
+    with manager.integration_gate.reader():
+        thread, outcome = _prepare_in_thread(manager, "REQ-3.1", "REQ-3")
+        thread.join(10)
+        assert "handle" in outcome, (
+            f"a reader prepare must not wait for another reader: {outcome.get('error')}"
+        )
+        assert Path(outcome["handle"].path) != Path(first.path)
