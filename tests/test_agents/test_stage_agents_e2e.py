@@ -17,6 +17,7 @@ from pathlib import Path
 
 from core import sessions
 from agents.interface_designer import InterfaceDesigner
+from agents.test_driven_developer import TestDrivenDeveloper
 from agents.test_generator import TestGenerator
 from agents.tools.test_manifest import DeclaredTestFile, TestManifestLock
 from tests.helpers.faux import FauxChatModel, faux_tool_call
@@ -1940,3 +1941,56 @@ def test_merge_conflict_context_validates_the_paths_shape(tmp_project_dir: Path,
     assert InterfaceDesigner._load_merge_conflict_context(node_id) is None
 
     assert InterfaceDesigner._load_merge_conflict_context("REQ-CONFLICT-NEVER") is None
+
+
+def test_tdd_merge_conflict_context_requires_the_retry_flag_and_phase(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """The TDD prompt only receives conflict paths for an IMPLEMENT-phase
+    one-shot retry: a fresh IMPLEMENT pass must not be steered around stale
+    paths, and a DESIGN-conflict record must not leak into the TDD prompt."""
+    from core import sessions
+
+    node_id = "REQ-CONFLICT-3"
+    sessions.merge_node_session(
+        node_id,
+        {"merge_conflict_context": {"paths": ["shared.js"], "phase": "implement"}},
+    )
+    assert TestDrivenDeveloper._load_merge_conflict_context(node_id) is None
+
+    sessions.merge_node_session(node_id, {"merge_conflict_retry_used": True})
+    assert TestDrivenDeveloper._load_merge_conflict_context(node_id) == {
+        "paths": ["shared.js"],
+        "phase": "implement",
+    }
+
+    # A design-phase record belongs to the DESIGN prompt, not the TDD prompt.
+    sessions.merge_node_session(
+        node_id,
+        {"merge_conflict_context": {"paths": ["shared.js"], "phase": "design"}},
+    )
+    assert TestDrivenDeveloper._load_merge_conflict_context(node_id) is None
+
+
+def test_tdd_merge_conflict_context_validates_the_paths_shape(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    from core import sessions
+
+    node_id = "REQ-CONFLICT-4"
+    sessions.merge_node_session(
+        node_id,
+        {"merge_conflict_retry_used": True, "merge_conflict_context": {"paths": "shared.js", "phase": "implement"}},
+    )
+    assert TestDrivenDeveloper._load_merge_conflict_context(node_id) is None
+
+    sessions.merge_node_session(
+        node_id,
+        {"merge_conflict_retry_used": True, "merge_conflict_context": {"paths": ["ok.ts", 3], "phase": "implement"}},
+    )
+    assert TestDrivenDeveloper._load_merge_conflict_context(node_id) is None
+
+    sessions.merge_node_session(node_id, {"merge_conflict_context": "not-a-dict"})
+    assert TestDrivenDeveloper._load_merge_conflict_context(node_id) is None
+
+    assert TestDrivenDeveloper._load_merge_conflict_context("REQ-CONFLICT-NEVER") is None

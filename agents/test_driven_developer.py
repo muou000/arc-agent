@@ -243,6 +243,7 @@ class TestDrivenDeveloper:
             test_type=test_type,
             node_tests=current_node_tests,
             previous_failure_summary=previous_failure_summary,
+            merge_conflict=self._load_merge_conflict_context(node_id),
         )
         await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking TDD implementation.", node_id=node_id)
@@ -308,6 +309,32 @@ class TestDrivenDeveloper:
         """
 
         return list(self._last_modified_files)
+
+    @staticmethod
+    def _load_merge_conflict_context(node_id: str) -> dict[str, Any] | None:
+        """Conflict paths recorded when this node's IMPLEMENT merge conflicted.
+
+        The workflow re-queues a conflicted IMPLEMENT once and stores the
+        conflicting paths (owned by a parallel sibling) in the node session
+        so this retry can steer edits away from them. The retry flag must be
+        set and the recorded phase must be ``implement``: a fresh IMPLEMENT
+        pass (manual retry, resume) must never be guided by a previous run's
+        stale conflict paths, and a DESIGN-conflict record must not leak into
+        the TDD prompt.
+        """
+
+        from core import sessions
+
+        session = sessions.load_node_session(node_id)
+        if not session.get("merge_conflict_retry_used"):
+            return None
+        context = session.get("merge_conflict_context")
+        if not isinstance(context, dict) or context.get("phase") != "implement":
+            return None
+        paths = context.get("paths")
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            return None
+        return {"paths": paths, "phase": "implement"}
 
     @staticmethod
     def _payload_to_final_text(payload: dict[str, Any]) -> str:
