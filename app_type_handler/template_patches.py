@@ -77,6 +77,7 @@ SKIPPED = "skipped"
 
 
 _INIT_DB_PATH = "backend/src/database/init_db.js"
+_TEST_HARNESS_PATH = "backend/src/database/test_harness.js"
 _README_PATH = "README.md"
 
 # PR #28 fixed two defects in the template's database bootstrap, and this
@@ -346,6 +347,82 @@ TEMPLATE_PATCHES: tuple[TemplatePatch, ...] = (
             ),
         ),
         requires=("init-db-never-return-closed-handle",),
+    ),
+    # The easy-ticketbooking run of 2026-09-21 lost ~1.5 minutes to a flaky
+    # SQLITE_CANTOPEN {errno: 14} (vitest unhandled error, Unit layer, attempt
+    # 2 of a TDD loop; self-healed over three retry rounds without a source
+    # change). Every harness wrote its sqlite file into one shared
+    # `.arc-test-db` root, and each cleanup removed that root when it was
+    # empty - so one worker's cleanup could delete the directory between
+    # another worker's mkdir and the open node-sqlite3 had already queued (the
+    # file only materializes when the queued open executes, and no later mkdir
+    # can repair a directory deleted in that window). Two directed fixes:
+    #
+    #  0. each harness opens its database inside a dedicated scope directory
+    #     (`<root>/<label>-<suffix>/`), so cleanup removes only a directory it
+    #     alone owns and the shared root is never removed by anyone;
+    #  1. reset() re-creates the root directory before reopening sqlite: it
+    #     can run long after setup() and must not assume that mkdir still
+    #     holds.
+    #
+    # The search shapes assume the official template's pre-fix content; see
+    # the init-db comment above for the realignment discipline.
+    TemplatePatch(
+        name="test-harness-temp-dir-guard",
+        template_id="web-react-express",
+        summary=(
+            "each test database harness opens sqlite inside its own scope "
+            "directory and reset() re-creates the root before reopening, so a "
+            "concurrent cleanup can no longer race a queued sqlite open"
+        ),
+        edits=(
+            TemplateEdit(
+                relative_path=_TEST_HARNESS_PATH,
+                search=(
+                    "  const uniqueSuffix = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;\n"
+                    "  return {\n"
+                    "    dbPath: path.join(rootDir, `${label}-${uniqueSuffix}.sqlite`),\n"
+                    "    rootDir,\n"
+                    "    preserveDatabaseOnCleanup,\n"
+                    "    removeRootDirWhenEmpty: true,\n"
+                    "  };\n"
+                ),
+                replace=(
+                    "  const uniqueSuffix = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;\n"
+                    "  // A dedicated scope directory per harness: cleanup then removes only a\n"
+                    "  // directory this harness alone owns, so a concurrent cleanup can never\n"
+                    "  // delete the directory another worker is between mkdir and its queued\n"
+                    "  // sqlite open (SQLITE_CANTOPEN, errno 14).\n"
+                    "  const scopeDir = path.join(rootDir, `${label}-${uniqueSuffix}`);\n"
+                    "  return {\n"
+                    "    dbPath: path.join(scopeDir, `${label}-${uniqueSuffix}.sqlite`),\n"
+                    "    rootDir: scopeDir,\n"
+                    "    preserveDatabaseOnCleanup,\n"
+                    "    removeRootDirWhenEmpty: true,\n"
+                    "  };\n"
+                ),
+                applied_marker="const scopeDir = path.join(rootDir,",
+            ),
+            TemplateEdit(
+                relative_path=_TEST_HARNESS_PATH,
+                search=(
+                    "  async function reset(seedHook) {\n"
+                    "    await ensureHarnessIsActive();\n"
+                    "    await resetDatabaseFile();\n"
+                    "    await initializeDatabase();\n"
+                ),
+                replace=(
+                    "  async function reset(seedHook) {\n"
+                    "    await ensureHarnessIsActive();\n"
+                    "    // Re-create the root directory before reopening sqlite: reset() can run\n"
+                    "    // long after setup() and must not assume the one setup() made still exists.\n"
+                    "    fs.mkdirSync(rootDir, { recursive: true });\n"
+                    "    await resetDatabaseFile();\n"
+                    "    await initializeDatabase();\n"
+                ),
+                applied_marker="Re-create the root directory before reopening sqlite",
+            ),
+        ),
     ),
 )
 
