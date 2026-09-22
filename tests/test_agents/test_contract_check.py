@@ -231,4 +231,4 @@ def test_normalize_strips_origin_to_path() -> None:
     assert _normalize_for_match("http://localhost:3301/register") == "register"
     assert _normalize_for_match("http://localhost:3301") == ""
     assert _normalize_for_match("https://example.com/api/auth") == "api/auth"
-    assert _normalize_for_match("\/register$") == "/register"
+    assert _normalize_for_match(r"\/register$") == "/register"
