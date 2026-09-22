@@ -283,11 +283,12 @@ class _BaselineRedHandler(FakeAppHandler):
         test_type: str,
         file_paths: list[str],
         web_port: int | None = None,
+        failed_case_names: list[str] | None = None,
     ) -> TestRunResult:
         key = "|".join(file_paths)
         first_run = key not in self._run_files
         self._run_files.add(key)
-        self.calls.append((test_type, list(file_paths)))
+        self._record_call(test_type, file_paths, failed_case_names)
         return parse_test_run(failing_test_output() if first_run else passing_test_output())
 
 

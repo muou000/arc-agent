@@ -212,7 +212,13 @@ class AndroidAppType(AppTypeHandler):
             return parse_test_run(f"Exit Code: 1\nSTDERR:\n{validation_error}\n")
         return parse_test_run(await _run_android_gradle_test(self.workspace_path, file_path))
 
-    async def run_test_group(self, test_type: str, file_paths: list[str]) -> TestRunResult:
+    async def run_test_group(
+        self,
+        test_type: str,
+        file_paths: list[str],
+        failed_case_names: list[str] | None = None,
+    ) -> TestRunResult:
+        del failed_case_names  # per-case retry filtering is a web E2E capability
         if not file_paths:
             return parse_test_run(
                 "Exit Code: 1\n"

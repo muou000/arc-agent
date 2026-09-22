@@ -28,6 +28,7 @@ from core.workflow import (
     ARCWorkflowManager,
     NODE_BLOCKED_BY_DEPENDENCY,
     NODE_DESIGNED,
+    NODE_DESIGNING,
     NODE_FAILED,
     NODE_PASSED,
     NODE_UNSEEN,
@@ -40,6 +41,7 @@ from core.workflow import (
     TASK_PENDING,
     TASK_RUNNING,
 )
+from tests.test_workflow.queue_faker import node_maps_from_tasks, settle
 
 
 class _Traceability:
@@ -138,6 +140,8 @@ def test_sibling_implements_run_concurrently_in_separate_worktrees(
     # Mark all DESIGN tasks done so the leaf IMPLEMENTs are runnable.
     for task in queue_state["tasks"]:
         if task["phase"] == PHASE_DESIGN:
+            queue_state["node_states"][task["node_id"]] = NODE_DESIGNED
+            queue_state.setdefault("node_design_done", {})[task["node_id"]] = True
             task["status"] = TASK_COMPLETED
 
     active: set[str] = set()
@@ -191,6 +195,8 @@ def test_parent_implement_waits_for_descendant_implements(
     queue_state = _queue_state(manager, tree)
     for task in queue_state["tasks"]:
         if task["phase"] == PHASE_DESIGN:
+            queue_state["node_states"][task["node_id"]] = NODE_DESIGNED
+            queue_state.setdefault("node_design_done", {})[task["node_id"]] = True
             task["status"] = TASK_COMPLETED
 
     finished_implements: list[str] = []
@@ -230,6 +236,8 @@ def test_implement_waits_for_declared_dependency_in_the_drain(
     queue_state = _queue_state(manager, tree)
     for task in queue_state["tasks"]:
         if task["phase"] == PHASE_DESIGN:
+            queue_state["node_states"][task["node_id"]] = NODE_DESIGNED
+            queue_state.setdefault("node_design_done", {})[task["node_id"]] = True
             task["status"] = TASK_COMPLETED
 
     events: list[tuple[str, str]] = []
@@ -439,6 +447,8 @@ def test_merge_conflict_fails_only_the_conflicting_node(
     queue_state = _queue_state(manager, _requirement_tree())
     for task in queue_state["tasks"]:
         if task["phase"] == PHASE_DESIGN:
+            queue_state["node_states"][task["node_id"]] = NODE_DESIGNED
+            queue_state.setdefault("node_design_done", {})[task["node_id"]] = True
             task["status"] = TASK_COMPLETED
     # Burn both leaves' one-shot conflict requeue budget so the first
     # conflict below is terminal for whichever node loses the race.
@@ -600,7 +610,8 @@ def test_dependency_block_propagation_is_idempotent_and_saves_once(
             {"task_id": "RC:DESIGN", "node_id": "RC", "phase": PHASE_DESIGN, "status": TASK_RUNNING},
             {"task_id": "RC:IMPLEMENT", "node_id": "RC", "phase": PHASE_IMPLEMENT, "status": TASK_PENDING},
         ],
-        "node_states": {"RA": NODE_FAILED, "RB": "UNSEEN", "RC": "UNSEEN"},
+        "node_states": {"RA": NODE_FAILED, "RB": "UNSEEN", "RC": NODE_DESIGNING},
+        "node_design_done": {"RA": False, "RB": False, "RC": False},
         "dependencies": {"RB": ["RA"], "RC": ["RA"]},
     }
     saves: list[int] = []
@@ -622,7 +633,7 @@ def test_dependency_block_propagation_is_idempotent_and_saves_once(
         TASK_PENDING,
     ], "RB is blocked; RC keeps its running task and is skipped"
     assert state["node_states"]["RB"] == NODE_BLOCKED_BY_DEPENDENCY
-    assert state["node_states"]["RC"] == "UNSEEN"
+    assert state["node_states"]["RC"] == NODE_DESIGNING
 
     asyncio.run(manager._propagate_dependency_blocks(state))
     assert len(saves) == 1, "a second pass over blocked state must not save again"
@@ -635,6 +646,8 @@ def test_dependency_block_propagation_is_idempotent_and_saves_once(
     ]
 
     # Once RC's running task ends, the next pass still blocks its pending work.
+    state["node_states"]["RC"] = NODE_DESIGNED
+    state["node_design_done"]["RC"] = True
     state["tasks"][3]["status"] = TASK_COMPLETED
     asyncio.run(manager._propagate_dependency_blocks(state))
     assert [task["status"] for task in state["tasks"]] == [
@@ -689,6 +702,9 @@ def _blocked_state() -> dict[str, Any]:
             {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_BLOCKED},
         ],
         "node_states": {"R": NODE_BLOCKED_BY_DEPENDENCY, "RA": NODE_FAILED, "RB": NODE_BLOCKED_BY_DEPENDENCY},
+        # R and RA got past their DESIGN before blocking/failing; the typed
+        # state keeps that progress explicit so a release restores DESIGNED.
+        "node_design_done": {"R": True, "RA": True, "RB": False},
         "descendants": {"R": ["RA", "RB"]},
         "dependencies": {"RB": ["RA"]},
     }
@@ -706,9 +722,10 @@ def test_release_returns_blocked_dependents_to_pending_after_retry_reset(
     """
     manager = _make_parallel_manager(tmp_path)
     state = _blocked_state()
-    # The retry reset RA the way _reset_node_from_implement_retry does.
+    # The retry reset RA the way an implement retry does: back to DESIGNED.
     state["tasks"][3]["status"] = TASK_PENDING
     state["node_states"]["RA"] = NODE_DESIGNED
+    state.setdefault("node_design_done", {})["RA"] = True
 
     released = asyncio.run(manager._release_dependency_blocks(state))
 
@@ -798,7 +815,7 @@ def test_release_holds_nested_ancestor_until_every_failed_descendant_is_reset(
 
     Ancestor blocking propagates through ``descendants`` (R waits for RA and
     RA1's IMPLEMENTs), and release checks the same map through the same
-    ``_failed_prerequisite_ids`` helper, so the two are mirror images: while
+    ``failed_prerequisite_ids`` helper, so the two are mirror images: while
     any failed descendant remains — here the middle layer RA after only the
     innermost RA1 was retried — the ancestor keeps its BLOCKED state, and it
     is released only once every failed descendant under it has been reset.
@@ -818,6 +835,7 @@ def test_release_holds_nested_ancestor_until_every_failed_descendant_is_reset(
             "RA": NODE_FAILED,
             "RA1": NODE_FAILED,
         },
+        "node_design_done": {"R": True, "RA": True, "RA1": True},
         "descendants": {"R": ["RA", "RA1"], "RA": ["RA1"]},
         "dependencies": {},
     }
@@ -826,6 +844,7 @@ def test_release_holds_nested_ancestor_until_every_failed_descendant_is_reset(
     # still failed, so the ancestor must stay blocked.
     state["tasks"][5]["status"] = TASK_PENDING
     state["node_states"]["RA1"] = NODE_DESIGNED
+    state.setdefault("node_design_done", {})["RA1"] = True
     released = asyncio.run(manager._release_dependency_blocks(state))
     assert released == [], "R stays blocked while the middle descendant RA is still failed"
     assert state["tasks"][1]["status"] == TASK_BLOCKED
@@ -834,6 +853,7 @@ def test_release_holds_nested_ancestor_until_every_failed_descendant_is_reset(
     # Resetting the middle layer too releases the ancestor.
     state["tasks"][3]["status"] = TASK_PENDING
     state["node_states"]["RA"] = NODE_DESIGNED
+    state["node_design_done"]["RA"] = True
     released = asyncio.run(manager._release_dependency_blocks(state))
     assert released == ["R"]
     assert state["tasks"][1]["status"] == TASK_PENDING
@@ -930,6 +950,8 @@ def test_subtree_tasks_share_one_worktree_directory(
     queue_state = _queue_state(manager, tree)
     for task in queue_state["tasks"]:
         if task["phase"] == PHASE_DESIGN:
+            queue_state["node_states"][task["node_id"]] = NODE_DESIGNED
+            queue_state.setdefault("node_design_done", {})[task["node_id"]] = True
             task["status"] = TASK_COMPLETED
 
     seen_worktrees: dict[str, str] = {}
@@ -980,6 +1002,8 @@ def test_additive_resolution_with_failing_health_gate_fails_the_node(
     queue_state = _queue_state(manager, _requirement_tree())
     for task in queue_state["tasks"]:
         if task["phase"] == PHASE_DESIGN:
+            queue_state["node_states"][task["node_id"]] = NODE_DESIGNED
+            queue_state.setdefault("node_design_done", {})[task["node_id"]] = True
             task["status"] = TASK_COMPLETED
 
     async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
@@ -1017,6 +1041,8 @@ def test_additive_resolution_passes_gate_and_lands_union(
     queue_state = _queue_state(manager, _requirement_tree())
     for task in queue_state["tasks"]:
         if task["phase"] == PHASE_DESIGN:
+            queue_state["node_states"][task["node_id"]] = NODE_DESIGNED
+            queue_state.setdefault("node_design_done", {})[task["node_id"]] = True
             task["status"] = TASK_COMPLETED
 
     async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
@@ -1534,6 +1560,8 @@ def test_manual_implement_retry_restores_the_conflict_retry_budget(
     manager = _make_parallel_manager(tmp_path)
     queue_state = _queue_state(manager, _requirement_tree())
     tasks_by_id = {task["task_id"]: task for task in queue_state["tasks"]}
+    queue_state["node_states"]["RA"] = NODE_FAILED
+    queue_state.setdefault("node_design_done", {})["RA"] = True
     tasks_by_id["RA:DESIGN"]["status"] = TASK_COMPLETED
     tasks_by_id["RA:IMPLEMENT"]["status"] = TASK_FAILED
     sessions.merge_node_session(
@@ -1564,6 +1592,7 @@ def _gate_queue_state(parent_status: str, *, with_parents: bool = True) -> dict[
         {"task_id": "RA:DESIGN", "node_id": "RA", "phase": PHASE_DESIGN, "status": TASK_PENDING},
     ]
     state: dict[str, Any] = {"tasks": tasks}
+    state["node_states"], state["node_design_done"] = node_maps_from_tasks(tasks)
     if with_parents:
         state["parents"] = {"RA": "R"}
     return state
@@ -1573,16 +1602,17 @@ def test_design_gate_blocks_until_the_parent_design_settles() -> None:
     parent = _gate_queue_state(TASK_RUNNING)["tasks"][0]
     child = _gate_queue_state(TASK_RUNNING)["tasks"][1]
     state = {"tasks": [parent, child], "parents": {"RA": "R"}}
+    state["node_states"], state["node_design_done"] = node_maps_from_tasks([parent, child])
 
     assert ARCWorkflowManager._task_dependencies_met(state, child) is False, "parent still running"
 
-    parent["status"] = TASK_PENDING
+    settle(state, "R", NODE_UNSEEN)
     assert ARCWorkflowManager._task_dependencies_met(state, child) is False, "parent still pending"
 
-    parent["status"] = TASK_COMPLETED
+    settle(state, "R", NODE_DESIGNED)
     assert ARCWorkflowManager._task_dependencies_met(state, child) is True
 
-    parent["status"] = TASK_FAILED
+    settle(state, "R", NODE_FAILED, design_done=False)
     assert ARCWorkflowManager._task_dependencies_met(state, child) is True, (
         "a failed parent must not deadlock its children"
     )
@@ -1618,6 +1648,7 @@ def test_design_gate_combines_parent_and_dependency_rules(
         {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
         {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_COMPLETED},
     ]
+    state["node_states"], state["node_design_done"] = node_maps_from_tasks(state["tasks"])
     state["dependencies"] = {"RA": ["RB"]}
     child = next(t for t in state["tasks"] if t["task_id"] == "RA:DESIGN")
     assert ARCWorkflowManager._task_dependencies_met(state, child) is True, (
@@ -1625,15 +1656,15 @@ def test_design_gate_combines_parent_and_dependency_rules(
     )
 
     # Parent failed but the dependency is still implementing: still blocked.
-    for rb_implement_status in (TASK_PENDING, TASK_RUNNING):
-        state["tasks"][3]["status"] = rb_implement_status
-        assert ARCWorkflowManager._task_dependencies_met(state, child) is False, (
-            "a failed parent must not let the dependency check pass the child through"
-        )
+    settle(state, "RB", NODE_DESIGNED)
+    assert ARCWorkflowManager._task_dependencies_met(state, child) is False, (
+        "a failed parent must not let the dependency check pass the child through"
+    )
 
     # Parent completed, dependency still implementing: still blocked.
+    state["node_states"]["R"] = NODE_DESIGNED
+    state["node_design_done"]["R"] = True
     state["tasks"][0]["status"] = TASK_COMPLETED
-    state["tasks"][3]["status"] = TASK_RUNNING
     assert ARCWorkflowManager._task_dependencies_met(state, child) is False
 
 
@@ -1642,22 +1673,24 @@ def test_design_gate_applies_declared_dependencies_to_the_root() -> None:
     straight to the dependency check - blocked while a declared dependency's
     IMPLEMENT runs, unblocked when it fails (the failed-dependency release
     the IMPLEMENT rule already follows)."""
-    state = {
-        "tasks": [
-            {"task_id": "R:DESIGN", "node_id": "R", "phase": PHASE_DESIGN, "status": TASK_PENDING},
-            {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
-            {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_RUNNING},
-        ],
+    tasks = [
+        {"task_id": "R:DESIGN", "node_id": "R", "phase": PHASE_DESIGN, "status": TASK_PENDING},
+        {"task_id": "RB:DESIGN", "node_id": "RB", "phase": PHASE_DESIGN, "status": TASK_COMPLETED},
+        {"task_id": "RB:IMPLEMENT", "node_id": "RB", "phase": PHASE_IMPLEMENT, "status": TASK_RUNNING},
+    ]
+    state: dict[str, Any] = {
+        "tasks": list(tasks),
         "dependencies": {"R": ["RB"]},
     }
+    state["node_states"], state["node_design_done"] = node_maps_from_tasks(tasks)
 
     root = state["tasks"][0]
     assert ARCWorkflowManager._task_dependencies_met(state, root) is False
 
-    state["tasks"][2]["status"] = TASK_COMPLETED
+    settle(state, "RB", NODE_PASSED)
     assert ARCWorkflowManager._task_dependencies_met(state, root) is True
 
-    state["tasks"][2]["status"] = TASK_FAILED
+    settle(state, "RB", NODE_FAILED, design_done=True)
     assert ARCWorkflowManager._task_dependencies_met(state, root) is False, (
         "a failed dependency must block the dependent root"
     )

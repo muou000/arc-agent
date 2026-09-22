@@ -26,6 +26,7 @@ from typing import Any, Awaitable, Callable
 
 from agents.tools.test_failure_digest import (
     build_failure_digest,
+    digest_failed_test_names,
     format_failure_digest,
     persist_run_output,
 )
@@ -41,7 +42,9 @@ TDD_STALL_THRESHOLD = 3
 TDD_BATCH_ORDER = CANONICAL_TEST_TYPES
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
-RunGroup = Callable[[str, list[str]], Awaitable[TestRunResult]]
+#: The handler seam: layer, files, and the retry round's failed-case filter
+#: (``None`` = unfiltered full run; only case-filterable runners consume it).
+RunGroup = Callable[[str, list[str], "list[str] | None"], Awaitable[TestRunResult]]
 
 #: Per-file verification state: ``"green"`` (passed), ``"red"`` (verifiably
 #: failing), or ``None`` (no verified state: never run, or the run stopped at
@@ -156,6 +159,7 @@ class TddTestExecutor:
         self._layer_passed: dict[str, bool] = {}
         self._fingerprints: dict[str, list[str]] = {}
         self._install_attempts: dict[str, int] = {}
+        self._retry_case_names: dict[str, list[str]] = {}
         self._results: dict[str, TestRunResult] = {}
         self._active_layer: str | None = None
         self._env_failure: str | None = None
@@ -179,6 +183,15 @@ class TddTestExecutor:
         self._layer_passed = {t: False for t in self._ordered}
         self._fingerprints = {t: [] for t in self._ordered}
         self._install_attempts = {t: 0 for t in self._ordered}
+        # Failed-case names parsed from a layer's most recent failed run
+        # digest (#115). A retry round re-runs only these cases through the
+        # handler's per-case filter (the web E2E executor's Playwright
+        # --grep); empty means run the full layer. Cleared whenever a round
+        # passes (the closing round must be a full run) and when the failure
+        # was environmental (the repair contract must revalidate broadly) -
+        # and unreachable across TDD passes, whose first round always runs
+        # the full layer.
+        self._retry_case_names = {t: [] for t in self._ordered}
         self._results = {}
         self._active_layer = None
         self._env_failure = None
@@ -384,7 +397,28 @@ class TddTestExecutor:
         await self._log(
             f"`run_tests` {selected_type} usage {self._usage[selected_type]}/{TDD_RUN_TESTS_BUDGET}."
         )
-        result = await self._run_group(selected_type, selected_files)
+        # Retry round (#115): the previous round's digest parsed failing case
+        # names, so re-run only those. First round, cross-pass rounds and any
+        # round after an unparseable/environmental failure carry no filter and
+        # run the full layer. Per-case filtering is an E2E-runner capability
+        # today, so other layers always run full - and run_was_case_filtered
+        # (which gates the layer-closing verdict below) must only fire when
+        # the runner really filtered, never on an ignored filter.
+        case_filter_applies = selected_type.lower() == "e2e"
+        prior_failed_names = self._retry_case_names.get(selected_type, []) if case_filter_applies else []
+        run_was_case_filtered = bool(prior_failed_names)
+        if run_was_case_filtered:
+            await self._log(
+                (
+                    f"`run_tests` {selected_type} retry filters to the {len(prior_failed_names)} "
+                    "failing case(s) parsed from the previous round's digest."
+                )
+            )
+        result = await self._run_group(
+            selected_type,
+            selected_files,
+            list(prior_failed_names) if prior_failed_names else None,
+        )
         passed = result.passed_run
         # Persist every run's raw output under .arc/tdd_runs (ignored by
         # Git checkpoints/merges) and expose it to the agent: in-session
@@ -417,10 +451,20 @@ class TddTestExecutor:
             # Structured per-test digest appended to the tool result: the
             # model sees each failed test's location and expected/received
             # up front instead of mining the long raw output for them.
+            failure_digest = build_failure_digest(result.output)
+            # Remember the parsed names for the next round's case filter.
+            # An environmental failure clears them: the workspace-repair
+            # contract must revalidate the whole layer, not just the cases
+            # that happened to report before the environment broke. An
+            # unparseable digest also degrades to the full run.
+            if case_filter_applies:
+                self._retry_case_names[selected_type] = (
+                    [] if result.environment_failure else digest_failed_test_names(failure_digest)
+                )
             result.output += (
                 "\n\n"
                 + format_failure_digest(
-                    build_failure_digest(result.output),
+                    failure_digest,
                     test_type=selected_type,
                     raw_output_path=run_log_path or None,
                     fingerprint=result.fingerprint,
@@ -430,6 +474,11 @@ class TddTestExecutor:
                 )
                 + "\n"
             )
+        else:
+            # A passing round resets the filter so the next round
+            # revalidates the full layer; a case-filtered green round only
+            # proves the previously failing cases now pass.
+            self._retry_case_names[selected_type] = []
         await self._log(
             (
                 "run_tests raw output\n"
@@ -457,7 +506,10 @@ class TddTestExecutor:
                 self._file_states[selected_type][path] = "green"
             # A layer passes only through a passing run that covered every
             # registered file; a passing subset run keeps the layer open.
-            if registered and set(selected_files) >= registered:
+            # A case-filtered run (#115) is such a subset at case level:
+            # only the previously failing cases were re-verified, so the
+            # layer-closing verdict stays with a full (unfiltered) run.
+            if not run_was_case_filtered and registered and set(selected_files) >= registered:
                 self._layer_passed[selected_type] = True
             if self._env_failure is not None:
                 # The reported environment failure was repaired (e.g. the
@@ -581,6 +633,27 @@ class TddTestExecutor:
                     f"- {len(not_yet_run)} file(s) in this layer have not been run yet: "
                     f"{', '.join(not_yet_run)}.\n"
                 )
+        if run_was_case_filtered:
+            # The agent must know this round was partial at case level: on
+            # a pass it must spend one more round on the unfiltered layer
+            # (if it stops here, the orchestrator's system-run regression
+            # closes the layer instead); on a failure the digest above only
+            # covers the re-run cases.
+            if passed:
+                result.output += (
+                    "\nARC_RETRY_FILTER_NOTE:\n"
+                    f"- This round re-ran only the previously failing {selected_type} case(s); "
+                    "the layer is not closed yet. Call run_tests once more for the full "
+                    "layer - the next round runs unfiltered, and a passing full run closes "
+                    "the layer.\n"
+                )
+            else:
+                result.output += (
+                    "\nARC_RETRY_FILTER_NOTE:\n"
+                    f"- This round re-ran only the previously failing {selected_type} case(s); "
+                    "cases that passed in earlier rounds were not re-verified here. The digest "
+                    "above lists the still-failing case(s) the next round will re-run.\n"
+                )
         if self._layer_passed[selected_type] and next_type:
             # Advance immediately instead of waiting for the session to
             # end. Otherwise a model that keeps polling `run_tests` after a
@@ -642,7 +715,7 @@ class TddTestExecutor:
         it explicitly via :meth:`record_file_state`.
         """
 
-        result = await self._run_group(test_type, [file_path])
+        result = await self._run_group(test_type, [file_path], None)
         state = classify_file_state(result)
         self._file_states.setdefault(test_type, {})[file_path] = state
         return BaselineRun(
@@ -663,7 +736,7 @@ class TddTestExecutor:
         """
 
         files = self.layer_files(test_type)
-        result = await self._run_group(test_type, files)
+        result = await self._run_group(test_type, files, None)
         self._results[test_type] = result
         state = classify_file_state(result)
         if state == "green":

@@ -3,6 +3,7 @@ import os
 import json
 import sys
 import asyncio
+import shlex
 import shutil
 import logging
 import subprocess
@@ -411,11 +412,54 @@ def _build_web_test_execution(
     }
 
 
+# Retry-round case filter: digest names are reporter display titles
+# ("suite › case" for Playwright, "suite > case" for Vitest list lines), so the
+# leaf case name is the segment that stays a contiguous substring of the full
+# title regardless of how the runner joins describe blocks (space in the
+# matched title, › in the printed form). Over-matching a same-named case in
+# another suite only re-runs a passing test; the final full run still decides.
+_FAILED_CASE_TITLE_SEPARATOR = re.compile(r"\s*[›>]\s*")
+
+
+def _shell_single_arg(value: str) -> str:
+    """Quote ``value`` as one shell argument for the running platform.
+
+    The test commands run through ``create_subprocess_shell``: cmd.exe on
+    Windows, /bin/sh elsewhere. cmd.exe ignores POSIX single quotes and does
+    not treat ``\`` as an escape, so a shlex-quoted pattern would arrive at
+    Playwright split on its spaces; double quotes are the form both cmd.exe
+    and the MSVCRT argv parser hand over intact.
+    """
+
+    if os.name == "nt":
+        if re.search(r'[\s"&|<>^()]', value):
+            return '"' + value.replace('"', '\\"') + '"'
+        return value
+    return shlex.quote(value)
+
+
+def _build_case_grep_pattern(failed_case_names: list[str] | None) -> str:
+    """Build the Playwright ``--grep`` regex for a retry round's failed cases.
+
+    Returns "" when no usable name survives (the caller then runs the full
+    layer). Each name contributes its leaf segment, regex-escaped; segments
+    are joined as an alternation.
+    """
+
+    leaves: list[str] = []
+    for raw_name in failed_case_names or []:
+        leaf = _FAILED_CASE_TITLE_SEPARATOR.split(str(raw_name or "").strip())[-1].strip()
+        if leaf and leaf not in leaves:
+            leaves.append(leaf)
+    return "|".join(re.escape(leaf) for leaf in leaves)
+
+
 def _build_web_group_execution(
     test_type: str,
     file_paths: list[str],
     workspace_path: str,
     web_port: int | None = None,
+    failed_case_names: list[str] | None = None,
 ) -> dict[str, str]:
     normalized_type = (test_type or "").strip().lower()
     requested_files = [str(path or "").strip() for path in file_paths if str(path or "").strip()]
@@ -471,6 +515,9 @@ def _build_web_group_execution(
                 {"requested_file": file_path, "resolved_target": _normalize_backend_test_path(file_path)}
                 for file_path in safe_paths
             ],
+            # Empty when no failed-case names were supplied (first round and
+            # full revalidation rounds): the runner command then stays unfiltered.
+            "failed_case_grep": _build_case_grep_pattern(failed_case_names),
             "web_port": str(resolved_port),
             "base_url": get_web_base_url(resolved_port),
         }
@@ -516,6 +563,15 @@ def _prepend_group_execution_header(execution: dict[str, str], test_result: str)
         lines.append(f"Working Directory: {execution['working_directory']}")
         lines.append("Resolved Targets:")
         lines.extend(f"- {file_path}" for file_path in execution.get("resolved_targets", []))
+        case_grep = execution.get("failed_case_grep", "")
+        if case_grep:
+            # Runner-side fact for the agent; the agent-facing directive to
+            # re-run the full layer lives in core/phases' ARC_RETRY_FILTER_NOTE.
+            lines.append(
+                "Failed Case Filter: this retry round re-ran only the previously "
+                f"failing case(s) (--grep {case_grep}); cases that passed in earlier "
+                "rounds were not re-verified here."
+            )
 
     return f"{chr(10).join(lines)}\n\n{test_result}"
 
@@ -1715,7 +1771,13 @@ class WebAppType(AppTypeHandler):
         if note:
             await self._log("System", f"Session-scoped E2E backend runtime shut down. {note}")
 
-    async def run_test_group(self, test_type: str, file_paths: list[str], web_port: int | None = None) -> TestRunResult:
+    async def run_test_group(
+        self,
+        test_type: str,
+        file_paths: list[str],
+        web_port: int | None = None,
+        failed_case_names: list[str] | None = None,
+    ) -> TestRunResult:
         resolved_port = int(web_port) if web_port is not None else get_web_port()
         normalized_type = (test_type or "").strip().lower()
         if not file_paths:
@@ -1739,7 +1801,13 @@ class WebAppType(AppTypeHandler):
             return TestRunResult(exit_code=1, output="\n".join(error_lines) + "\n")
 
         try:
-            execution = _build_web_group_execution(test_type, file_paths, self.workspace_path, web_port=resolved_port)
+            execution = _build_web_group_execution(
+                test_type,
+                file_paths,
+                self.workspace_path,
+                web_port=resolved_port,
+                failed_case_names=failed_case_names,
+            )
         except ValueError as exc:
             return TestRunResult(exit_code=1, output=str(exc))
 
@@ -2002,6 +2070,12 @@ class WebAppType(AppTypeHandler):
         playwright_command = "npx playwright test"
         if execution.get("resolved_targets"):
             playwright_command += " " + " ".join(execution["resolved_targets"])
+        # Retry rounds run only the previous round's failed cases; the SPA
+        # static-host recovery re-runs the same command on purpose, so the
+        # filter rides on the execution dict and survives that second attempt.
+        case_grep = execution.get("failed_case_grep", "")
+        if case_grep:
+            playwright_command += " --grep " + _shell_single_arg(case_grep)
         playwright_result = await stage_timer.measure(
             "playwright",
             _execute_web_test_command(

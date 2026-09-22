@@ -27,6 +27,10 @@ python arc_main.py usage --project-dir path/to/output --json   # 机读 JSON
 
 agent 的每次工具往返（含被 stage discipline 拦截的调用）同样写入 `runner-events.jsonl`（`tool_usage` 事件：`tool` / `status`（`ok`、`error`、`blocked`）/ `detail`（文件路径、`read_file` 的 `offset`/`limit`、结果字符数与是否为空））。`usage` 命令聚合出每节点 / 每工具的往返次数，以及两个浪费信号：`unpaged_reads`（未带 `limit` 的整文件读取）和 `empty_results`（成功但返回为空，即无效 grep/读取），用于定位"全量读大文件""无效搜索"这类可修复的往返浪费。
 
+### `layer_reverify` 事件与 TDD 迟到修复复验
+
+某个测试层预算耗尽仍未通过、但判决时存在已全绿的后续层时（迟到落地的修复可能已让它变绿），TDD 阶段在判负前会系统自行复验一次：agent 会话结束后在预算计数之外重跑该层 manifest 内的全部测试文件，通过则该层按通过关闭，失败则照旧判负；存在未解决的环境失败时不触发。每次复验写入两条 `layer_reverify` 事件：`status` 取 `triggered`（触发留痕）与 `passed` / `failed`（结果留痕），字段含 `node_id` / `layer`（节点与层类型）、`files`（复验执行的 manifest 文件清单）、`used`（触发时该层已消耗的 `run_tests` 预算）和 `message`（`failed` 时的复验失败输出摘要，其余为 `null`）。`usage` 命令不聚合该事件；它会出现在评测报告 `events` 诊断的按类型事件计数中，用于解释"预算耗尽层最终按通过"的判定来源。
+
 ### 成本单价目录
 
 内置单价取自基准评测模型目录（DeepSeek / Z.AI / Moonshot / MiniMax / Qwen，CNY 每百万 token，2026-09，见 `agents/model/costing.py`）。目录是封闭集合：模型名匹配不区分大小写（`MiniMax-M3` 与 `minimax-m3` 同价），表外模型一律不计成本（报表中显示为 unpriced），目录调整时直接更新 `costing.py` 中的 `_BUILTIN_MODEL_COSTS` 表。
