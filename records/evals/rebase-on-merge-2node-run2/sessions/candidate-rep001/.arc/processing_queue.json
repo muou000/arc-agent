@@ -1,0 +1,120 @@
+{
+  "root_id": "ROOT",
+  "tasks": [
+    {
+      "task_id": "ROOT:DESIGN",
+      "node_id": "ROOT",
+      "phase": "DESIGN",
+      "order": 0,
+      "status": "COMPLETED"
+    },
+    {
+      "task_id": "REQ-A:DESIGN",
+      "node_id": "REQ-A",
+      "phase": "DESIGN",
+      "order": 1,
+      "status": "COMPLETED"
+    },
+    {
+      "task_id": "REQ-A.1:DESIGN",
+      "node_id": "REQ-A.1",
+      "phase": "DESIGN",
+      "order": 2,
+      "status": "COMPLETED"
+    },
+    {
+      "task_id": "REQ-A.1:IMPLEMENT",
+      "node_id": "REQ-A.1",
+      "phase": "IMPLEMENT",
+      "order": 3,
+      "status": "COMPLETED"
+    },
+    {
+      "task_id": "REQ-A:IMPLEMENT",
+      "node_id": "REQ-A",
+      "phase": "IMPLEMENT",
+      "order": 4,
+      "status": "COMPLETED"
+    },
+    {
+      "task_id": "REQ-B:DESIGN",
+      "node_id": "REQ-B",
+      "phase": "DESIGN",
+      "order": 5,
+      "status": "COMPLETED"
+    },
+    {
+      "task_id": "REQ-B.1:DESIGN",
+      "node_id": "REQ-B.1",
+      "phase": "DESIGN",
+      "order": 6,
+      "status": "FAILED"
+    },
+    {
+      "task_id": "REQ-B.1:IMPLEMENT",
+      "node_id": "REQ-B.1",
+      "phase": "IMPLEMENT",
+      "order": 7,
+      "status": "FAILED"
+    },
+    {
+      "task_id": "REQ-B:IMPLEMENT",
+      "node_id": "REQ-B",
+      "phase": "IMPLEMENT",
+      "order": 8,
+      "status": "BLOCKED"
+    },
+    {
+      "task_id": "ROOT:IMPLEMENT",
+      "node_id": "ROOT",
+      "phase": "IMPLEMENT",
+      "order": 9,
+      "status": "BLOCKED"
+    }
+  ],
+  "node_states": {
+    "ROOT": "BLOCKED_BY_DEPENDENCY",
+    "REQ-A": "CONVERGED",
+    "REQ-A.1": "PASSED",
+    "REQ-B": "BLOCKED_BY_DEPENDENCY",
+    "REQ-B.1": "FAILED"
+  },
+  "node_design_done": {
+    "ROOT": true,
+    "REQ-A": true,
+    "REQ-A.1": true,
+    "REQ-B": true,
+    "REQ-B.1": false
+  },
+  "descendants": {
+    "ROOT": [
+      "REQ-A",
+      "REQ-A.1",
+      "REQ-B",
+      "REQ-B.1"
+    ],
+    "REQ-A": [
+      "REQ-A.1"
+    ],
+    "REQ-B": [
+      "REQ-B.1"
+    ]
+  },
+  "parents": {
+    "REQ-A": "ROOT",
+    "REQ-A.1": "REQ-A",
+    "REQ-B": "ROOT",
+    "REQ-B.1": "REQ-B"
+  },
+  "affinity": {
+    "ROOT": "ROOT",
+    "REQ-A": "REQ-A",
+    "REQ-A.1": "REQ-A.1",
+    "REQ-B": "REQ-B",
+    "REQ-B.1": "REQ-B.1"
+  },
+  "dependencies": {},
+  "dropped_dependency_edges": [],
+  "last_task_id": "REQ-A:IMPLEMENT",
+  "recovered_interrupted_tasks": []
+}

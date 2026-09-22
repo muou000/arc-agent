@@ -1,0 +1,134 @@
+{
+  "REQ-A": {
+    "req_id": "REQ-A",
+    "id": "REQ-A",
+    "name": "Feature A",
+    "description": "Feature A subtree. Adds a notes area backed by a notes table and a GET API.",
+    "visual_reference": [],
+    "scenarios": [],
+    "parent_id": "ROOT",
+    "children_ids": [
+      "REQ-A.1"
+    ],
+    "dependencies": []
+  },
+  "REQ-A.1": {
+    "req_id": "REQ-A.1",
+    "id": "REQ-A.1",
+    "name": "Notes List",
+    "description": "Display a notes area on the home page with the heading \"Notes\" listing notes from the database via a GET /api/notes endpoint. Each note row shows its title. An empty state says \"No notes yet.\" when the table has no rows.",
+    "visual_reference": [],
+    "scenarios": [
+      {
+        "name": "Notes list displays database notes",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "The notes table contains notes with titles."
+          },
+          {
+            "keyword": "WHEN",
+            "content": "View the home page."
+          },
+          {
+            "keyword": "THEN",
+            "content": "A section with heading Notes lists the note titles."
+          }
+        ]
+      },
+      {
+        "name": "Notes empty state",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "The notes table is empty."
+          },
+          {
+            "keyword": "WHEN",
+            "content": "View the home page."
+          },
+          {
+            "keyword": "THEN",
+            "content": "The notes area shows No notes yet."
+          }
+        ]
+      }
+    ],
+    "parent_id": "REQ-A",
+    "children_ids": [],
+    "dependencies": []
+  },
+  "REQ-B": {
+    "req_id": "REQ-B",
+    "id": "REQ-B",
+    "name": "Feature B",
+    "description": "Feature B subtree. Adds a tasks area backed by a tasks table and a GET API.",
+    "visual_reference": [],
+    "scenarios": [],
+    "parent_id": "ROOT",
+    "children_ids": [
+      "REQ-B.1"
+    ],
+    "dependencies": []
+  },
+  "REQ-B.1": {
+    "req_id": "REQ-B.1",
+    "id": "REQ-B.1",
+    "name": "Tasks List",
+    "description": "Display a tasks area on the home page with the heading \"Tasks\" listing tasks from the database via a GET /api/tasks endpoint. Each task row shows its title. An empty state says \"No tasks yet.\" when the table has no rows.",
+    "visual_reference": [],
+    "scenarios": [
+      {
+        "name": "Tasks list displays database tasks",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "The tasks table contains tasks with titles."
+          },
+          {
+            "keyword": "WHEN",
+            "content": "View the home page."
+          },
+          {
+            "keyword": "THEN",
+            "content": "A section with heading Tasks lists the task titles."
+          }
+        ]
+      },
+      {
+        "name": "Tasks empty state",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "The tasks table is empty."
+          },
+          {
+            "keyword": "WHEN",
+            "content": "View the home page."
+          },
+          {
+            "keyword": "THEN",
+            "content": "The tasks area shows No tasks yet."
+          }
+        ]
+      }
+    ],
+    "parent_id": "REQ-B",
+    "children_ids": [],
+    "dependencies": []
+  },
+  "ROOT": {
+    "req_id": "ROOT",
+    "id": "ROOT",
+    "name": "RebaseBench2",
+    "description": "Two-feature mini benchmark. The product is a small web workspace; both features add a DB-backed list section to the home page and extend the same shared surfaces (home page composition, backend route registration, schema init).",
+    "visual_reference": [],
+    "scenarios": [],
+    "parent_id": null,
+    "children_ids": [
+      "REQ-A",
+      "REQ-B"
+    ],
+    "dependencies": []
+  }
+}

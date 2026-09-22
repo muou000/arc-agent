@@ -1,0 +1,23 @@
+{
+  "node_id": "ROOT",
+  "phase_status": {
+    "design": "skipped",
+    "test": "skipped",
+    "implement": "pending"
+  },
+  "requirement_snapshot": {
+    "name": "RebaseBench2",
+    "description": "Two-feature mini benchmark. The product is a small web workspace with a shared app entry file both features extend.",
+    "visual_reference": [],
+    "children_ids": [
+      "REQ-A",
+      "REQ-B"
+    ],
+    "dependencies": []
+  },
+  "recent_failure_summary": "",
+  "interfaces": [],
+  "materialized_files": [],
+  "test_artifacts": [],
+  "resume_context": {}
+}

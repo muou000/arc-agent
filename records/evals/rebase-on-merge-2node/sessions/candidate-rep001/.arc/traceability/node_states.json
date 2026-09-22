@@ -1,0 +1,32 @@
+{
+  "REQ-A": {
+    "req_id": "REQ-A",
+    "state": "BLOCKED_BY_DEPENDENCY",
+    "phase": null,
+    "updated_at": "2026-09-22 02:50:36"
+  },
+  "REQ-A.1": {
+    "req_id": "REQ-A.1",
+    "state": "FAILED",
+    "phase": "design",
+    "updated_at": "2026-09-22 02:50:36"
+  },
+  "REQ-B": {
+    "req_id": "REQ-B",
+    "state": "BLOCKED_BY_DEPENDENCY",
+    "phase": null,
+    "updated_at": "2026-09-22 02:50:36"
+  },
+  "REQ-B.1": {
+    "req_id": "REQ-B.1",
+    "state": "FAILED",
+    "phase": "design",
+    "updated_at": "2026-09-22 02:50:36"
+  },
+  "ROOT": {
+    "req_id": "ROOT",
+    "state": "BLOCKED_BY_DEPENDENCY",
+    "phase": null,
+    "updated_at": "2026-09-22 02:50:36"
+  }
+}

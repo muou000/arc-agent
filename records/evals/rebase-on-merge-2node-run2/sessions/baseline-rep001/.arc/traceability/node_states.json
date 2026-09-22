@@ -1,0 +1,32 @@
+{
+  "REQ-A": {
+    "req_id": "REQ-A",
+    "state": "PASSED",
+    "phase": "test",
+    "updated_at": "2026-09-22 03:37:44"
+  },
+  "REQ-A.1": {
+    "req_id": "REQ-A.1",
+    "state": "PASSED",
+    "phase": "test",
+    "updated_at": "2026-09-22 03:37:43"
+  },
+  "REQ-B": {
+    "req_id": "REQ-B",
+    "state": "PASSED",
+    "phase": "test",
+    "updated_at": "2026-09-22 03:44:01"
+  },
+  "REQ-B.1": {
+    "req_id": "REQ-B.1",
+    "state": "PASSED",
+    "phase": "test",
+    "updated_at": "2026-09-22 03:44:00"
+  },
+  "ROOT": {
+    "req_id": "ROOT",
+    "state": "PASSED",
+    "phase": "test",
+    "updated_at": "2026-09-22 03:44:02"
+  }
+}

@@ -387,8 +387,8 @@ def test_keep_req2_faux_compile_end_to_end(
     # scripted handler at that seam (the serial-mode shared runner too).
     original_builder = ARCWorkflowManager._build_task_phase_runner
 
-    def build_with_faux(self, workspace_path: str, web_port: int | None):
-        runner = original_builder(self, workspace_path, web_port)
+    def build_with_faux(self, workspace_path: str, web_port: int | None, **kwargs):
+        runner = original_builder(self, workspace_path, web_port, **kwargs)
         runner.interface_designer.model = model
         runner.test_generator.model = model
         runner.test_driven_developer.model = model
@@ -537,8 +537,8 @@ def test_keep_req2_pipeline_mode_starts_dependent_design_before_dependency_imple
 
     original_builder = ARCWorkflowManager._build_task_phase_runner
 
-    def build_with_faux(self, workspace_path: str, web_port: int | None):
-        runner = original_builder(self, workspace_path, web_port)
+    def build_with_faux(self, workspace_path: str, web_port: int | None, **kwargs):
+        runner = original_builder(self, workspace_path, web_port, **kwargs)
         runner.interface_designer.model = model
         runner.test_generator.model = model
         runner.test_driven_developer.model = model

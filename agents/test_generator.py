@@ -15,6 +15,7 @@ from agents.results import normalize_test_manifest_payload
 from agents.runtime.capabilities import normalize_manifest_path
 from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
+from agents.runtime.rebase_gate import cached_rebase_gate
 from agents.skills.selection import SKILLS_SOURCE, test_generation_skills
 from agents.tools.test_manifest import (
     DeclaredTestFile,
@@ -64,6 +65,7 @@ class TestGenerator:
         requirement_path: str | None = None,
         app_type: str | None = None,
         context_workspace_root: str | None = None,
+        rebase_gate_provider: Callable[[], Any | None] | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
@@ -73,6 +75,12 @@ class TestGenerator:
         # Context/session root: stays on the main workspace when the agent's
         # filesystem root is an isolated per-node worktree.
         self.context_workspace_root = context_workspace_root
+        # Optional per-pass mid-phase replay gate (issue #127), shared by
+        # every agent build of this adapter's passes.
+        self._rebase_gate_provider = rebase_gate_provider
+
+    def _rebase_gate(self) -> Any | None:
+        return cached_rebase_gate(self)
 
     async def run(
         self,
@@ -105,6 +113,7 @@ class TestGenerator:
                 [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=TestGenerationResponse,
+            rebase_gate=self._rebase_gate(),
             tools=[
                 *build_traceability_tools(
                     node_id=node_id,
@@ -349,6 +358,7 @@ class TestGenerator:
             stage="test_generation",
             system_prompt=get_system_prompt(),
             response_format=TestGenerationResponse,
+            rebase_gate=self._rebase_gate(),
             tools=[
                 *build_traceability_tools(
                     node_id=node_id,

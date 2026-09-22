@@ -1,0 +1,318 @@
+{
+  "node_id": "REQ-A.1",
+  "phase_status": {
+    "design": "completed",
+    "test": "completed",
+    "implement": "completed"
+  },
+  "requirement_snapshot": {
+    "name": "Notes List",
+    "description": "Display a notes area on the home page with the heading \"Notes\" listing notes from the database via a GET /api/notes endpoint. Each note row shows its title. An empty state says \"No notes yet.\" when the table has no rows.",
+    "visual_reference": [],
+    "children_ids": [],
+    "dependencies": []
+  },
+  "recent_failure_summary": "",
+  "interfaces": [
+    {
+      "interface_id": "REQ-A.1-FUNC-App",
+      "req_id": "REQ-A.1",
+      "type": "FUNC",
+      "name": "App",
+      "file_path": "backend/src/app.js",
+      "first_line": "const express = require('express');",
+      "responsibility": "Extends the Express app entry additively: imports notesRouter and mounts it at /api/notes without touching health route or SPA fallback.",
+      "specification": "app.use('/api/notes', notesRouter) registered before /api/health; existing routes and static/SPA serving preserved.",
+      "callers": [
+        "backend/src/index.js"
+      ],
+      "callees": [
+        "REQ-A.1-API-Notes"
+      ],
+      "inputs": [
+        "notesRouter (express.Router)"
+      ],
+      "outputs": [
+        "Express app with GET /api/notes available"
+      ],
+      "test_focus": "Supertest GET /api/notes returns 200 with notes payload through app instance",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-DB-NotesTable",
+      "req_id": "REQ-A.1",
+      "type": "DB",
+      "name": "NotesTable",
+      "file_path": "backend/src/database/init_db.js",
+      "first_line": "CREATE TABLE notes",
+      "responsibility": "Adds idempotent CREATE TABLE IF NOT EXISTS notes (id, title, created_at) inside initializeDatabase so the schema exists at every startup/reset.",
+      "specification": "notes table: id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT datetime('now'); created idempotently in startInit.",
+      "callers": [
+        "backend/src/database/init_db.js"
+      ],
+      "callees": [],
+      "inputs": [
+        "database handle"
+      ],
+      "outputs": [
+        "notes table present in schema"
+      ],
+      "test_focus": "Harness DB contains notes table with required columns; empty table drives 'No notes yet.'",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-FUNC-SeedDb",
+      "req_id": "REQ-A.1",
+      "type": "FUNC",
+      "name": "SeedDb",
+      "file_path": "backend/src/database/seed_db.js",
+      "first_line": "const { closeDb } = require('./init_db');",
+      "responsibility": "Seeds deterministic idempotent notes rows via INSERT OR IGNORE (ids 1-3) inside the existing seed transaction so the list scenario has DB data after startup.",
+      "specification": "INSERT OR IGNORE INTO notes (id, title) VALUES (1,'Welcome to Notes'),(2,'Buy groceries'),(3,'Call the dentist'); repeated seeding is safe and non-duplicating.",
+      "callers": [
+        "backend/src/database/test_harness.js",
+        "npm run db:seed"
+      ],
+      "callees": [],
+      "inputs": [
+        "transaction run helper"
+      ],
+      "outputs": [
+        "three persisted note rows with fixed ids/titles"
+      ],
+      "test_focus": "After seedDefault, GET /api/notes returns exactly these titles; re-seed keeps row count stable",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-API-Notes",
+      "req_id": "REQ-A.1",
+      "type": "API",
+      "name": "Notes",
+      "file_path": "backend/src/routes/notes.js",
+      "first_line": "const express = require('express');",
+      "responsibility": "Owns GET /api/notes handler: returns {code:200,message:'OK',data:Note[]} from the service, 500 {code:'INTERNAL_ERROR'} on failure.",
+      "specification": "GET /api/notes -> 200 {code, message, data: [{id,title,createdAt},...]}; empty table yields data: []; failure -> 500 {code:'INTERNAL_ERROR', message:'Failed to load notes'}.",
+      "callers": [
+        "REQ-A.1-FUNC-App",
+        "frontend fetchNotes"
+      ],
+      "callees": [
+        "REQ-A.1-FUNC-NotesService"
+      ],
+      "inputs": [
+        "HTTP GET request"
+      ],
+      "outputs": [
+        "JSON notes payload or 500 error"
+      ],
+      "test_focus": "Supertest: seeded DB returns titles; empty DB returns []; error path returns 500 with INTERNAL_ERROR",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-FUNC-NotesService",
+      "req_id": "REQ-A.1",
+      "type": "FUNC",
+      "name": "NotesService",
+      "file_path": "backend/src/services/notes/notesService.js",
+      "first_line": "const { all } = require('../../database/db_runtime');",
+      "responsibility": "Owns notes persistence queries: listNotes selects all notes ordered by id with created_at aliased as createdAt via the shared db_runtime.",
+      "specification": "listNotes() -> Promise<Array<{id:number,title:string,createdAt:string}>> ordered by id ASC using SELECT id, title, created_at AS createdAt FROM notes.",
+      "callers": [
+        "REQ-A.1-API-Notes"
+      ],
+      "callees": [
+        "backend/src/database/db_runtime.js all"
+      ],
+      "inputs": {},
+      "outputs": [
+        "ordered note rows from the notes table"
+      ],
+      "test_focus": "Unit test against harness DB: returns rows in insertion order; empty table returns []",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-FUNC-Notes",
+      "req_id": "REQ-A.1",
+      "type": "FUNC",
+      "name": "Notes",
+      "file_path": "frontend/src/api/notes.ts",
+      "first_line": "import apiClient from './index';",
+      "responsibility": "Owns the frontend API boundary for notes: exports Note type and fetchNotes() calling GET /api/notes through the shared axios client.",
+      "specification": "fetchNotes(): Promise<Note[]> issues apiClient.get('/notes') and returns response.data.data; Note = {id:number,title:string,createdAt:string}.",
+      "callers": [
+        "REQ-A.1-UI-NOTES-LOAD-ERROR (useNotes)"
+      ],
+      "callees": [
+        "frontend/src/api/index.ts apiClient"
+      ],
+      "inputs": {},
+      "outputs": [
+        "Promise resolving to Note[] from the API"
+      ],
+      "test_focus": "Mocked apiClient returns {code:200,data:[...]}; fetchNotes maps to Note[] and rejects on error",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-UI-NotesPanel",
+      "req_id": "REQ-A.1",
+      "type": "UI",
+      "name": "NotesPanel",
+      "file_path": "frontend/src/features/notes/NotesPanel.tsx",
+      "first_line": "import { useNotes } from './useNotes';",
+      "responsibility": "Owns the visible notes area: heading 'Notes', one row per note title, and the 'No notes yet.' empty state with loading/error states.",
+      "specification": "section with heading 'Notes' (exact literal); empty list renders 'No notes yet.'; renders each note.title as a list row; loading shows 'Loading notes...'; error shows alert message.",
+      "callers": [
+        "REQ-A.1-UI-HomePage"
+      ],
+      "callees": [
+        "REQ-A.1-UI-NOTES-LOAD-ERROR"
+      ],
+      "inputs": [
+        "useNotes() state"
+      ],
+      "outputs": [
+        "notes area DOM per data state"
+      ],
+      "test_focus": "getByRole('heading',{name:'Notes'}); notes titles visible; 'No notes yet.' shown for empty data; error/loading states rendered",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-UI-NOTES-LOAD-ERROR",
+      "req_id": "REQ-A.1",
+      "type": "UI",
+      "name": "NOTES_LOAD_ERROR",
+      "file_path": "frontend/src/features/notes/useNotes.ts",
+      "first_line": "import { useCallback, useEffect, useState } from 'react';",
+      "responsibility": "Owns notes load state: fetches on mount via fetchNotes, exposing notes, loading, error, reload with the stable NOTES_LOAD_ERROR message.",
+      "specification": "useNotes(): {notes:Note[], loading:boolean, error:string|null, reload:()=>void}; loads on mount; on failure error = \"Couldn't load notes.\" (exported NOTES_LOAD_ERROR).",
+      "callers": [
+        "REQ-A.1-UI-NotesPanel"
+      ],
+      "callees": [
+        "REQ-A.1-FUNC-Notes"
+      ],
+      "inputs": {},
+      "outputs": [
+        "data/loading/error state and reload trigger"
+      ],
+      "test_focus": "Render-hook test: resolves notes on success; sets NOTES_LOAD_ERROR on rejection; reload refetches",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-UI-HomePage",
+      "req_id": "REQ-A.1",
+      "type": "UI",
+      "name": "HomePage",
+      "file_path": "frontend/src/pages/HomePage.tsx",
+      "first_line": "import NotesPanel from '../features/notes/NotesPanel';",
+      "responsibility": "Mounts NotesPanel inside the existing home page container so the notes area renders on '/' without restructuring the page shell.",
+      "specification": "HomePage renders <NotesPanel /> inside the max-w-7xl page container; existing shell classes preserved.",
+      "callers": [
+        "frontend/src/App.tsx route /"
+      ],
+      "callees": [
+        "REQ-A.1-UI-NotesPanel"
+      ],
+      "inputs": {},
+      "outputs": [
+        "home page with notes area"
+      ],
+      "test_focus": "Rendering HomePage shows NotesPanel; '/'-level UI test sees the notes section",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    }
+  ],
+  "materialized_files": [],
+  "test_contract_hooks": [],
+  "test_artifacts": [
+    {
+      "test_id": "REQ-A.1-api-notes-integration",
+      "req_id": "REQ-A.1",
+      "interface_ids": [
+        "REQ-A.1-API-Notes",
+        "REQ-A.1-FUNC-App",
+        "REQ-A.1-FUNC-SeedDb",
+        "REQ-A.1-DB-NotesTable"
+      ],
+      "coverage_scope": "owned",
+      "type": "Integration",
+      "file_path": "backend/tests/notes_api.test.js",
+      "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';"
+    },
+    {
+      "test_id": "REQ-A.1-notes-panel-unit",
+      "req_id": "REQ-A.1",
+      "interface_ids": [
+        "REQ-A.1-UI-NotesPanel",
+        "REQ-A.1-UI-HomePage"
+      ],
+      "coverage_scope": "owned",
+      "type": "Unit",
+      "file_path": "frontend/tests/features/NotesPanel.test.tsx",
+      "first_line": "import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';"
+    },
+    {
+      "test_id": "REQ-A.1-notes-e2e",
+      "req_id": "REQ-A.1",
+      "interface_ids": [
+        "REQ-A.1-UI-NotesPanel",
+        "REQ-A.1-API-Notes"
+      ],
+      "coverage_scope": "owned",
+      "type": "E2E",
+      "file_path": "backend/test-e2e/notes.e2e.spec.js",
+      "first_line": "const { test, expect } = require('@playwright/test');"
+    }
+  ],
+  "design_baseline": {
+    "frontend/tests/features/NotesPanel.test.tsx": "red",
+    "backend/tests/notes_api.test.js": "red",
+    "backend/test-e2e/notes.e2e.spec.js": "red"
+  },
+  "resume_context": {},
+  "tdd_handoff": {
+    "last_test_type": "E2E",
+    "last_failed_output_summary": "",
+    "modified_files": [
+      "backend/src/services/notes/notesService.js",
+      "backend/test-e2e/notes.e2e.spec.js",
+      "backend/tests/notes_api.test.js",
+      "frontend/src/features/notes/NotesPanel.tsx"
+    ],
+    "layer_usage": {
+      "Unit": 2,
+      "Integration": 3,
+      "E2E": 3
+    },
+    "fingerprint_history": {
+      "Unit": [
+        "1|❯ tests/features/NotesPanel.test.tsx (4 tests | 1 failed) <dur>"
+      ],
+      "Integration": [
+        "1|❯ tests/notes_api.test.js (4 tests | 1 failed) <dur>",
+        "1|❯ tests/notes_api.test.js (4 tests | 1 failed) <dur>"
+      ],
+      "E2E": [
+        "1|Error: expect(locator).toHaveCount(expected) failed"
+      ]
+    }
+  },
+  "merge_arbitration_used": true
+}

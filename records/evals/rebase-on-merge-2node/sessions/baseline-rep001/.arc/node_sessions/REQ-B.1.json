@@ -1,0 +1,62 @@
+{
+  "node_id": "REQ-B.1",
+  "phase_status": {
+    "design": "prepared",
+    "test": "pending",
+    "implement": "pending"
+  },
+  "requirement_snapshot": {
+    "name": "Tasks Area",
+    "description": "Display a tasks area section on the home page with a heading \"Tasks\".",
+    "visual_reference": [],
+    "children_ids": [],
+    "dependencies": []
+  },
+  "recent_failure_summary": "",
+  "interfaces": [
+    {
+      "interface_id": "REQ-B.1-UI-TasksSection",
+      "req_id": "REQ-B.1",
+      "type": "UI",
+      "name": "TasksSection",
+      "file_path": "frontend/src/features/tasks/TasksSection.tsx",
+      "first_line": "function TasksSection() {",
+      "responsibility": "Renders the Tasks area section on the home page with the visible heading \"Tasks\" and an explicit empty state.",
+      "specification": "Renders a <section aria-labelledby=\"tasks-heading\"> containing an <h2 id=\"tasks-heading\"> with exact text \"Tasks\"; no task data is owned, so it shows an empty-state note.",
+      "callers": [
+        "HomePage"
+      ],
+      "callees": [],
+      "inputs": "none",
+      "outputs": "section element with heading Tasks and empty-state text",
+      "test_focus": "getByRole('heading', { name: 'Tasks' }) and section labelled by it are present; renders empty state without fabricated rows",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-UI-HomePage",
+      "req_id": "REQ-B.1",
+      "type": "UI",
+      "name": "HomePage",
+      "file_path": "frontend/src/pages/HomePage.tsx",
+      "first_line": "import TasksSection from '../features/tasks/TasksSection';",
+      "responsibility": "Home page entry surface, additively extended to mount TasksSection inside its content container.",
+      "specification": "Imports and mounts TasksSection inside the main content wrapper; App.tsx route registration for HomePage is untouched.",
+      "callers": [
+        "App.tsx route /"
+      ],
+      "callees": [
+        "TasksSection"
+      ],
+      "inputs": "none",
+      "outputs": "main element containing the Tasks section",
+      "test_focus": "Rendering HomePage shows the Tasks heading; existing home page mount point remains intact",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    }
+  ],
+  "materialized_files": [],
+  "test_contract_hooks": []
+}

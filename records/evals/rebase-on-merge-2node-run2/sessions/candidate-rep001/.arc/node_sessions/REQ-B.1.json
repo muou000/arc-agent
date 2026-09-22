@@ -1,0 +1,300 @@
+{
+  "node_id": "REQ-B.1",
+  "phase_status": {
+    "design": "completed",
+    "test": "completed",
+    "implement": "pending"
+  },
+  "requirement_snapshot": {
+    "name": "Tasks List",
+    "description": "Display a tasks area on the home page with the heading \"Tasks\" listing tasks from the database via a GET /api/tasks endpoint. Each task row shows its title. An empty state says \"No tasks yet.\" when the table has no rows.",
+    "visual_reference": [],
+    "children_ids": [],
+    "dependencies": []
+  },
+  "recent_failure_summary": "",
+  "interfaces": [
+    {
+      "interface_id": "REQ-B.1-FUNC-App",
+      "req_id": "REQ-B.1",
+      "type": "FUNC",
+      "name": "App",
+      "file_path": "backend/src/app.js",
+      "first_line": "const express = require('express');",
+      "responsibility": "Express app entry that wires route modules and serves the built frontend; additively mounts the tasks router under /api.",
+      "specification": "Registers tasksRouter with app.use('/api', tasksRouter); preserves /api/health, static hosting of frontend/dist, and SPA fallback; exports app for index.js and supertest.",
+      "callers": [
+        "backend/src/index.js",
+        "backend tests"
+      ],
+      "callees": [
+        "REQ-B.1-API-Tasks",
+        "backend/src/database/init_db.js"
+      ],
+      "inputs": "HTTP requests",
+      "outputs": "Express app handling routes",
+      "test_focus": "App boots; GET /api/tasks responds 200 with {tasks:[...]}",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-DB-TasksTable",
+      "req_id": "REQ-B.1",
+      "type": "DB",
+      "name": "TasksTable",
+      "file_path": "backend/src/database/init_db.js",
+      "first_line": "CREATE TABLE tasks",
+      "responsibility": "Idempotent creation of the tasks table during database initialization so the repository has a durable source of rows.",
+      "specification": "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))); runs inside startInit() on every initializeDatabase().",
+      "callers": [
+        "REQ-B.1-FUNC-App",
+        "backend/src/database/seed_db.js"
+      ],
+      "callees": [],
+      "inputs": "initializeDatabase() startup",
+      "outputs": "tasks table exists",
+      "test_focus": "After initializeDatabase, tasks table exists; fresh DB has zero rows until seeded",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-FUNC-SeedDb",
+      "req_id": "REQ-B.1",
+      "type": "FUNC",
+      "name": "SeedDb",
+      "file_path": "backend/src/database/seed_db.js",
+      "first_line": "const { closeDb } = require('./init_db');",
+      "responsibility": "Deterministic idempotent seed of three task rows so the home page list has real database data after startup.",
+      "specification": "seedDatabase() runs INSERT OR IGNORE INTO tasks (id, title) VALUES (1,'First task'),(2,'Second task'),(3,'Third task') inside withTransaction; repeat-safe.",
+      "callers": [
+        "backend/src/database/prepare_e2e.js",
+        "test_harness seedDefault",
+        "npm run db:seed"
+      ],
+      "callees": [
+        "REQ-B.1-DB-TasksTable",
+        "db_runtime withTransaction"
+      ],
+      "inputs": "none",
+      "outputs": "3 seeded tasks",
+      "test_focus": "Seeding twice does not duplicate rows; seeded titles reachable via repository",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-FUNC-TasksRepository",
+      "req_id": "REQ-B.1",
+      "type": "FUNC",
+      "name": "TasksRepository",
+      "file_path": "backend/src/repositories/tasksRepository.js",
+      "first_line": "const { all } = require('../database/db_runtime');",
+      "responsibility": "Repository query that reads all task rows from the database in stable order for the tasks route.",
+      "specification": "listTasks(): SELECT id, title FROM tasks ORDER BY id ASC via db_runtime.all; returns [{id:number,title:string}] preserving DB order.",
+      "callers": [
+        "REQ-B.1-API-Tasks"
+      ],
+      "callees": [
+        "backend/src/database/db_runtime.js"
+      ],
+      "inputs": "none",
+      "outputs": "Promise<Array<{id:number,title:string}>>",
+      "test_focus": "Returns seeded titles ordered by id; empty table yields []",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-API-Tasks",
+      "req_id": "REQ-B.1",
+      "type": "API",
+      "name": "Tasks",
+      "file_path": "backend/src/routes/tasks.js",
+      "first_line": "const express = require('express');",
+      "responsibility": "Express router exposing GET /api/tasks that returns the task list from the repository as JSON.",
+      "specification": "GET /api/tasks -> 200 {tasks:[{id,title},...]}; errors delegated via next(error); mounted at /api by app.js.",
+      "callers": [
+        "REQ-B.1-FUNC-App"
+      ],
+      "callees": [
+        "REQ-B.1-FUNC-TasksRepository"
+      ],
+      "inputs": "GET /api/tasks",
+      "outputs": "200 {tasks: Array<{id:number,title:string}>} or 500",
+      "test_focus": "supertest GET /api/tasks returns seeded titles; empty DB returns {tasks:[]}",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-UI-TasksSection",
+      "req_id": "REQ-B.1",
+      "type": "UI",
+      "name": "TasksSection",
+      "file_path": "frontend/src/features/tasks/TasksSection.tsx",
+      "first_line": "import { useTasks } from './useTasks';",
+      "responsibility": "Renders the home-page tasks area: heading 'Tasks', one row per task title, and the 'No tasks yet.' empty state.",
+      "specification": "Section with h2 'Tasks'; success+empty renders 'No tasks yet.'; success renders <li> per task showing title; loading and error states rendered; aria-labelledby ties heading to section.",
+      "callers": [
+        "REQ-B.1-UI-HomePage"
+      ],
+      "callees": [
+        "REQ-B.1-UI-useTasks"
+      ],
+      "inputs": "useTasks state",
+      "outputs": "Tasks section JSX",
+      "test_focus": "Renders heading 'Tasks', task titles from response, and 'No tasks yet.' when tasks array is empty",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-FUNC-TasksApi",
+      "req_id": "REQ-B.1",
+      "type": "FUNC",
+      "name": "TasksApi",
+      "file_path": "frontend/src/features/tasks/tasksApi.ts",
+      "first_line": "import apiClient from '../../api';",
+      "responsibility": "Typed frontend API client function that fetches tasks from GET /api/tasks through the shared axios client.",
+      "specification": "fetchTasks(): apiClient.get<TasksResponse>('/tasks') -> response.data.tasks ?? []; exports Task {id,title} and TasksResponse types.",
+      "callers": [
+        "REQ-B.1-UI-useTasks"
+      ],
+      "callees": [
+        "frontend/src/api/index.ts (apiClient)"
+      ],
+      "inputs": "none",
+      "outputs": "Promise<Task[]>",
+      "test_focus": "Resolves response tasks; falls back to [] when tasks field missing",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-UI-useTasks",
+      "req_id": "REQ-B.1",
+      "type": "UI",
+      "name": "useTasks",
+      "file_path": "frontend/src/features/tasks/useTasks.ts",
+      "first_line": "import { useCallback, useEffect, useState } from 'react';",
+      "responsibility": "React hook loading tasks on mount and exposing loading/error/success state plus a reload trigger.",
+      "specification": "useTasks(): {state: {status:'loading'}|{status:'error',message}|{status:'success',tasks}, reload} fetching via fetchTasks on mount.",
+      "callers": [
+        "REQ-B.1-UI-TasksSection"
+      ],
+      "callees": [
+        "REQ-B.1-FUNC-TasksApi"
+      ],
+      "inputs": "none",
+      "outputs": "UseTasksResult",
+      "test_focus": "Sets success with fetched tasks; error state on rejection; reload re-fetches",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-UI-HomePage",
+      "req_id": "REQ-B.1",
+      "type": "UI",
+      "name": "HomePage",
+      "file_path": "frontend/src/pages/HomePage.tsx",
+      "first_line": "import TasksSection from '../features/tasks/TasksSection';",
+      "responsibility": "Home page route component that mounts the TasksSection inside the existing layout container.",
+      "specification": "Renders <TasksSection /> within main.min-h-screen > div.max-w-7xl at route /; unchanged shell behavior preserved.",
+      "callers": [
+        "frontend/src/App.tsx (route /)"
+      ],
+      "callees": [
+        "REQ-B.1-UI-TasksSection"
+      ],
+      "inputs": "none",
+      "outputs": "Home page JSX",
+      "test_focus": "Home page renders Tasks section heading and list/empty state through the real chain",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-B.1-FUNC-ApiClient",
+      "req_id": "REQ-B.1",
+      "type": "FUNC",
+      "name": "SharedApiClient",
+      "file_path": "frontend/src/api/index.ts",
+      "first_line": "import axios from 'axios';",
+      "relation": "reused shared integration surface",
+      "responsibility": "Shared axios instance with baseURL '/api' used by all feature API clients including tasks.",
+      "specification": "Exports default apiClient (axios.create({baseURL:'/api', timeout:5000, Content-Type json})) consumed by tasksApi fetchTasks.",
+      "inputs": "axios request config",
+      "outputs": "AxiosInstance",
+      "callers": [
+        "REQ-B.1-FUNC-TasksApi"
+      ],
+      "callees": [],
+      "test_focus": "Requests hit '/api/tasks' on the same origin as the backend-hosted app",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    }
+  ],
+  "materialized_files": [],
+  "test_contract_hooks": [
+    {
+      "kind": "role",
+      "value": "^Tasks$",
+      "file_path": "frontend/tests/tasks/TasksSection.test.tsx",
+      "source": "test_contract"
+    },
+    {
+      "kind": "role",
+      "value": "^Tasks$",
+      "file_path": "backend/test-e2e/tasks.e2e.spec.js",
+      "source": "test_contract"
+    }
+  ],
+  "test_artifacts": [
+    {
+      "test_id": "REQ-B.1-UNIT-SeedDb",
+      "req_id": "REQ-B.1",
+      "interface_ids": [
+        "REQ-B.1-FUNC-SeedDb",
+        "REQ-B.1-DB-TasksTable"
+      ],
+      "coverage_scope": "owned",
+      "type": "Unit",
+      "file_path": "backend/tests/seedDb.test.js",
+      "first_line": "import { describe, it, expect, beforeEach, afterEach } from 'vitest';"
+    },
+    {
+      "test_id": "REQ-B.1-INTEGRATION-TasksApi",
+      "req_id": "REQ-B.1",
+      "interface_ids": [
+        "REQ-B.1-API-Tasks",
+        "REQ-B.1-FUNC-App"
+      ],
+      "coverage_scope": "owned",
+      "type": "Integration",
+      "file_path": "backend/tests/tasksApi.test.js",
+      "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';"
+    },
+    {
+      "test_id": "REQ-B.1-INTEGRATION-TasksSection",
+      "req_id": "REQ-B.1",
+      "interface_ids": [
+        "REQ-B.1-UI-TasksSection",
+        "REQ-B.1-UI-useTasks",
+        "REQ-B.1-FUNC-TasksApi"
+      ],
+      "coverage_scope": "owned",
+      "type": "Integration",
+      "file_path": "frontend/tests/tasks/TasksSection.test.tsx",
+      "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';"
+    }
+  ],
+  "design_baseline": {
+    "backend/tests/seedDb.test.js": "red",
+    "backend/tests/tasksApi.test.js": "red",
+    "frontend/tests/tasks/TasksSection.test.tsx": "red"
+  },
+  "merge_arbitration_used": true
+}

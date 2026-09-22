@@ -1,0 +1,23 @@
+{
+  "node_id": "REQ-B",
+  "phase_status": {
+    "design": "skipped",
+    "test": "skipped",
+    "implement": "completed"
+  },
+  "requirement_snapshot": {
+    "name": "Feature B",
+    "description": "Feature B subtree. Adds a tasks area backed by a tasks table and a GET API.",
+    "visual_reference": [],
+    "children_ids": [
+      "REQ-B.1"
+    ],
+    "dependencies": []
+  },
+  "recent_failure_summary": "",
+  "interfaces": [],
+  "materialized_files": [],
+  "test_artifacts": [],
+  "resume_context": {},
+  "result_state": "CONVERGED"
+}

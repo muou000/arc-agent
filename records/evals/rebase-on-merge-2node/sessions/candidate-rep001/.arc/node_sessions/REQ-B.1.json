@@ -1,0 +1,16 @@
+{
+  "node_id": "REQ-B.1",
+  "phase_status": {
+    "design": "pending",
+    "test": "pending",
+    "implement": "pending"
+  },
+  "requirement_snapshot": {
+    "name": "Tasks Area",
+    "description": "Display a tasks area section on the home page with a heading \"Tasks\".",
+    "visual_reference": [],
+    "children_ids": [],
+    "dependencies": []
+  },
+  "recent_failure_summary": ""
+}

@@ -1,0 +1,24 @@
+{
+  "node_id": "ROOT",
+  "phase_status": {
+    "design": "skipped",
+    "test": "skipped",
+    "implement": "completed"
+  },
+  "requirement_snapshot": {
+    "name": "RebaseBench2",
+    "description": "Two-feature mini benchmark. The product is a small web workspace; both features add a DB-backed list section to the home page and extend the same shared surfaces (home page composition, backend route registration, schema init).",
+    "visual_reference": [],
+    "children_ids": [
+      "REQ-A",
+      "REQ-B"
+    ],
+    "dependencies": []
+  },
+  "recent_failure_summary": "",
+  "interfaces": [],
+  "materialized_files": [],
+  "test_artifacts": [],
+  "resume_context": {},
+  "result_state": "CONVERGED"
+}

@@ -11,6 +11,7 @@ from agents.context.prompts.test_driven_developer import get_system_prompt, get_
 from agents.runtime.capabilities import normalize_manifest_path
 from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
+from agents.runtime.rebase_gate import cached_rebase_gate
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_install_dependencies_tool
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
@@ -42,6 +43,7 @@ class TestDrivenDeveloper:
         app_type: str | None = None,
         app_handler: Any | None = None,
         context_workspace_root: str | None = None,
+        rebase_gate_provider: Callable[[], Any | None] | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
@@ -52,6 +54,9 @@ class TestDrivenDeveloper:
         # Context/session root: stays on the main workspace when the agent's
         # filesystem root is an isolated per-node worktree.
         self.context_workspace_root = context_workspace_root
+        # Optional per-pass mid-phase replay gate (issue #127), shared by
+        # every TDD-layer agent build of this adapter.
+        self._rebase_gate_provider = rebase_gate_provider
         self._last_run_tests_result: str | None = None
         self._last_run_tests_exit_code: int | None = None
         self._last_verifier_report_text = ""
@@ -64,7 +69,13 @@ class TestDrivenDeveloper:
         # fingerprint plus the write-event position at that failure, so the
         # next same-fingerprint failure can ask "what was edited in between?".
         self._stage_build: StageAgentBuild | None = None
+        # Per-run test-edit stall chain: per test layer, the last failure's
+        # fingerprint plus the write-event position at that failure, so the
+        # next same-fingerprint failure can ask "what was edited in between?".
         self._stall_chains: dict[str, tuple[str, int]] = {}
+
+    def _rebase_gate(self) -> Any | None:
+        return cached_rebase_gate(self)
 
     async def run(
         self,
@@ -243,6 +254,7 @@ class TestDrivenDeveloper:
                 [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=None,
+            rebase_gate=self._rebase_gate(),
             tools=[run_tests, run_build, install_dependencies, *traceability_tools],
             skills=[SKILLS_SOURCE],
         )

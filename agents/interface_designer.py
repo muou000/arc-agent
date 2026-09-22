@@ -24,6 +24,7 @@ from agents.runtime.factory import StageAgentBuild
 from agents.runtime.runners import salvage_json_objects
 from agents.runtime.stage_discipline import MAX_DESIGN_WRITES, MAX_NON_LEAF_DESIGN_WRITES
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
+from agents.runtime.rebase_gate import cached_rebase_gate
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
 from agents.tools.traceability import build_traceability_tools
 
@@ -120,6 +121,7 @@ class InterfaceDesigner:
         requirement_path: str | None = None,
         app_type: str | None = None,
         context_workspace_root: str | None = None,
+        rebase_gate_provider: Callable[[], Any | None] | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
@@ -131,6 +133,9 @@ class InterfaceDesigner:
         # isolated per-node worktree: sessions and caches stay in the main
         # workspace while the agent's filesystem root is the worktree.
         self.context_workspace_root = context_workspace_root
+        # Optional per-pass mid-phase replay gate (issue #127): called per
+        # agent build so the repair flows' rebuilds share the pass's gate.
+        self._rebase_gate_provider = rebase_gate_provider
         # Write budget tier pinned by ``run()`` for the pass it is executing.
         # The repair flows rebuild agents mid-pass and read this instead of
         # re-deriving from anything, so every rebuild within one ``run`` shares
@@ -297,7 +302,11 @@ class InterfaceDesigner:
             skills=[SKILLS_SOURCE],
             pending_contract_registry=pending_contract_registry,
             max_design_writes=max_design_writes,
+            rebase_gate=self._rebase_gate() if self._rebase_gate_provider else None,
         )
+
+    def _rebase_gate(self) -> Any | None:
+        return cached_rebase_gate(self)
 
     async def _repair_empty_interfaces(
         self,

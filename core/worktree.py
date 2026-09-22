@@ -54,6 +54,18 @@ Branches stay per node; each new node's branch starts at the latest
 integration HEAD. A directory holding a conflicting or crashed task is
 quarantined and later tasks fall back to their own node-keyed directory.
 
+While a task executes, a sibling's merge landing on the integration branch
+does not interrupt it: the manager records a ``PendingMerge`` (the merge's
+changed-file set) against the in-flight worktree, and the task's agent
+replays it at its *next file-tool boundary* regardless of the touched path
+(eager, ADR 0003) - a ``wip:`` commit of the dirty tree, a rebase onto the
+new integration HEAD (under the ``integration_gate`` as a reader, like every
+other tree-reading operation), and either a fresh tree or conflict markers
+the resolving agent settles with its ordinary file tools (calls outside the
+conflict set are refused until the markers clear). The replay is
+fail-open: any mechanical failure aborts it,
+restores the pre-replay state and leaves the overlap to the merge rails.
+
 Parent and child DESIGN phases are serialized by the workflow's dependency
 gate (a child's DESIGN waits for its parent's DESIGN to settle), so a child
 always branches from an integration HEAD that already contains the parent's
@@ -83,7 +95,7 @@ import shutil
 import subprocess
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -102,6 +114,10 @@ DEFAULT_GIT_USER_EMAIL = "arcbench@example.com"
 
 # Files larger than this never go through the additive conflict resolver.
 MAX_ADDITIVE_RESOLUTION_BYTES = 2_000_000
+
+# ``wip:``-prefixed commits on node branches are the mid-phase replay
+# checkpoints (issue #127); they are audit markers, never integration output.
+WIP_COMMIT_PREFIX = "wip:"
 
 
 class WorktreeError(RuntimeError):
@@ -231,6 +247,87 @@ class WorktreeHandle:
     reusable: bool = False
 
 
+@dataclass
+class PendingMerge:
+    """A sibling merge that landed while this task was still executing.
+
+    The workflow records one of these per sibling merge against every
+    in-flight task's worktree. Under eager replay (issue #127 revision) it is
+    consumed at the in-flight agent's next file-tool call regardless of the
+    touched path; the changed-file list rides the replay outcome's notice.
+    """
+
+    source_node_id: str
+    integration_head: str
+    changed_files: list[str]
+
+
+@dataclass
+class ReplayOutcome:
+    """What one mid-phase replay did (issue #127 / ADR 0003).
+
+    ``status`` is one of ``"replayed"`` (the rebase landed; ``files`` carries
+    the applied pending merges' changed files for result annotation),
+    ``"conflicts"`` (the rebase landed with conflict markers in the tree;
+    ``files`` carries the conflicted paths for the agent to resolve),
+    ``"aborted"`` (a mechanical failure rolled the worktree back to its
+    pre-replay state; the call proceeds against the old tree and the merge
+    rails own the overlap), or ``"skipped"`` (no replay was needed - no
+    pending merges, nothing touched, or replay disabled for this stage).
+
+    ``attempted`` marks outcomes where git state actually moved (a rebase
+    ran, or a ``rebase --continue`` round executed): the soft guard counts
+    only attempted conflict rounds, not the passive "still unresolved"
+    observation a boundary call makes while the agent works on other
+    files.
+
+    ``origin`` distinguishes a fresh replay (``"replay"``) from a conflict-
+    resolution round (``"continue"``): the soft guard's consecutive streak
+    resets on a clean fresh replay (a conflict-free wave breaks the run)
+    but not on a continue's completion, which only resolves a conflict the
+    same replay already carried.
+    """
+
+    REPLAYED = "replayed"
+    CONFLICTS = "conflicts"
+    ABORTED = "aborted"
+    SKIPPED = "skipped"
+
+    status: str
+    files: list[str] = field(default_factory=list)
+    detail: str = ""
+    attempted: bool = False
+    origin: str = "replay"
+
+
+def normalize_repo_path(value: object) -> str:
+    """Normalize a git-reported repo-relative path for path-set matching.
+
+    Git reports forward-slash repo-relative paths; tool-call paths arrive as
+    virtual (``/workspace/a/b``), slash-prefixed or relative forms. This maps
+    them onto the same comparison space (``a/b``). Empty and workspace-root
+    forms return ``""``.
+
+    Deliberately not shared with ``agents.runtime.capabilities``'s
+    ``normalize_manifest_path``: that one maps onto manifest-declared test
+    paths with its own semantics, and importing from ``agents`` here would
+    invert the layering (``agents.runtime.rebase_gate`` already imports
+    from this module). The shapes coincide today; a future divergence is
+    fine because the two never compare paths against each other.
+    """
+
+    path = str(value or "").replace("\\", "/").strip()
+    if not path:
+        return ""
+    while path.startswith("./"):
+        path = path[2:]
+    if path in {"/workspace", "/workspace/"}:
+        return ""
+    if path.startswith("/workspace/"):
+        path = path[len("/workspace/"):]
+    return path.strip("/")
+
+
 def sanitize_node_id(node_id: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(node_id or "").strip())
     return normalized or "node"
@@ -294,6 +391,18 @@ class NodeWorktreeManager:
         # Worktree directories that must not be handed to another node: they
         # hold a conflicting or crashed task's state for inspection/retry.
         self._quarantined: set[str] = set()
+        # Landed sibling merges awaiting eager replay, keyed by the
+        # in-flight task's worktree path (issue #127). Populated by
+        # ``record_pending_merge``, consumed by ``replay_pending_merges`` and
+        # the task's settle.
+        self._pending_merges: dict[str, list[PendingMerge]] = {}
+        # Worktrees sitting mid-rebase after a conflicted replay: the agent
+        # is resolving conflict markers with its file tools, and the next
+        # tool boundary may complete the rebase. Keyed like _pending_merges.
+        self._mid_rebase: set[str] = set()
+        # Pre-replay branch head per mid-rebase worktree, for restoring the
+        # uncommitted (dirty) view when a stuck rebase is aborted.
+        self._mid_rebase_base: dict[str, str] = {}
         # Issue #91: ``prepare`` (and the conflict-requeue reset) materialize
         # the integration branch's tree into a group worktree while another
         # group's ``integrate`` may be moving that same branch. A checkout
@@ -760,8 +869,12 @@ class NodeWorktreeManager:
         """
 
         if result is WorktreeTaskResult.FAILED:
+            self._clear_mid_rebase_marks(handle)
+            self._pending_merges.pop(str(Path(handle.path)), None)
             return WorktreeOutcome.PRESERVED
         if result is WorktreeTaskResult.RESET_FOR_RETRY:
+            self._clear_mid_rebase_marks(handle)
+            self._pending_merges.pop(str(Path(handle.path)), None)
             self._reset_branch_to_integration(handle)
             if handle.reusable:
                 return WorktreeOutcome.REUSED
@@ -774,6 +887,11 @@ class NodeWorktreeManager:
                 # removal.
                 return WorktreeOutcome.REUSED
             return WorktreeOutcome.DELETED
+        # MERGED: a merged task cannot be mid-rebase (its integrate commits
+        # the tree), but the bookkeeping is dropped unconditionally so a
+        # reused group directory never inherits a stale mark.
+        self._clear_mid_rebase_marks(handle)
+        self._pending_merges.pop(str(Path(handle.path)), None)
         if handle.reusable:
             return WorktreeOutcome.REUSED
         self._remove_worktree(handle)
@@ -828,6 +946,439 @@ class NodeWorktreeManager:
                     f"resetting branch {handle.branch} to {integration} failed: "
                     f"{reset.stderr.strip() or reset.stdout.strip()}"
                 )
+
+    def read_integration_diff(self, base_ref: str) -> list[str]:
+        """Changed (repo-relative) paths between ``base_ref`` and the integration HEAD.
+
+        The workflow's pending-merge attach reads the just-landed merge's
+        changed-file set through this instead of the manager's git handle.
+        An empty ``base_ref`` returns an empty list (nothing to diff).
+        """
+
+        if not str(base_ref or "").strip():
+            return []
+        diff = self._git(
+            ["diff", "--name-only", f"{base_ref}..HEAD"], check=False
+        )
+        if diff.returncode != 0:
+            raise WorktreeError(
+                f"git diff {base_ref}..HEAD failed: {diff.stderr.strip() or diff.stdout.strip()}"
+            )
+        return [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+
+    def integration_head_sha(self) -> str:
+        """Current integration HEAD sha (empty when git cannot answer)."""
+
+        result = self._git(["rev-parse", "HEAD"], check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    # ------------------------------------------------------------------
+    # mid-phase replay (issue #127 / ADR 0003: rebase-on-merge, eager)
+    # ------------------------------------------------------------------
+
+    def record_pending_merge(
+        self,
+        handle: WorktreeHandle,
+        source_node_id: str,
+        integration_head: str,
+        changed_files: list[str],
+    ) -> None:
+        """Attach a landed sibling merge to an in-flight task (best effort).
+
+        Called by the workflow right after a sibling's merge committed, with
+        the merge's changed-file set. The pending record only matters if the
+        in-flight task's agent later touches one of those paths; otherwise it
+        is silently consumed by the task's settle.
+        """
+
+        self._pending_merges.setdefault(str(Path(handle.path)), []).append(
+            PendingMerge(
+                source_node_id=source_node_id,
+                integration_head=str(integration_head or ""),
+                changed_files=[str(path) for path in changed_files if str(path)],
+            )
+        )
+
+    def take_pending_merges(self, handle: WorktreeHandle) -> list[PendingMerge]:
+        """Consume the task's pending merges (settle-time bookkeeping)."""
+
+        return self._pending_merges.pop(str(Path(handle.path)), [])
+
+    def pending_merges_for(self, handle: WorktreeHandle) -> list[PendingMerge]:
+        """The task's current pending merges without consuming them.
+
+        The replay gate's touch check reads this on every file tool call;
+        the consuming pop stays inside ``replay_pending_merges`` so a merge
+        landing between the check and the replay is never lost.
+        """
+
+        return list(self._pending_merges.get(str(Path(handle.path)), []))
+
+    def replay_pending_merges(self, handle: WorktreeHandle) -> ReplayOutcome:
+        """Replay the task's pending merges at a tool-call boundary.
+
+        Eager rebase-on-merge (ADR 0003): a sibling merge has landed and the
+        agent's next file-tool call arrived - regardless of which path it
+        touches. At this quiescent point - no
+        filesystem tool is mid-flight - the dirty tree is committed as a
+        ``wip:`` checkpoint, the node branch is rebased onto the current
+        integration HEAD, and the working tree comes back either clean
+        (``replayed``) or with conflict markers in the touched files
+        (``conflicts``; the resolving agent continues its phase against
+        them). Every mechanical step runs under ``integration_gate`` as a
+        *reader*: the rebase reads the integration branch's tree, exactly
+        like ``prepare``'s checkouts (issue #91) - it never moves that
+        branch, so it must not exclude a concurrent sibling merge.
+
+        Fail-open everywhere (ADR 0003's hard contract): any mechanical
+        failure - including the Windows leftover dev-server lock files that
+        block ``git rebase --autostash``'s working-tree bookkeeping - aborts
+        the replay, restores the pre-replay state and returns
+        ``ReplayOutcome.ABORTED``. The caller serves the tool call against
+        the old tree; the overlap stays owned by the existing merge rails
+        (additive resolution / arbitration / conflict requeue). This method
+        never raises for git-level failures and never adds a terminal task
+        state.
+        """
+
+        pending = self._pending_merges.pop(str(Path(handle.path)), [])
+        if not pending:
+            return ReplayOutcome(status=ReplayOutcome.SKIPPED)
+        return self._replay_onto_integration(handle, pending)
+
+    def _replay_onto_integration(
+        self, handle: WorktreeHandle, pending: list[PendingMerge]
+    ) -> ReplayOutcome:
+        applied_files = sorted(
+            {path for merge in pending for path in merge.changed_files if path}
+        )
+        try:
+            with self.integration_gate.reader():
+                return self._replay_git_section(handle, pending, applied_files)
+        except Exception as exc:  # noqa: BLE001 - fail-open is the contract
+            return ReplayOutcome(
+                status=ReplayOutcome.ABORTED,
+                files=applied_files,
+                detail=f"{type(exc).__name__}: {exc}",
+                attempted=True,
+            )
+
+    def _replay_git_section(
+        self,
+        handle: WorktreeHandle,
+        pending: list[PendingMerge],
+        applied_files: list[str],
+    ) -> ReplayOutcome:
+        integration = self._integration_branch()
+        # No common history is the one genuine mechanical precondition;
+        # everything else is decided by the rebase itself.
+        merge_bases = self._git(
+            ["merge-base", handle.branch, integration], cwd=handle.path, check=False
+        )
+        if merge_bases.returncode != 0:
+            return ReplayOutcome(
+                status=ReplayOutcome.ABORTED,
+                files=applied_files,
+                detail=f"merge-base failed: {merge_bases.stderr.strip()}",
+                attempted=True,
+            )
+        integration_sha = (
+            self._git(["rev-parse", integration], cwd=handle.path, check=False).stdout.strip()
+        )
+        branch_head_sha = self._git(["rev-parse", handle.branch], cwd=handle.path).stdout.strip()
+        if integration_sha and integration_sha == branch_head_sha:
+            # Every pending merge already sits under the branch (a second
+            # wave arrived between the merge landing and this touch): the
+            # rebase is a no-op and the merges count as applied.
+            return ReplayOutcome(status=ReplayOutcome.REPLAYED, files=applied_files)
+
+        dirty = self._worktree_dirty(handle.path)
+        pre_replay_head = branch_head_sha
+        if dirty:
+            self._wip_commit(handle)
+        rebase = self._git(["rebase", integration], cwd=handle.path, check=False)
+        if rebase.returncode != 0:
+            conflicted = self._unmerged_paths_in(handle.path)
+            if conflicted:
+                # The rebase stops mid-replay with markers in the tree; the
+                # resolving agent continues against them (``continue_replay``
+                # at the next tool boundary completes the replay).
+                self._mid_rebase.add(str(Path(handle.path)))
+                self._mid_rebase_base[str(Path(handle.path))] = pre_replay_head
+                return ReplayOutcome(
+                    status=ReplayOutcome.CONFLICTS,
+                    files=conflicted,
+                    detail=f"rebase onto {integration} conflicted",
+                    attempted=True,
+                )
+            # A failed rebase with no conflict paths is a mechanical failure
+            # (locked file, index damage): roll back to the pre-replay state.
+            self._git(["rebase", "--abort"], cwd=handle.path, check=False)
+            self._abort_replay(handle, pre_replay_head)
+            failure = (rebase.stderr or rebase.stdout or "").strip()
+            return ReplayOutcome(
+                status=ReplayOutcome.ABORTED,
+                files=applied_files,
+                detail=failure,
+                attempted=True,
+            )
+        return ReplayOutcome(
+            status=ReplayOutcome.REPLAYED, files=applied_files, attempted=True
+        )
+
+    def _wip_commit(self, handle: WorktreeHandle) -> None:
+        """Commit the dirty tree as a ``wip:`` checkpoint on the node branch.
+
+        Mid-phase there is no prior commit to replay over (the phase's only
+        commit happens at integrate), so a dirty tree must land before a
+        rebase can start. The commit stays on the node branch; the phase-end
+        ``integrate`` merges the branch as usual, so WIP commits are audit
+        markers on the node branch, never integration output.
+        """
+
+        self._git(["add", "-A", "."], cwd=handle.path)
+        result = self._git(
+            ["commit", "-m", f"{WIP_COMMIT_PREFIX} mid-phase replay checkpoint"],
+            cwd=handle.path,
+            check=False,
+        )
+        if result.returncode != 0:
+            output = (result.stdout + result.stderr).lower()
+            if "nothing to commit" not in output:
+                raise WorktreeError(
+                    f"WIP commit failed in worktree {handle.path}: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                )
+
+    def _abort_replay(self, handle: WorktreeHandle, pre_replay_head: str) -> None:
+        """Restore the pre-replay state after a mechanical failure.
+
+        The WIP checkpoint (if the tree was dirty) is reset back into the
+        working tree so the agent's uncommitted view is byte-identical to
+        before the replay; failures here are swallowed by the caller's
+        fail-open envelope. ``pre_replay_head`` is the branch head captured
+        *before* the WIP commit, so the reset lands on the exact prior
+        commit even when a stale WIP from an earlier round sits in between.
+        """
+
+        current_head = (
+            self._git(["rev-parse", "HEAD"], cwd=handle.path, check=False).stdout.strip()
+        )
+        if not pre_replay_head or current_head == pre_replay_head:
+            return
+        # Only the replay's own WIP commit is rolled back; a divergence the
+        # replay did not create is left for the failure rails to explain.
+        parents = self._git(
+            ["rev-list", "--parents", "-n", "1", "HEAD"], cwd=handle.path, check=False
+        ).stdout.split()
+        if len(parents) >= 2 and parents[1] == pre_replay_head:
+            self._git(
+                ["reset", "--mixed", pre_replay_head], cwd=handle.path, check=False
+            )
+
+    def _unmerged_paths_in(self, worktree_path: str) -> list[str]:
+        """Conflicted (unmerged) repo-relative paths inside a worktree."""
+
+        return [
+            line.strip()
+            for line in self._git(
+                ["diff", "--name-only", "--diff-filter=U"],
+                cwd=worktree_path,
+                check=False,
+            ).stdout.splitlines()
+            if line.strip()
+        ]
+
+    def is_mid_rebase(self, handle: WorktreeHandle) -> bool:
+        """Whether a prior replay left this worktree mid-rebase."""
+
+        return str(Path(handle.path)) in self._mid_rebase
+
+    def unresolved_conflict_paths(self, handle: WorktreeHandle) -> list[str]:
+        """Repo-relative paths that still carry conflict markers (mid-rebase).
+
+        The forced-resolution gate reads this to refuse file calls outside
+        the conflict set while a replay's markers remain. Paths come from the
+        merge index's unmerged entries; an empty list means either nothing
+        is mid-rebase or every entry resolved (the next boundary completes).
+        """
+
+        return self._unmerged_paths_in(handle.path)
+
+    def abort_replay(self, handle: WorktreeHandle) -> None:
+        """Abort a mid-rebase worktree and restore its pre-replay state.
+
+        The disarm path of the soft guard (issue #127): after three
+        attempted conflict rounds the mid-phase replay stands down for the
+        rest of the pass, and a rebase still sitting mid-replay must not
+        dangle into the phase-end integrate - it is aborted here, the
+        branch returns to the pre-replay head and the WIP checkpoint's
+        content back into the working tree, so the merge rails own the
+        overlap exactly like a mechanical failure. Never raises.
+        """
+
+        if str(Path(handle.path)) not in self._mid_rebase:
+            return
+        try:
+            self._recover_aborted_rebase(handle)
+        except Exception:  # noqa: BLE001 - fail-open is the contract
+            self._clear_mid_rebase_marks(handle)
+
+    def continue_replay(self, handle: WorktreeHandle) -> ReplayOutcome:
+        """Advance or complete a mid-rebase worktree at a tool boundary.
+
+        After a conflicted replay the agent resolves the markers with its
+        ordinary file tools (edit/write). This method runs at the *next*
+        tool boundary: when every conflicted path is resolved, the edits are
+        staged, the rebase is continued (replaying any further commits), and
+        the outcome is ``replayed`` (or ``conflicts`` again when a later
+        commit of the replay also conflicts - the agent keeps resolving).
+        Unresolved paths leave everything untouched. A mechanical failure
+        aborts the rebase and restores the pre-replay WIP state, exactly
+        like ``replay_pending_merges`` (fail-open; ``_wip_backup_commit``
+        bookkeeping rides along). Never raises.
+        """
+
+        if str(Path(handle.path)) not in self._mid_rebase:
+            return ReplayOutcome(status=ReplayOutcome.SKIPPED)
+        try:
+            with self.integration_gate.reader():
+                return self._continue_rebase_section(handle)
+        except Exception as exc:  # noqa: BLE001 - fail-open is the contract
+            self._recover_aborted_rebase(handle)
+            return ReplayOutcome(
+                status=ReplayOutcome.ABORTED,
+                detail=f"{type(exc).__name__}: {exc}",
+                attempted=True,
+            )
+    def _continue_rebase_section(self, handle: WorktreeHandle) -> ReplayOutcome:
+        conflict_paths = self._rebase_conflict_paths(handle)
+        if not conflict_paths:
+            # No unmerged index entries: the worktree may still be dirty with
+            # the agent's ongoing edits. Continue the replay directly.
+            return self._run_rebase_continue(handle, conflict_paths=[])
+        # Unresolved-marker check first: staging a file that still carries
+        # conflict markers would "resolve" the index with broken content
+        # (the arbitration hand-off rejects the same shape).
+        marker_tainted = [
+            path
+            for path in conflict_paths
+            if _carries_conflict_markers(Path(handle.path) / path)
+        ]
+        if marker_tainted:
+            return ReplayOutcome(status=ReplayOutcome.CONFLICTS, files=marker_tainted)
+        # Stage the agent's resolutions: ``git add`` of an edited unmerged
+        # path collapses the index entry and clears the unmerged state.
+        for path in conflict_paths:
+            add = self._git(["add", "--", path], cwd=handle.path, check=False)
+            if add.returncode != 0:
+                return ReplayOutcome(
+                    status=ReplayOutcome.CONFLICTS,
+                    files=conflict_paths,
+                    detail=f"staging {path} failed: {add.stderr.strip()}",
+                )
+        still_unmerged = self._unmerged_paths_in(handle.path)
+        if still_unmerged:
+            return ReplayOutcome(status=ReplayOutcome.CONFLICTS, files=still_unmerged)
+        return self._run_rebase_continue(handle, conflict_paths=conflict_paths)
+
+    def _run_rebase_continue(
+        self, handle: WorktreeHandle, *, conflict_paths: list[str]
+    ) -> ReplayOutcome:
+        """Run ``git rebase --continue`` and classify its outcome."""
+
+        continue_result = self._git(
+            ["rebase", "--continue"],
+            cwd=handle.path,
+            check=False,
+            env_override={"GIT_EDITOR": ":"},
+        )
+        if continue_result.returncode == 0:
+            self._clear_mid_rebase_marks(handle)
+            self._wip_backup_commit(handle)
+            # ``conflict_paths`` (the resolved round) ride along so the
+            # boundary notice can name what was applied.
+            return ReplayOutcome(
+                status=ReplayOutcome.REPLAYED,
+                files=conflict_paths,
+                detail="rebase continued after conflict resolution",
+                attempted=True,
+                origin="continue",
+            )
+        unresolved = self._unmerged_paths_in(handle.path)
+        if unresolved:
+            # The next commit of the replay conflicts: another round.
+            return ReplayOutcome(
+                status=ReplayOutcome.CONFLICTS,
+                files=unresolved,
+                attempted=True,
+                origin="continue",
+            )
+        self._recover_aborted_rebase(handle)
+        failure = (continue_result.stderr or continue_result.stdout or "").strip()
+        return ReplayOutcome(
+            status=ReplayOutcome.ABORTED,
+            detail=failure,
+            attempted=True,
+            origin="continue",
+        )
+
+    def _rebase_conflict_paths(self, handle: WorktreeHandle) -> list[str]:
+        """The paths the in-progress rebase wants resolved.
+
+        ``git status --porcelain`` lists them as ``UU``/``AA``/... entries
+        plus unmerged index entries; the ``diff-filter=U`` read is empty at
+        this point only when called before staging, so both reads union.
+        """
+
+        status = self._git(
+            ["status", "--porcelain", "--untracked-files=no"],
+            cwd=handle.path,
+            check=False,
+        ).stdout
+        paths = {
+            line[3:].strip().strip('"')
+            for line in status.splitlines()
+            if line and line[:2] in {"UU", "AA", "DU", "UD", "AU", "UA", "DD"}
+        }
+        return sorted(path for path in paths if path)
+
+    def _wip_backup_commit(self, handle: WorktreeHandle) -> None:
+        """Commit any post-replay working-tree edits as a WIP checkpoint.
+
+        The agent may have resolved conflicts (or made further edits) in the
+        working tree after the replay; landing them as a ``wip:`` commit
+        keeps the branch self-describing for audit and the next replay.
+        """
+
+        if not self._worktree_dirty(handle.path):
+            return
+        try:
+            self._wip_commit(handle)
+        except WorktreeError:
+            # Fail-open: an uncommittable tree stays dirty; the phase-end
+            # integrate's own commit picks it up.
+            pass
+
+    def _recover_aborted_rebase(self, handle: WorktreeHandle) -> None:
+        """Abort a stuck mid-rebase and restore the pre-replay state.
+
+        ``git rebase --abort`` returns the branch to the pre-replay head -
+        which includes the replay's WIP checkpoint, leaving a clean tree
+        where the agent's view was dirty. The mixed reset onto the recorded
+        pre-replay base puts the WIP content back into the working tree, so
+        the agent's files are byte-identical to before the replay attempt.
+        """
+
+        self._git(["rebase", "--abort"], cwd=handle.path, check=False)
+        base = self._mid_rebase_base.get(str(Path(handle.path)))
+        self._clear_mid_rebase_marks(handle)
+        if base:
+            self._abort_replay(handle, base)
+
+    def _clear_mid_rebase_marks(self, handle: WorktreeHandle) -> None:
+        self._mid_rebase.discard(str(Path(handle.path)))
+        self._mid_rebase_base.pop(str(Path(handle.path)), None)
 
     def cleanup_reusable_worktrees(self) -> list[str]:
         """Remove reusable worktree directories left over after a run.
@@ -1053,6 +1604,7 @@ class NodeWorktreeManager:
         cwd: str | None = None,
         check: bool = True,
         binary: bool = False,
+        env_override: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         user_name = (
@@ -1069,6 +1621,8 @@ class NodeWorktreeManager:
         env["GIT_AUTHOR_EMAIL"] = user_email
         env["GIT_COMMITTER_NAME"] = user_name
         env["GIT_COMMITTER_EMAIL"] = user_email
+        if env_override:
+            env.update(env_override)
         completed = subprocess.run(
             ["git", *args],
             cwd=cwd or self.main_workspace,

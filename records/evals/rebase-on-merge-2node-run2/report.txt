@@ -1,0 +1,10 @@
+Eval Comparisons
+  rebase-on-merge-2node
+     Baseline  rebase-off
+    Candidate  rebase-on (1/1 pairs)
+    Pass rate  -100.0 pp (candidate 0.0%, baseline 100.0%)
+       Tokens  -4202170.0 (candidate 4821966.0, baseline 9024136.0)
+    Cache hit  -2.5 pp (candidate 90.1%, baseline 92.6%)
+      Latency  -245731.9ms (candidate 1406576.8ms, baseline 1652308.8ms)
+  Latency p95  candidate 1406576.8ms (n=1), baseline 1652308.8ms (n=1)
+    Est. cost  -¥1.8007 (candidate ¥6.3696, baseline ¥8.1703)

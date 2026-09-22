@@ -1,0 +1,100 @@
+{
+  "REQ-A": {
+    "req_id": "REQ-A",
+    "id": "REQ-A",
+    "name": "Feature A",
+    "description": "Feature A subtree. Adds a notes area to the home page.",
+    "visual_reference": [],
+    "scenarios": [],
+    "parent_id": "ROOT",
+    "children_ids": [
+      "REQ-A.1"
+    ],
+    "dependencies": []
+  },
+  "REQ-A.1": {
+    "req_id": "REQ-A.1",
+    "id": "REQ-A.1",
+    "name": "Notes Area",
+    "description": "Display a notes area section on the home page with a heading \"Notes\".",
+    "visual_reference": [],
+    "scenarios": [
+      {
+        "name": "Notes area visible",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "User has opened the application."
+          },
+          {
+            "keyword": "WHEN",
+            "content": "View the home page."
+          },
+          {
+            "keyword": "THEN",
+            "content": "A notes area with the heading Notes is displayed."
+          }
+        ]
+      }
+    ],
+    "parent_id": "REQ-A",
+    "children_ids": [],
+    "dependencies": []
+  },
+  "REQ-B": {
+    "req_id": "REQ-B",
+    "id": "REQ-B",
+    "name": "Feature B",
+    "description": "Feature B subtree. Adds a tasks area to the home page.",
+    "visual_reference": [],
+    "scenarios": [],
+    "parent_id": "ROOT",
+    "children_ids": [
+      "REQ-B.1"
+    ],
+    "dependencies": []
+  },
+  "REQ-B.1": {
+    "req_id": "REQ-B.1",
+    "id": "REQ-B.1",
+    "name": "Tasks Area",
+    "description": "Display a tasks area section on the home page with a heading \"Tasks\".",
+    "visual_reference": [],
+    "scenarios": [
+      {
+        "name": "Tasks area visible",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "User has opened the application."
+          },
+          {
+            "keyword": "WHEN",
+            "content": "View the home page."
+          },
+          {
+            "keyword": "THEN",
+            "content": "A tasks area with the heading Tasks is displayed."
+          }
+        ]
+      }
+    ],
+    "parent_id": "REQ-B",
+    "children_ids": [],
+    "dependencies": []
+  },
+  "ROOT": {
+    "req_id": "ROOT",
+    "id": "ROOT",
+    "name": "RebaseBench2",
+    "description": "Two-feature mini benchmark. The product is a small web workspace with a shared app entry file both features extend.",
+    "visual_reference": [],
+    "scenarios": [],
+    "parent_id": null,
+    "children_ids": [
+      "REQ-A",
+      "REQ-B"
+    ],
+    "dependencies": []
+  }
+}

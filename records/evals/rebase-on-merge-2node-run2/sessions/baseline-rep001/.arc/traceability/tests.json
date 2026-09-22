@@ -1,0 +1,139 @@
+{
+  "REQ-A.1-e2e-notes-list": {
+    "test_id": "REQ-A.1-e2e-notes-list",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-API-Notes",
+      "REQ-A.1-UI-NotesSection",
+      "REQ-A.1-UI-HomePage",
+      "REQ-A.1-DB-NotesTable"
+    ],
+    "type": "E2E",
+    "file_path": "backend/test-e2e/notes.e2e.spec.js",
+    "passed": true,
+    "first_line": "const { test, expect } = require('@playwright/test');",
+    "scenario_id": null
+  },
+  "REQ-A.1-integration-notes-api": {
+    "test_id": "REQ-A.1-integration-notes-api",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-API-Notes",
+      "REQ-A.1-FUNC-App",
+      "REQ-A.1-DB-NotesTable"
+    ],
+    "type": "Integration",
+    "file_path": "backend/tests/notesApi.test.js",
+    "passed": true,
+    "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-A.1-integration-notes-section": {
+    "test_id": "REQ-A.1-integration-notes-section",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-UI-NotesSection",
+      "REQ-A.1-UI-useNotes"
+    ],
+    "type": "Integration",
+    "file_path": "frontend/tests/NotesSection.test.tsx",
+    "passed": true,
+    "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-A.1-integration-use-notes": {
+    "test_id": "REQ-A.1-integration-use-notes",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-UI-useNotes",
+      "REQ-A.1-FUNC-Notes"
+    ],
+    "type": "Integration",
+    "file_path": "frontend/tests/hooks/useNotes.test.ts",
+    "passed": true,
+    "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-A.1-unit-notes-repo": {
+    "test_id": "REQ-A.1-unit-notes-repo",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-FUNC-NotesRepo",
+      "REQ-A.1-DB-NotesTable",
+      "REQ-A.1-FUNC-SeedDb"
+    ],
+    "type": "Unit",
+    "file_path": "backend/tests/notesRepo.test.js",
+    "passed": true,
+    "first_line": "import { describe, it, expect, beforeEach, afterEach } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-B.1-TASKS-API-INTEGRATION": {
+    "test_id": "REQ-B.1-TASKS-API-INTEGRATION",
+    "req_id": "REQ-B.1",
+    "interface_ids": [
+      "REQ-B.1-API-Tasks",
+      "REQ-B.1-FUNC-App",
+      "REQ-B.1-FUNC-SeedDb"
+    ],
+    "type": "Integration",
+    "file_path": "backend/tests/routes/tasks.api.test.js",
+    "passed": true,
+    "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-B.1-TASKS-E2E": {
+    "test_id": "REQ-B.1-TASKS-E2E",
+    "req_id": "REQ-B.1",
+    "interface_ids": [
+      "REQ-B.1-UI-HomePage",
+      "REQ-B.1-UI-TasksSection",
+      "REQ-B.1-API-Tasks"
+    ],
+    "type": "E2E",
+    "file_path": "backend/test-e2e/tasks-list.e2e.spec.js",
+    "passed": true,
+    "first_line": "const { test, expect } = require('@playwright/test');",
+    "scenario_id": null
+  },
+  "REQ-B.1-TASKS-SECTION-UNIT": {
+    "test_id": "REQ-B.1-TASKS-SECTION-UNIT",
+    "req_id": "REQ-B.1",
+    "interface_ids": [
+      "REQ-B.1-UI-TasksSection",
+      "REQ-B.1-UI-useTasks"
+    ],
+    "type": "Unit",
+    "file_path": "frontend/tests/features/tasks/TasksSection.test.tsx",
+    "passed": true,
+    "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-B.1-TASKS-SERVICE-UNIT": {
+    "test_id": "REQ-B.1-TASKS-SERVICE-UNIT",
+    "req_id": "REQ-B.1",
+    "interface_ids": [
+      "REQ-B.1-FUNC-Tasks",
+      "REQ-B.1-DB-TasksTable",
+      "REQ-B.1-FUNC-DbRuntime"
+    ],
+    "type": "Unit",
+    "file_path": "backend/tests/services/tasks.service.test.js",
+    "passed": true,
+    "first_line": "import { describe, it, expect, beforeEach, afterEach } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-B.1-USETASKS-UNIT": {
+    "test_id": "REQ-B.1-USETASKS-UNIT",
+    "req_id": "REQ-B.1",
+    "interface_ids": [
+      "REQ-B.1-UI-useTasks",
+      "REQ-B.1-FUNC-Tasks"
+    ],
+    "type": "Unit",
+    "file_path": "frontend/tests/features/tasks/useTasks.test.ts",
+    "passed": true,
+    "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';",
+    "scenario_id": null
+  }
+}

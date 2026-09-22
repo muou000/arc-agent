@@ -218,9 +218,25 @@ class FileClaimGate:
         if not self._tracked_loaded:
             # One snapshot per agent: the tracked set cannot change while the
             # agent runs (its own writes stay uncommitted until integrate).
+            # The mid-phase replay (issue #127) is the sanctioned exception -
+            # it lands a sibling's tracked files mid-run - and drops the
+            # snapshot through ``invalidate_tracked_snapshot``.
             self._tracked = self._tracked_loader(self._agent_root)
             self._tracked_loaded = True
         return self._tracked
+
+    def invalidate_tracked_snapshot(self) -> None:
+        """Drop the tracked-set snapshot so the next check reloads it.
+
+        Called after the mid-phase replay moved the worktree onto a sibling's
+        merged tree: files that were untracked here (sibling-owned, its
+        branch invisible) are now tracked, and the claim arbitration must
+        see that instead of the stale pre-replay set.
+        """
+
+        with self._lock:
+            self._tracked = None
+            self._tracked_loaded = False
 
     def check_and_claim(self, virtual_path: str) -> str | None:
         """Validate a write to ``virtual_path`` and claim new-file paths.

@@ -140,6 +140,7 @@ class StageSession:
         test_manifest_lock: Any | None = None,
         pending_contract_registry: Any | None = None,
         max_design_writes: int | None = None,
+        rebase_gate: Any | None = None,
     ) -> StageAgentBuild:
         """Build one stage agent with the session's shared parameters; stage
         differences arrive only through the arguments."""
@@ -161,6 +162,7 @@ class StageSession:
             pending_contract_registry=pending_contract_registry,
             app_type=self.app_type,
             max_design_writes=max_design_writes,
+            rebase_gate=rebase_gate,
         )
 
     # -- thread identity -----------------------------------------------------------
