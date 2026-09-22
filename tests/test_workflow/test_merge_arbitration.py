@@ -36,6 +36,7 @@ from core.merge_arbitration import (
     read_conflict_stages,
 )
 from tests.helpers.faux import FauxChatModel, faux_text
+from tests.helpers.jsonl import read_jsonl
 
 
 # ----------------------------------------------------------------------
@@ -170,8 +171,6 @@ def test_workflow_run_hook_emits_audit_runner_events(
     """Every workflow-level arbitration lands in .arc/runner-events.jsonl as a
     merge_arbitration record (the audit trail)."""
 
-    import json as jsonlib
-
     from core.config import set_workspace_root
     from core.workflow import ARCWorkflowManager
 
@@ -200,11 +199,7 @@ def test_workflow_run_hook_emits_audit_runner_events(
     arbitration_input = hooks.collect_input(["backend/src.js"], TRIGGER_CONFLICT)
     assert hooks.run(arbitration_input, ["backend/src.js"], TRIGGER_CONFLICT) is None
 
-    records = [
-        jsonlib.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    records = read_jsonl(events_path)
     assert records, "the audit record must be persisted"
     record = records[-1]
     assert record["type"] == "merge_arbitration"

@@ -21,12 +21,7 @@ from arcbench_agent_runtime import (
     TestRecord,
 )
 from arcbench_agent_runtime.context import RuntimePaths as _RuntimePaths  # noqa: F401
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+from tests.helpers.jsonl import read_jsonl
 
 
 def _read_json(path: Path) -> dict:
@@ -143,7 +138,7 @@ class TestFullWorkflow:
         assert "R1" in _read_json(trace_dir / "node_contracts.json")
 
         # runner-events.jsonl must include at least one event of each kind
-        events = _read_jsonl(tmp_project_dir / ".arc" / "runner-events.jsonl")
+        events = read_jsonl(tmp_project_dir / ".arc" / "runner-events.jsonl")
         event_types = {e.get("type") for e in events}
         assert "requirement_state" in event_types
         assert "signal" in event_types

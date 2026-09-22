@@ -45,6 +45,7 @@ from core.workflow import (
     TASK_RUNNING,
     _design_pipelining_enabled,
 )
+from tests.helpers.jsonl import read_jsonl
 from tests.test_workflow.queue_faker import queue_with_states, settle
 
 
@@ -650,15 +651,9 @@ def test_pipeline_mode_implementation_drift_records_event_and_warning(
     # The audit record landed in the real runner-events stream (the drain's
     # event emitter is the runtime's, not a stub here).
     events_path = Path(manager.workspace_path) / ".arc" / "runner-events.jsonl"
-    drift_events = []
-    if events_path.is_file():
-        for line in events_path.read_text(encoding="utf-8").splitlines():
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if payload.get("type") == "contract_drift":
-                drift_events.append(payload)
+    drift_events = [
+        event for event in read_jsonl(events_path) if event.get("type") == "contract_drift"
+    ]
     assert len(drift_events) == 1, "one drift record per drifted IMPLEMENT merge"
     assert drift_events[0]["node_id"] == "RA"
     assert drift_events[0]["drift"][0]["interface_id"] == "RA-FUNC-Auth"
