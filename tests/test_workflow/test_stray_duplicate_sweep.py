@@ -22,7 +22,6 @@ is explicitly out of scope.
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -35,6 +34,7 @@ from core.phases import (
     load_template_skeleton_roots,
 )
 from tests.helpers.faux import FakeAppHandler, passing_test_output
+from tests.helpers.jsonl import read_jsonl
 
 # Reuse the process-wide runtime fixture so WorkflowPhaseRunner.traceability,
 # core.sessions and context_pipeline all resolve inside tmp_project_dir.
@@ -174,14 +174,7 @@ def _run_implement(runner: WorkflowPhaseRunner, node_id: str) -> bool:
 
 
 def _runner_events(project: Path) -> list[dict[str, Any]]:
-    events_path = project / ".arc" / "runner-events.jsonl"
-    if not events_path.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        if line.strip()
-    ]
+    return read_jsonl(project / ".arc" / "runner-events.jsonl")
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +252,61 @@ def test_collect_stray_ignores_untracked_twin_pairs(tmp_path: Path) -> None:
     found = collect_stray_duplicate_files(str(project), skeleton_roots=SKELETON_ROOTS)
 
     assert found == [{"path": STRAY_FILE, "twin": TWIN_FILE}]
+
+
+def test_collect_stray_ignores_staged_but_uncommitted_twin(tmp_path: Path) -> None:
+    """A path staged in the index is not yet an already-committed anchor."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_workspace(project)
+    twin = project / "frontend/src/api/session.ts"
+    twin.parent.mkdir(parents=True, exist_ok=True)
+    twin.write_bytes(b"export class Session {}\n")
+    stray = project / "src/api/session.ts"
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_bytes(b"export class Session {}\n")
+    staged = _git(["add", str(twin.relative_to(project))], project)
+    assert staged.returncode == 0, staged.stderr
+
+    found = collect_stray_duplicate_files(str(project), skeleton_roots=SKELETON_ROOTS)
+
+    assert found == []
+
+
+def test_collect_stray_ignores_modified_committed_twin(tmp_path: Path) -> None:
+    """A committed path whose current content changed no longer anchors the
+    old duplicate at the wrong location."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_workspace(project)
+    _write_incident_files(project)
+    _commit_all(project, "design checkpoint")
+    (project / TWIN_FILE).write_bytes(b"export class AuthService {\n  logout() {}\n}\n")
+
+    found = collect_stray_duplicate_files(str(project), skeleton_roots=SKELETON_ROOTS)
+
+    assert found == []
+
+
+def test_collect_stray_keeps_binary_files_with_different_bytes(tmp_path: Path) -> None:
+    """Invalid UTF-8 bytes must not collapse to the same replacement text."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_workspace(project)
+    twin = project / "frontend/src/api/binary.bin"
+    twin.parent.mkdir(parents=True, exist_ok=True)
+    twin.write_bytes(b"\xff\n")
+    stray = project / "src/api/binary.bin"
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_bytes(b"\xef\xbf\xbd\n")
+    _commit_all(project, "binary files")
+
+    found = collect_stray_duplicate_files(str(project), skeleton_roots=SKELETON_ROOTS)
+
+    assert found == []
 
 
 def test_collect_stray_without_git_repo_returns_empty(tmp_path: Path) -> None:

@@ -1805,9 +1805,42 @@ def _load_untracked_paths(workspace_root: str) -> set[str]:
 
 
 def _load_tracked_paths(workspace_root: str) -> set[str]:
-    """Git-tracked (staged or committed) paths of ``workspace_root``."""
+    """Git-index paths of ``workspace_root`` (staged or committed)."""
 
     return _git_ls_paths(["--cached"], workspace_root)
+
+
+def _load_head_paths(workspace_root: str) -> set[str]:
+    """Paths present in the committed ``HEAD`` tree (repo-relative, POSIX style)."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+            cwd=str(workspace_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if completed.returncode != 0:
+        return set()
+    return {
+        line.replace("\\", "/").strip()
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    }
+
+
+def _fingerprint_bytes(raw: bytes) -> str:
+    """Hash bytes after normalizing only line endings."""
+
+    return hashlib.sha256(
+        raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    ).hexdigest()
 
 
 def collect_undeclared_test_files(
@@ -1863,16 +1896,15 @@ def _is_under_skeleton(path: str, roots: list[str]) -> bool:
 
 
 def _content_fingerprint(path: Path) -> str | None:
-    """sha256 over newline-normalized text, so a CRLF copy of a committed LF
-    file still counts as the same content; unreadable files never match."""
+    """sha256 over newline-normalized bytes, so a CRLF copy of a committed LF
+    file still counts as the same content while distinct binaries stay
+    distinct; unreadable files never match."""
 
     try:
-        text = path.read_bytes().decode("utf-8", errors="replace")
+        raw = path.read_bytes()
     except OSError:
         return None
-    return hashlib.sha256(
-        text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
-    ).hexdigest()
+    return _fingerprint_bytes(raw)
 
 
 def load_template_skeleton_roots(template_dir: str) -> list[str]:
@@ -1916,17 +1948,19 @@ def collect_stray_duplicate_files(
     committed fourteen seconds later. A file is collected only when *both*
     hold:
 
-    - its content equals another **committed** file's (sha256 over
-      newline-normalized text), and
+    - its content equals another **committed-path** file's current content
+      (sha256 over newline-normalized bytes), and
     - its path lies outside every skeleton root, while the twin's path lies
       inside one — so the content provably survives the deletion at its
       declared location, and two identical files that are both outside the
       skeleton are left alone.
 
     Candidates come from tracked and untracked-but-not-ignored git paths
-    (both would ride the next ``git add -A`` checkpoint); the twin must be
-    tracked, because an untracked in-skeleton copy is not durable state.
-    Generic "unreferenced file" detection is deliberately out of scope.
+    (both would ride the next ``git add -A`` checkpoint); the twin path must
+    already exist in ``HEAD`` (an index-only path is not a durable anchor),
+    while its fingerprint is read from the current worktree so an edited twin
+    no longer matching the stray is not treated as a duplicate. Generic
+    "unreferenced file" detection is deliberately out of scope.
 
     Returns ``[{"path": ..., "twin": ...}]`` with workspace-relative
     POSIX-style paths, sorted.
@@ -1941,7 +1975,8 @@ def collect_stray_duplicate_files(
     if not roots:
         return []
     tracked = _load_tracked_paths(str(root))
-    if not tracked:
+    head_paths = _load_head_paths(str(root))
+    if not tracked or not head_paths:
         return []
 
     def _sweepable(paths: set[str]) -> list[str]:
@@ -1955,12 +1990,12 @@ def collect_stray_duplicate_files(
         return sweepable
 
     inside_fingerprints: dict[str, str] = {}
-    for path in _sweepable(tracked):
+    for path in _sweepable(head_paths):
         if not _is_under_skeleton(path, roots):
             continue
         fingerprint = _content_fingerprint(root / path)
-        if fingerprint and fingerprint not in inside_fingerprints:
-            inside_fingerprints[fingerprint] = path
+        if fingerprint:
+            inside_fingerprints.setdefault(fingerprint, path)
     if not inside_fingerprints:
         return []
 
