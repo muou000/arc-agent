@@ -262,6 +262,37 @@ class EventClient:
             },
         )
 
+    def record_rebase_replay(
+        self,
+        *,
+        node_id: str = "",
+        status: str = "",
+        files: list[str] | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Append one ``rebase_replay`` event for the mid-phase replay.
+
+        Emitted at the replay lifecycle's decision points (issue #127 /
+        ADR 0003): ``replayed`` for a clean replay, ``conflicts`` when the
+        rebase landed with conflict markers for the resolving agent,
+        ``aborted`` when a mechanical failure rolled the worktree back
+        (fail-open), and ``skipped`` when a boundary check consumed the
+        pending set without a replay. ``files`` carries the applied or
+        conflicted paths. An empty ``node_id`` attributes the event to the
+        run as a whole.
+        """
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "rebase_replay",
+                "node_id": str(node_id or "").strip(),
+                "status": str(status or "").strip(),
+                "files": [str(path or "").strip() for path in (files or []) if str(path or "").strip()],
+                "message": message,
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def _emit_runner_state(self, state: str, message: str | None = None) -> None:
         append_jsonl(
             self.paths.runner_events_path,

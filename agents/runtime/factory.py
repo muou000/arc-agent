@@ -398,6 +398,7 @@ def build_stage_agent(
     pending_contract_registry: Any | None = None,
     app_type: str | None = None,
     max_design_writes: int | None = None,
+    rebase_gate: Any | None = None,
 ) -> StageAgentBuild:
     """Create an agent instance with ARC's first-batch filesystem policy.
 
@@ -423,6 +424,12 @@ def build_stage_agent(
     ``max_design_writes`` overrides the interface_design stage's write budget
     (distinct-file cap; see ``StageDisciplineMiddleware``); other stages
     ignore it and ``None`` keeps the default leaf ceiling.
+
+    ``rebase_gate`` optionally wires the demand-pull mid-phase replay
+    (``agents.runtime.rebase_gate.RebaseOnMergeMiddleware``, issue #127):
+    a prepared middleware instance whose ``handle`` is this agent's task
+    worktree. ``None`` (serial mode, non-worktree agents, feature off)
+    mounts nothing.
 
     Filesystem behaviors (delete not-found precedence, permission-denied
     hints, Windows extended-path compatibility) are wired as build-time
@@ -466,6 +473,14 @@ def build_stage_agent(
             agent_root=str(root),
         )
 
+    permissions = _build_filesystem_permissions(
+        root,
+        writable_roots,
+        skill_instruction_paths=_resolve_skill_instruction_paths(
+            resolved_skills,
+            skills_root,
+        ),
+    )
     stage_discipline = StageDisciplineMiddleware(
         stage=stage,
         file_claim_gate=file_claim_gate,
@@ -474,13 +489,34 @@ def build_stage_agent(
         template_shared_surfaces=_template_shared_surfaces(app_type),
         max_design_writes=max_design_writes if stage == "interface_design" else None,
     )
-    permissions = _build_filesystem_permissions(
-        root,
-        writable_roots,
-        skill_instruction_paths=_resolve_skill_instruction_paths(
-            resolved_skills,
-            skills_root,
-        ),
+    middleware: list[Any] = [
+        ToolUsageMiddleware(),
+        TruncatedToolCallGuardMiddleware(),
+        ToolArgumentSanitizerMiddleware(),
+        stage_discipline,
+    ]
+    if rebase_gate is not None:
+        # Order note: the replay gate sits ahead of the filesystem
+        # middleware so the replayed tree is what the tool executes against,
+        # and behind stage discipline so discipline blocks (which never
+        # reach the handler) also never trigger a replay.
+        if file_claim_gate is not None:
+            attach = getattr(rebase_gate, "attach_claim_gate", None)
+            if callable(attach):
+                # A successful replay lands the sibling's tracked files;
+                # the claim gate must re-snapshot instead of trusting its
+                # pre-replay view (issue #127).
+                attach(file_claim_gate)
+        middleware.append(rebase_gate)
+    middleware.extend(
+        [
+            DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
+            # Replaces deepagents' stock FilesystemMiddleware by name inside
+            # create_deep_agent (delete not-found precedence); the hint
+            # middleware rewrites permission-denied results afterwards.
+            ARCFilesystemMiddleware(backend=backend, _permissions=permissions),
+            PermissionDeniedHintMiddleware(),
+        ]
     )
     # Mount-time capability filter: the same table the middleware enforces
     # at call time keeps a stage from ever seeing a tool it may not call
@@ -498,18 +534,7 @@ def build_stage_agent(
         model=resolved_model,
         backend=backend,
         system_prompt=system_prompt,
-        middleware=[
-            ToolUsageMiddleware(),
-            TruncatedToolCallGuardMiddleware(),
-            ToolArgumentSanitizerMiddleware(),
-            stage_discipline,
-            DisableToolsMiddleware(disabled=DISABLED_BUILTIN_TOOLS),
-            # Replaces deepagents' stock FilesystemMiddleware by name inside
-            # create_deep_agent (delete not-found precedence); the hint
-            # middleware rewrites permission-denied results afterwards.
-            ARCFilesystemMiddleware(backend=backend, _permissions=permissions),
-            PermissionDeniedHintMiddleware(),
-        ],
+        middleware=middleware,
         tools=stage_tools,
         skills=resolved_skills,
         memory=_resolve_source_paths(memory, root, skills_root, default=[]),

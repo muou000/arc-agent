@@ -64,6 +64,7 @@ class TestGenerator:
         requirement_path: str | None = None,
         app_type: str | None = None,
         context_workspace_root: str | None = None,
+        rebase_gate_provider: Callable[[], Any | None] | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
@@ -73,6 +74,18 @@ class TestGenerator:
         # Context/session root: stays on the main workspace when the agent's
         # filesystem root is an isolated per-node worktree.
         self.context_workspace_root = context_workspace_root
+        # Optional per-pass mid-phase replay gate (issue #127), shared by
+        # every agent build of this adapter's passes.
+        self._rebase_gate_provider = rebase_gate_provider
+
+    def _rebase_gate(self) -> Any | None:
+        """Build (or reuse) this adapter's mid-phase replay gate."""
+
+        cached = getattr(self, "_current_rebase_gate", None)
+        if cached is None and self._rebase_gate_provider is not None:
+            cached = self._rebase_gate_provider()
+            self._current_rebase_gate = cached
+        return cached
 
     async def run(
         self,
@@ -105,6 +118,7 @@ class TestGenerator:
                 [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=TestGenerationResponse,
+            rebase_gate=self._rebase_gate(),
             tools=[
                 *build_traceability_tools(
                     node_id=node_id,
@@ -349,6 +363,7 @@ class TestGenerator:
             stage="test_generation",
             system_prompt=get_system_prompt(),
             response_format=TestGenerationResponse,
+            rebase_gate=self._rebase_gate(),
             tools=[
                 *build_traceability_tools(
                     node_id=node_id,

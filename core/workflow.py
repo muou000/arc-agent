@@ -182,6 +182,23 @@ def _design_pipelining_enabled() -> bool:
     return os.environ.get(DESIGN_GATE_PIPELINE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+REBASE_ON_MERGE_ENV = "ARC_REBASE_ON_MERGE"
+
+
+def _rebase_on_merge_enabled() -> bool:
+    """Whether landed sibling merges replay onto in-flight tasks on demand.
+
+    Default off (ADR 0003): with the gate closed a sibling merge never
+    touches an executing task - the overlap surfaces at the task's own
+    integrate through the merge rails, exactly like main. With the gate
+    open, the merge attaches its changed-file set to each in-flight task
+    and the task's file tools replay it at the boundary where they first
+    touch one of those paths.
+    """
+
+    return os.environ.get(REBASE_ON_MERGE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class _TaskWorkspace:
     """An in-flight task's isolated resources (worktree mode only)."""
@@ -231,6 +248,13 @@ class ARCWorkflowManager:
         self._merge_lock = asyncio.Lock()
         self._port_slots: dict[int, str] = {}
         self._port_slot_count = 1
+        # In-flight task workspaces by node id (parallel mode). The merge
+        # path consults this to attach pending merges for the demand-pull
+        # replay (issue #127); entries live for the task's duration only.
+        self._inflight: dict[str, _TaskWorkspace] = {}
+        # Demand-pull mid-phase replay gate (issue #127, ARC_REBASE_ON_MERGE,
+        # default off): off keeps the merge rails byte-for-byte identical.
+        self._rebase_on_merge = _rebase_on_merge_enabled()
 
         set_web_port(self.web_port)
         self.interface_designer = InterfaceDesigner(
@@ -567,6 +591,9 @@ class ARCWorkflowManager:
         inside their shared worktree while different subtrees overlap.
         """
 
+        # A resumed/interrupted drain cannot have live in-flight tasks in
+        # this process; stale registrations would misdirect pending merges.
+        self._inflight.clear()
         max_concurrency = self._max_concurrent_tasks()
         if max_concurrency <= 1:
             while True:
@@ -797,6 +824,9 @@ class ARCWorkflowManager:
         if self._parallel_mode:
             try:
                 ctx = await self._open_task_workspace(task, queue_state)
+                # In-flight registration for the demand-pull replay (issue
+                # #127): sibling merges attach their changed files here.
+                self._inflight[node_id] = ctx
             except Exception as exc:
                 await self._log(
                     "Compiler",
@@ -949,7 +979,7 @@ class ARCWorkflowManager:
             self._release_port_slot(slot)
             raise
         web_port = self._slot_port(slot)
-        runner = self._build_task_phase_runner(handle.path, web_port)
+        runner = self._build_task_phase_runner(handle.path, web_port, handle=handle)
         await self._log(
             "Compiler",
             f"Isolated workspace for {node_id}: {handle.path}"
@@ -964,13 +994,20 @@ class ARCWorkflowManager:
             phase_runner=runner,
         )
 
-    def _build_task_phase_runner(self, workspace_path: str, web_port: int | None) -> WorkflowPhaseRunner:
+    def _build_task_phase_runner(
+        self,
+        workspace_path: str,
+        web_port: int | None,
+        handle: Any | None = None,
+    ) -> WorkflowPhaseRunner:
         """Build adapters and an app handler rooted at the task's worktree.
 
         The adapters are per-task instances because they carry per-run state
         (TDD budget/verifier bookkeeping) that parallel tasks must not share.
         Traceability, node sessions and the context pipeline stay rooted in the
         main workspace via context_workspace_root/context_workspace_path.
+        ``handle`` (the task's worktree handle) additionally wires the
+        mid-phase replay gate when ARC_REBASE_ON_MERGE is on.
         """
 
         common = dict(
@@ -980,13 +1017,20 @@ class ARCWorkflowManager:
             app_type=self.app_type,
             context_workspace_root=self.workspace_path,
         )
+        # The mid-phase replay gate (issue #127) is per task: its handle is
+        # this task's worktree. ``None`` (serial mode / gate off) leaves the
+        # adapters without a provider, unchanged from main.
+        rebase_provider = None
+        if handle is not None and self._rebase_on_merge:
+            def rebase_provider() -> Any:
+                return self._build_task_rebase_gate(handle.node_id, handle)
         return WorkflowPhaseRunner(
             workspace_path=workspace_path,
             requirement_path=self.requirement_path,
             app_type=self.app_type,
-            interface_designer=InterfaceDesigner(**common),
-            test_generator=TestGenerator(**common),
-            test_driven_developer=TestDrivenDeveloper(**common),
+            interface_designer=InterfaceDesigner(rebase_gate_provider=rebase_provider, **common),
+            test_generator=TestGenerator(rebase_gate_provider=rebase_provider, **common),
+            test_driven_developer=TestDrivenDeveloper(rebase_gate_provider=rebase_provider, **common),
             log_cb=self._log,
             web_port=web_port,
             context_workspace_path=self.workspace_path,
@@ -1010,6 +1054,7 @@ class ARCWorkflowManager:
         verify = self._build_merge_health_gate() if self.app_type == "web" else None
         arbiter = self._build_merge_arbitration_hooks(ctx, node_id, phase)
         async with self._merge_lock:
+            pre_merge_head = self._integration_head_sha()
             try:
                 committed, detail = await asyncio.to_thread(
                     self._worktree_manager.integrate,
@@ -1024,12 +1069,106 @@ class ARCWorkflowManager:
             except WorktreeError as exc:
                 await self._log("Compiler", f"Integration of {node_id} failed: {exc}", "error", node_id)
                 return False, str(exc), []
+            # The merge is done and the integration branch moved (a no-change
+            # merge leaves it in place and the diff inside comes back empty,
+            # making the attach a no-op).
+            self._attach_pending_merge(node_id, pre_merge_head)
         if not committed:
             await self._log("Compiler", "No file changes detected for this checkpoint.", node_id=node_id)
         await self._log("Compiler", f"Integrated {node_id}: {detail}.", node_id=node_id)
         if phase == PHASE_IMPLEMENT:
             await self._check_contract_drift(node_id)
         return True, detail, []
+
+    def _integration_head_sha(self) -> str:
+        """Current integration HEAD sha (empty when unavailable)."""
+
+        if self._worktree_manager is None:
+            return ""
+        try:
+            return self._worktree_manager.integration_head_sha()
+        except Exception:  # noqa: BLE001 - a pending-merge attach is best effort
+            return ""
+
+    def _attach_pending_merge(self, source_node_id: str, pre_merge_head: str) -> None:
+        """Attach the just-landed merge to every other in-flight task.
+
+        Demand-pull bookkeeping (issue #127): the changed-file set
+        (pre-merge HEAD..HEAD) lands on each in-flight task's worktree as a
+        ``PendingMerge``; nothing replays until the task's agent touches one
+        of those paths. Skipped entirely when the gate is off or no other
+        task is in flight. Best effort: a git failure here must not fail the
+        merge that already succeeded.
+        """
+
+        if not self._rebase_on_merge or not self._inflight:
+            return
+        try:
+            changed_files = self._worktree_manager.read_integration_diff(pre_merge_head)
+        except Exception as exc:  # noqa: BLE001 - the merge already landed
+            append_debug_log(
+                "Compiler",
+                f"pending-merge attach for {source_node_id} failed: {type(exc).__name__}: {exc}",
+                workspace_root=self.workspace_path,
+            )
+            return
+        if not changed_files:
+            return
+        head_sha = self._integration_head_sha()
+        for other_id, ctx in self._inflight.items():
+            if other_id == source_node_id:
+                continue
+            self._worktree_manager.record_pending_merge(
+                ctx.handle, source_node_id, head_sha, changed_files
+            )
+
+    def _build_task_rebase_gate(self, node_id: str, handle: Any) -> Any | None:
+        """The per-task mid-phase replay middleware (issue #127).
+
+        ``None`` keeps the agent stack unchanged: serial mode (no worktree),
+        or the feature gate closed. The middleware receives the manager's
+        replay entry points and an audit hook that writes the
+        ``rebase_replay`` runner events; the file-claim gate's tracked-set
+        snapshot is invalidated after each successful replay (the factory
+        wires ``RebaseOnMergeMiddleware.attach_claim_gate`` to the claim gate
+        it builds) so a sibling's newly-tracked file is claim-checked
+        against the fresh tree.
+        """
+
+        if not self._rebase_on_merge or self._worktree_manager is None:
+            return None
+        from agents.runtime.rebase_gate import RebaseOnMergeMiddleware
+
+        manager = self._worktree_manager
+
+        def on_replay(outcome: Any) -> None:
+            self._emit_rebase_replay_event(node_id, outcome)
+
+        return RebaseOnMergeMiddleware(
+            handle=handle,
+            replay=manager.replay_pending_merges,
+            pending_files=lambda: manager.pending_merges_for(handle),
+            is_mid_rebase=manager.is_mid_rebase,
+            continue_replay=manager.continue_replay,
+            on_replay=on_replay,
+        )
+
+    def _emit_rebase_replay_event(self, node_id: str, outcome: Any) -> None:
+        """Persist one ``rebase_replay`` runner event (best effort)."""
+
+        try:
+            self.runtime.events.record_rebase_replay(
+                node_id=node_id,
+                status=str(getattr(outcome, "status", "") or ""),
+                files=[str(path) for path in (getattr(outcome, "files", None) or [])],
+                message=str(getattr(outcome, "detail", "") or "") or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - audit must never break the tool call
+            append_debug_log(
+                "RebaseReplay",
+                f"rebase replay audit emit failed: {type(exc).__name__}: {exc}",
+                workspace_root=self.workspace_path,
+            )
 
     async def _check_contract_drift(self, node_id: str) -> None:
         """Validate the node's registered contracts against the merged tree.
@@ -1643,9 +1782,12 @@ class ARCWorkflowManager:
             )
             return None
         finally:
-            # Release the node's new-file claims: after a successful merge the
-            # files are tracked in git (claims are moot), and after a terminal
-            # failure the paths must be free for other nodes.
+            # The task is no longer in flight: drop the demand-pull replay
+            # registration and release the node's new-file claims (after a
+            # successful merge the files are tracked in git - claims are
+            # moot; after a terminal failure the paths must be free for
+            # other nodes).
+            self._inflight.pop(ctx.node_id, None)
             get_file_claim_registry(self.workspace_path).release_node(ctx.node_id)
             self._release_port_slot(ctx.slot)
         return outcome

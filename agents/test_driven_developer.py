@@ -42,6 +42,7 @@ class TestDrivenDeveloper:
         app_type: str | None = None,
         app_handler: Any | None = None,
         context_workspace_root: str | None = None,
+        rebase_gate_provider: Callable[[], Any | None] | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
@@ -52,6 +53,9 @@ class TestDrivenDeveloper:
         # Context/session root: stays on the main workspace when the agent's
         # filesystem root is an isolated per-node worktree.
         self.context_workspace_root = context_workspace_root
+        # Optional per-pass mid-phase replay gate (issue #127), shared by
+        # every TDD-layer agent build of this adapter.
+        self._rebase_gate_provider = rebase_gate_provider
         self._last_run_tests_result: str | None = None
         self._last_run_tests_exit_code: int | None = None
         self._last_verifier_report_text = ""
@@ -64,6 +68,15 @@ class TestDrivenDeveloper:
         # fingerprint plus the write-event position at that failure, so the
         # next same-fingerprint failure can ask "what was edited in between?".
         self._stage_build: StageAgentBuild | None = None
+
+    def _rebase_gate(self) -> Any | None:
+        """Build (or reuse) this adapter's mid-phase replay gate."""
+
+        cached = getattr(self, "_current_rebase_gate", None)
+        if cached is None and self._rebase_gate_provider is not None:
+            cached = self._rebase_gate_provider()
+            self._current_rebase_gate = cached
+        return cached
         self._stall_chains: dict[str, tuple[str, int]] = {}
 
     async def run(
@@ -243,6 +256,7 @@ class TestDrivenDeveloper:
                 [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=None,
+            rebase_gate=self._rebase_gate(),
             tools=[run_tests, run_build, install_dependencies, *traceability_tools],
             skills=[SKILLS_SOURCE],
         )

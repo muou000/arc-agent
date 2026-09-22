@@ -120,6 +120,7 @@ class InterfaceDesigner:
         requirement_path: str | None = None,
         app_type: str | None = None,
         context_workspace_root: str | None = None,
+        rebase_gate_provider: Callable[[], Any | None] | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
@@ -131,6 +132,9 @@ class InterfaceDesigner:
         # isolated per-node worktree: sessions and caches stay in the main
         # workspace while the agent's filesystem root is the worktree.
         self.context_workspace_root = context_workspace_root
+        # Optional per-pass mid-phase replay gate (issue #127): called per
+        # agent build so the repair flows' rebuilds share the pass's gate.
+        self._rebase_gate_provider = rebase_gate_provider
         # Write budget tier pinned by ``run()`` for the pass it is executing.
         # The repair flows rebuild agents mid-pass and read this instead of
         # re-deriving from anything, so every rebuild within one ``run`` shares
@@ -297,7 +301,17 @@ class InterfaceDesigner:
             skills=[SKILLS_SOURCE],
             pending_contract_registry=pending_contract_registry,
             max_design_writes=max_design_writes,
+            rebase_gate=self._rebase_gate() if self._rebase_gate_provider else None,
         )
+
+    def _rebase_gate(self) -> Any | None:
+        """Build (or reuse) this pass's mid-phase replay gate."""
+
+        cached = getattr(self, "_current_rebase_gate", None)
+        if cached is None and self._rebase_gate_provider is not None:
+            cached = self._rebase_gate_provider()
+            self._current_rebase_gate = cached
+        return cached
 
     async def _repair_empty_interfaces(
         self,
