@@ -71,6 +71,36 @@ def isolate_model_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     yield
 
 
+# Scheduling/merge semantics switches (see core/workflow.py). They reach
+# `os.environ` through the same import-time `load_project_env()` call when the
+# host `.env` sets them, but they flip scheduling semantics instead of
+# provider wiring: tests asserting default scheduling behaviour
+# (test_parallel_scheduling_rules, test_parallel_worktree_drain, ...) do not
+# pin every switch, so a host override false-reds them in a batch (issue
+# #146). Delete them before every test; tests that exercise a switch
+# explicitly monkeypatch.setenv over this fixture (they run later, so the
+# explicit value wins). The names mirror core/workflow.py literals instead of
+# importing its constants (e.g. DESIGN_GATE_PIPELINE_ENV) on purpose: importing
+# core.workflow would run load_project_env() at import time in every test
+# session — the very leak this fixture exists to neutralize.
+SCHEDULING_SWITCH_ENV_VARS = (
+    "ARC_NODE_WORKTREES",
+    "ARC_MAX_CONCURRENT_TASKS",
+    "ARC_AFFINITY_DEPTH",
+    "ARC_DESIGN_GATE_PIPELINE",
+    "ARC_MERGE_ARBITRATION",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_scheduling_switches(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep host scheduling switches from flipping scheduling-semantics tests."""
+
+    for key in SCHEDULING_SWITCH_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+    yield
+
+
 @pytest.fixture
 def tmp_project_dir(tmp_path: Path, clean_env: None) -> Iterator[Path]:
     """Yield a fresh project directory with no ARC artefacts present.
