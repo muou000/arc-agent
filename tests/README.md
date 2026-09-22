@@ -57,6 +57,13 @@ python -m pytest -p no:anyio
 
 `-p no:anyio` 用于禁用本环境中加载会失败的可选插件，与被测代码无关。
 
+测试默认通过 `pytest-xdist` 多进程并行运行（`pytest.ini` 的 `addopts` 含 `-n auto`，
+worker 数等于 CPU 核数）。需要回到单进程串行时追加 `-n0`：
+
+```bash
+python -m pytest -p no:anyio -n0 -m "not slow"   # 串行运行快速路径
+```
+
 也可以使用 Make 目标：
 
 ```bash

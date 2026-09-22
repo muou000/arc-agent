@@ -13,3 +13,4 @@ deepagents
 langchain-openai
 pytest>=8.0
 pytest-cov>=4.1
+pytest-xdist>=3.6

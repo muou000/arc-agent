@@ -547,9 +547,22 @@ def test_pipeline_drain_starts_dependent_design_before_dependency_implement(
     queue_state = manager._load_or_create_processing_queue(_dependency_tree())
 
     events: list[tuple[str, str]] = []
+    # The start/end events are appended inside the faked _run_task, which only
+    # runs after _execute_task's real worktree prepare. Under parallel load the
+    # git subprocesses can delay one task's append past a sibling's entire
+    # cycle, so the overlap claim below is enforced by handoff, not wall clock:
+    # RA:IMPLEMENT stays executing until RB:DESIGN has actually started.
+    rb_design_started = asyncio.Event()
 
     async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
         events.append(("start", task["task_id"]))
+        if task["task_id"] == "RA:IMPLEMENT":
+            try:
+                await asyncio.wait_for(rb_design_started.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass  # fall through and let the ordering assertion fail loudly
+        if task["task_id"] == "RB:DESIGN":
+            rb_design_started.set()
         await asyncio.sleep(0.05)
         events.append(("end", task["task_id"]))
         return True
