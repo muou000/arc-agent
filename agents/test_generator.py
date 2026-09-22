@@ -15,6 +15,7 @@ from agents.results import normalize_test_manifest_payload
 from agents.runtime.capabilities import normalize_manifest_path
 from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
+from agents.runtime.rebase_gate import cached_rebase_gate
 from agents.skills.selection import SKILLS_SOURCE, test_generation_skills
 from agents.tools.test_manifest import (
     DeclaredTestFile,
@@ -79,13 +80,7 @@ class TestGenerator:
         self._rebase_gate_provider = rebase_gate_provider
 
     def _rebase_gate(self) -> Any | None:
-        """Build (or reuse) this adapter's mid-phase replay gate."""
-
-        cached = getattr(self, "_current_rebase_gate", None)
-        if cached is None and self._rebase_gate_provider is not None:
-            cached = self._rebase_gate_provider()
-            self._current_rebase_gate = cached
-        return cached
+        return cached_rebase_gate(self)
 
     async def run(
         self,

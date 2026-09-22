@@ -290,6 +290,18 @@ class ReplayOutcome:
     pre-replay state; the call proceeds against the old tree and the merge
     rails own the overlap), or ``"skipped"`` (no replay was needed - no
     pending merges, nothing touched, or replay disabled for this stage).
+
+    ``attempted`` marks outcomes where git state actually moved (a rebase
+    ran, or a ``rebase --continue`` round executed): the soft guard counts
+    only attempted conflict rounds, not the passive "still unresolved"
+    observation a boundary call makes while the agent works on other
+    files.
+
+    ``origin`` distinguishes a fresh replay (``"replay"``) from a conflict-
+    resolution round (``"continue"``): the soft guard's consecutive streak
+    resets on a clean fresh replay (a conflict-free wave breaks the run)
+    but not on a continue's completion, which only resolves a conflict the
+    same replay already carried.
     """
 
     REPLAYED = "replayed"
@@ -300,6 +312,8 @@ class ReplayOutcome:
     status: str
     files: list[str] = field(default_factory=list)
     detail: str = ""
+    attempted: bool = False
+    origin: str = "replay"
 
 
 def normalize_repo_path(value: object) -> str:
@@ -309,6 +323,13 @@ def normalize_repo_path(value: object) -> str:
     virtual (``/workspace/a/b``), slash-prefixed or relative forms. This maps
     them onto the same comparison space (``a/b``). Empty and workspace-root
     forms return ``""``.
+
+    Deliberately not shared with ``agents.runtime.capabilities``'s
+    ``normalize_manifest_path``: that one maps onto manifest-declared test
+    paths with its own semantics, and importing from ``agents`` here would
+    invert the layering (``agents.runtime.rebase_gate`` already imports
+    from this module). The shapes coincide today; a future divergence is
+    fine because the two never compare paths against each other.
     """
 
     path = str(value or "").replace("\\", "/").strip()
@@ -1061,6 +1082,7 @@ class NodeWorktreeManager:
                 status=ReplayOutcome.ABORTED,
                 files=applied_files,
                 detail=f"{type(exc).__name__}: {exc}",
+                attempted=True,
             )
 
     def _replay_git_section(
@@ -1080,6 +1102,7 @@ class NodeWorktreeManager:
                 status=ReplayOutcome.ABORTED,
                 files=applied_files,
                 detail=f"merge-base failed: {merge_bases.stderr.strip()}",
+                attempted=True,
             )
         integration_sha = (
             self._git(["rev-parse", integration], cwd=handle.path, check=False).stdout.strip()
@@ -1108,6 +1131,7 @@ class NodeWorktreeManager:
                     status=ReplayOutcome.CONFLICTS,
                     files=conflicted,
                     detail=f"rebase onto {integration} conflicted",
+                    attempted=True,
                 )
             # A failed rebase with no conflict paths is a mechanical failure
             # (locked file, index damage): roll back to the pre-replay state.
@@ -1115,9 +1139,14 @@ class NodeWorktreeManager:
             self._abort_replay(handle, pre_replay_head)
             failure = (rebase.stderr or rebase.stdout or "").strip()
             return ReplayOutcome(
-                status=ReplayOutcome.ABORTED, files=applied_files, detail=failure
+                status=ReplayOutcome.ABORTED,
+                files=applied_files,
+                detail=failure,
+                attempted=True,
             )
-        return ReplayOutcome(status=ReplayOutcome.REPLAYED, files=applied_files)
+        return ReplayOutcome(
+            status=ReplayOutcome.REPLAYED, files=applied_files, attempted=True
+        )
 
     def _wip_commit(self, handle: WorktreeHandle) -> None:
         """Commit the dirty tree as a ``wip:`` checkpoint on the node branch.
@@ -1187,6 +1216,25 @@ class NodeWorktreeManager:
 
         return str(Path(handle.path)) in self._mid_rebase
 
+    def abort_replay(self, handle: WorktreeHandle) -> None:
+        """Abort a mid-rebase worktree and restore its pre-replay state.
+
+        The disarm path of the soft guard (issue #127): after three
+        attempted conflict rounds the mid-phase replay stands down for the
+        rest of the pass, and a rebase still sitting mid-replay must not
+        dangle into the phase-end integrate - it is aborted here, the
+        branch returns to the pre-replay head and the WIP checkpoint's
+        content back into the working tree, so the merge rails own the
+        overlap exactly like a mechanical failure. Never raises.
+        """
+
+        if str(Path(handle.path)) not in self._mid_rebase:
+            return
+        try:
+            self._recover_aborted_rebase(handle)
+        except Exception:  # noqa: BLE001 - fail-open is the contract
+            self._clear_mid_rebase_marks(handle)
+
     def continue_replay(self, handle: WorktreeHandle) -> ReplayOutcome:
         """Advance or complete a mid-rebase worktree at a tool boundary.
 
@@ -1210,7 +1258,9 @@ class NodeWorktreeManager:
         except Exception as exc:  # noqa: BLE001 - fail-open is the contract
             self._recover_aborted_rebase(handle)
             return ReplayOutcome(
-                status=ReplayOutcome.ABORTED, detail=f"{type(exc).__name__}: {exc}"
+                status=ReplayOutcome.ABORTED,
+                detail=f"{type(exc).__name__}: {exc}",
+                attempted=True,
             )
     def _continue_rebase_section(self, handle: WorktreeHandle) -> ReplayOutcome:
         conflict_paths = self._rebase_conflict_paths(handle)
@@ -1263,14 +1313,26 @@ class NodeWorktreeManager:
                 status=ReplayOutcome.REPLAYED,
                 files=conflict_paths,
                 detail="rebase continued after conflict resolution",
+                attempted=True,
+                origin="continue",
             )
         unresolved = self._unmerged_paths_in(handle.path)
         if unresolved:
             # The next commit of the replay conflicts: another round.
-            return ReplayOutcome(status=ReplayOutcome.CONFLICTS, files=unresolved)
+            return ReplayOutcome(
+                status=ReplayOutcome.CONFLICTS,
+                files=unresolved,
+                attempted=True,
+                origin="continue",
+            )
         self._recover_aborted_rebase(handle)
         failure = (continue_result.stderr or continue_result.stdout or "").strip()
-        return ReplayOutcome(status=ReplayOutcome.ABORTED, detail=failure)
+        return ReplayOutcome(
+            status=ReplayOutcome.ABORTED,
+            detail=failure,
+            attempted=True,
+            origin="continue",
+        )
 
     def _rebase_conflict_paths(self, handle: WorktreeHandle) -> list[str]:
         """The paths the in-progress rebase wants resolved.
@@ -1328,18 +1390,6 @@ class NodeWorktreeManager:
     def _clear_mid_rebase_marks(self, handle: WorktreeHandle) -> None:
         self._mid_rebase.discard(str(Path(handle.path)))
         self._mid_rebase_base.pop(str(Path(handle.path)), None)
-
-    def clear_mid_rebase(self, handle: WorktreeHandle) -> None:
-        """Drop the mid-rebase mark without touching the tree (settle path).
-
-        A task whose phase ended mid-rebase (budget exhausted with markers
-        still in the tree, crash) settles through the normal failure rails;
-        the worktree is preserved for inspection, and this only clears the
-        manager's bookkeeping so a reused directory is not mistaken for a
-        live rebase.
-        """
-
-        self._clear_mid_rebase_marks(handle)
 
     def cleanup_reusable_worktrees(self) -> list[str]:
         """Remove reusable worktree directories left over after a run.

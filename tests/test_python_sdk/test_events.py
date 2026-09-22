@@ -502,3 +502,40 @@ class TestDemoTestStatus:
     ) -> None:
         events.set_demo_requirement_status("", "PASSED")
         assert read_jsonl(event_paths.runner_events_path) == []
+
+class TestRebaseReplayEvents:
+    """Pin the ``rebase_replay`` schema: the mid-phase replay lifecycle
+    (issue #127 / ADR 0003)."""
+
+    @pytest.mark.parametrize("status", ["started", "resolved", "conflicts", "aborted"])
+    def test_record_rebase_replay_writes_canonical_schema(
+        self,
+        events: EventClient,
+        event_paths: RuntimePaths,
+        status: str,
+    ) -> None:
+        events.record_rebase_replay(
+            node_id=" REQ-2.1 ",
+            status=status,
+            files=["backend/shared.js", "  "],
+            message="rebase onto master conflicted",
+        )
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "rebase_replay",
+            "node_id": "REQ-2.1",
+            "status": status,
+            "files": ["backend/shared.js"],
+            "message": "rebase onto master conflicted",
+            "timestamp": lines[0]["timestamp"],
+        }
+
+    def test_defaults_and_invalid_values_are_normalized(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_rebase_replay(node_id="REQ-2.1", status="resolved")
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["files"] == []
+        assert lines[0]["message"] is None

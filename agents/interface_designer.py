@@ -24,6 +24,7 @@ from agents.runtime.factory import StageAgentBuild
 from agents.runtime.runners import salvage_json_objects
 from agents.runtime.stage_discipline import MAX_DESIGN_WRITES, MAX_NON_LEAF_DESIGN_WRITES
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
+from agents.runtime.rebase_gate import cached_rebase_gate
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
 from agents.tools.traceability import build_traceability_tools
 
@@ -305,13 +306,7 @@ class InterfaceDesigner:
         )
 
     def _rebase_gate(self) -> Any | None:
-        """Build (or reuse) this pass's mid-phase replay gate."""
-
-        cached = getattr(self, "_current_rebase_gate", None)
-        if cached is None and self._rebase_gate_provider is not None:
-            cached = self._rebase_gate_provider()
-            self._current_rebase_gate = cached
-        return cached
+        return cached_rebase_gate(self)
 
     async def _repair_empty_interfaces(
         self,

@@ -501,12 +501,10 @@ def build_stage_agent(
         # and behind stage discipline so discipline blocks (which never
         # reach the handler) also never trigger a replay.
         if file_claim_gate is not None:
-            attach = getattr(rebase_gate, "attach_claim_gate", None)
-            if callable(attach):
-                # A successful replay lands the sibling's tracked files;
-                # the claim gate must re-snapshot instead of trusting its
-                # pre-replay view (issue #127).
-                attach(file_claim_gate)
+            # A successful replay lands the sibling's tracked files; the
+            # claim gate must re-snapshot instead of trusting its
+            # pre-replay view (issue #127).
+            rebase_gate.attach_claim_gate(file_claim_gate)
         middleware.append(rebase_gate)
     middleware.extend(
         [

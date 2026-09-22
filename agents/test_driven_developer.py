@@ -11,6 +11,7 @@ from agents.context.prompts.test_driven_developer import get_system_prompt, get_
 from agents.runtime.capabilities import normalize_manifest_path
 from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
+from agents.runtime.rebase_gate import cached_rebase_gate
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_install_dependencies_tool
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
@@ -68,16 +69,13 @@ class TestDrivenDeveloper:
         # fingerprint plus the write-event position at that failure, so the
         # next same-fingerprint failure can ask "what was edited in between?".
         self._stage_build: StageAgentBuild | None = None
+        # Per-run test-edit stall chain: per test layer, the last failure's
+        # fingerprint plus the write-event position at that failure, so the
+        # next same-fingerprint failure can ask "what was edited in between?".
+        self._stall_chains: dict[str, tuple[str, int]] = {}
 
     def _rebase_gate(self) -> Any | None:
-        """Build (or reuse) this adapter's mid-phase replay gate."""
-
-        cached = getattr(self, "_current_rebase_gate", None)
-        if cached is None and self._rebase_gate_provider is not None:
-            cached = self._rebase_gate_provider()
-            self._current_rebase_gate = cached
-        return cached
-        self._stall_chains: dict[str, tuple[str, int]] = {}
+        return cached_rebase_gate(self)
 
     async def run(
         self,

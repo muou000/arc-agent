@@ -152,9 +152,7 @@ def test_lazy_replay_does_not_run_until_a_pending_path_is_touched(
     gate = RebaseOnMergeMiddleware(
         handle=handle,
         replay=manager.replay_pending_merges,
-        pending_files=lambda: list(
-            manager._pending_merges.get(str(Path(handle.path)), [])
-        ),
+        pending_files=lambda: manager.pending_merges_for(handle),
         is_mid_rebase=manager.is_mid_rebase,
         continue_replay=manager.continue_replay,
         enabled=True,
@@ -164,7 +162,7 @@ def test_lazy_replay_does_not_run_until_a_pending_path_is_touched(
         _make_request("read_file", {"file_path": "/workspace/backend/own.js"}), _ok_tool
     )
     assert result.content == "ok"
-    assert manager._pending_merges.get(str(Path(handle.path))), (
+    assert manager.pending_merges_for(handle), (
         "an unrelated touch must leave the pending merge in place"
     )
     # And the branch is still at the pre-merge head.
@@ -221,9 +219,7 @@ def test_replay_through_middleware_serves_call_against_fresh_tree(
     gate = RebaseOnMergeMiddleware(
         handle=handle,
         replay=manager.replay_pending_merges,
-        pending_files=lambda: list(
-            manager._pending_merges.get(str(Path(handle.path)), [])
-        ),
+        pending_files=lambda: manager.pending_merges_for(handle),
         is_mid_rebase=manager.is_mid_rebase,
         continue_replay=manager.continue_replay,
         enabled=True,
@@ -322,9 +318,7 @@ def test_conflicted_replay_annotation_and_completion_at_boundaries(
     gate = RebaseOnMergeMiddleware(
         handle=handle,
         replay=manager.replay_pending_merges,
-        pending_files=lambda: list(
-            manager._pending_merges.get(str(Path(handle.path)), [])
-        ),
+        pending_files=lambda: manager.pending_merges_for(handle),
         is_mid_rebase=manager.is_mid_rebase,
         continue_replay=manager.continue_replay,
         enabled=True,
@@ -424,7 +418,9 @@ def test_aborted_notice_is_silent(tmp_path: Path) -> None:
 
 def test_soft_guard_disables_after_three_conflict_rounds() -> None:
     handle = WorktreeHandle("A", "arc-node/A", "/tmp/x", "/tmp/x")
-    conflicts = ReplayOutcome(status=ReplayOutcome.CONFLICTS, files=["a.js"])
+    conflicts = ReplayOutcome(
+        status=ReplayOutcome.CONFLICTS, files=["a.js"], attempted=True
+    )
     gate = RebaseOnMergeMiddleware(
         handle=handle,
         replay=lambda _h: conflicts,
@@ -712,7 +708,7 @@ def test_settle_clears_pending_and_mid_rebase_state(tmp_path: Path) -> None:
     outcome = manager.settle(handle, result=WorktreeTaskResult.FAILED)
     assert outcome is WorktreeOutcome.PRESERVED
     key = str(Path(handle.path))
-    assert key not in manager._pending_merges
+    assert not manager.pending_merges_for(handle)
     assert key not in manager._mid_rebase
     assert key not in manager._mid_rebase_base
 
@@ -804,3 +800,147 @@ def test_conflict_notice_survives_a_failing_card_provider() -> None:
     )
     assert "merge conflicts" in result.content
     assert "interface contracts" not in result.content
+
+
+def _conflicted_replay_scenario(
+    tmp_path: Path,
+) -> tuple[NodeWorktreeManager, WorktreeHandle, Path, Path]:
+    """A prepared repo where the task's replay lands with conflict markers."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-A")
+    shared = Path(handle.path) / "backend" / "shared.js"
+    shared.write_text("base;\nagent;\n", encoding="utf-8")
+    sibling = manager.prepare("REQ-B")
+    (Path(sibling.path) / "backend" / "shared.js").write_text(
+        "base;\nsibling;\n", encoding="utf-8"
+    )
+    manager.integrate(sibling, "REQ-B (implement): shared")
+    _record_pending(manager, handle, ["backend/shared.js"])
+    outcome = manager.replay_pending_merges(handle)
+    assert outcome.status == ReplayOutcome.CONFLICTS
+    return manager, handle, shared, repo
+
+
+def test_resolution_then_integrate_merges_cleanly(tmp_path: Path) -> None:
+    """「冲突呈现与消解后合并成功」: after the agent resolves the markers and
+    the boundary completes the rebase, the phase-end integrate succeeds."""
+
+    manager, handle, shared, repo = _conflicted_replay_scenario(tmp_path)
+    shared.write_text("base;\nagent;\nsibling;\n", encoding="utf-8")
+    completed = manager.continue_replay(handle)
+    assert completed.status == ReplayOutcome.REPLAYED
+    # ``committed`` is False here: the replay's WIP/continue commits already
+    # hold every change, so the merge commit has nothing new to stage. The
+    # merge itself must succeed and the resolved content must land.
+    committed, detail = manager.integrate(handle, "REQ-A (implement): resolved")
+    assert "merged arc-node/REQ-A" in detail
+    assert (repo / "backend" / "shared.js").read_text(encoding="utf-8") == (
+        "base;\nagent;\nsibling;\n"
+    )
+
+
+def test_soft_guard_real_git_disarms_and_aborts_the_dangling_rebase(
+    tmp_path: Path,
+) -> None:
+    """Real-git soft guard: three attempted conflict episodes disarm the pass,
+    and a rebase left mid-replay at disarm is aborted back to the WIP state
+    (no unmerged index reaches the phase-end integrate)."""
+
+    manager, handle, shared, repo = _conflicted_replay_scenario(tmp_path)
+    gate = RebaseOnMergeMiddleware(
+        handle=handle,
+        replay=manager.replay_pending_merges,
+        pending_files=lambda: manager.pending_merges_for(handle),
+        is_mid_rebase=manager.is_mid_rebase,
+        continue_replay=manager.continue_replay,
+        abort_replay=manager.abort_replay,
+        enabled=True,
+    )
+
+    def touching_call() -> Any:
+        return gate.wrap_tool_call(
+            _make_request("edit_file", {"file_path": "/workspace/backend/shared.js"}),
+            _ok_tool,
+        )
+
+    # Episode 1: the scenario's mid-rebase conflict observed through the
+    # gate (the continue attempt is passive while markers remain: no count
+    # yet). Resolve it and let the next boundary complete the rebase.
+    assert "merge conflicts" in touching_call().content
+    shared.write_text("base;\nagent;\nsibling;\n", encoding="utf-8")
+    assert "were applied to this workspace" in touching_call().content
+    # The gate observed episode 1's attempted conflict (the scenario's
+    # replay ran through gate-less manager calls; re-enter it honestly:
+    # fresh conflict waves through the gate from here on).
+    for round_index in range(3):
+        sibling = manager.prepare(f"REQ-C{round_index}")
+        (Path(sibling.path) / "backend" / "shared.js").write_text(
+            f"base;\nsibling{round_index};\n", encoding="utf-8"
+        )
+        manager.integrate(sibling, f"REQ-C{round_index} (implement): shared")
+        _record_pending(manager, handle, ["backend/shared.js"])
+        # The gate's touch replays the new wave → conflict episode.
+        result = touching_call()
+        assert "merge conflicts" in result.content, round_index
+        # Resolve so the next wave can conflict again (the continue
+        # completion must not reset the streak - origin="continue").
+        shared.write_text(
+            f"base;\nagent;\nsibling;\nsibling{round_index};\n", encoding="utf-8"
+        )
+        touching_call()
+
+    # The guard is disarmed and the dangling mid-rebase was aborted: the
+    # worktree has no unmerged paths and no conflict markers remain.
+    assert gate._disarmed
+    assert not manager.is_mid_rebase(handle)
+    assert "<<<<<<<" not in shared.read_text(encoding="utf-8")
+    # A fourth wave records pending, but the disarmed gate never replays.
+    sibling = manager.prepare("REQ-D")
+    (Path(sibling.path) / "backend" / "new.js").write_text("d;\n", encoding="utf-8")
+    manager.integrate(sibling, "REQ-D (implement): new")
+    _record_pending(manager, handle, ["backend/new.js"])
+    silent = gate.wrap_tool_call(
+        _make_request("read_file", {"file_path": "/workspace/backend/new.js"}), _ok_tool
+    )
+    assert silent.content == "ok"
+    # And the phase can still settle through the ordinary failure rails.
+    settled = manager.settle(handle, result=WorktreeTaskResult.FAILED)
+    assert settled is WorktreeOutcome.PRESERVED
+
+
+def test_resume_pending_records_are_process_local_and_consistent(
+    tmp_path: Path,
+) -> None:
+    """「--resume 后 pending 记录一致」: a resumed process starts with no
+    pending bookkeeping; merges that land before the interruption are part
+    of the recorded history and the fresh drain attaches only new merges.
+    A stale pending record left in a *live* manager (the crash window) is
+    replayed idempotently - the already-merged files report applied."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-A")
+    sibling = manager.prepare("REQ-B")
+    (Path(sibling.path) / "backend" / "shared.js").write_text(
+        "base;\nsibling;\n", encoding="utf-8"
+    )
+    manager.integrate(sibling, "REQ-B (implement): shared")
+
+    # A resumed process: fresh manager, same repository.
+    resumed_manager = NodeWorktreeManager(str(repo))
+    assert not any(resumed_manager._pending_merges.values())
+    resumed_handle = resumed_manager.prepare("REQ-A")
+    # The branch still sits on the pre-merge head: attaching the same merge
+    # as pending and replaying brings the tree forward, consistent with the
+    # recorded history.
+    _record_pending(resumed_manager, resumed_handle, ["backend/shared.js"])
+    outcome = resumed_manager.replay_pending_merges(resumed_handle)
+    assert outcome.status == ReplayOutcome.REPLAYED
+    assert (
+        (Path(resumed_handle.path) / "backend" / "shared.js").read_text(encoding="utf-8")
+        == "base;\nsibling;\n"
+    )
+    # Consumed on replay: a second identical attach reports applied.
+    _record_pending(resumed_manager, resumed_handle, ["backend/shared.js"])
+    second = resumed_manager.replay_pending_merges(resumed_handle)
+    assert second.status == ReplayOutcome.REPLAYED

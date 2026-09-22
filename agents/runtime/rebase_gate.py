@@ -68,6 +68,23 @@ def rebase_on_merge_enabled() -> bool:
     return os.environ.get(REBASE_ON_MERGE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def cached_rebase_gate(adapter: Any) -> Any | None:
+    """Build (or reuse) an adapter's mid-phase replay gate (issue #127).
+
+    The gate is cached on the adapter so every agent build of one pass
+    (including the repair/re-ask rebuilds) shares the pass's soft-guard
+    state. The cache is never cleared within an adapter: adapters are
+    per-task instances, so its lifetime is exactly one task's stage.
+    """
+
+    cached = getattr(adapter, "_current_rebase_gate", None)
+    provider = getattr(adapter, "_rebase_gate_provider", None)
+    if cached is None and provider is not None:
+        cached = provider()
+        adapter._current_rebase_gate = cached
+    return cached
+
+
 class RebaseOnMergeMiddleware(AgentMiddleware):
     """Replay pending sibling merges at the touching tool call."""
 
@@ -80,6 +97,8 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         is_mid_rebase: Callable[[WorktreeHandle], bool] | None = None,
         continue_replay: Callable[[WorktreeHandle], ReplayOutcome] | None = None,
         on_replay: Callable[[ReplayOutcome], None] | None = None,
+        on_replay_started: Callable[[], None] | None = None,
+        abort_replay: Callable[[WorktreeHandle], None] | None = None,
         conflict_contract_cards: Callable[[list[str]], dict[str, Any]] | None = None,
         enabled: bool | None = None,
     ) -> None:
@@ -95,6 +114,13 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         # resolving agent sees the other side's declared interfaces next to
         # the conflict markers.
         self._conflict_contract_cards = conflict_contract_cards
+        # Audit hook fired when a replay is about to run (the ``started``
+        # lifecycle event, issue #127 item 6).
+        self._on_replay_started = on_replay_started
+        # Guard-disarm hook: aborts a rebase left mid-replay when the soft
+        # guard stands the pass down (the phase-end integrate must never
+        # meet an unmerged index).
+        self._abort_replay = abort_replay
         self._enabled = rebase_on_merge_enabled() if enabled is None else enabled
         # Soft-guard state: consecutive conflict-carrying replays this pass,
         # and whether the guard has tripped (mid-phase replay stands down).
@@ -153,6 +179,7 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         # this call touches, so the rebase cannot dangle behind unrelated
         # calls. The replay consumes its own pending set here.
         if self._is_mid_rebase is not None and self._is_mid_rebase(self._handle):
+            self._notify_started()
             outcome = self._continue_replay(self._handle) if self._continue_replay else None
             if outcome is not None and outcome.status != ReplayOutcome.SKIPPED:
                 self._observe(outcome)
@@ -166,6 +193,7 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         pending = self._pending_files() if self._pending_files else []
         if not pending or not touches_pending_file(pending, rel_path):
             return None
+        self._notify_started()
         try:
             outcome = self._replay(self._handle)
         except Exception:  # noqa: BLE001 - fail-open is the contract
@@ -175,18 +203,53 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
             return None
         return outcome
 
-    def _observe(self, outcome: ReplayOutcome) -> None:
-        """Track the soft guard, refresh the claim snapshot, and audit."""
+    def _notify_started(self) -> None:
+        """Fire the started audit hook (best effort)."""
 
-        if outcome.status == ReplayOutcome.CONFLICTS:
+        if self._on_replay_started is None:
+            return
+        try:
+            self._on_replay_started()
+        except Exception:  # noqa: BLE001 - audit must not break the tool call
+            pass
+
+    def _observe(self, outcome: ReplayOutcome) -> None:
+        """Track the soft guard, refresh the claim snapshot, and audit.
+
+        The guard counts only *attempted* conflict rounds (git state moved);
+        the passive "markers still unresolved" observation a boundary call
+        makes while the agent works elsewhere informs the notice but never
+        disarms the pass - no replay, no count.
+        """
+
+        if outcome.status == ReplayOutcome.CONFLICTS and outcome.attempted:
             self._conflict_replays += 1
             if self._conflict_replays >= _MAX_CONFLICT_REPLAYS_PER_PASS:
                 self._disarmed = True
-        elif outcome.status == ReplayOutcome.REPLAYED:
-            # A clean replay resets the consecutive-conflict streak only
-            # through an intervening success; conflicts carried across
-            # continue accumulate (the guard counts consecutive rounds).
+                if self._abort_replay is not None and self._is_mid_rebase is not None:
+                    if self._is_mid_rebase(self._handle):
+                        # Standing down with a rebase mid-replay would leave
+                        # the worktree in an unmerged state the phase-end
+                        # integrate cannot survive: abort it now (restoring
+                        # the pre-replay WIP state) so the merge rails own
+                        # the overlap (issue #127 item 5).
+                        try:
+                            self._abort_replay(self._handle)
+                        except Exception:  # noqa: BLE001 - fail-open is the contract
+                            pass
+        elif outcome.status == ReplayOutcome.REPLAYED and outcome.origin == "replay":
+            # Only a conflict-free fresh replay breaks the consecutive run;
+            # a continue's completion resolves a conflict the same replay
+            # already carried, so the streak survives it (the guard counts
+            # conflict-carrying episodes, not rounds).
             self._conflict_replays = 0
+            if self._claim_gate is not None:
+                try:
+                    self._claim_gate.invalidate_tracked_snapshot()
+                except Exception:  # noqa: BLE001 - claim refresh is best effort
+                    pass
+        elif outcome.status == ReplayOutcome.REPLAYED:
+            # A continue-completed replay: the claim snapshot still moved.
             if self._claim_gate is not None:
                 try:
                     self._claim_gate.invalidate_tracked_snapshot()

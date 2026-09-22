@@ -182,9 +182,6 @@ def _design_pipelining_enabled() -> bool:
     return os.environ.get(DESIGN_GATE_PIPELINE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-REBASE_ON_MERGE_ENV = "ARC_REBASE_ON_MERGE"
-
-
 def _rebase_on_merge_enabled() -> bool:
     """Whether landed sibling merges replay onto in-flight tasks on demand.
 
@@ -193,10 +190,14 @@ def _rebase_on_merge_enabled() -> bool:
     integrate through the merge rails, exactly like main. With the gate
     open, the merge attaches its changed-file set to each in-flight task
     and the task's file tools replay it at the boundary where they first
-    touch one of those paths.
+    touch one of those paths. The env read itself lives with the middleware
+    (``agents.runtime.rebase_gate.rebase_on_merge_enabled``) so there is one
+    definition of the flag's truthy set.
     """
 
-    return os.environ.get(REBASE_ON_MERGE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    from agents.runtime.rebase_gate import rebase_on_merge_enabled
+
+    return rebase_on_merge_enabled()
 
 
 @dataclass
@@ -1141,8 +1142,22 @@ class ARCWorkflowManager:
 
         manager = self._worktree_manager
 
+        def on_replay_started() -> None:
+            self._emit_rebase_replay_event(node_id, "started", [], "pending merge touched")
+
         def on_replay(outcome: Any) -> None:
-            self._emit_rebase_replay_event(node_id, outcome)
+            status = str(getattr(outcome, "status", "") or "")
+            # Issue #127's lifecycle vocabulary: a landed replay (clean or
+            # conflict-completed) reports ``resolved``; a conflict round and
+            # a fail-open abort keep their own statuses.
+            if status == "replayed":
+                status = "resolved"
+            self._emit_rebase_replay_event(
+                node_id,
+                status,
+                [str(path) for path in (getattr(outcome, "files", None) or [])],
+                str(getattr(outcome, "detail", "") or "") or None,
+            )
 
         def conflict_contract_cards(conflict_paths: list[str]) -> dict[str, Any]:
             # The same pruned both-sides cards the merge arbiter's input
@@ -1159,7 +1174,9 @@ class ARCWorkflowManager:
             pending_files=lambda: manager.pending_merges_for(handle),
             is_mid_rebase=manager.is_mid_rebase,
             continue_replay=manager.continue_replay,
+            abort_replay=manager.abort_replay,
             on_replay=on_replay,
+            on_replay_started=on_replay_started,
             conflict_contract_cards=conflict_contract_cards,
         )
 
