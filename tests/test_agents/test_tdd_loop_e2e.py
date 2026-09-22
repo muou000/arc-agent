@@ -1546,6 +1546,239 @@ def test_note_preamble_never_becomes_the_failure_headline(tmp_project_dir: Path,
     assert "getByLabel('用户名')" in digest_text
 
 
+# ---------------------------------------------------------------------------
+# Retry-round case filter (#115): an E2E red round's successors re-run only
+# the digest's failed cases; the first round and the layer-closing round
+# stay full, and unparseable/environmental failures fall back to full.
+# ---------------------------------------------------------------------------
+
+
+def _seed_e2e_node_with_file(arc_runtime, tmp_project_dir: Path, node_id: str) -> list[dict]:
+    tests = [{"test_id": "T1", "type": "E2E", "file_path": E2E_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    (tmp_project_dir / E2E_TEST_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_project_dir / E2E_TEST_FILE).write_text("// e2e spec\n", encoding="utf-8")
+    return tests
+
+
+def test_e2e_retry_rounds_filter_to_digest_failed_cases(tmp_project_dir: Path, arc_runtime) -> None:
+    """Red rounds re-run only the parsed failed cases; the closing round is full.
+
+    Round map: baseline (system, full) -> r1 agent round 1 (full, fails) ->
+    r2 filtered retry (fails again) -> r3 filtered retry (passes, must not
+    close the layer) -> r4, the agent's immediate full re-run in the same
+    session, closes it.
+    """
+
+    node_id = "REQ-TDD-GREP"
+    tests = _seed_e2e_node_with_file(arc_runtime, tmp_project_dir, node_id)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {}, call_id="r1"),
+            faux_text("repairing, next round"),
+            faux_tool_call("run_tests", {}, call_id="r2"),
+            faux_text("still red, editing again"),
+            faux_tool_call("run_tests", {}, call_id="r3"),
+            # The agent heeds the filter note and re-runs the full layer in
+            # the same session; that full green run closes it.
+            faux_tool_call("run_tests", {}, call_id="r4"),
+            faux_text("IMPLEMENTED"),
+            faux_text("script pad for an extra scheduler turn"),
+        ]
+    )
+    fake = FakeAppHandler(
+        [
+            E2E_FAILURE_OUTPUT,      # baseline RED
+            E2E_FAILURE_OUTPUT,      # r1: full run, fails
+            E2E_FAILURE_OUTPUT,      # r2: filtered retry, fails again
+            passing_test_output(),   # r3: filtered retry, passes
+            passing_test_output(),   # r4: full run closes the layer
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert fake.calls == [("E2E", [E2E_TEST_FILE])] * 5
+    # baseline + r1 run unfiltered; r2/r3 carry the digest's failed case;
+    # the layer-closing r4 is full again.
+    assert fake.case_filters == [
+        None,
+        None,
+        ["register › rejects invalid input"],
+        ["register › rejects invalid input"],
+        None,
+    ]
+    all_tool_results = tool_results_text(model)
+    # The filtered rounds say so, and the filtered pass demands one full run.
+    assert "ARC_RETRY_FILTER_NOTE" in all_tool_results
+    assert "the layer is not closed yet" in all_tool_results
+    assert "passed (full layer)" in all_tool_results
+
+
+def test_non_e2e_layers_stay_full_even_when_the_digest_parses(tmp_project_dir: Path, arc_runtime) -> None:
+    """Per-case retry filtering is E2E-only: unit rounds run full and close normally.
+
+    A digest-parseable unit failure must not flip run_was_case_filtered (it
+    gates the layer-closing verdict): the full green retry closes the layer
+    in the same round instead of forcing a spurious extra round.
+    """
+
+    node_id = "REQ-TDD-GREP-UNIT"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    write_test_file(tmp_project_dir)
+    vitest_failure = (
+        "Exit Code: 1\n"
+        "\n=== Backend Vitest Batch ===\n"
+        " FAIL tests/unit/test_calc.py > Calc > adds two numbers\n"
+        "AssertionError: expected 2 got 1\n"
+        "Exit Code: 1\n"
+    )
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {}, call_id="r1"),
+            faux_text("repairing, next round"),
+            faux_tool_call("run_tests", {}, call_id="r2"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    fake = FakeAppHandler(
+        [
+            vitest_failure,          # baseline RED (digest parses)
+            vitest_failure,          # r1: full run, digest parses
+            passing_test_output(),   # r2: full retry closes the layer
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * 3
+    # No round carries a case filter; the full green retry closed the layer
+    # directly (no filter-note, no extra round).
+    assert fake.case_filters == [None, None, None]
+    all_tool_results = tool_results_text(model)
+    assert "passed (full layer)" in all_tool_results
+    assert "ARC_RETRY_FILTER_NOTE" not in all_tool_results
+
+
+def test_retry_falls_back_to_full_run_without_parseable_digest(tmp_project_dir: Path, arc_runtime) -> None:
+    """A failure the digest cannot structure must not produce an empty filter."""
+
+    node_id = "REQ-TDD-GREP-FALLBACK"
+    tests = _seed_e2e_node_with_file(arc_runtime, tmp_project_dir, node_id)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {}, call_id="r1"),
+            faux_text("repairing, next round"),
+            faux_tool_call("run_tests", {}, call_id="r2"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    fake = FakeAppHandler(
+        [
+            failing_test_output(),   # baseline RED (no per-test structure)
+            failing_test_output(),   # r1: full run, digest unparseable
+            passing_test_output(),   # r2: full retry passes and closes the layer
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert fake.case_filters == [None, None, None]
+    assert "passed (full layer)" in tool_results_text(model)
+
+
+def test_environment_failure_clears_the_retry_filter(tmp_project_dir: Path, arc_runtime) -> None:
+    """An environmental failure must not narrow the next round to stale cases.
+
+    The round failed on a broken workspace, not just on the reported case, so
+    the repair contract revalidates the whole layer.
+    """
+
+    node_id = "REQ-TDD-GREP-ENV"
+    tests = _seed_e2e_node_with_file(arc_runtime, tmp_project_dir, node_id)
+    env_failure_output = E2E_FAILURE_OUTPUT + "\nError: Cannot find module 'db-helper'\n"
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {}, call_id="r1"),
+            # The repair-and-revalidate attempt happens in the same session
+            # (the env-failure contract ends the layer when the session ends).
+            faux_tool_call("run_tests", {}, call_id="r2"),
+            faux_text("IMPLEMENTED"),
+        ]
+    )
+    fake = FakeAppHandler(
+        [
+            E2E_FAILURE_OUTPUT,      # baseline RED
+            env_failure_output,      # r1: parseable case failure + broken workspace
+            passing_test_output(),   # r2: full revalidation passes and closes
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert fake.case_filters == [None, None, None]
+
+
+def test_filtered_pass_and_agent_stop_closes_via_system_regression(tmp_project_dir: Path, arc_runtime) -> None:
+    """If the agent stops after a filtered pass, the system closes the layer.
+
+    The safety net: all files green but no full green run -> the system-run
+    full-layer regression runs unfiltered and closes (or reopens) the layer
+    without a new agent session.
+    """
+
+    node_id = "REQ-TDD-GREP-REGRESSION"
+    tests = _seed_e2e_node_with_file(arc_runtime, tmp_project_dir, node_id)
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {}, call_id="r1"),
+            faux_text("repairing, next round"),
+            faux_tool_call("run_tests", {}, call_id="r2"),
+            faux_text("cases green, ending my turn"),
+        ]
+    )
+    fake = FakeAppHandler(
+        [
+            E2E_FAILURE_OUTPUT,      # baseline RED
+            E2E_FAILURE_OUTPUT,      # r1: full run, fails
+            passing_test_output(),   # r2: filtered retry, passes
+            passing_test_output(),   # system regression: full, closes the layer
+        ]
+    )
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert final_ok is True
+    assert fake.case_filters == [None, None, ["register › rejects invalid input"], None]
+    # The layer closed via the system-run regression, not an agent round: no
+    # tool result carries the full-layer status, and the agent only saw the
+    # two run_tests rounds (fail, then the filtered pass with its note).
+    all_tool_results = tool_results_text(model)
+    assert "ARC_RETRY_FILTER_NOTE" in all_tool_results
+    assert "the layer is not closed yet" in all_tool_results
+    assert "passed (full layer)" not in all_tool_results
+
+
 def test_tdd_handoff_records_modified_files(tmp_project_dir: Path, arc_runtime) -> None:
     """The node session handoff must tell the next TDD round what was edited.
 

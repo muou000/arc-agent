@@ -13,6 +13,9 @@ when the node's IMPLEMENT phase finishes.
 from __future__ import annotations
 
 import asyncio
+import os
+import re
+import shlex
 import sqlite3
 from pathlib import Path
 from unittest import mock
@@ -832,3 +835,152 @@ def test_single_file_e2e_request_routes_to_the_group_executor(tmp_path, monkeypa
 
     assert group_calls == [("e2e", ["backend/test-e2e/login.spec.ts"])]
     assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# Retry-round case filter (#115): the digest's failed case names reach the
+# Playwright command as --grep; unfiltered rounds stay untouched.
+# ---------------------------------------------------------------------------
+
+
+def test_case_grep_pattern_maps_display_titles_to_leaf_names() -> None:
+    """Digest display titles become regex-escaped leaf names in an alternation."""
+
+    pattern = web_handler._build_case_grep_pattern(
+        [
+            "register › rejects duplicate username",
+            "register › rejects duplicate username",  # deduped
+            "登录 › 拒绝缺失或格式错误的资料",
+        ]
+    )
+    assert pattern == "|".join(
+        [re.escape("rejects duplicate username"), re.escape("拒绝缺失或格式错误的资料")]
+    )
+    # The pattern matches the space-joined full title Playwright greps against
+    # and the › display form the digest printed.
+    assert re.search(pattern, "register rejects duplicate username")
+    assert re.search(pattern, "register › rejects duplicate username")
+    # Vitest-style list names ("suite > case") split on the same separator.
+    assert web_handler._build_case_grep_pattern(["Auth API > rejects duplicate username with 409"]) == re.escape(
+        "rejects duplicate username with 409"
+    )
+    # Shell/regex metachars in the title survive as literals: re.escape
+    # backslash-escapes the regex-special ones, and the quoting dialect
+    # (test_shell_single_arg_quotes_for_the_running_platform) hands the
+    # result to Playwright as one argv entry on either shell.
+    metachar_pattern = web_handler._build_case_grep_pattern(
+        ["checkout › can't login (guest) $100 off?"]
+    )
+    assert metachar_pattern == re.escape("can't login (guest) $100 off?")
+    assert re.search(metachar_pattern, "checkout can't login (guest) $100 off?")
+    # Unusable names degrade to the empty pattern (full run).
+    assert web_handler._build_case_grep_pattern(["", "   "]) == ""
+    assert web_handler._build_case_grep_pattern(None) == ""
+    assert web_handler._build_case_grep_pattern([]) == ""
+
+
+def test_shell_single_arg_quotes_for_the_running_platform() -> None:
+    """The filter argument survives the platform's shell as one argv entry.
+
+    The commands run through ``create_subprocess_shell``: cmd.exe on Windows
+    (single quotes are not quoting there), /bin/sh elsewhere. Apostrophes in
+    localized case names must survive both dialects as literals.
+    """
+
+    value = "rejects\\ duplicate\\ username|other\\ case"
+    quoted = web_handler._shell_single_arg(value)
+    if os.name == "nt":
+        # cmd metachars (space, pipe) force double quotes.
+        assert quoted == f'"{value}"'
+        assert web_handler._shell_single_arg("plain-case") == "plain-case"
+    else:
+        assert quoted == shlex.quote(value)
+    # An apostrophe never needs cmd.exe quoting (it is a literal char there)
+    # and POSIX shlex.quote handles the embedded-quote dance itself.
+    apostrophe = "can't\\ login"
+    assert re.escape("can't login") in web_handler._shell_single_arg(apostrophe)
+
+
+def test_non_e2e_layers_ignore_the_case_filter(tmp_path, monkeypatch) -> None:
+    """Per-case filtering is an E2E capability: Vitest rounds run full and say so.
+
+    A filtered-shaped request on the unit layer must not filter the Vitest
+    command nor print the Failed Case Filter header - the runner has no such
+    mechanism, and phases must not treat the round as case-filtered.
+    """
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+    (workspace / "backend" / "tests").mkdir()
+    (workspace / "backend" / "tests" / "authApi.test.js").write_text("test('t', () => {});\n", encoding="utf-8")
+    handler = _make_handler(workspace)
+    recorder = _CommandRecorder()
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+
+    result = asyncio.run(
+        handler.run_test_group(
+            "unit",
+            ["backend/tests/authApi.test.js"],
+            web_port=4321,
+            failed_case_names=["Auth API > rejects duplicate username with 409"],
+        )
+    )
+
+    assert result.exit_code == 0
+    assert recorder.calls == ["npx vitest run tests/authApi.test.js"]
+    assert "Failed Case Filter" not in result.output
+
+
+def test_retry_round_playwright_command_carries_grep_filter(tmp_path, monkeypatch) -> None:
+    """A retry round's runner command filters to the previously failing cases.
+
+    The failed-case names ride ``run_test_group(..., failed_case_names=[...])``
+    into the one E2E executor and land as a single quoted ``--grep`` word; the
+    resolved targets stay on the command, and the result header says the round
+    was partial so pass/fail verdicts are read in that light.
+    """
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+    handler = _make_handler(workspace)
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+
+    result = asyncio.run(
+        handler.run_test_group(
+            "e2e",
+            ["backend/test-e2e/login.spec.ts"],
+            web_port=4321,
+            failed_case_names=["register › rejects duplicate username"],
+        )
+    )
+
+    assert result.exit_code == 0
+    playwright_commands = [command for command in recorder.calls if "playwright" in command]
+    assert len(playwright_commands) == 1
+    command = playwright_commands[0]
+    # The executor normalizes targets backend-relative; the filter appends as
+    # one shell argument after them (re.escape backslash-escapes spaces; the
+    # quoting dialect is the running platform's - see _shell_single_arg).
+    assert command.startswith("npx playwright test test-e2e/login.spec.ts --grep ")
+    assert re.escape("rejects duplicate username") in command
+    # The suite display segment must not leak into the pattern.
+    assert "register" not in command.split("--grep", 1)[1]
+    # The result header tells the agent the round was case-filtered.
+    assert "Failed Case Filter" in result.output
+
+
+def test_unfiltered_round_keeps_the_plain_playwright_command(tmp_path, monkeypatch) -> None:
+    """Without failed-case names the command and header stay unfiltered."""
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+    handler = _make_handler(workspace)
+    recorder = _CommandRecorder()
+    start_calls: list[str] = []
+    _patch_fresh_start(monkeypatch, recorder, start_calls)
+
+    result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
+
+    assert result.exit_code == 0
+    playwright_commands = [command for command in recorder.calls if "playwright" in command]
+    assert playwright_commands == ["npx playwright test test-e2e/login.spec.ts"]
+    assert "Failed Case Filter" not in result.output

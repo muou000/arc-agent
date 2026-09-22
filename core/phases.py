@@ -912,18 +912,26 @@ class WorkflowPhaseRunner:
             "revised_tests": current_tests if manifest_revised else None,
         }
 
-    async def _run_test_group(self, test_type: str, file_paths: list[str]) -> TestRunResult:
+    async def _run_test_group(
+        self,
+        test_type: str,
+        file_paths: list[str],
+        failed_case_names: list[str] | None = None,
+    ) -> TestRunResult:
         """Single choke point over the app handler's batch runner.
 
         Both executor instances (the TDD loop's and the DESIGN gate's
         adapter) run every batch through here so the per-task port override
-        applies uniformly.
+        applies uniformly. ``failed_case_names`` carries the TDD retry
+        round's parsed failed-case filter (#115); only case-filterable
+        runners (the web E2E executor) consume it.
         """
 
         return await self.app_handler.run_test_group(
             test_type,
             file_paths,
             web_port=self.web_port,
+            failed_case_names=failed_case_names,
         )
 
     async def _run_tdd_for_node(

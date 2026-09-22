@@ -17,6 +17,7 @@ import pytest
 
 from agents.tools.test_failure_digest import (
     build_failure_digest,
+    digest_failed_test_names,
     format_failure_digest,
     persist_run_output,
 )
@@ -133,6 +134,24 @@ def test_unstructured_failure_yields_no_entries() -> None:
 
     output = "Exit Code: 1\nSTDERR:\nsomething exploded\n"
     assert build_failure_digest(output)["failed_tests"] == []
+
+
+def test_digest_failed_test_names_extracts_ordered_names() -> None:
+    """The retry filter reads the digest's failed names; empties are dropped."""
+
+    digest = build_failure_digest(PLAYWRIGHT_FAILURE)
+    names = digest_failed_test_names(digest)
+    assert names
+    assert all(isinstance(name, str) and name.strip() for name in names)
+    # Deterministic order: the digest's entry order, no re-sorting.
+    assert names == [item["name"] for item in digest["failed_tests"] if item.get("name")]
+
+
+def test_digest_failed_test_names_empty_without_structure() -> None:
+    """An unparseable digest yields no names: the caller must fall back to a full run."""
+
+    assert digest_failed_test_names(build_failure_digest("Exit Code: 1\n")) == []
+    assert digest_failed_test_names({}) == []
 
 
 def test_format_includes_pointer_and_fingerprint() -> None:
