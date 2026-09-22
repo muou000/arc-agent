@@ -484,7 +484,7 @@ def test_e2e_recovery_cleanup_note_survives_into_failure_bodies(tmp_path, monkey
     """
 
     workspace, _fingerprint = _make_workspace(tmp_path)
-    handler = _make_handler(workspace)
+    handler = _make_handler(workspace, backend_runtime=InMemoryBackendRuntime())
     recorder = _CommandRecorder()
     _patch_scaffold(monkeypatch, recorder)
 
@@ -537,10 +537,10 @@ def test_e2e_timeout_has_a_single_source(tmp_path, monkeypatch) -> None:
             seen_timeouts.append(timeout)
         return _CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
 
-    recorder = _CommandRecorder()
-    _patch_scaffold(monkeypatch, recorder)
-    # The scaffold routes _execute_web_test_command through its own recorder;
-    # layer the timeout probe on top of it.
+    async def _ok_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+        return web_handler._FrontendBuildOutcome(ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0)
+
+    monkeypatch.setattr(web_handler, "_build_frontend_dist", _ok_build)
     monkeypatch.setattr(web_handler, "_execute_web_test_command", _recording_command)
 
     _run_e2e_group(handler)
