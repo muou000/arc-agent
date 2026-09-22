@@ -1,0 +1,287 @@
+{
+  "node_id": "REQ-A.1",
+  "phase_status": {
+    "design": "completed",
+    "test": "completed",
+    "implement": "completed"
+  },
+  "requirement_snapshot": {
+    "name": "Notes Area",
+    "description": "Display a notes area section on the home page with a heading \"Notes\".",
+    "visual_reference": [],
+    "children_ids": [],
+    "dependencies": []
+  },
+  "recent_failure_summary": "",
+  "interfaces": [
+    {
+      "interface_id": "REQ-A.1-DB-NotesTable",
+      "req_id": "REQ-A.1",
+      "type": "DB",
+      "name": "NotesTable",
+      "file_path": "backend/src/database/init_db.js",
+      "first_line": "CREATE TABLE notes",
+      "responsibility": "Idempotent schema bootstrap for the notes table inside initializeDatabase, centralized in init_db.js.",
+      "specification": "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', created_at/updated_at TEXT NOT NULL DEFAULT datetime('now')); runs on every init.",
+      "callers": [
+        "backend/src/database/init_db.js"
+      ],
+      "callees": [],
+      "inputs": {},
+      "outputs": {},
+      "test_focus": "Table exists after initializeDatabase; columns match Note DTO",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-FUNC-NotesRepository",
+      "req_id": "REQ-A.1",
+      "type": "FUNC",
+      "name": "NotesRepository",
+      "file_path": "backend/src/repositories/notesRepository.js",
+      "first_line": "const { all } = require('../database/db_runtime');",
+      "responsibility": "Persistence boundary for notes using the shared db_runtime.all helper; orders notes newest-updated first.",
+      "specification": "findAllNotes() -> all('SELECT id,title,content,created_at,updated_at FROM notes ORDER BY updated_at DESC, id DESC').",
+      "callers": [
+        "backend/src/services/notesService.js"
+      ],
+      "callees": [
+        "backend/src/database/db_runtime.js"
+      ],
+      "inputs": {},
+      "outputs": {},
+      "test_focus": "Returns seeded rows ordered by updated_at DESC",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-API-Notes",
+      "req_id": "REQ-A.1",
+      "type": "API",
+      "name": "Notes",
+      "file_path": "backend/src/routes/notes.js",
+      "first_line": "const express = require('express');",
+      "responsibility": "Express router mounted at /api/notes exposing GET / that lists notes through notesService.",
+      "specification": "GET /api/notes responds 200 { code: 200, notes: Note[] }; Note = { id, title, content, createdAt, updatedAt }.",
+      "callers": [
+        "backend/src/app.js"
+      ],
+      "callees": [
+        "backend/src/services/notesService.js"
+      ],
+      "inputs": {},
+      "outputs": {},
+      "test_focus": "GET /api/notes returns seeded notes with camelCase fields",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-FUNC-NotesService",
+      "req_id": "REQ-A.1",
+      "type": "FUNC",
+      "name": "NotesService",
+      "file_path": "backend/src/services/notesService.js",
+      "first_line": "const { findAllNotes } = require('../repositories/notesRepository');",
+      "responsibility": "Maps repository rows to Note DTOs (snake_case to camelCase) and delegates listing to the repository.",
+      "specification": "listNotes() -> Note[] via findAllNotes(); each row mapped to { id, title, content, createdAt: created_at, updatedAt: updated_at }.",
+      "callers": [
+        "backend/src/routes/notes.js"
+      ],
+      "callees": [
+        "backend/src/repositories/notesRepository.js"
+      ],
+      "inputs": {},
+      "outputs": {},
+      "test_focus": "DTO shape and ordering of listNotes",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-UI-NotesArea",
+      "req_id": "REQ-A.1",
+      "type": "UI",
+      "name": "NotesArea",
+      "file_path": "frontend/src/features/notes/NotesArea.tsx",
+      "first_line": "import { useNotes } from './useNotes';",
+      "responsibility": "Renders the notes area section with heading \"Notes\" and explicit loading, error, empty, and list states from useNotes.",
+      "specification": "Section aria-labelledby 'notes-heading' with h2 text exactly 'Notes'; states: loading text, error message, 'No notes yet.', or note title/content list.",
+      "callers": [
+        "frontend/src/pages/HomePage.tsx"
+      ],
+      "callees": [
+        "frontend/src/features/notes/useNotes.ts"
+      ],
+      "inputs": {},
+      "outputs": {},
+      "test_focus": "Heading 'Notes' visible; each state renders",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-FUNC-Api",
+      "req_id": "REQ-A.1",
+      "type": "FUNC",
+      "name": "Api",
+      "file_path": "frontend/src/features/notes/api.ts",
+      "first_line": "import apiClient from '../../api';",
+      "responsibility": "Frontend notes API client; defines the Note type and fetchNotes using the shared axios apiClient.",
+      "specification": "fetchNotes(): Promise<Note[]> -> apiClient.get('/notes'), returns response.data.notes from { code, notes }.",
+      "callers": [
+        "frontend/src/features/notes/useNotes.ts"
+      ],
+      "callees": [
+        "frontend/src/api/index.ts"
+      ],
+      "inputs": {},
+      "outputs": {},
+      "test_focus": "GET /notes requested; notes extracted from response",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-UI-useNotes",
+      "req_id": "REQ-A.1",
+      "type": "UI",
+      "name": "useNotes",
+      "file_path": "frontend/src/features/notes/useNotes.ts",
+      "first_line": "import { useCallback, useEffect, useState } from 'react';",
+      "responsibility": "Loads notes on mount through fetchNotes and exposes a discriminated NotesState plus reload.",
+      "specification": "Returns { state: loading | error(message) | ready(notes), reload }; fetch rejection maps to { status: 'error', message }.",
+      "callers": [
+        "frontend/src/features/notes/NotesArea.tsx"
+      ],
+      "callees": [
+        "frontend/src/features/notes/api.ts"
+      ],
+      "inputs": {},
+      "outputs": {},
+      "test_focus": "Loading -> ready with notes; failure -> error state",
+      "relation": "owned",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-FUNC-App",
+      "req_id": "REQ-A.1",
+      "type": "FUNC",
+      "name": "App",
+      "file_path": "backend/src/app.js",
+      "first_line": "const express = require('express');",
+      "relation": "reused",
+      "responsibility": "Reused shared Express surface; registers the notes router additively at /api/notes so the owned chain is reachable at runtime.",
+      "specification": "Requires require('./routes/notes') wired as app.use('/api/notes', notesRoutes) before static/SPA fallback; existing /api/health and SPA handling stay untouched.",
+      "callers": [
+        "backend/src/index.js"
+      ],
+      "callees": [
+        "backend/src/routes/notes.js"
+      ],
+      "test_focus": "GET /api/notes returns 200 via supertest through the full app",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-A.1-UI-HomePage",
+      "req_id": "REQ-A.1",
+      "type": "UI",
+      "name": "HomePage",
+      "file_path": "frontend/src/pages/HomePage.tsx",
+      "first_line": "import NotesArea from '../features/notes/NotesArea';",
+      "relation": "reused",
+      "responsibility": "Home page mount point that composes NotesArea into the main layout container; route registration stays unchanged.",
+      "specification": "Renders <main> with max-w-7xl px-6 py-8 container containing NotesArea; existing route / -> HomePage untouched.",
+      "callers": [
+        "frontend/src/App.tsx"
+      ],
+      "callees": [
+        "frontend/src/features/notes/NotesArea.tsx"
+      ],
+      "test_focus": "Home page render includes the Notes area",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    }
+  ],
+  "materialized_files": [],
+  "test_contract_hooks": [],
+  "test_artifacts": [
+    {
+      "test_id": "REQ-A.1-E2E-notes-area-visible",
+      "req_id": "REQ-A.1",
+      "interface_ids": [
+        "REQ-A.1-UI-NotesArea",
+        "REQ-A.1-UI-HomePage",
+        "REQ-A.1-API-Notes"
+      ],
+      "coverage_scope": "owned",
+      "type": "E2E",
+      "file_path": "backend/test-e2e/notes-area.e2e.spec.js",
+      "first_line": "const { test, expect } = require('@playwright/test');"
+    },
+    {
+      "test_id": "REQ-A.1-API-notes-list",
+      "req_id": "REQ-A.1",
+      "interface_ids": [
+        "REQ-A.1-API-Notes",
+        "REQ-A.1-FUNC-App"
+      ],
+      "coverage_scope": "owned",
+      "type": "Integration",
+      "file_path": "backend/tests/notesApi.test.js",
+      "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';"
+    },
+    {
+      "test_id": "REQ-A.1-FUNC-notes-persistence",
+      "req_id": "REQ-A.1",
+      "interface_ids": [
+        "REQ-A.1-FUNC-NotesService",
+        "REQ-A.1-FUNC-NotesRepository",
+        "REQ-A.1-DB-NotesTable"
+      ],
+      "coverage_scope": "owned",
+      "type": "Unit",
+      "file_path": "backend/tests/notesService.test.js",
+      "first_line": "import { describe, it, expect, beforeEach, afterEach } from 'vitest';"
+    },
+    {
+      "test_id": "REQ-A.1-UI-NotesArea",
+      "req_id": "REQ-A.1",
+      "interface_ids": [
+        "REQ-A.1-UI-NotesArea",
+        "REQ-A.1-UI-useNotes",
+        "REQ-A.1-FUNC-Api"
+      ],
+      "coverage_scope": "owned",
+      "type": "Unit",
+      "file_path": "frontend/tests/NotesArea.test.tsx",
+      "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';"
+    }
+  ],
+  "design_baseline": {
+    "backend/tests/notesService.test.js": "red",
+    "frontend/tests/NotesArea.test.tsx": "red",
+    "backend/tests/notesApi.test.js": "red",
+    "backend/test-e2e/notes-area.e2e.spec.js": "red"
+  },
+  "resume_context": {},
+  "tdd_handoff": {
+    "last_test_type": "E2E",
+    "last_failed_output_summary": "",
+    "modified_files": [
+      "backend/src/database/seed_db.js",
+      "frontend/src/features/notes/NotesArea.tsx"
+    ],
+    "layer_usage": {
+      "Unit": 1,
+      "Integration": 1,
+      "E2E": 1
+    },
+    "fingerprint_history": {}
+  },
+  "merge_arbitration_used": true
+}

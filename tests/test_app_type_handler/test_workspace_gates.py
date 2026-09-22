@@ -785,6 +785,12 @@ def test_post_template_setup_applies_the_shipped_template_fixes(tmp_path, monkey
     )
     assert "const scopeDir = path.join(rootDir," in harness
 
+    gitignore_lines = (workspace / "backend" / ".gitignore").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert "test-results" in gitignore_lines
+    assert "playwright-report" in gitignore_lines
+
 
 def test_shipped_template_fixes_are_idempotent(tmp_path) -> None:
     """A resumed compile must neither re-apply nor rewrite anything."""
@@ -793,11 +799,12 @@ def test_shipped_template_fixes_are_idempotent(tmp_path) -> None:
     shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
 
     first = apply_template_patches(str(workspace), "web-react-express")
-    assert [outcome.status for outcome in first] == [APPLIED, APPLIED, APPLIED]
+    assert [outcome.status for outcome in first] == [APPLIED, APPLIED, APPLIED, APPLIED]
     after_first = _patched_file_contents(workspace)
 
     second = apply_template_patches(str(workspace), "web-react-express")
     assert [outcome.status for outcome in second] == [
+        ALREADY_APPLIED,
         ALREADY_APPLIED,
         ALREADY_APPLIED,
         ALREADY_APPLIED,
@@ -828,6 +835,7 @@ def test_shipped_template_fixes_refuse_an_unknown_shape_atomically(tmp_path) -> 
         UNRECOGNIZED,
         UNRECOGNIZED,
         APPLIED,
+        APPLIED,
     ]
     assert bootstrap.read_text(encoding="utf-8") == "// rewritten upstream\n"
     assert readme.read_text(encoding="utf-8") == readme_before
@@ -848,7 +856,7 @@ def test_harness_fix_refuses_an_unknown_shape_and_keeps_the_file(tmp_path) -> No
 
     outcomes = apply_template_patches(str(workspace), "web-react-express")
 
-    assert [outcome.status for outcome in outcomes] == [APPLIED, APPLIED, UNRECOGNIZED]
+    assert [outcome.status for outcome in outcomes] == [APPLIED, APPLIED, UNRECOGNIZED, APPLIED]
     assert "test_harness.js" in outcomes[2].detail
     assert harness.read_text(encoding="utf-8") == "// rewritten upstream\n"
 
@@ -957,6 +965,7 @@ def test_a_dependent_patch_is_unrecognized_when_its_prerequisite_fails(tmp_path)
         UNRECOGNIZED,
         UNRECOGNIZED,
         APPLIED,
+        APPLIED,
     ]
     assert "prerequisite" in outcomes[1].detail
     assert bootstrap.read_text(encoding="utf-8") == "// rewritten upstream\n"
@@ -974,7 +983,7 @@ def test_a_template_without_the_target_files_skips_instead_of_failing(tmp_path) 
 
     outcomes = apply_template_patches(str(workspace), "web-react-express")
 
-    assert [outcome.status for outcome in outcomes] == [SKIPPED, SKIPPED, SKIPPED]
+    assert [outcome.status for outcome in outcomes] == [SKIPPED, SKIPPED, SKIPPED, SKIPPED]
     assert "no target files" in outcomes[0].detail
     assert "prerequisite" in outcomes[1].detail
     assert "no target files" in outcomes[2].detail
@@ -1039,10 +1048,11 @@ def test_shipped_template_fixes_recognize_a_crlf_copy_that_already_has_them(tmp_
         )
 
     first = apply_template_patches(str(workspace), "web-react-express")
-    assert [outcome.status for outcome in first] == [APPLIED, APPLIED, APPLIED]
+    assert [outcome.status for outcome in first] == [APPLIED, APPLIED, APPLIED, APPLIED]
 
     second = apply_template_patches(str(workspace), "web-react-express")
     assert [outcome.status for outcome in second] == [
+        ALREADY_APPLIED,
         ALREADY_APPLIED,
         ALREADY_APPLIED,
         ALREADY_APPLIED,
@@ -1079,6 +1089,7 @@ def test_shipped_template_fixes_refuse_a_half_repaired_file(tmp_path) -> None:
         UNRECOGNIZED,
         UNRECOGNIZED,
         APPLIED,
+        APPLIED,
     ]
     assert "init_db.js" in outcomes[0].detail
     assert bootstrap.read_text(encoding="utf-8") == pre_fix_with_stray_marker
@@ -1105,10 +1116,13 @@ def test_shipped_template_fixes_leave_no_trace_when_staging_fails(
     def flaky_write(path: str, text: str) -> None:
         written.append(path)
         # Fail the first staging write of every patch that reaches one: the
-        # bootstrap chain (init_db.js) and the harness guard (test_harness.js).
-        # Staged paths carry the `.arc-patch-tmp` suffix, hence the substring
-        # match.
-        if any(name in os.path.basename(path) for name in ("init_db.js", "test_harness.js")):
+        # bootstrap chain (init_db.js), the harness guard (test_harness.js)
+        # and the gitignore entry (.gitignore). Staged paths carry the
+        # `.arc-patch-tmp` suffix, hence the substring match.
+        if any(
+            name in os.path.basename(path)
+            for name in ("init_db.js", "test_harness.js", ".gitignore")
+        ):
             raise OSError("disk full")
         real_write(path, text)
 
@@ -1117,6 +1131,7 @@ def test_shipped_template_fixes_leave_no_trace_when_staging_fails(
     outcomes = apply_template_patches(str(workspace), "web-react-express")
 
     assert [outcome.status for outcome in outcomes] == [
+        UNRECOGNIZED,
         UNRECOGNIZED,
         UNRECOGNIZED,
         UNRECOGNIZED,

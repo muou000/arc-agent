@@ -250,10 +250,10 @@ class ARCWorkflowManager:
         self._port_slots: dict[int, str] = {}
         self._port_slot_count = 1
         # In-flight task workspaces by node id (parallel mode). The merge
-        # path consults this to attach pending merges for the demand-pull
+        # path consults this to attach pending merges for the eager
         # replay (issue #127); entries live for the task's duration only.
         self._inflight: dict[str, _TaskWorkspace] = {}
-        # Demand-pull mid-phase replay gate (issue #127, ARC_REBASE_ON_MERGE,
+        # Eager mid-phase replay gate (issue #127, ARC_REBASE_ON_MERGE,
         # default off): off keeps the merge rails byte-for-byte identical.
         self._rebase_on_merge = _rebase_on_merge_enabled()
 
@@ -825,7 +825,7 @@ class ARCWorkflowManager:
         if self._parallel_mode:
             try:
                 ctx = await self._open_task_workspace(task, queue_state)
-                # In-flight registration for the demand-pull replay (issue
+                # In-flight registration for the eager replay (issue
                 # #127): sibling merges attach their changed files here.
                 self._inflight[node_id] = ctx
             except Exception as exc:
@@ -1094,7 +1094,7 @@ class ARCWorkflowManager:
     def _attach_pending_merge(self, source_node_id: str, pre_merge_head: str) -> None:
         """Attach the just-landed merge to every other in-flight task.
 
-        Demand-pull bookkeeping (issue #127): the changed-file set
+        Eager-replay bookkeeping (issue #127): the changed-file set
         (pre-merge HEAD..HEAD) lands on each in-flight task's worktree as a
         ``PendingMerge``; nothing replays until the task's agent touches one
         of those paths. Skipped entirely when the gate is off or no other
@@ -1175,6 +1175,7 @@ class ARCWorkflowManager:
             is_mid_rebase=manager.is_mid_rebase,
             continue_replay=manager.continue_replay,
             abort_replay=manager.abort_replay,
+            conflict_paths_reader=manager.unresolved_conflict_paths,
             on_replay=on_replay,
             on_replay_started=on_replay_started,
             conflict_contract_cards=conflict_contract_cards,
@@ -1809,7 +1810,7 @@ class ARCWorkflowManager:
             )
             return None
         finally:
-            # The task is no longer in flight: drop the demand-pull replay
+            # The task is no longer in flight: drop the eager replay
             # registration and release the node's new-file claims (after a
             # successful merge the files are tracked in git - claims are
             # moot; after a terminal failure the paths must be free for

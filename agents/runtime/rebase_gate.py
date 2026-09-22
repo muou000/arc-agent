@@ -1,15 +1,16 @@
-"""Demand-pull mid-phase replay at file-tool boundaries (issue #127 / ADR 0003).
+"""Eager mid-phase replay at file-tool boundaries (issue #127 / ADR 0003, revised).
 
 When a sibling merge lands while a task is executing, the workflow attaches
 the merge's changed-file set to the task's worktree as a ``PendingMerge``.
-Nothing happens until the task's agent actually touches one of those paths;
-at that tool-call quiescent point this gate runs the mechanical replay
+At the in-flight agent's *next file-tool call* - regardless of which path it
+touches - this gate runs the mechanical replay
 (``NodeWorktreeManager.replay_pending_merges``: WIP commit + rebase onto the
-new integration HEAD) *before* the call is served, so the agent reads and
-edits the fresh tree instead of a stale one. A replay that lands with
-conflict markers hands the conflicted paths back to the resolving agent in
-the tool result; the agent resolves them with its ordinary file tools and
-the next boundary completes the rebase.
+new integration HEAD) *before* the call is served, so the agent always works
+against the freshest integration tree. A replay that lands with conflict
+markers hands the conflicted paths back to the resolving agent in the tool
+result; resolution is **forced**: while markers remain, file calls outside
+the conflict set are refused, and the resolving edits (on the conflicted
+paths) complete the rebase at the next boundary.
 
 The whole feature is gated by ``ARC_REBASE_ON_MERGE`` (default off) and is
 fail-open at every mechanical step: a failed replay aborts, restores the
@@ -18,10 +19,10 @@ stays owned by the existing merge rails (additive resolution / arbitration /
 conflict requeue). No new terminal task state, no agent-facing git: the
 agent only ever sees file tools.
 
-Soft guard: after three consecutive conflict-carrying replays in one stage
-pass, mid-phase replay is disabled for the rest of that pass (the stage
-falls back to the merge rails), so a pathological overlap cannot burn the
-pass in a resolve-conflict loop.
+Soft guard: after three consecutive conflict-carrying replay episodes in one
+stage pass, mid-phase replay is disabled for the rest of that pass (the
+stage falls back to the merge rails), so a pathological overlap cannot burn
+the pass in a resolve-conflict loop.
 """
 
 from __future__ import annotations
@@ -37,7 +38,6 @@ from core.worktree import (
     ReplayOutcome,
     WorktreeHandle,
     normalize_repo_path,
-    touches_pending_file,
 )
 
 if TYPE_CHECKING:
@@ -100,6 +100,7 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         on_replay_started: Callable[[], None] | None = None,
         abort_replay: Callable[[WorktreeHandle], None] | None = None,
         conflict_contract_cards: Callable[[list[str]], dict[str, Any]] | None = None,
+        conflict_paths_reader: Callable[[WorktreeHandle], list[str]] | None = None,
         enabled: bool | None = None,
     ) -> None:
         self._handle = handle
@@ -121,6 +122,10 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         # guard stands the pass down (the phase-end integrate must never
         # meet an unmerged index).
         self._abort_replay = abort_replay
+        # Unresolved conflict paths of a mid-rebase worktree, for the forced
+        # resolution gate (``_before_call``). Reads the marker-tainted paths
+        # from the manager; ``None`` disables forced resolution.
+        self._conflict_paths_reader = conflict_paths_reader
         self._enabled = rebase_on_merge_enabled() if enabled is None else enabled
         # Soft-guard state: consecutive conflict-carrying replays this pass,
         # and whether the guard has tripped (mid-phase replay stands down).
@@ -146,22 +151,86 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
     # -- middleware contract ------------------------------------------------------
 
     def wrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
-        notice = self._before_call(request)
+        blocked = self._before_call(request)
+        if blocked is not None:
+            return self._blocked(request, blocked)
+        notice = self._pre_call_replay(request)
         result = handler(request)
         return self._annotate(request, result, notice)
 
     async def awrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
-        notice = self._before_call(request)
+        blocked = self._before_call(request)
+        if blocked is not None:
+            return self._blocked(request, blocked)
+        notice = self._pre_call_replay(request)
         result = await handler(request)
         return self._annotate(request, result, notice)
+
+    @staticmethod
+    def _blocked(request: ToolCallRequest, outcome: ReplayOutcome) -> ToolMessage:
+        """The forced-resolution refusal for a call outside the conflict set."""
+
+        listed = ", ".join(outcome.files[:8])
+        return ToolMessage(
+            content=(
+                "Error: ARC rebase-on-merge: this workspace has unresolved merge "
+                f"conflicts in: {listed}. Resolve every one of them first with "
+                "edit_file/write_file (keep both sides' behavior where they are "
+                "compatible, prefer your node's contract for what your "
+                "requirement owns); file work outside the conflicted files "
+                "resumes once the last conflict is resolved. Validation tools "
+                "(run_tests/run_build) stay available."
+            ),
+            name=str(request.tool_call.get("name", "tool")),
+            tool_call_id=str(request.tool_call.get("id", "")),
+            status="error",
+        )
 
     # -- replay orchestration -----------------------------------------------------
 
     def _before_call(self, request: ToolCallRequest) -> ReplayOutcome | None:
-        """Run the replay before the call is served; returns the outcome.
+        """The forced-resolution gate: ``CONFLICTS`` blocks the call.
 
-        ``None`` means no replay ran (feature off, guard tripped, no touch,
-        or a non-file tool) and the call proceeds untouched.
+        While the worktree sits mid-rebase, every call on a path outside the
+        conflict set is refused until the agent resolves the markers - the
+        conflict set itself stays writable, so the resolving edits are exactly
+        the calls that get through. Returns the ``CONFLICTS`` outcome the
+        caller turns into a blocked tool result, or ``None`` when the call may
+        proceed (nothing mid-rebase, the call resolves a conflict path, or the
+        replay already completed at this boundary).
+        """
+
+        if not self._enabled:
+            return None
+        if self._is_mid_rebase is None or not self._is_mid_rebase(self._handle):
+            return None
+        name = str(request.tool_call.get("name", ""))
+        if name not in _FILE_PATH_TOOLS:
+            return None
+        args = request.tool_call.get("args", {}) or {}
+        rel_path = normalize_repo_path(args.get("file_path", ""))
+        if not rel_path:
+            return None
+        unresolved = self._unresolved_conflict_paths()
+        if not unresolved:
+            return None
+        if rel_path in unresolved:
+            return None
+        return ReplayOutcome(
+            status=ReplayOutcome.CONFLICTS,
+            files=unresolved,
+            detail="forced resolution: this call's path is outside the unresolved conflict set",
+        )
+
+    def _pre_call_replay(self, request: ToolCallRequest) -> ReplayOutcome | None:
+        """Run the eager replay before the call is served; returns the outcome.
+
+        ``None`` means no replay ran (feature off, guard tripped, no pending
+        merges, or a non-file tool) and the call proceeds untouched. Eager
+        semantics (issue #127 revision): any file-tool call while pending
+        merges exist replays them - the touch check is deliberately absent,
+        so a merge that lands while the agent works on unrelated files still
+        reaches it at the very next boundary.
         """
 
         if not self._enabled or self._disarmed:
@@ -191,7 +260,7 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
                     return outcome
                 # ABORTED: fail-open, serve the call silently.
         pending = self._pending_files() if self._pending_files else []
-        if not pending or not touches_pending_file(pending, rel_path):
+        if not pending:
             return None
         self._notify_started()
         try:
@@ -202,6 +271,23 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         if outcome.status == ReplayOutcome.SKIPPED:
             return None
         return outcome
+
+    def _unresolved_conflict_paths(self) -> list[str]:
+        """Repo-relative paths still carrying conflict markers (best effort).
+
+        Reads the conflicted paths through the injected reader; an
+        unavailable reader means no forced resolution (fail-open) - the
+        disarmed/abort rails still own that tree.
+        """
+
+        if self._conflict_paths_reader is None:
+            return []
+        try:
+            paths = self._conflict_paths_reader(self._handle)
+        except Exception:  # noqa: BLE001 - fail-open is the contract
+            return []
+        normalized = [normalize_repo_path(path) for path in (paths or [])]
+        return [path for path in normalized if path]
 
     def _notify_started(self) -> None:
         """Fire the started audit hook (best effort)."""

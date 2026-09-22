@@ -1,0 +1,57 @@
+{
+  "REQ-A.1-API-notes-list": {
+    "test_id": "REQ-A.1-API-notes-list",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-API-Notes",
+      "REQ-A.1-FUNC-App"
+    ],
+    "type": "Integration",
+    "file_path": "backend/tests/notesApi.test.js",
+    "passed": true,
+    "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-A.1-E2E-notes-area-visible": {
+    "test_id": "REQ-A.1-E2E-notes-area-visible",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-UI-NotesArea",
+      "REQ-A.1-UI-HomePage",
+      "REQ-A.1-API-Notes"
+    ],
+    "type": "E2E",
+    "file_path": "backend/test-e2e/notes-area.e2e.spec.js",
+    "passed": true,
+    "first_line": "const { test, expect } = require('@playwright/test');",
+    "scenario_id": null
+  },
+  "REQ-A.1-FUNC-notes-persistence": {
+    "test_id": "REQ-A.1-FUNC-notes-persistence",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-FUNC-NotesService",
+      "REQ-A.1-FUNC-NotesRepository",
+      "REQ-A.1-DB-NotesTable"
+    ],
+    "type": "Unit",
+    "file_path": "backend/tests/notesService.test.js",
+    "passed": true,
+    "first_line": "import { describe, it, expect, beforeEach, afterEach } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-A.1-UI-NotesArea": {
+    "test_id": "REQ-A.1-UI-NotesArea",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-UI-NotesArea",
+      "REQ-A.1-UI-useNotes",
+      "REQ-A.1-FUNC-Api"
+    ],
+    "type": "Unit",
+    "file_path": "frontend/tests/NotesArea.test.tsx",
+    "passed": true,
+    "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';",
+    "scenario_id": null
+  }
+}

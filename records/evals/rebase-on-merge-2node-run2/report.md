@@ -34,3 +34,12 @@
 
 - 未做 repetitions>1 的统计对比（单对运行，pass/fail 与 token 差异不构成显著性）。
 - 未在会真实触发重叠触碰的树上（如 simple-keep REQ-2 深子树 + ARC_AFFINITY_DEPTH=2）验证重放的正向路径；回归测试（`tests/test_workflow/test_rebase_on_merge.py` 26 个真实 git 用例）覆盖了机械与边界行为。
+
+## 附注（2026-09-22 晚，饿式修订）
+
+本报告的判读基于**懒式**实现（触碰变更路径才重放）。当日与用户对齐后翻案为**饿式**（任意文件工具边界即重放）+ **强制消解**（冲突标记未清期间冲突集之外的文件调用被拒绝）：
+
+- 判读 1 的「懒式触发 0 命中」正是翻案的直接论据——「写完即不再触碰」是真实高发形态，懒式对它无覆盖，重叠原样落到阶段末合并轨道（该次 run 的 4 文件冲突 + 健康门禁失败即此形态的后果）。
+- 决策一节中「暂不补饿式触发」随之作废：饿式已实施（本 PR 内），懒式降为 ADR 0003 的 considered option。
+- 判读 2（candidate 失败与重放无关）仍然成立；维持默认关闭的结论不变，翻默认需要饿式版本在 keep 规模树上重放正向路径的证据。
+- 同批配套：模板补丁把 Playwright 易变产物（test-results/、playwright-report/）加入 backend .gitignore——该次合并冲突集里的 `backend/test-results/.last-run.json` 即此类产物。

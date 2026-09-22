@@ -1,0 +1,64 @@
+[2026-09-22T10:50:13.169+08:00] [Compiler] ARC compilation started.
+[2026-09-22T10:50:13.170+08:00] [RequirementLoader] Reading requirements file: D:\code\arc-rebase-benchmark\reb2\requirements\requirements.yaml
+[2026-09-22T10:50:13.174+08:00] [System] Initializing project environment in D:\code\arc-rebase-benchmark\work\candidate-rep001...
+[2026-09-22T10:50:13.235+08:00] [System] Prerequisite check passed for app_type=web.
+[2026-09-22T10:50:13.237+08:00] [System] Using app_type=web, template=D:\code\arc-rebase-on-merge\arc-template\templates\web-react-express
+[2026-09-22T10:50:13.238+08:00] [System] Copying template from D:\code\arc-rebase-on-merge\arc-template\templates\web-react-express to D:\code\arc-rebase-benchmark\work\candidate-rep001...
+[2026-09-22T10:50:13.274+08:00] [System] Template files copied successfully.
+[2026-09-22T10:50:13.281+08:00] [System] Applied template patch(es): init-db-never-return-closed-handle, init-db-rethrow-genuine-init-failures, test-harness-temp-dir-guard.
+[2026-09-22T10:50:13.284+08:00] [System] Configured web template for single-port backend hosting on port 3311.
+[2026-09-22T10:50:13.286+08:00] [System] Installing backend dependencies. This might take a moment...
+[2026-09-22T10:50:13.288+08:00] [System] Installing frontend dependencies. This might take a moment...
+[2026-09-22T10:50:13.290+08:00] [System] Installing Playwright browsers alongside npm dependencies...
+[2026-09-22T10:50:16.251+08:00] [System] Verifying workspace: installing Playwright browsers...
+[2026-09-22T10:50:18.536+08:00] [System] NPM install success in D:\code\arc-rebase-benchmark\work\candidate-rep001\backend
+[2026-09-22T10:50:18.641+08:00] [System] Workspace verification passed: Playwright browsers ready.
+[2026-09-22T10:50:31.484+08:00] [System] NPM install success in D:\code\arc-rebase-benchmark\work\candidate-rep001\frontend
+[2026-09-22T10:50:31.486+08:00] [System] Verifying workspace: building frontend...
+[2026-09-22T10:50:33.672+08:00] [System] Workspace verification passed: frontend build succeeded.
+[2026-09-22T10:50:33.674+08:00] [System] Initializing Git repository...
+[2026-09-22T10:50:34.300+08:00] [Compiler] Loaded processing queue with 10 task(s) for root node ROOT.
+[2026-09-22T10:50:34.304+08:00] [Compiler] Parallel drain enabled: up to 3 task(s) in flight, one worktree and web port per task (base port 3311).
+[2026-09-22T10:50:34.317+08:00] [Compiler][ROOT] Running DESIGN for node ROOT...
+[2026-09-22T10:50:34.617+08:00] [Compiler][ROOT] Isolated workspace for ROOT: D:\code\arc-rebase-benchmark\work\candidate-rep001\.arc\worktrees\ROOT (web port 3312)
+[2026-09-22T10:50:34.620+08:00] [System][ROOT][info] No image found in the description or visual_reference.
+[2026-09-22T10:50:34.636+08:00] [InterfaceDesigner][ROOT][info] Skipping non-leaf DESIGN because this node has no visual reference; no UI/API/FUNC/DB interfaces are owned here.
+[2026-09-22T10:50:34.637+08:00] [TestGenerator][ROOT][info] Skipping test generation for non-leaf node.
+[2026-09-22T10:50:34.918+08:00] [Compiler][ROOT] No file changes detected for this checkpoint.
+[2026-09-22T10:50:34.920+08:00] [Compiler][ROOT] Integrated ROOT: merged arc-node/ROOT into master.
+[2026-09-22T10:50:34.936+08:00] [Compiler][ROOT] DESIGN completed for node ROOT.
+[2026-09-22T10:50:35.045+08:00] [Compiler][REQ-A] Running DESIGN for node REQ-A...
+[2026-09-22T10:50:35.047+08:00] [Compiler][REQ-B] Running DESIGN for node REQ-B...
+[2026-09-22T10:50:35.373+08:00] [Compiler][REQ-A] Isolated workspace for REQ-A: D:\code\arc-rebase-benchmark\work\candidate-rep001\.arc\worktrees\REQ-A (web port 3312)
+[2026-09-22T10:50:35.375+08:00] [System][REQ-A][info] No image found in the description or visual_reference.
+[2026-09-22T10:50:35.393+08:00] [InterfaceDesigner][REQ-A][info] Skipping non-leaf DESIGN because this node has no visual reference; no UI/API/FUNC/DB interfaces are owned here.
+[2026-09-22T10:50:35.395+08:00] [TestGenerator][REQ-A][info] Skipping test generation for non-leaf node.
+[2026-09-22T10:50:35.426+08:00] [Compiler][REQ-B] Isolated workspace for REQ-B: D:\code\arc-rebase-benchmark\work\candidate-rep001\.arc\worktrees\REQ-B (web port 3313)
+[2026-09-22T10:50:35.429+08:00] [System][REQ-B][info] No image found in the description or visual_reference.
+[2026-09-22T10:50:35.446+08:00] [InterfaceDesigner][REQ-B][info] Skipping non-leaf DESIGN because this node has no visual reference; no UI/API/FUNC/DB interfaces are owned here.
+[2026-09-22T10:50:35.448+08:00] [TestGenerator][REQ-B][info] Skipping test generation for non-leaf node.
+[2026-09-22T10:50:35.672+08:00] [Compiler][REQ-A] No file changes detected for this checkpoint.
+[2026-09-22T10:50:35.674+08:00] [Compiler][REQ-A] Integrated REQ-A: merged arc-node/REQ-A into master.
+[2026-09-22T10:50:35.690+08:00] [Compiler][REQ-A] DESIGN completed for node REQ-A.
+[2026-09-22T10:50:35.796+08:00] [Compiler][REQ-A.1] Running DESIGN for node REQ-A.1...
+[2026-09-22T10:50:35.973+08:00] [Compiler][REQ-B] No file changes detected for this checkpoint.
+[2026-09-22T10:50:35.974+08:00] [Compiler][REQ-B] Integrated REQ-B: merged arc-node/REQ-B into master.
+[2026-09-22T10:50:35.990+08:00] [Compiler][REQ-B] DESIGN completed for node REQ-B.
+[2026-09-22T10:50:36.097+08:00] [Compiler][REQ-B.1] Running DESIGN for node REQ-B.1...
+[2026-09-22T10:50:36.260+08:00] [Compiler][REQ-A.1] Isolated workspace for REQ-A.1: D:\code\arc-rebase-benchmark\work\candidate-rep001\.arc\worktrees\REQ-A.1 (web port 3312)
+[2026-09-22T10:50:36.263+08:00] [System][REQ-A.1][info] No image found in the description or visual_reference.
+[2026-09-22T10:50:36.267+08:00] [InterfaceDesigner][REQ-A.1] Running interface design.
+[2026-09-22T10:50:36.301+08:00] [Compiler][REQ-A.1][error] DESIGN task for node REQ-A.1 crashed: NameError: name 'node_id' is not defined
+[2026-09-22T10:50:36.303+08:00] [Compiler][REQ-A.1][warning] Skipping integration for failed DESIGN task of node REQ-A.1; preserving the isolated worktree for inspection/retry.
+[2026-09-22T10:50:36.315+08:00] [Compiler][REQ-A.1][error] DESIGN failed for node REQ-A.1.
+[2026-09-22T10:50:36.336+08:00] [Compiler][ROOT][warning] Blocked node ROOT: prerequisite node(s) failed or were blocked (REQ-A.1). Its tasks will not be treated as successful; independent nodes may continue for diagnostics.
+[2026-09-22T10:50:36.339+08:00] [Compiler][REQ-A][warning] Blocked node REQ-A: prerequisite node(s) failed or were blocked (REQ-A.1). Its tasks will not be treated as successful; independent nodes may continue for diagnostics.
+[2026-09-22T10:50:36.430+08:00] [Compiler][REQ-B.1] Isolated workspace for REQ-B.1: D:\code\arc-rebase-benchmark\work\candidate-rep001\.arc\worktrees\REQ-B.1 (web port 3313)
+[2026-09-22T10:50:36.436+08:00] [System][REQ-B.1][info] No image found in the description or visual_reference.
+[2026-09-22T10:50:36.440+08:00] [InterfaceDesigner][REQ-B.1] Running interface design.
+[2026-09-22T10:50:36.472+08:00] [Compiler][REQ-B.1][error] DESIGN task for node REQ-B.1 crashed: NameError: name 'node_id' is not defined
+[2026-09-22T10:50:36.474+08:00] [Compiler][REQ-B.1][warning] Skipping integration for failed DESIGN task of node REQ-B.1; preserving the isolated worktree for inspection/retry.
+[2026-09-22T10:50:36.492+08:00] [Compiler][REQ-B.1][error] DESIGN failed for node REQ-B.1.
+[2026-09-22T10:50:36.501+08:00] [Compiler][REQ-B][warning] Blocked node REQ-B: prerequisite node(s) failed or were blocked (REQ-B.1). Its tasks will not be treated as successful; independent nodes may continue for diagnostics.
+[2026-09-22T10:50:36.774+08:00] [Compiler] Removed 2 reusable worktree(s) after the drain.
+[2026-09-22T10:50:36.777+08:00] [Compiler][error] Compilation finished without an accepted result (failed: REQ-A.1, REQ-B.1; blocked: REQ-A, REQ-B, ROOT)

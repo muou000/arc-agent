@@ -56,13 +56,14 @@ quarantined and later tasks fall back to their own node-keyed directory.
 
 While a task executes, a sibling's merge landing on the integration branch
 does not interrupt it: the manager records a ``PendingMerge`` (the merge's
-changed-file set) against the in-flight worktree, and only when the task's
-agent touches one of those paths does the mid-phase replay run at that tool
-boundary - a ``wip:`` commit of the dirty tree, a rebase onto the new
-integration HEAD (under the ``integration_gate`` as a reader, like every
+changed-file set) against the in-flight worktree, and the task's agent
+replays it at its *next file-tool boundary* regardless of the touched path
+(eager, ADR 0003) - a ``wip:`` commit of the dirty tree, a rebase onto the
+new integration HEAD (under the ``integration_gate`` as a reader, like every
 other tree-reading operation), and either a fresh tree or conflict markers
-the resolving agent settles with its ordinary file tools. The replay is
-demand-pull (ADR 0003) and fail-open: any mechanical failure aborts it,
+the resolving agent settles with its ordinary file tools (calls outside the
+conflict set are refused until the markers clear). The replay is
+fail-open: any mechanical failure aborts it,
 restores the pre-replay state and leaves the overlap to the merge rails.
 
 Parent and child DESIGN phases are serialized by the workflow's dependency
@@ -250,32 +251,15 @@ class WorktreeHandle:
 class PendingMerge:
     """A sibling merge that landed while this task was still executing.
 
-    The workflow records one of these per sibling merge whose changed files
-    overlap paths an in-flight task may touch. Nothing happens until the
-    task's agent actually touches one of the changed paths (read/edit/write/
-    delete): at that tool-call boundary the middleware replays the task onto
-    the new integration HEAD (WIP commit + rebase), then serves the call
-    against the fresh tree. This is the *demand-pull* half of ADR 0003 - the
-    alternative (replaying eagerly at merge time) was rejected there.
+    The workflow records one of these per sibling merge against every
+    in-flight task's worktree. Under eager replay (issue #127 revision) it is
+    consumed at the in-flight agent's next file-tool call regardless of the
+    touched path; the changed-file list rides the replay outcome's notice.
     """
 
     source_node_id: str
     integration_head: str
     changed_files: list[str]
-
-    def touches(self, rel_path: str) -> bool:
-        return rel_path in self._changed_set
-
-    @property
-    def _changed_set(self) -> frozenset[str]:
-        # PendingMerge instances are created once per merge and consulted on
-        # every file tool call afterwards, so the frozen set is cached.
-        cached = getattr(self, "_cached_changed_set", None)
-        if cached is None:
-            normalized = {normalize_repo_path(path) for path in self.changed_files}
-            cached = frozenset(path for path in normalized if path)
-            self._cached_changed_set = cached
-        return cached
 
 
 @dataclass
@@ -344,13 +328,6 @@ def normalize_repo_path(value: object) -> str:
     return path.strip("/")
 
 
-def touches_pending_file(pending: list[PendingMerge], rel_path: str) -> bool:
-    """Whether any pending merge changed ``rel_path`` (normalized)."""
-
-    normalized = normalize_repo_path(rel_path)
-    return bool(normalized) and any(merge.touches(normalized) for merge in pending)
-
-
 def sanitize_node_id(node_id: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(node_id or "").strip())
     return normalized or "node"
@@ -414,7 +391,7 @@ class NodeWorktreeManager:
         # Worktree directories that must not be handed to another node: they
         # hold a conflicting or crashed task's state for inspection/retry.
         self._quarantined: set[str] = set()
-        # Landed sibling merges awaiting demand-pull replay, keyed by the
+        # Landed sibling merges awaiting eager replay, keyed by the
         # in-flight task's worktree path (issue #127). Populated by
         # ``record_pending_merge``, consumed by ``replay_pending_merges`` and
         # the task's settle.
@@ -996,7 +973,7 @@ class NodeWorktreeManager:
         return result.stdout.strip() if result.returncode == 0 else ""
 
     # ------------------------------------------------------------------
-    # mid-phase replay (issue #127 / ADR 0003: rebase-on-merge, demand-pull)
+    # mid-phase replay (issue #127 / ADR 0003: rebase-on-merge, eager)
     # ------------------------------------------------------------------
 
     def record_pending_merge(
@@ -1040,8 +1017,9 @@ class NodeWorktreeManager:
     def replay_pending_merges(self, handle: WorktreeHandle) -> ReplayOutcome:
         """Replay the task's pending merges at a tool-call boundary.
 
-        Demand-pull rebase-on-merge (ADR 0003): the agent just touched a file
-        a landed sibling merge also changed. At this quiescent point - no
+        Eager rebase-on-merge (ADR 0003): a sibling merge has landed and the
+        agent's next file-tool call arrived - regardless of which path it
+        touches. At this quiescent point - no
         filesystem tool is mid-flight - the dirty tree is committed as a
         ``wip:`` checkpoint, the node branch is rebased onto the current
         integration HEAD, and the working tree comes back either clean
@@ -1215,6 +1193,17 @@ class NodeWorktreeManager:
         """Whether a prior replay left this worktree mid-rebase."""
 
         return str(Path(handle.path)) in self._mid_rebase
+
+    def unresolved_conflict_paths(self, handle: WorktreeHandle) -> list[str]:
+        """Repo-relative paths that still carry conflict markers (mid-rebase).
+
+        The forced-resolution gate reads this to refuse file calls outside
+        the conflict set while a replay's markers remain. Paths come from the
+        merge index's unmerged entries; an empty list means either nothing
+        is mid-rebase or every entry resolved (the next boundary completes).
+        """
+
+        return self._unmerged_paths_in(handle.path)
 
     def abort_replay(self, handle: WorktreeHandle) -> None:
         """Abort a mid-rebase worktree and restore its pre-replay state.

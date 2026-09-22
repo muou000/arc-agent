@@ -1,4 +1,4 @@
-"""Demand-pull rebase-on-merge regression tests (issue #127 / ADR 0003).
+"""Eager rebase-on-merge regression tests (issue #127 / ADR 0003).
 
 Real git, no mocks, no models: the replay machinery (``core.worktree``'s
 WIP commit + rebase + conflict completion, ``agents.runtime.rebase_gate``'s
@@ -37,7 +37,6 @@ from core.worktree import (
     WorktreeOutcome,
     WorktreeTaskResult,
     normalize_repo_path,
-    touches_pending_file,
 )
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
@@ -109,16 +108,8 @@ def test_normalize_repo_path_accepts_tool_call_forms() -> None:
     assert normalize_repo_path("/workspace") == ""
 
 
-def test_touches_pending_file_matches_normalized_paths() -> None:
-    pending = [PendingMerge("SIB", "abc", ["backend/shared.js", "app.js"])]
-    assert touches_pending_file(pending, "/workspace/backend/shared.js")
-    assert touches_pending_file(pending, "app.js")
-    assert not touches_pending_file(pending, "backend/other.js")
-    assert not touches_pending_file(pending, "")
-
-
 # ---------------------------------------------------------------------------
-# lazy trigger: no touch, no replay
+# eager trigger: any file call replays pending merges
 # ---------------------------------------------------------------------------
 
 
@@ -129,11 +120,13 @@ def test_replay_without_pending_merges_is_skipped(tmp_path: Path) -> None:
     assert outcome.status == ReplayOutcome.SKIPPED
 
 
-def test_lazy_replay_does_not_run_until_a_pending_path_is_touched(
+def test_eager_replay_runs_on_an_unrelated_file_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The core demand-pull contract: a recorded pending merge that is never
-    touched never replays - the branch and working tree stay put."""
+    """The eager contract (issue #127 revision): the in-flight agent's next
+    file-tool call replays the pending merges regardless of which path it
+    touches - a merge that lands while the agent works on unrelated files
+    still reaches it immediately."""
 
     repo, manager = _init_repo(tmp_path)
     handle = manager.prepare("REQ-A")
@@ -155,19 +148,24 @@ def test_lazy_replay_does_not_run_until_a_pending_path_is_touched(
         pending_files=lambda: manager.pending_merges_for(handle),
         is_mid_rebase=manager.is_mid_rebase,
         continue_replay=manager.continue_replay,
+        conflict_paths_reader=manager.unresolved_conflict_paths,
         enabled=True,
     )
-    # A tool call on an unrelated path must not consume the pending merge.
+    # A tool call on an unrelated path still consumes the pending merge and
+    # serves the call against the replayed tree.
     result = gate.wrap_tool_call(
         _make_request("read_file", {"file_path": "/workspace/backend/own.js"}), _ok_tool
     )
-    assert result.content == "ok"
-    assert manager.pending_merges_for(handle), (
-        "an unrelated touch must leave the pending merge in place"
+    assert "[ARC rebase-on-merge" in result.content
+    assert not manager.pending_merges_for(handle), (
+        "the eager boundary must consume the pending merge"
     )
-    # And the branch is still at the pre-merge head.
-    own_sha = _git(["rev-parse", "HEAD"], Path(handle.path)).stdout.strip()
-    assert (Path(handle.path) / "backend" / "shared.js").read_text(encoding="utf-8") == "base;\n"
+    assert (
+        (Path(handle.path) / "backend" / "shared.js").read_text(encoding="utf-8")
+        == "base;\nsibling;\n"
+    )
+    # The agent's own dirty file survived the replay.
+    assert (Path(handle.path) / "backend" / "own.js").read_text(encoding="utf-8") == "own;\n"
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +220,7 @@ def test_replay_through_middleware_serves_call_against_fresh_tree(
         pending_files=lambda: manager.pending_merges_for(handle),
         is_mid_rebase=manager.is_mid_rebase,
         continue_replay=manager.continue_replay,
+        conflict_paths_reader=manager.unresolved_conflict_paths,
         enabled=True,
     )
     result = gate.wrap_tool_call(
@@ -321,6 +320,7 @@ def test_conflicted_replay_annotation_and_completion_at_boundaries(
         pending_files=lambda: manager.pending_merges_for(handle),
         is_mid_rebase=manager.is_mid_rebase,
         continue_replay=manager.continue_replay,
+        conflict_paths_reader=manager.unresolved_conflict_paths,
         enabled=True,
     )
     result = gate.wrap_tool_call(
@@ -329,14 +329,27 @@ def test_conflicted_replay_annotation_and_completion_at_boundaries(
     assert "merge conflicts" in result.content
     assert "backend/shared.js" in result.content
 
-    # Agent resolves; the next boundary completes the replay even though the
-    # touched path is unrelated.
+    # While the markers remain, a file call outside the conflict set is
+    # refused (forced resolution).
+    blocked = gate.wrap_tool_call(
+        _make_request("read_file", {"file_path": "/workspace/backend/own.js"}), _ok_tool
+    )
+    assert blocked.content.startswith("Error: ARC rebase-on-merge")
+    assert "unresolved merge conflicts" in blocked.content
+
+    # The resolving edit (on the conflicted path) completes the replay at
+    # its own boundary.
     shared.write_text("base;\nagent;\nsibling;\n", encoding="utf-8")
     completed = gate.wrap_tool_call(
-        _make_request("read_file", {"file_path": "/workspace/backend/own.js"}), _ok_tool
+        _make_request("edit_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
     )
     assert "were applied to this workspace" in completed.content
     assert not manager.is_mid_rebase(handle)
+    # After completion, unrelated file work is served again.
+    after = gate.wrap_tool_call(
+        _make_request("read_file", {"file_path": "/workspace/backend/own.js"}), _ok_tool
+    )
+    assert after.content == "ok"
 
 
 # ---------------------------------------------------------------------------

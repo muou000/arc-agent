@@ -79,6 +79,7 @@ SKIPPED = "skipped"
 _INIT_DB_PATH = "backend/src/database/init_db.js"
 _TEST_HARNESS_PATH = "backend/src/database/test_harness.js"
 _README_PATH = "README.md"
+_BACKEND_GITIGNORE_PATH = "backend/.gitignore"
 
 # PR #28 fixed two defects in the template's database bootstrap, and this
 # chain also carries the earlier handle-return fix (a15ad24) the provisioned
@@ -421,6 +422,47 @@ TEMPLATE_PATCHES: tuple[TemplatePatch, ...] = (
                     "    await initializeDatabase();\n"
                 ),
                 applied_marker="Re-create the root directory before reopening sqlite",
+            ),
+        ),
+    ),
+    # `npx playwright test` writes its volatile artifacts (traces, videos,
+    # `.last-run.json`) into `backend/test-results/` and
+    # `backend/playwright-report/` by default; the template's backend
+    # .gitignore ignores neither. Two costs: every phase checkpoint
+    # (`git add -A`) commits them, and every parallel sibling merge carries
+    # them as changed files - the 2026-09-22 rebase-on-merge benchmark saw
+    # `backend/test-results/.last-run.json` inside a four-file merge
+    # conflict set. A live dev server holding a trace file open is also the
+    # Windows lock shape that can block a mid-phase replay's git operations.
+    # The fix is the ignore entry every Playwright scaffold carries.
+    TemplatePatch(
+        name="gitignore-playwright-artifacts",
+        template_id="web-react-express",
+        summary=(
+            "backend .gitignore ignores Playwright's volatile test-results/ and "
+            "playwright-report/ output directories, keeping runner artifacts out "
+            "of checkpoints, merges and replays"
+        ),
+        edits=(
+            TemplateEdit(
+                relative_path=_BACKEND_GITIGNORE_PATH,
+                search=(
+                    "node_modules\n"
+                    "*.db\n"
+                    ".arc-test-db\n"
+                    ".env\n"
+                    "coverage\n"
+                ),
+                replace=(
+                    "node_modules\n"
+                    "*.db\n"
+                    ".arc-test-db\n"
+                    ".env\n"
+                    "coverage\n"
+                    "test-results\n"
+                    "playwright-report\n"
+                ),
+                applied_marker="playwright-report",
             ),
         ),
     ),

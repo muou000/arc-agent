@@ -120,3 +120,20 @@ def test_harness_reset_recreates_the_temp_dir_before_reopening(patched_harness: 
 
     assert patched_harness.count("fs.mkdirSync(rootDir, { recursive: true });") == 2
     assert "Re-create the root directory before reopening sqlite" in patched_harness
+
+
+def test_patched_gitignore_excludes_playwright_artifacts(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The workspace's backend .gitignore ignores Playwright's volatile
+    output directories, so runner artifacts never enter checkpoints, merges
+    or replays (the rebase-on-merge benchmark saw test-results/.last-run.json
+    inside a four-file merge conflict set)."""
+
+    workspace = tmp_path_factory.mktemp("patched-gitignore-") / "workspace"
+    shutil.copytree(TEMPLATE_ROOT, workspace)
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+    assert all(outcome.status in {APPLIED, ALREADY_APPLIED} for outcome in outcomes), outcomes
+    lines = (workspace / "backend" / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "test-results" in lines
+    assert "playwright-report" in lines

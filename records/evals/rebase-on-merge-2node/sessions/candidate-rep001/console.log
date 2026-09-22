@@ -1,0 +1,200 @@
+=== stdout ===
+
+==============================================================================
+ ARC Requirement Compiler
+ Compile requirement graphs into interfaces, tests, and runnable code
+==============================================================================
+
+ Session
+   mode      start-compilation
+   input     requirements
+   output    D:\code\arc-rebase-benchmark\work\candidate-rep001
+   target    web
+   port      3311
+   model api chat_completions
+   stack     backend=nodejs, frontend=react, database=sqlite, web_port=3311
+   view      progress
+   debug log D:\code\arc-rebase-benchmark\work\candidate-rep001\.arc\debug.log
+------------------------------------------------------------------------------
+
+
+                                                                                                    
+
+10:50:13  Compiler             ARC         ==============================================================================
+10:50:13  Compiler             ARC         ARC compilation started
+
+                                                                                                    
+10:50:13  RequirementLoader    ARC         Input        Loading requirement model
+
+                                                                                                    
+10:50:13  System               ARC         Workspace    Preparing runtime workspace
+
+                                                                                                    
+10:50:13  System               ARC         Check        app_type=web.
+
+                                                                                                    
+10:50:13  System               ARC         Workspace    Scaffolding project template
+
+                                                                                                    
+10:50:13  System               ARC         Workspace    Template ready
+
+                                                                                                    
+10:50:13  System               ARC         Workspace    Web stack configured
+
+                                                                                                    
+10:50:13  System               ARC         Deps         Installing backend packages
+
+                                                                                                    
+10:50:13  System               ARC         Deps         Installing frontend packages
+
+                                                                                                    
+10:50:16  System               ARC         Verify       Smoke check: building frontend
+
+                                                                                                    
+10:50:18  System               ARC         Deps         backend packages ready
+
+                                                                                                    
+10:50:18  System               ARC         Verify       Smoke check passed
+
+                                                                                                    
+10:50:31  System               ARC         Deps         frontend packages ready
+
+                                                                                                    
+10:50:31  System               ARC         Verify       Smoke check: building frontend
+
+                                                                                                    
+10:50:33  System               ARC         Verify       Smoke check passed
+
+                                                                                                    
+10:50:33  System               ARC         Checkpoint   Initializing git history
+
+                                                                                                    
+10:50:34  Compiler             ARC         Queue        10 task(s) scheduled
+
+                                                                                                    
+
+10:50:34  Compiler             ROOT        ==============================================================================
+10:50:34  Compiler             ROOT        ROOT / Design starting
+
+                                                                                                    
+10:50:34  System               ROOT        Info         No image found in the description or visual_reference.
+
+                                                                                                    
+10:50:34  InterfaceDesigner    ROOT        Info         Skipping non-leaf DESIGN because this node has no visual reference; no UI/API/FUNC/DB interfaces are owned here.
+
+                                                                                                    
+10:50:34  TestGenerator        ROOT        Info         Skipping test generation for non-leaf node.
+
+                                                                                                    
+10:50:34  Compiler             ROOT        done         Design complete
+
+                                                                                                    
+
+10:50:35  Compiler             REQ-A       ==============================================================================
+10:50:35  Compiler             REQ-A       REQ-A / Design starting
+
+                                                                                                    
+
+10:50:35  Compiler             REQ-B       ==============================================================================
+10:50:35  Compiler             REQ-B       REQ-B / Design starting
+
+                                                                                                    
+10:50:35  System               REQ-A       Info         No image found in the description or visual_reference.
+
+                                                                                                    
+10:50:35  InterfaceDesigner    REQ-A       Info         Skipping non-leaf DESIGN because this node has no visual reference; no UI/API/FUNC/DB interfaces are owned here.
+
+                                                                                                    
+10:50:35  TestGenerator        REQ-A       Info         Skipping test generation for non-leaf node.
+
+                                                                                                    
+10:50:35  System               REQ-B       Info         No image found in the description or visual_reference.
+
+                                                                                                    
+10:50:35  InterfaceDesigner    REQ-B       Info         Skipping non-leaf DESIGN because this node has no visual reference; no UI/API/FUNC/DB interfaces are owned here.
+
+                                                                                                    
+10:50:35  TestGenerator        REQ-B       Info         Skipping test generation for non-leaf node.
+
+                                                                                                    
+10:50:35  Compiler             REQ-A       done         Design complete
+
+                                                                                                    
+
+10:50:35  Compiler             REQ-A.1     ==============================================================================
+10:50:35  Compiler             REQ-A.1     REQ-A.1 / Design starting
+
+                                                                                                    
+10:50:35  Compiler             REQ-B       done         Design complete
+
+                                                                                                    
+
+10:50:36  Compiler             REQ-B.1     ==============================================================================
+10:50:36  Compiler             REQ-B.1     REQ-B.1 / Design starting
+
+                                                                                                    
+10:50:36  System               REQ-A.1     Info         No image found in the description or visual_reference.
+
+                                                                                                    
+10:50:36  InterfaceDesigner    REQ-A.1     Design       InterfaceDesigner is shaping interfaces
+
+                                                                                                    
+10:50:36  Compiler             REQ-A.1     Error        DESIGN task for node REQ-A.1 crashed: NameError: name 'node_id' is not defined
+
+                                                                                                    
+10:50:36  Compiler             REQ-A.1     Note         Skipping integration for failed DESIGN task of node REQ-A.1; preserving the isolated worktree for inspection/retry.
+
+                                                                                                    
+10:50:36  Compiler             REQ-A.1     Error        DESIGN failed for node REQ-A.1.
+
+                                                                                                    
+10:50:36  Compiler             ROOT        Note         Blocked node ROOT: prerequisite node(s) failed or were blocked (REQ-A.1). Its tasks will not be treated as successful; independent nodes ...
+
+                                                                                                    
+10:50:36  Compiler             REQ-A       Note         Blocked node REQ-A: prerequisite node(s) failed or were blocked (REQ-A.1). Its tasks will not be treated as successful; independent nodes...
+
+                                                                                                    
+10:50:36  System               REQ-B.1     Info         No image found in the description or visual_reference.
+
+                                                                                                    
+10:50:36  InterfaceDesigner    REQ-B.1     Design       InterfaceDesigner is shaping interfaces
+
+                                                                                                    
+10:50:36  Compiler             REQ-B.1     Error        DESIGN task for node REQ-B.1 crashed: NameError: name 'node_id' is not defined
+
+                                                                                                    
+10:50:36  Compiler             REQ-B.1     Note         Skipping integration for failed DESIGN task of node REQ-B.1; preserving the isolated worktree for inspection/retry.
+
+                                                                                                    
+10:50:36  Compiler             REQ-B.1     Error        DESIGN failed for node REQ-B.1.
+
+                                                                                                    
+10:50:36  Compiler             REQ-B       Note         Blocked node REQ-B: prerequisite node(s) failed or were blocked (REQ-B.1). Its tasks will not be treated as successful; independent nodes...
+
+                                                                                                    
+
+10:50:36  Compiler             REQ-B.1     FAILED       Compilation finished without an accepted result (failed: REQ-A.1, REQ-B.1; blocked: REQ-A, REQ-B, ROOT)
+
+                                                                                                    
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Compilation Summary
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Duration: 23.6s
+✗ Failed:  REQ-A.1, REQ-B.1
+⊙ Skipped: ROOT, REQ-A, REQ-B
+
+Output:    D:\code\arc-rebase-benchmark\work\candidate-rep001
+Debug log: D:\code\arc-rebase-benchmark\work\candidate-rep001\.arc\debug.log
+
+Next steps:
+  • Review failure details in debug log
+  • Fix requirement issues and retry: arc compile <input> -o D:\code\arc-rebase-benchmark\work\candidate-rep001 --resume --retry-failed
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+=== stderr ===
+D:\code\arc-rebase-on-merge\arc_main.py:563: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+  if asyncio.iscoroutinefunction(args.func):
+
