@@ -9,7 +9,6 @@ contained. These tests also pin the canonical pi-style usage semantics
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +26,7 @@ from agents.model.usage_capture import (
     record_chat_result_usage,
     set_llm_usage_sink,
 )
+from tests.helpers.jsonl import read_jsonl
 
 
 @pytest.fixture(autouse=True)
@@ -559,11 +559,7 @@ class TestConfigureRuntimeWiring:
                     messages=[{"role": "user", "content": "hi"}],
                 )
 
-            lines = [
-                json.loads(line)
-                for line in runtime.paths.runner_events_path.read_text(encoding="utf-8").splitlines()
-                if line
-            ]
+            lines = read_jsonl(runtime.paths.runner_events_path)
             assert len(lines) == 1
             event = lines[0]
             assert event["type"] == "llm_usage"
@@ -594,11 +590,7 @@ class TestConfigureRuntimeWiring:
                     result_chars=90000,
                 )
 
-            lines = [
-                json.loads(line)
-                for line in runtime.paths.runner_events_path.read_text(encoding="utf-8").splitlines()
-                if line
-            ]
+            lines = read_jsonl(runtime.paths.runner_events_path)
             assert len(lines) == 1
             event = lines[0]
             assert event["type"] == "tool_usage"
