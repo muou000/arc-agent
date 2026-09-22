@@ -376,3 +376,24 @@ def test_fingerprint_masks_assertion_embedded_durations_by_design() -> None:
     # A genuinely different assertion stays distinct.
     other = failure_fingerprint("Exit Code: 1\nAssertionError: expected status 200 but got 500")
     assert fast != other
+
+
+def test_has_error_fingerprint_rejects_gate_rejection_shape() -> None:
+    """``<exit>|`` (no error key line) must not count as a real failure.
+
+    Layer/budget gate rejections render with no error-bearing line, so their
+    fingerprint is ``<exit>|``. Consumers keying consecutive-failure chains
+    on the fingerprint (the TDD stall hint) must exclude them, while a real
+    assertion failure carries its error line.
+    """
+
+    from app_type_handler.test_results import parse_test_run
+
+    rejection = parse_test_run("Exit Code: 1\nSTDERR:\nNo active TDD test layer is currently scheduled.\n")
+    assert rejection.fingerprint.endswith("|")
+    assert rejection.has_error_fingerprint is False
+
+    real_failure = parse_test_run(failing := "Exit Code: 1\nSTDERR:\nAssertionError: expected 2 got 1\n")
+    del failing
+    assert real_failure.has_error_fingerprint is True
+    assert parse_test_run("Exit Code: 0\nok\n").has_error_fingerprint is False

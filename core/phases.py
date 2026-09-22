@@ -945,6 +945,11 @@ class WorkflowPhaseRunner:
             workspace_path=self.workspace_path,
             run_group=self._run_test_group,
             log_cb=self._log,
+            # The adapter owns the test-edit stall chain (discipline
+            # write-event log + manifest files); the executor pulls the hint
+            # mid-executor while the chain still holds the previous failure.
+            # Optional by contract: minimal adapters (test stubs) may omit it.
+            test_edit_hint=getattr(self.test_driven_developer, "test_edit_stall_hint", None),
         )
         ordered_types = executor.register_tests(tests)
         if not ordered_types:

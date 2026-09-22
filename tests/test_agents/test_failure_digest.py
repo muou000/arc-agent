@@ -17,6 +17,7 @@ import pytest
 
 from agents.tools.test_failure_digest import (
     build_failure_digest,
+    build_test_edit_stall_hint,
     digest_failed_test_names,
     format_failure_digest,
     persist_run_output,
@@ -513,3 +514,119 @@ def test_digest_summary_reset_matches_decorated_lines() -> None:
     digest = build_failure_digest(output)
     names = [item["name"] for item in digest["failed_tests"]]
     assert names == ["real failure"]
+
+
+# ---------------------------------------------------------------------------
+# Test-edit stall hint: same fingerprint + only-test-file edits in between
+# ---------------------------------------------------------------------------
+
+
+def test_stall_hint_fires_on_repeated_fingerprint_with_test_edits() -> None:
+    """Same fingerprint repeated + only test files edited in between fires."""
+
+    hint = build_test_edit_stall_hint(
+        fingerprint="1|AssertionError: expected 'Login'",
+        previous_fingerprint="1|AssertionError: expected 'Login'",
+        edited_paths=[
+            "/workspace/tests/integration/loginPage.test.tsx",
+            "/workspace/tests/integration/loginPage.test.tsx",
+        ],
+        manifest_test_files=["tests/integration/loginPage.test.tsx"],
+    )
+    assert hint.startswith("TEST-EDIT STALL: the last 2 edits all landed in test files ")
+    # Re-edits of the same file count per edit but list once.
+    assert hint.count("loginPage.test.tsx") == 1
+    assert "implementation or environment layer" in hint
+
+
+def test_stall_hint_counts_unmanifested_test_shaped_edits() -> None:
+    """A test-shaped path outside the manifest still counts as a test edit."""
+
+    hint = build_test_edit_stall_hint(
+        fingerprint="1|Error: boom",
+        previous_fingerprint="1|Error: boom",
+        edited_paths=["tests/helpers/setup.spec.ts"],
+    )
+    assert "the last 1 edit all landed in test files (`tests/helpers/setup.spec.ts`)" in hint
+
+
+def test_stall_hint_silent_when_fingerprint_moved() -> None:
+    hint = build_test_edit_stall_hint(
+        fingerprint="1|Error: B",
+        previous_fingerprint="1|Error: A",
+        edited_paths=["tests/a.test.ts"],
+    )
+    assert hint == ""
+
+
+def test_stall_hint_silent_without_previous_failure() -> None:
+    hint = build_test_edit_stall_hint(
+        fingerprint="1|Error: A",
+        previous_fingerprint="",
+        edited_paths=["tests/a.test.ts"],
+    )
+    assert hint == ""
+
+
+def test_stall_hint_silent_when_nothing_was_edited() -> None:
+    """A pure re-run (no edits between failures) is the stall governor's case."""
+
+    hint = build_test_edit_stall_hint(
+        fingerprint="1|Error: A",
+        previous_fingerprint="1|Error: A",
+        edited_paths=[],
+    )
+    assert hint == ""
+
+
+def test_stall_hint_silent_when_a_source_edit_interleaves() -> None:
+    """Any non-test edit between the failures keeps the hint silent.
+
+    The sentence "all recent edits landed in test files" must stay true; an
+    unchanged fingerprint despite a source edit is the diff hint's territory.
+    """
+
+    hint = build_test_edit_stall_hint(
+        fingerprint="1|Error: A",
+        previous_fingerprint="1|Error: A",
+        edited_paths=["src/loginPage.tsx", "tests/loginPage.test.tsx"],
+    )
+    assert hint == ""
+
+
+def test_stall_hint_accepts_manifest_file_without_test_shape() -> None:
+    """A manifest-declared path counts even when its name is not test-shaped."""
+
+    hint = build_test_edit_stall_hint(
+        fingerprint="1|Error: A",
+        previous_fingerprint="1|Error: A",
+        edited_paths=["backend/test-e2e/login.js"],
+        manifest_test_files=["backend/test-e2e/login.js"],
+    )
+    assert "backend/test-e2e/login.js" in hint
+
+
+def test_format_appends_stall_hint_after_existing_fields() -> None:
+    """The hint renders as the trailing bullet; existing fields stay put."""
+
+    digest = build_failure_digest(VITEST_FAILURE)
+    with_hint = format_failure_digest(
+        digest,
+        test_type="Integration",
+        raw_output_path=".arc/tdd_runs/REQ-1/Integration-001.log",
+        fingerprint="1|AssertionError: x",
+        test_edit_hint="TEST-EDIT STALL: the last 2 edits all landed in test files (`tests/a.test.ts`)",
+    )
+    lines = with_hint.splitlines()
+    assert lines[-1].startswith("- TEST-EDIT STALL:")
+    assert "- test_type: Integration" in lines
+    assert "- fingerprint: 1|AssertionError: x" in lines
+    assert any(line.startswith("- full raw output of this run:") for line in lines)
+
+
+def test_format_without_hint_matches_previous_shape() -> None:
+    """No hint kwarg: the rendered digest carries no stall line."""
+
+    digest = build_failure_digest(VITEST_FAILURE)
+    text = format_failure_digest(digest, test_type="Unit", fingerprint="1|Error: x")
+    assert "TEST-EDIT STALL" not in text

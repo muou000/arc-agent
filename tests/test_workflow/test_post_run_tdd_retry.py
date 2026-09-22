@@ -221,3 +221,40 @@ def test_build_reprompt_dedupes_across_layers() -> None:
     assert "Unit: 1|b" in reprompt
     assert "E2E: 1|c" in reprompt
     assert "unchanged across runs" not in reprompt
+
+
+# ---------------------------------------------------------------------------
+# Digest stall-hint compatibility: the injected hint rides in the message
+# field and must not disturb the scan
+# ---------------------------------------------------------------------------
+
+
+def test_scan_message_carrying_stall_hint_still_dedupes_in_order(tmp_path: Path) -> None:
+    """A failure message embedding the TEST-EDIT STALL digest hint stays scannable.
+
+    The stall hint is appended to the failure digest text, which can reach
+    ``runner-events.jsonl`` inside a ``test/failed`` message. The scanner keys
+    on the structured fields only (type/phase/status/node_id) and dedupes per
+    node with first message winning — a hint-bearing message must neither
+    break parsing nor change the dedup order.
+    """
+
+    path = tmp_path / ".arc" / "runner-events.jsonl"
+    hint_message = (
+        "### Structured Failure Digest (system-parsed from the latest failed run)\n"
+        "- test_type: Integration\n"
+        "- fingerprint: 1|AssertionError: expected 'Login' to equal 'Log in'\n"
+        "- TEST-EDIT STALL: the last 8 edits all landed in test files "
+        "(`tests/integration/loginPage.test.tsx`) and the failure fingerprint is "
+        "unchanged; the failure most likely lives in the implementation or "
+        "environment layer. Fix the implementation or repair the environment "
+        "instead of adjusting the tests again.\n"
+    )
+    _append_record(path, _timestamped(type="requirement_state", node_id="REQ-A", phase="test", status="failed", message=hint_message))
+    _append_record(path, _timestamped(type="requirement_state", node_id="REQ-A", phase="test", status="failed", message="second failure"))
+    _append_record(path, _timestamped(type="requirement_state", node_id="REQ-B", phase="test", status="failed", message="other node"))
+
+    assert scan_test_failures(path) == [
+        ("REQ-A", hint_message),
+        ("REQ-B", "other node"),
+    ]

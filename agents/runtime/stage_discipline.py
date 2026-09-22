@@ -153,6 +153,12 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._repeated_read_counts: dict[str, int] = {}
         self._written_paths: set[str] = set()
+        # Call-ordered log of every successful write/edit/append/delete path,
+        # repeats included (``_written_paths`` is a set: a re-edit of the same
+        # file never reappears there). The TDD failure-digest stall hint keys
+        # on this to tell "kept editing the same test file" from "edited
+        # source".
+        self._write_events: list[str] = []
         self._failed_paths: set[str] = set()
         self._validation_failed = False
         # Paths that consumed budget at validation time. The agent emits file
@@ -595,6 +601,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 self._write_block_counts.pop(path, None)
             if was_written:
                 self._rewrite_counts[path] = self._rewrite_counts.get(path, 0) + 1
+            self._write_events.append(path)
             self._discard_written_path(request, path)
             return
         if name == "read_file" and path:
@@ -613,6 +620,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             self._cache_read_summary(request, path, offset, limit, result)
         if (name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS) and path:
             self._written_paths.add(path)
+            self._write_events.append(path)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
             self._cache_written_path(request, path)
@@ -628,6 +636,18 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         """
 
         return sorted(self._written_paths)
+
+    def write_events(self) -> list[str]:
+        """Successful write/edit/append/delete paths in call order, repeats kept.
+
+        Where :meth:`materialized_paths` answers "what exists that this
+        session wrote", this answers "what did the session do": a re-edit of
+        the same file appears once per edit, and a delete appears even though
+        it removes the path from the materialized set. Failed attempts are
+        absent (only successful operations count as edits).
+        """
+
+        return list(self._write_events)
 
     def _annotate_pending_contract(self, request: ToolCallRequest, result: ToolMessage | Any) -> ToolMessage | Any:
         """Re-state the serialization obligation on a successful design write.

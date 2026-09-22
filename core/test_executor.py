@@ -45,6 +45,9 @@ LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | Non
 #: The handler seam: layer, files, and the retry round's failed-case filter
 #: (``None`` = unfiltered full run; only case-filterable runners consume it).
 RunGroup = Callable[[str, list[str], "list[str] | None"], Awaitable[TestRunResult]]
+#: Stall-hint source for the failure digest: ``(test_type, fingerprint) -> hint
+#: text`` (empty string when the hint does not fire). Owned by the TDD adapter.
+TestEditHint = Callable[[str, str], str]
 
 #: Per-file verification state: ``"green"`` (passed), ``"red"`` (verifiably
 #: failing), or ``None`` (no verified state: never run, or the run stopped at
@@ -144,12 +147,18 @@ class TddTestExecutor:
         run_group: RunGroup,
         log_cb: LogCallback | None = None,
         agent_name: str = "TestDrivenDeveloper",
+        test_edit_hint: "TestEditHint | None" = None,
     ) -> None:
         self._node_id = node_id
         self._workspace_path = str(workspace_path)
         self._run_group = run_group
         self._log_cb = log_cb
         self._agent_name = agent_name
+        # Stall-hint source for the failure digest, owned by the TDD adapter
+        # (it holds the discipline's write-event log and the manifest files).
+        # Optional: the DESIGN baseline gate runs this executor without an
+        # adapter and never renders a hint.
+        self._test_edit_hint = test_edit_hint
         # Manifest groups keyed by lowercased raw type; only canonical types
         # are scheduled (non-canonical groups surface via unsupported_layers).
         self._groups: dict[str, list[dict[str, Any]]] = {}
@@ -461,6 +470,10 @@ class TddTestExecutor:
                 self._retry_case_names[selected_type] = (
                     [] if result.environment_failure else digest_failed_test_names(failure_digest)
                 )
+            # The stall hint compares this fingerprint against the layer's
+            # previous failure via the adapter's chain, whose state is still
+            # the PREVIOUS failure's at this point (the adapter advances it
+            # only after this executor returns).
             result.output += (
                 "\n\n"
                 + format_failure_digest(
@@ -471,6 +484,11 @@ class TddTestExecutor:
                     environment_failure=result.environment_failure,
                     build=result.build_note,
                     served=result.served_verdict,
+                    test_edit_hint=(
+                        self._test_edit_hint(selected_type, result.fingerprint)
+                        if self._test_edit_hint is not None
+                        else ""
+                    ),
                 )
                 + "\n"
             )

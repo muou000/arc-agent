@@ -43,6 +43,20 @@ class TestRunResult:
     def passed_run(self) -> bool:
         return self.exit_code == 0
 
+    @property
+    def has_error_fingerprint(self) -> bool:
+        """Whether the stall fingerprint carries a real error key line.
+
+        ``failure_fingerprint`` pairs the exit code with the first
+        error-bearing line; layer/budget gate rejections render as
+        ``<exit>|`` with nothing after the pipe. Only error-bearing failures
+        may count as "the agent ran tests and they failed on content" —
+        consumers keying consecutive-failure chains on the fingerprint (the
+        TDD stall hint) must not let rejections in.
+        """
+
+        return bool(self.fingerprint.partition("|")[2].strip())
+
 
 def parse_test_run(
     test_output: str,

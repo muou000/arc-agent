@@ -13,10 +13,13 @@ failure, not from a search for it.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+
+from agents.runtime.capabilities import is_test_file_path, normalize_manifest_path
 
 #: Cap on the excerpt lines kept per failed test in the digest text.
 _PER_TEST_EXCERPT_LINES = 8
@@ -252,6 +255,45 @@ def build_failure_digest(test_output: str) -> dict[str, Any]:
     }
 
 
+def build_test_edit_stall_hint(
+    *,
+    fingerprint: str,
+    previous_fingerprint: str,
+    edited_paths: Sequence[str],
+    manifest_test_files: Sequence[str] = (),
+) -> str:
+    """Guidance for the "kept editing tests while the failure stood still" stall.
+
+    Fires when the just-returned failure repeats the previous failure's
+    fingerprint AND every path edited between the two failures is a test file
+    (manifest-declared or test-shaped). The returned sentence points the agent
+    at the implementation/environment layer instead of another test
+    adjustment. Any non-test edit between the failures keeps it silent: the
+    claim "all recent edits landed in test files" would no longer be true,
+    and an unchanged fingerprint despite a source edit is the existing diff
+    hint's territory. Pure prompt material — no verdict, budget or layer
+    semantics change.
+    """
+
+    if not fingerprint or not previous_fingerprint or fingerprint != previous_fingerprint:
+        return ""
+    events = [normalized for path in edited_paths if (normalized := normalize_manifest_path(path))]
+    if not events:
+        return ""
+    manifest = {normalize_manifest_path(path) for path in manifest_test_files}
+    manifest.discard("")
+    if any(path not in manifest and not is_test_file_path(path) for path in events):
+        return ""
+    listed = ", ".join(f"`{path}`" for path in dict.fromkeys(events))
+    return (
+        f"TEST-EDIT STALL: the last {len(events)} edit"
+        f"{'s' if len(events) != 1 else ''} all landed in test files "
+        f"({listed}) and the failure fingerprint is unchanged; the failure most likely "
+        "lives in the implementation or environment layer. Fix the implementation or "
+        "repair the environment instead of adjusting the tests again."
+    )
+
+
 def digest_failed_test_names(digest: dict[str, Any]) -> list[str]:
     """Return the non-empty failed-test names a parsed digest carries, in order.
 
@@ -277,6 +319,7 @@ def format_failure_digest(
     environment_failure: str = "",
     build: str = "",
     served: str = "",
+    test_edit_hint: str = "",
 ) -> str:
     """Render a digest dict into the handoff text block for the next session."""
 
@@ -312,6 +355,10 @@ def format_failure_digest(
             f"- full raw output of this run: `{raw_output_path}` — read this file "
             "for the complete output instead of re-running tests."
         )
+    if test_edit_hint:
+        # Trailing on purpose: existing bullet order and the jsonl scan fields
+        # stay byte-identical when no hint fires.
+        blocks.append(f"- {test_edit_hint}")
     return "\n".join(blocks)
 
 

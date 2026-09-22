@@ -9,16 +9,19 @@ from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
 from agents.runtime.capabilities import normalize_manifest_path
+from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.skills.selection import SKILLS_SOURCE, implementation_skills
 from agents.tools.build import build_install_dependencies_tool
 from agents.tools.build import build_run_build_tool as build_system_run_build_tool
 from agents.tools.test_failure_digest import (
     build_failure_digest,
+    build_test_edit_stall_hint,
     format_failure_digest,
 )
 from agents.tools.traceability import build_traceability_tools
 from app_type_handler.test_results import TestRunResult
+from core.test_types import canonical_test_type
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -57,6 +60,11 @@ class TestDrivenDeveloper:
         self._test_budget_exhausted = False
         self._current_test_files: list[str] = []
         self._current_test_type = ""
+        # Per-run test-edit stall chain: per test layer, the last failure's
+        # fingerprint plus the write-event position at that failure, so the
+        # next same-fingerprint failure can ask "what was edited in between?".
+        self._stage_build: StageAgentBuild | None = None
+        self._stall_chains: dict[str, tuple[str, int]] = {}
 
     async def run(
         self,
@@ -78,6 +86,8 @@ class TestDrivenDeveloper:
         self._last_failure_digest_text = ""
         self._last_modified_files = []
         self._test_budget_exhausted = False
+        self._stage_build = None
+        self._stall_chains = {}
         self._current_test_files = [str(path or "").strip() for path in test_files if str(path or "").strip()]
         self._current_test_type = test_type
         current_node_tests = [item for item in (node_tests or []) if isinstance(item, dict)]
@@ -182,9 +192,21 @@ class TestDrivenDeveloper:
                 if run_tests_executor is None
                 else await run_tests_executor(requested_type, requested_files or None)
             )
+            # One call computes the stall hint from the PRE-advance chain and
+            # then advances it, so the ordering contract ("hint first, then
+            # chain update") cannot drift apart. The chain key is the
+            # canonical layer name, which always matches the key core.phases
+            # uses for its in-session digest lookup: bare run_tests calls
+            # resolve to _current_test_type (the layer this run() serves),
+            # aliases never carry a runnable type through this closure (the
+            # file-resolution gate rejects them first), and after an in-session
+            # layer advance the stale layer name is rejected by the executor
+            # before any run - so only agreed-upon keys ever enter the chain.
+            chain_type = canonical_test_type(requested_type) or requested_type
+            stall_hint = self._advance_stall_chain(chain_type, result)
             self._last_run_tests_result = result.output
             self._last_run_tests_exit_code = result.exit_code
-            self._record_failure_state(result)
+            self._record_failure_state(result, test_edit_hint=stall_hint)
             return result.output
 
         if self.app_handler is None:
@@ -224,6 +246,10 @@ class TestDrivenDeveloper:
             tools=[run_tests, run_build, install_dependencies, *traceability_tools],
             skills=[SKILLS_SOURCE],
         )
+        # Live handle for the stall hint: the discipline's write-event log is
+        # queryable mid-session, while materialized_paths is read only at the
+        # end for the diff hint below.
+        self._stage_build = built
         message = get_user_prompt(
             node_id=node_id,
             dynamic_context=context_text,
@@ -283,6 +309,52 @@ class TestDrivenDeveloper:
 
         return list(self._last_modified_files)
 
+    def test_edit_stall_hint(self, test_type: str, fingerprint: str) -> str:
+        """The test-edit stall hint for a just-returned failed ``run_tests`` result.
+
+        Non-empty only when this failure repeats the previous failure's
+        fingerprint for *test_type* and everything edited since that previous
+        failure is a test file (manifest-declared or test-shaped). Read by
+        ``core.phases`` while composing the in-session digest — at which point
+        the chain state below is still the previous failure's — so one failure
+        renders the identical hint on the in-session and cross-session
+        surfaces.
+        """
+
+        chain = self._stall_chains.get(test_type)
+        if not chain or chain[0] != fingerprint:
+            return ""
+        return build_test_edit_stall_hint(
+            fingerprint=fingerprint,
+            previous_fingerprint=chain[0],
+            edited_paths=self._stage_write_events()[chain[1] :],
+            manifest_test_files=self._current_test_files,
+        )
+
+    def _stage_write_events(self) -> list[str]:
+        build = self._stage_build
+        return build.write_events() if build is not None else []
+
+    def _advance_stall_chain(self, test_type: str, result: TestRunResult) -> str:
+        """Compute the stall hint for this result, then advance the chain.
+
+        The hint must reflect the chain state BEFORE this failure is recorded
+        (it compares against the previous failure), so both happen here in
+        that order and the ``run_tests`` closure cannot get them reversed.
+        Only real failures extend the chain: layer/budget gate rejections
+        carry no error key line (``has_error_fingerprint``) and would
+        otherwise break - or fabricate - the consecutive-repeat condition. A
+        passing run clears the chain: the next same-fingerprint failure
+        starts a fresh one.
+        """
+
+        stall_hint = self.test_edit_stall_hint(test_type, result.fingerprint)
+        if result.passed_run:
+            self._stall_chains.pop(test_type, None)
+        elif result.has_error_fingerprint:
+            self._stall_chains[test_type] = (result.fingerprint, len(self._stage_write_events()))
+        return stall_hint
+
     @staticmethod
     def _load_merge_conflict_context(node_id: str) -> dict[str, Any] | None:
         """Conflict paths recorded when this node's IMPLEMENT merge conflicted.
@@ -320,7 +392,7 @@ class TestDrivenDeveloper:
                 return value.strip()
         return json.dumps(payload, ensure_ascii=False, default=str)
 
-    def _record_failure_state(self, result: TestRunResult) -> None:
+    def _record_failure_state(self, result: TestRunResult, *, test_edit_hint: str = "") -> None:
         """Record the failure evidence of the latest run for the next session.
 
         Reads the run's structured fields — the workflow already interpreted
@@ -341,6 +413,7 @@ class TestDrivenDeveloper:
             environment_failure=result.environment_failure,
             build=result.build_note,
             served=result.served_verdict,
+            test_edit_hint=test_edit_hint,
         )
         lines = [line for line in (result.output or "").splitlines() if line.strip()]
         excerpt = "\n".join(lines[-40:])
