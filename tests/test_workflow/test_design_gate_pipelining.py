@@ -34,6 +34,8 @@ import pytest
 from core.contract_drift import ContractDrift, detect_contract_drift
 from core.workflow import (
     ARCWorkflowManager,
+    NODE_DESIGNED,
+    NODE_FAILED,
     NODE_PASSED,
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
@@ -43,6 +45,7 @@ from core.workflow import (
     TASK_RUNNING,
     _design_pipelining_enabled,
 )
+from tests.test_workflow.queue_faker import queue_with_states, settle
 
 
 def _task(node_id: str, phase: str, status: str = TASK_PENDING, order: int = 0) -> dict:
@@ -50,7 +53,10 @@ def _task(node_id: str, phase: str, status: str = TASK_PENDING, order: int = 0) 
 
 
 def _queue(tasks: list[dict], dependencies: dict[str, list[str]] | None = None) -> dict:
-    queue: dict = {"tasks": tasks, "descendants": {}}
+    # The typed queue derives task statuses from node states; the helper
+    # converts the task statuses above into the equivalent node maps.
+    queue = queue_with_states(tasks)
+    queue["descendants"] = {}
     if dependencies is not None:
         queue["dependencies"] = dependencies
     return queue
@@ -111,7 +117,7 @@ def test_gate_closed_implement_gate_unchanged(monkeypatch: pytest.MonkeyPatch) -
     )
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][3]) is True
 
-    queue["tasks"][1]["status"] = TASK_FAILED
+    settle(queue, "RA", NODE_FAILED)
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][3]) is False
 
 
@@ -225,7 +231,7 @@ def test_gate_open_multiple_dependencies_all_designs_required(
 
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][4]) is False
 
-    queue["tasks"][2]["status"] = TASK_COMPLETED
+    settle(queue, "RC", NODE_DESIGNED)
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][4]) is True
 
 
@@ -247,7 +253,7 @@ def test_gate_open_parent_design_rule_unchanged(
 
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
 
-    queue["tasks"][0]["status"] = TASK_COMPLETED
+    settle(queue, "R", NODE_DESIGNED)
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
 
 
