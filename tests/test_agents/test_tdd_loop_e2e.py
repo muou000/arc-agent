@@ -12,7 +12,6 @@ the node session updates all run for real — no tokens, no npm.
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,6 +29,7 @@ from tests.helpers.faux import (
     faux_tool_call,
     passing_test_output,
 )
+from tests.helpers.jsonl import read_jsonl
 
 UNIT_TEST_FILE = "tests/unit/test_calc.py"
 INTEGRATION_TEST_FILE = "tests/integration/test_flow.py"
@@ -117,19 +117,6 @@ def tool_results_text(model: FauxChatModel) -> str:
     return "\n".join(
         str(m.content) for call in model.calls for m in call if getattr(m, "type", "") == "tool"
     )
-
-
-def read_runner_events(runtime) -> list[dict]:
-    """Parse ``.arc/runner-events.jsonl`` for event-contract assertions."""
-
-    path = runtime.paths.runner_events_path
-    if not path.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -744,7 +731,7 @@ def test_late_fix_reverify_passes_after_later_layer_green(tmp_project_dir: Path,
     assert arc_runtime.traceability.get_test("T-I")["passed"] is True
     assert arc_runtime.traceability.get_test("T-E")["passed"] is True
     reverify = [
-        event for event in read_runner_events(arc_runtime) if event["type"] == "layer_reverify"
+        event for event in read_jsonl(arc_runtime.paths.runner_events_path) if event["type"] == "layer_reverify"
     ]
     assert [(event["status"], event["layer"]) for event in reverify] == [
         ("triggered", "Integration"),
@@ -810,7 +797,7 @@ def test_late_fix_reverify_failure_keeps_layer_failed(tmp_project_dir: Path, arc
     node_session = sessions.load_node_session(node_id)
     assert "Integration:" in node_session["recent_failure_summary"]
     reverify = [
-        event for event in read_runner_events(arc_runtime) if event["type"] == "layer_reverify"
+        event for event in read_jsonl(arc_runtime.paths.runner_events_path) if event["type"] == "layer_reverify"
     ]
     assert [(event["status"], event["layer"]) for event in reverify] == [
         ("triggered", "Integration"),
@@ -866,7 +853,7 @@ def test_no_reverify_when_no_later_layer_green(tmp_project_dir: Path, arc_runtim
     assert arc_runtime.traceability.get_test("T-U")["passed"] is False
     assert arc_runtime.traceability.get_test("T-I")["passed"] is False
     reverify = [
-        event for event in read_runner_events(arc_runtime) if event["type"] == "layer_reverify"
+        event for event in read_jsonl(arc_runtime.paths.runner_events_path) if event["type"] == "layer_reverify"
     ]
     assert reverify == []
 
@@ -938,7 +925,7 @@ def test_no_reverify_while_environment_failure_unresolved(tmp_project_dir: Path,
     assert arc_runtime.traceability.get_test("T-I")["passed"] is True
     assert arc_runtime.traceability.get_test("T-E")["passed"] is False
     reverify = [
-        event for event in read_runner_events(arc_runtime) if event["type"] == "layer_reverify"
+        event for event in read_jsonl(arc_runtime.paths.runner_events_path) if event["type"] == "layer_reverify"
     ]
     assert reverify == []
 
@@ -994,7 +981,7 @@ def test_no_reverify_when_budget_not_exhausted(tmp_project_dir: Path, arc_runtim
     assert arc_runtime.traceability.get_test("T-U")["passed"] is False
     assert arc_runtime.traceability.get_test("T-I")["passed"] is True
     reverify = [
-        event for event in read_runner_events(arc_runtime) if event["type"] == "layer_reverify"
+        event for event in read_jsonl(arc_runtime.paths.runner_events_path) if event["type"] == "layer_reverify"
     ]
     assert reverify == []
 

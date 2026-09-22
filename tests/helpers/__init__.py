@@ -1,1 +1,1 @@
-"""Shared test helpers for agent-level e2e tests."""
+"""Shared test helpers for e2e and contract tests."""
