@@ -6,13 +6,13 @@ These tests pin the on-disk JSONL schema that ARC-Bench frontend reads from
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 from arcbench_agent_runtime.context import RuntimePaths
 from arcbench_agent_runtime.events import EventClient
+from tests.helpers.jsonl import read_jsonl
 
 
 @pytest.fixture
@@ -23,12 +23,6 @@ def event_paths(tmp_project_dir: Path) -> RuntimePaths:
 @pytest.fixture
 def events(event_paths: RuntimePaths) -> EventClient:
     return EventClient(event_paths)
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
 class TestRequirementStateEvents:
@@ -56,7 +50,7 @@ class TestRequirementStateEvents:
         method = getattr(events, method_name)
         method("REQ-1", "msg")
 
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert len(lines) == 1
         event = lines[0]
         assert event["type"] == "requirement_state"
@@ -71,20 +65,20 @@ class TestRequirementStateEvents:
     ) -> None:
         events.mark_design_done("", "ignored")
         events.mark_design_done("   ", "ignored")
-        assert _read_jsonl(event_paths.runner_events_path) == []
+        assert read_jsonl(event_paths.runner_events_path) == []
 
     def test_whitespace_node_id_is_stripped(
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.mark_design_done("  REQ-1  ", "msg")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["node_id"] == "REQ-1"
 
     def test_default_message_is_null(
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.mark_design_done("REQ-1")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["message"] is None
 
 
@@ -143,7 +137,7 @@ class TestRunnerStateEvents:
         state: str,
     ) -> None:
         getattr(events, method_name)("hello")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[-1] == {
             "type": "runner_state",
             "state": state,
@@ -157,7 +151,7 @@ class TestRefreshSignals:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.notify_traceability_changed("interfaces_updated")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert len(lines) == 1
         event = lines[0]
         assert event["type"] == "signal"
@@ -175,7 +169,7 @@ class TestRefreshSignals:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.notify_commit_history_changed("git_commit", preview=True)
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         event = lines[0]
         assert event["reason"] == "git_commit"
         assert event["refresh"]["commit_history"] is True
@@ -185,7 +179,7 @@ class TestRefreshSignals:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.notify_commit_history_changed("git_initialized")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         event = lines[0]
         assert event["refresh"]["commit_history"] is True
         assert event["refresh"]["preview"] is False
@@ -194,7 +188,7 @@ class TestRefreshSignals:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.notify_traceability_changed("   ")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["reason"] == "arcbench_agent_runtime"
 
 
@@ -230,7 +224,7 @@ class TestLLMUsageEvents:
             attempts=2,
         )
 
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert len(lines) == 1
         assert lines[0] == {
             "type": "llm_usage",
@@ -261,7 +255,7 @@ class TestLLMUsageEvents:
         optional without keying on the block's presence."""
 
         events.record_llm_usage(node_id="REQ-1")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["latency"] == {"duration_s": None, "transport": "", "attempts": None}
 
     def test_latency_invalid_values_are_normalized(
@@ -273,7 +267,7 @@ class TestLLMUsageEvents:
             transport="carrier-pigeon",
             attempts=0,
         )
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["latency"] == {"duration_s": None, "transport": "", "attempts": None}
 
     def test_empty_node_id_is_allowed_for_run_level_calls(
@@ -282,7 +276,7 @@ class TestLLMUsageEvents:
         # Unlike requirement_state events, usage without a node is valid: it
         # attributes model calls made outside any node's context to the run.
         events.record_llm_usage(model="gpt-4o", input_tokens=1, output_tokens=1, total_tokens=2)
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["node_id"] == ""
         assert lines[0]["phase"] == ""
 
@@ -290,7 +284,7 @@ class TestLLMUsageEvents:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.record_llm_usage(node_id="REQ-1")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["source"] == "reported"
         assert lines[0]["usage"] == {
             "input": 0,
@@ -313,7 +307,7 @@ class TestLLMUsageEvents:
             reasoning_tokens=-1,
             total_tokens=None,
         )
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         usage = lines[0]["usage"]
         assert usage["input"] == 0
         assert usage["output"] == 7
@@ -324,7 +318,7 @@ class TestLLMUsageEvents:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.record_llm_usage(node_id="REQ-1", cost="not-a-dict")  # type: ignore[arg-type]
-        assert _read_jsonl(event_paths.runner_events_path)[0]["cost"] is None
+        assert read_jsonl(event_paths.runner_events_path)[0]["cost"] is None
 
 
 class TestToolUsageEvents:
@@ -344,7 +338,7 @@ class TestToolUsageEvents:
             result_chars=12345,
         )
 
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert len(lines) == 1
         assert lines[0] == {
             "type": "tool_usage",
@@ -366,7 +360,7 @@ class TestToolUsageEvents:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.record_tool_usage(tool="grep")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["status"] == "ok"
         assert lines[0]["detail"] == {
             "path": None,
@@ -381,7 +375,7 @@ class TestToolUsageEvents:
     ) -> None:
         events.record_tool_usage(node_id="REQ-1", tool="read_file", status="blocked")
         events.record_tool_usage(node_id="REQ-1", tool="run_tests", status="error", result_chars=42)
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert [line["status"] for line in lines] == ["blocked", "error"]
         assert lines[1]["detail"]["result_empty"] is False
 
@@ -395,7 +389,7 @@ class TestToolUsageEvents:
             limit="7",
             result_chars=-1,
         )
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         detail = lines[0]["detail"]
         assert detail["offset"] is None  # negative breakdown is not reportable
         assert detail["limit"] == 7
@@ -406,7 +400,7 @@ class TestToolUsageEvents:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.record_tool_usage(tool="grep", status="error")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["node_id"] == ""
         assert lines[0]["phase"] == ""
 
@@ -431,7 +425,7 @@ class TestLayerReverifyEvents:
             message="AssertionError: boom" if status == "failed" else None,
         )
 
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert len(lines) == 1
         assert lines[0] == {
             "type": "layer_reverify",
@@ -448,14 +442,14 @@ class TestLayerReverifyEvents:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.record_layer_reverify(node_id="REQ-2", layer="Unit", status="triggered", used=-3)
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["files"] == []
         assert lines[0]["used"] == 0
         assert lines[0]["message"] is None
 
     def test_string_used_is_coerced(self, events: EventClient, event_paths: RuntimePaths) -> None:
         events.record_layer_reverify(node_id="REQ-2", layer="Unit", status="passed", used="7")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["used"] == 7
 
 
@@ -474,7 +468,7 @@ class TestDemoTestStatus:
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.set_demo_test_status("T1", "passed")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["type"] == "signal"
 
     def test_set_demo_test_status_empty_id_is_ignored(
@@ -482,29 +476,29 @@ class TestDemoTestStatus:
     ) -> None:
         events.set_demo_test_status("", "passed")
         events.set_demo_test_status("   ", "passed")
-        assert _read_jsonl(event_paths.runner_events_path) == []
+        assert read_jsonl(event_paths.runner_events_path) == []
 
     def test_set_demo_test_statuses_skips_when_empty(
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.set_demo_test_statuses({})
-        assert _read_jsonl(event_paths.runner_events_path) == []
+        assert read_jsonl(event_paths.runner_events_path) == []
 
     def test_clear_demo_test_statuses_skips_when_empty(
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.clear_demo_test_statuses([])
-        assert _read_jsonl(event_paths.runner_events_path) == []
+        assert read_jsonl(event_paths.runner_events_path) == []
 
     def test_set_demo_requirement_status_emits_signal(
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.set_demo_requirement_status("R1", "PASSED")
-        lines = _read_jsonl(event_paths.runner_events_path)
+        lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["type"] == "signal"
 
     def test_set_demo_requirement_status_empty_id_is_ignored(
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
         events.set_demo_requirement_status("", "PASSED")
-        assert _read_jsonl(event_paths.runner_events_path) == []
+        assert read_jsonl(event_paths.runner_events_path) == []
