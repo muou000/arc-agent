@@ -234,6 +234,69 @@ def test_terminate_clears_the_session_and_records_the_context() -> None:
 
 
 # --------------------------------------------------------------------------
+# Database prepare retries (#157)
+# --------------------------------------------------------------------------
+
+
+class _ScriptedPrepareRuntime(InMemoryBackendRuntime):
+    """Scripts a sequence of prepare outcomes to drive the ensure retry loop."""
+
+    def __init__(self, outcomes: list[bool]) -> None:
+        super().__init__()
+        self._outcomes = list(outcomes)
+        self.retry_cleanups: list[int] = []
+
+    async def _prepare_db(self, runtime_env: dict[str, str]) -> tuple[bool, int | None, str]:
+        self.prepared.append(runtime_env.get("ARC_E2E_DB_PATH", ""))
+        # The last scripted outcome repeats, so always-failing runs stay simple.
+        outcome = self._outcomes.pop(0) if len(self._outcomes) > 1 else self._outcomes[0]
+        if not outcome:
+            return False, 1, "SQLITE_CANTOPEN: unable to open database file"
+        return True, 0, self.prepare_output
+
+    async def _prepare_retry_cleanup(self, port: int) -> str:
+        self.retry_cleanups.append(port)
+        return f"retry cleanup ran for port {port}"
+
+
+def test_ensure_retries_a_failed_database_prepare_and_succeeds(monkeypatch) -> None:
+    """A transient prepare failure (stale sqlite handle) is retried, not fatal."""
+
+    monkeypatch.setattr(backend_runtime_module, "_E2E_DB_PREPARE_RETRY_DELAYS_SECONDS", (0.0, 0.0))
+    runtime = _ScriptedPrepareRuntime([False, True, True])
+
+    acquisition = asyncio.run(
+        runtime.ensure(4321, "suite.sqlite", "fp1", runtime_env={"ARC_E2E_DB_PATH": "suite.sqlite"})
+    )
+
+    assert not acquisition.reused
+    assert acquisition.session is not None
+    assert acquisition.failure_stage is None
+    assert runtime.prepared == ["suite.sqlite", "suite.sqlite"]  # one retry, then success
+    assert runtime.retry_cleanups == [4321]  # the port was re-checked before the retry
+    assert "succeeded on retry" in acquisition.cleanup_note
+    assert "prepare attempt 1 of 3 failed" in acquisition.cleanup_note
+
+
+def test_ensure_reports_retries_exhausted_when_prepare_keeps_failing(monkeypatch) -> None:
+    """A persistent prepare failure keeps the database failure stage and says so."""
+
+    monkeypatch.setattr(backend_runtime_module, "_E2E_DB_PREPARE_RETRY_DELAYS_SECONDS", (0.0, 0.0))
+    runtime = _ScriptedPrepareRuntime([False])
+
+    acquisition = asyncio.run(
+        runtime.ensure(4321, "suite.sqlite", "fp1", runtime_env={"ARC_E2E_DB_PATH": "suite.sqlite"})
+    )
+
+    assert acquisition.session is None
+    assert acquisition.failure_stage == "database"
+    assert runtime.prepared == ["suite.sqlite"] * 3  # the initial attempt plus two retries
+    assert runtime.retry_cleanups == [4321, 4321]  # before each retry, never before the first
+    assert "E2E database prepare failed after 3 attempts; retries exhausted." in acquisition.cleanup_note
+    assert "SQLITE_CANTOPEN" in acquisition.db_output  # the last attempt's raw output is kept
+
+
+# --------------------------------------------------------------------------
 # The web handler drives the same interface (in-memory adapter injected)
 # --------------------------------------------------------------------------
 
@@ -442,6 +505,7 @@ def test_e2e_failure_bodies_come_from_one_renderer(tmp_path, monkeypatch) -> Non
         )
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _ok_build)
+    monkeypatch.setattr(backend_runtime_module, "_E2E_DB_PREPARE_RETRY_DELAYS_SECONDS", (0.0, 0.0))
     runtime = InMemoryBackendRuntime()
     runtime.prepare_ok = False
     runtime.prepare_output = "db:prepare:e2e failed"
@@ -939,6 +1003,34 @@ def test_process_teardown_surfaces_retained_crash_output(tmp_path) -> None:
     assert "Backend Process Output (session teardown)" in note
     assert "STDERR:" in note
     assert "TypeError: Cannot read properties of undefined" in note
+
+
+def test_process_retry_cleanup_reports_a_free_port_without_killing_anything(tmp_path) -> None:
+    """Between prepare retries the port state is observed, never force-killed."""
+
+    runtime = ProcessBackendRuntime(str(tmp_path))
+    port = _free_port()
+
+    note = asyncio.run(runtime._prepare_retry_cleanup(port))
+
+    assert f"port {port} is released" in note
+
+
+def test_process_retry_cleanup_notes_an_unknown_port_owner_instead_of_raising(tmp_path) -> None:
+    """An occupied port belongs to an unknown owner; note it, never raise."""
+
+    port = _free_port()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", port))
+        # A tiny backlog would make Windows reset the probe connections and
+        # read the port as released; hold the listen queue open instead.
+        sock.listen(128)
+        runtime = ProcessBackendRuntime(str(tmp_path))
+
+        note = asyncio.run(runtime._prepare_retry_cleanup(port))
+
+    assert "still occupied" in note
+    assert "refusing to terminate unknown" in note
 
 
 def test_process_teardown_without_retained_output_keeps_plain_note(tmp_path) -> None:
