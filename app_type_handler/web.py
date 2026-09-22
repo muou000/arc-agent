@@ -469,7 +469,7 @@ _FAILED_CASE_TITLE_SEPARATOR = re.compile(r"\s*[›>]\s*")
 
 
 def _shell_single_arg(value: str) -> str:
-    """Quote ``value`` as one shell argument for the running platform.
+    r"""Quote ``value`` as one shell argument for the running platform.
 
     The test commands run through ``create_subprocess_shell``: cmd.exe on
     Windows, /bin/sh elsewhere. cmd.exe ignores POSIX single quotes and does
