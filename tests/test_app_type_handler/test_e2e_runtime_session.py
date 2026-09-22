@@ -864,6 +864,15 @@ def test_case_grep_pattern_maps_display_titles_to_leaf_names() -> None:
     assert web_handler._build_case_grep_pattern(["Auth API > rejects duplicate username with 409"]) == re.escape(
         "rejects duplicate username with 409"
     )
+    # Shell/regex metachars in the title survive as literals: re.escape
+    # backslash-escapes the regex-special ones, and the quoting dialect
+    # (test_shell_single_arg_quotes_for_the_running_platform) hands the
+    # result to Playwright as one argv entry on either shell.
+    metachar_pattern = web_handler._build_case_grep_pattern(
+        ["checkout › can't login (guest) $100 off?"]
+    )
+    assert metachar_pattern == re.escape("can't login (guest) $100 off?")
+    assert re.search(metachar_pattern, "checkout can't login (guest) $100 off?")
     # Unusable names degrade to the empty pattern (full run).
     assert web_handler._build_case_grep_pattern(["", "   "]) == ""
     assert web_handler._build_case_grep_pattern(None) == ""
@@ -874,7 +883,8 @@ def test_shell_single_arg_quotes_for_the_running_platform() -> None:
     """The filter argument survives the platform's shell as one argv entry.
 
     The commands run through ``create_subprocess_shell``: cmd.exe on Windows
-    (single quotes are not quoting there), /bin/sh elsewhere.
+    (single quotes are not quoting there), /bin/sh elsewhere. Apostrophes in
+    localized case names must survive both dialects as literals.
     """
 
     value = "rejects\\ duplicate\\ username|other\\ case"
@@ -885,6 +895,10 @@ def test_shell_single_arg_quotes_for_the_running_platform() -> None:
         assert web_handler._shell_single_arg("plain-case") == "plain-case"
     else:
         assert quoted == shlex.quote(value)
+    # An apostrophe never needs cmd.exe quoting (it is a literal char there)
+    # and POSIX shlex.quote handles the embedded-quote dance itself.
+    apostrophe = "can't\\ login"
+    assert re.escape("can't login") in web_handler._shell_single_arg(apostrophe)
 
 
 def test_non_e2e_layers_ignore_the_case_filter(tmp_path, monkeypatch) -> None:
