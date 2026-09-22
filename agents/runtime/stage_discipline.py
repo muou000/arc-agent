@@ -451,11 +451,17 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
     def _manifest_fully_written(self) -> list[str] | None:
         """Declared manifest paths when every one of them is materialized.
 
-        ``None`` when there is no locked manifest or at least one declared
-        file was never written — the caller then falls back to the generic
-        rewrite-budget wording.
+        ``None`` when there is no locked manifest, at least one declared
+        file was never written, or the stage is not the test generator —
+        the caller then falls back to the generic rewrite-budget wording.
+        The implementation stage receives a manifest lock as read-only
+        import-check metadata (issue #156); its delete-rewrite budget
+        wording must stay the generic one, because "return your manifest
+        response" is TestGenerator vocabulary a TDD session cannot act on.
         """
 
+        if self._stage != "test_generation":
+            return None
         if self._test_manifest_lock is None or not self._test_manifest_lock.locked:
             return None
         written = {normalize_manifest_path(path) for path in self._written_paths}
@@ -656,10 +662,13 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
 
         Files written earlier in this session are already on disk, so the
         probe covers them. The reservation set covers the parallel-batch
-        case the disk cannot: an interface_design batch that writes a
-        skeleton and a test importing it validates both before either
-        handler has materialized a file, so a skeleton already claimed by
-        an in-flight write in the same batch counts as existing.
+        case the disk cannot: a stage that reserves a skeleton and a test
+        importing it in one tool-call batch validates both before either
+        handler has materialized a file. (Reservations exist only in the
+        interface_design budget; today's pipeline runs the DESIGN-phase
+        test writes through TestGenerator, which materializes each file
+        before the next batch — but the reservation check is cheap and
+        correct whenever a lock-bearing stage batches writes.)
         """
 
         for reservation in self._design_write_reservations:
@@ -679,8 +688,10 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         Reads the file on disk and applies the edit's replacement so the
         import scan sees the surviving imports, not just the replaced
         fragment. ``None`` (missing file, unreadable content, replacement
-        text absent from disk — any divergence from the real edit's
-        semantics) falls back to scanning the ``new_string`` alone.
+        text absent from disk, or an ambiguous anchor — the real tool
+        errors on a duplicate ``old_string`` without ``replace_all``, and
+        this reconstruction must not guess which occurrence it meant) falls
+        back to scanning the ``new_string`` alone.
         """
 
         if self._import_probe_root is None:
@@ -692,11 +703,15 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         new_string = args.get("new_string")
         if not isinstance(old_string, str) or not isinstance(new_string, str):
             return None
+        replace_all = bool(args.get("replace_all", False))
         try:
             current = (self._import_probe_root / relative).read_text(encoding="utf-8", errors="replace")
         except (OSError, ValueError):
             return None
-        if old_string not in current:
+        occurrences = current.count(old_string)
+        if occurrences == 0:
+            return None
+        if occurrences > 1 and not replace_all:
             return None
         return current.replace(old_string, new_string)
 

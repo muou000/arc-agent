@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
-from agents.runtime.capabilities import is_test_file_path, normalize_manifest_path
+from agents.runtime.capabilities import normalize_manifest_path
 from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.runtime.rebase_gate import cached_rebase_gate
@@ -95,23 +95,11 @@ class TestDrivenDeveloper:
         rows: list[DeclaredTestFile] = []
         seen: set[str] = set()
         for item in node_tests:
-            raw_path = str(item.get("file_path", "") or "").strip()
-            path = normalize_manifest_path(raw_path)
-            if not path or path in seen or not is_test_file_path(path):
+            row = DeclaredTestFile.from_manifest_item(item)
+            if row is None or row.file_path in seen:
                 continue
-            seen.add(path)
-            rows.append(
-                DeclaredTestFile(
-                    file_path=path,
-                    test_type=str(item.get("type", "") or "Unit"),
-                    interface_ids=[
-                        str(value).strip()
-                        for value in item.get("interface_ids", []) or []
-                        if str(value or "").strip()
-                    ],
-                    coverage_scope=str(item.get("coverage_scope", "owned") or "owned"),
-                )
-            )
+            seen.add(row.file_path)
+            rows.append(row)
         if not rows:
             return None
         lock = TestManifestLock()

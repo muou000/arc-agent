@@ -35,7 +35,7 @@ from __future__ import annotations
 import posixpath
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Literal
 
 from agents.runtime.capabilities import normalize_manifest_path
 
@@ -124,12 +124,14 @@ class ImportViolation:
     #: ``extension`` = right depth, target exists only with an explicit
     #: extension; ``depth`` = a ±1/±2 ``../`` correction lands on a file;
     #: ``missing`` = nothing at or near the specifier exists.
-    kind: str
-    #: Workspace-relative path the specifier (or its best correction)
-    #: resolves to, when one was found.
+    kind: Literal["extension", "depth", "missing"]
+    #: Workspace-relative path the specifier actually resolves to (the wrong
+    #: one — the thing to diagnose), or ``"<outside workspace>"``.
     resolved: str
     #: The corrected specifier the model should have written, when known.
     suggestion: str
+    #: Workspace-relative path the suggestion resolves to, when one was found.
+    suggested_target: str = ""
 
 
 def classify_import(
@@ -171,8 +173,9 @@ def classify_import(
             return ImportViolation(
                 specifier=specifier,
                 kind="extension",
-                resolved=resolved_rel,
+                resolved=base,
                 suggestion=specifier + suffix,
+                suggested_target=resolved_rel,
             )
 
     for delta in _DEPTH_DELTAS:
@@ -184,16 +187,18 @@ def classify_import(
             return ImportViolation(
                 specifier=specifier,
                 kind="depth",
-                resolved=corrected_base,
+                resolved=base,
                 suggestion=corrected,
+                suggested_target=corrected_base,
             )
         for resolved_rel, suffix in _completion_candidates(corrected_base):
             if exists(resolved_rel):
                 return ImportViolation(
                     specifier=specifier,
                     kind="depth",
-                    resolved=resolved_rel,
+                    resolved=base,
                     suggestion=corrected + suffix,
+                    suggested_target=resolved_rel,
                 )
 
     return ImportViolation(specifier=specifier, kind="missing", resolved=base, suggestion="")
@@ -215,21 +220,22 @@ def build_import_block_message(target_path: str, violations: list[ImportViolatio
     for violation in violations:
         if violation.kind == "extension":
             lines.append(
-                f"- '{violation.specifier}': the target exists only as "
-                f"'{violation.resolved}' — relative ESM imports need the explicit "
-                f"extension, use '{violation.suggestion}'."
+                f"- '{violation.specifier}' resolves to '{violation.resolved}', which is not a file; "
+                f"the target exists as '{violation.suggested_target}' — relative ESM imports need "
+                f"the explicit extension, use '{violation.suggestion}'."
             )
         elif violation.kind == "depth":
             lines.append(
-                f"- '{violation.specifier}': resolves to '{violation.resolved}' which does not "
-                f"exist — did you mean '{violation.suggestion}'?"
+                f"- '{violation.specifier}' resolves to '{violation.resolved}', which does not "
+                f"exist — did you mean '{violation.suggestion}' (the file at "
+                f"'{violation.suggested_target}')?"
             )
         else:
             lines.append(
-                f"- '{violation.specifier}': no file at '{violation.resolved}' and no "
-                "depth/extension correction lands on an existing file. Import only files "
-                "that exist (template skeletons or files written in this session); create "
-                "the target module first if this test needs it."
+                f"- '{violation.specifier}' resolves to '{violation.resolved}' and no file is "
+                "there or at any nearby depth/extension correction. Import only files that "
+                "exist (template skeletons or files written in this session); create the "
+                "target module first if this test needs it."
             )
     return "\n".join(lines)
 

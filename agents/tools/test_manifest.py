@@ -50,6 +50,32 @@ class DeclaredTestFile:
     interface_ids: list[str] = field(default_factory=list)
     coverage_scope: str = "owned"
 
+    @classmethod
+    def from_manifest_item(cls, item: dict[str, Any]) -> "DeclaredTestFile | None":
+        """Build a row from a stored/returned manifest item, or ``None``.
+
+        The single construction site for rebuilding a declared row from an
+        already-validated manifest item: the green-baseline repair pre-seeds
+        its lock from the previous manifest, and TDD rebuilds its read-only
+        import-check lock from the node manifest the same way. ``None`` when
+        the item carries no usable test-file path — callers treat that as
+        "no row", never an error.
+        """
+
+        path = normalize_manifest_path(str(item.get("file_path", "") or "").strip())
+        if not path or not is_test_file_path(path):
+            return None
+        return cls(
+            file_path=path,
+            test_type=canonical_test_type(str(item.get("type", "") or "").strip()) or "Unit",
+            interface_ids=[
+                str(value).strip()
+                for value in item.get("interface_ids", []) or []
+                if str(value or "").strip()
+            ],
+            coverage_scope=normalize_coverage_scope(item.get("coverage_scope")) or "owned",
+        )
+
 
 @dataclass
 class TestManifestLock:

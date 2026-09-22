@@ -226,7 +226,10 @@ def test_wrong_depth_is_blocked_with_correction(workspace) -> None:
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
     assert "Test import blocked" in result.content
+    # The diagnostic names the wrong resolution (spec wording), then the fix.
+    assert "resolves to 'backend/tests/src/app'" in result.content
     assert "did you mean '../../src/app.js'" in result.content
+    assert "'backend/src/app.js'" in result.content
 
 
 def test_missing_extension_is_blocked_with_correction(workspace) -> None:
@@ -236,6 +239,8 @@ def test_missing_extension_is_blocked_with_correction(workspace) -> None:
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
     assert "explicit extension" in result.content
+    assert "resolves to 'backend/src/database/test_harness', which is not a file" in result.content
+    assert "exists as 'backend/src/database/test_harness.js'" in result.content
     assert "'../../src/database/test_harness.js'" in result.content
 
 
@@ -245,7 +250,7 @@ def test_missing_target_is_blocked_without_invented_correction(workspace) -> Non
     result = run(middleware, make_request("write_file", write_args(content)))
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
-    assert "no file at 'backend/src/services/tokenService.js'" in result.content
+    assert "resolves to 'backend/src/services/tokenService.js'" in result.content
     # No correction may be suggested: nothing near the specifier exists.
     assert "did you mean" not in result.content
 
@@ -308,7 +313,7 @@ def test_escaping_relative_import_is_blocked(workspace) -> None:
     result = run(middleware, make_request("write_file", write_args(content)))
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
-    assert "outside the workspace" in result.content or "<outside workspace>" in result.content
+    assert "<outside workspace>" in result.content
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +466,64 @@ def test_edit_with_stale_old_string_falls_back_to_new_string_scan(workspace_with
     assert "tokenService.js" in result.content
 
 
+def test_edit_with_ambiguous_anchor_falls_back_to_new_string_scan(workspace_with_broken_test) -> None:
+    """A duplicate old_string without replace_all: the merge must not guess."""
+
+    target = workspace_with_broken_test / "backend/tests/integration/auth_register_api.test.js"
+    target.write_text("const a = 1;\nconst a = 1;\n", encoding="utf-8")
+    middleware = StageDisciplineMiddleware(
+        stage="implementation",
+        workspace_root=str(workspace_with_broken_test),
+        test_manifest_lock=declared_lock(DECLARED),
+    )
+    result = run(middleware, make_request(
+        "edit_file",
+        {
+            "file_path": TEST_PATH,
+            "old_string": "const a = 1;",
+            "new_string": "import { x } from '../../src/services/ghost.js';\n",
+        },
+    ))
+    # Ambiguous merge fell back to scanning the new_string alone: the broken
+    # import inside it is still flagged.
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "ghost.js" in result.content
+
+
+def test_implementation_delete_rewrite_budget_keeps_generic_wording(workspace) -> None:
+    """The implementation stage's lock is import-check metadata only.
+
+    A TDD session that wrote every manifest file and hit the delete cap
+    must get the generic rewrite-budget wording, not the TestGenerator
+    "return your manifest response" wording its stage cannot act on.
+    """
+
+    middleware = StageDisciplineMiddleware(
+        stage="implementation",
+        workspace_root=str(workspace),
+        test_manifest_lock=declared_lock(DECLARED),
+    )
+    # Two delete-rewrite cycles exhaust the budget; a final write leaves the
+    # path session-owned so the third delete reaches the budget gate.
+    for index in range(2):
+        assert run(middleware, make_request(
+            "write_file", write_args(f"v{index}\n"), call_id=f"w{index}"
+        )).content == "ok"
+        deleted = run(middleware, make_request(
+            "delete", {"file_path": TEST_PATH}, call_id=f"d{index}"
+        ))
+        assert not isinstance(deleted, ToolMessage) or deleted.status != "error"
+    assert run(middleware, make_request(
+        "write_file", write_args("final\n"), call_id="w-final"
+    )).content == "ok"
+    blocked = run(middleware, make_request("delete", {"file_path": TEST_PATH}, call_id="d2"))
+    assert isinstance(blocked, ToolMessage)
+    assert blocked.status == "error"
+    assert "Rewrite budget blocked" in blocked.content
+    assert "return your manifest" not in blocked.content
+
+
 def test_edit_of_clean_test_file_passes(workspace_with_broken_test) -> None:
     clean = ON_DISK_TEST.replace("'../src/database/test_harness';", "'../../src/database/test_harness.js';")
     (workspace_with_broken_test / "backend/tests/integration/auth_register_api.test.js").write_text(
@@ -549,7 +612,8 @@ def test_classify_depth_suggestion_carries_extension() -> None:
     assert violation is not None
     assert violation.kind == "depth"
     assert violation.suggestion == "../../src/app.js"
-    assert violation.resolved == "backend/src/app.js"
+    assert violation.resolved == "backend/tests/src/app"
+    assert violation.suggested_target == "backend/src/app.js"
 
 
 def test_classify_extension_kind() -> None:
@@ -559,6 +623,7 @@ def test_classify_extension_kind() -> None:
     assert violation is not None
     assert violation.kind == "extension"
     assert violation.suggestion == "../../src/database/test_harness.js"
+    assert violation.suggested_target == "backend/src/database/test_harness.js"
 
 
 def test_classify_missing_kind_has_no_suggestion() -> None:
@@ -574,7 +639,19 @@ def test_classify_escaping_import_is_blocked() -> None:
     )
     assert violation is not None
     assert violation.kind == "missing"
+    assert violation.resolved == "<outside workspace>"
     assert violation.suggestion == ""
+
+
+def test_classify_depth_violation_carries_wrong_and_fixed_paths() -> None:
+    violation = classify_import("../src/app", "backend/tests/integration", _exists_factory(PRESENT))
+    assert violation is not None
+    assert violation.kind == "depth"
+    # ``resolved`` names where the specifier actually lands (the defect);
+    # ``suggested_target`` names the file the correction resolves to.
+    assert violation.resolved == "backend/tests/src/app"
+    assert violation.suggestion == "../../src/app.js"
+    assert violation.suggested_target == "backend/src/app.js"
 
 
 def test_extract_reports_relative_only_and_counts_opaque() -> None:

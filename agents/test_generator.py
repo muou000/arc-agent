@@ -341,17 +341,13 @@ class TestGenerator:
         # introduce a new path. This closes the rename escape (delete the
         # green file, re-add the same tautology under a fresh name) at the
         # write gate, before the re-baseline could ever see it.
+        seeded_rows = [
+            row
+            for item in previous_manifest
+            if isinstance(item, dict) and (row := DeclaredTestFile.from_manifest_item(item)) is not None
+        ]
         manifest_lock = TestManifestLock(
-            declared_files={
-                path: DeclaredTestFile(
-                    file_path=path,
-                    test_type=canonical_test_type(item.get("type")) or "Unit",
-                    interface_ids=[str(i) for i in item.get("interface_ids") or [] if str(i or "").strip()],
-                    coverage_scope=normalize_coverage_scope(item.get("coverage_scope")) or "owned",
-                )
-                for item in previous_manifest
-                if (path := str(item.get("file_path", "") or "").strip())
-            }
+            declared_files={row.file_path: row for row in seeded_rows}
         )
         built = session.build_agent(
             name="test_generator",
