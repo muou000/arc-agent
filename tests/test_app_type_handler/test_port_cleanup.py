@@ -6,7 +6,9 @@ import asyncio
 
 import pytest
 
+from app_type_handler import backend_runtime
 from app_type_handler import web
+from app_type_handler.backend_runtime import BackendSpawn
 
 
 def test_pre_start_cleanup_refuses_unknown_port_owners(monkeypatch) -> None:
@@ -18,12 +20,12 @@ def test_pre_start_cleanup_refuses_unknown_port_owners(monkeypatch) -> None:
     async def record_kill(pid: int):
         killed.append(pid)
 
-    monkeypatch.setattr(web, "_wait_for_tcp_server_shutdown", server_still_running)
-    monkeypatch.setattr(web, "_list_port_owner_pids", lambda _port: [4242])
-    monkeypatch.setattr(web, "_force_kill_pid", record_kill)
+    monkeypatch.setattr(backend_runtime, "_wait_for_tcp_server_shutdown", server_still_running)
+    monkeypatch.setattr(backend_runtime, "_list_port_owner_pids", lambda _port: [4242])
+    monkeypatch.setattr(backend_runtime, "_force_kill_pid", record_kill)
 
     with pytest.raises(RuntimeError, match="refusing to terminate unknown"):
-        asyncio.run(web._ensure_port_released(3301, context="Pre-start port cleanup"))
+        asyncio.run(backend_runtime._ensure_port_released(3301, context="Pre-start port cleanup"))
 
     assert killed == []
 
@@ -46,13 +48,13 @@ def test_cleanup_only_terminates_explicitly_owned_processes(monkeypatch) -> None
     async def record_kill(pid: int):
         killed.append(pid)
 
-    monkeypatch.setattr(web, "_wait_for_tcp_server_shutdown", server_shutdown)
-    monkeypatch.setattr(web, "_list_port_owner_pids", lambda _port: [4242, 5252])
-    monkeypatch.setattr(web, "_get_process_fingerprint", lambda pid: {**owned_fingerprint, "pid": str(pid)})
-    monkeypatch.setattr(web, "_force_kill_pid", record_kill)
+    monkeypatch.setattr(backend_runtime, "_wait_for_tcp_server_shutdown", server_shutdown)
+    monkeypatch.setattr(backend_runtime, "_list_port_owner_pids", lambda _port: [4242, 5252])
+    monkeypatch.setattr(backend_runtime, "_get_process_fingerprint", lambda pid: {**owned_fingerprint, "pid": str(pid)})
+    monkeypatch.setattr(backend_runtime, "_force_kill_pid", record_kill)
 
     result = asyncio.run(
-        web._ensure_port_released(
+        backend_runtime._ensure_port_released(
             3301,
             context="Backend runtime cleanup",
             allowed_processes={4242: owned_fingerprint},
@@ -89,13 +91,13 @@ def test_cleanup_kills_orphaned_child_whose_ppid_changed(monkeypatch) -> None:
     async def record_kill(pid: int):
         killed.append(pid)
 
-    monkeypatch.setattr(web, "_wait_for_tcp_server_shutdown", server_shutdown)
-    monkeypatch.setattr(web, "_list_port_owner_pids", lambda _port: [4242])
-    monkeypatch.setattr(web, "_get_process_fingerprint", lambda _pid: orphaned)
-    monkeypatch.setattr(web, "_force_kill_pid", record_kill)
+    monkeypatch.setattr(backend_runtime, "_wait_for_tcp_server_shutdown", server_shutdown)
+    monkeypatch.setattr(backend_runtime, "_list_port_owner_pids", lambda _port: [4242])
+    monkeypatch.setattr(backend_runtime, "_get_process_fingerprint", lambda _pid: orphaned)
+    monkeypatch.setattr(backend_runtime, "_force_kill_pid", record_kill)
 
     result = asyncio.run(
-        web._ensure_port_released(
+        backend_runtime._ensure_port_released(
             3301,
             context="Backend runtime cleanup",
             allowed_processes={4242: captured},
@@ -124,14 +126,14 @@ def test_cleanup_refuses_reused_pid_with_different_fingerprint(monkeypatch) -> N
         "cwd": "C:/workspace/backend",
     }
     reused = {**expected, "command": "unrelated.exe"}
-    monkeypatch.setattr(web, "_wait_for_tcp_server_shutdown", server_still_running)
-    monkeypatch.setattr(web, "_list_port_owner_pids", lambda _port: [4242])
-    monkeypatch.setattr(web, "_get_process_fingerprint", lambda _pid: reused)
-    monkeypatch.setattr(web, "_force_kill_pid", record_kill)
+    monkeypatch.setattr(backend_runtime, "_wait_for_tcp_server_shutdown", server_still_running)
+    monkeypatch.setattr(backend_runtime, "_list_port_owner_pids", lambda _port: [4242])
+    monkeypatch.setattr(backend_runtime, "_get_process_fingerprint", lambda _pid: reused)
+    monkeypatch.setattr(backend_runtime, "_force_kill_pid", record_kill)
 
     with pytest.raises(RuntimeError, match="still occupied after forced cleanup"):
         asyncio.run(
-            web._ensure_port_released(
+            backend_runtime._ensure_port_released(
                 3301,
                 context="Backend runtime cleanup",
                 allowed_processes={4242: expected},
@@ -149,10 +151,10 @@ def test_capture_owned_port_processes_filters_unrelated_owners(monkeypatch) -> N
         9999: {"pid": "9999", "ppid": "1", "name": "service.exe"},
         1: {"pid": "1", "ppid": "0", "name": "init"},
     }
-    monkeypatch.setattr(web, "_list_port_owner_pids", lambda _port: [4242, 5252])
-    monkeypatch.setattr(web, "_get_process_fingerprint", lambda pid: fingerprints[pid])
+    monkeypatch.setattr(backend_runtime, "_list_port_owner_pids", lambda _port: [4242, 5252])
+    monkeypatch.setattr(backend_runtime, "_get_process_fingerprint", lambda pid: fingerprints[pid])
 
-    owned = web._capture_owned_port_processes(3301, launcher_pid=3131)
+    owned = backend_runtime._capture_owned_port_processes(3301, launcher_pid=3131)
 
     assert owned == {4242: fingerprints[4242]}
 
@@ -172,13 +174,18 @@ class _FakeProbeProcess:
 
 
 def _stub_probe_boot(monkeypatch, terminate) -> None:
-    async def fake_start(*_args, **_kwargs):
-        return _FakeProbeProcess(), "npm run start", "", "fingerprint"
+    async def fake_spawn(*_args, **_kwargs):
+        return BackendSpawn(
+            handle=_FakeProbeProcess(),
+            start_command="npm run start",
+            detail="",
+            instance_fingerprint="fingerprint",
+        )
 
     monkeypatch.setattr(web, "_resolve_backend_start_command", lambda _backend: "npm run start")
     monkeypatch.setattr(web, "_build_e2e_runtime_env", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(web, "_start_backend_runtime", fake_start)
-    monkeypatch.setattr(web, "_terminate_process", terminate)
+    monkeypatch.setattr(web, "spawn_backend_process", fake_spawn)
+    monkeypatch.setattr(web, "terminate_backend_process", terminate)
     monkeypatch.setattr(web.urllib.request, "urlopen", lambda _url, timeout=5: _FakeUrlopenResponse())
 
 

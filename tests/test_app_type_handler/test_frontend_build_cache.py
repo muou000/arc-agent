@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from app_type_handler import web as web_handler
+from app_type_handler.backend_runtime import _CommandResult
 
 
 class _BuildRecorder:
@@ -29,13 +30,13 @@ class _BuildRecorder:
         cwd: str,
         timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
-    ) -> web_handler._CommandResult:
+    ) -> _CommandResult:
         self.calls.append(command)
         if self.produce_dist:
             dist_dir = Path(cwd) / "dist"
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-        return web_handler._CommandResult(
+        return _CommandResult(
             exit_code=self.exit_code,
             text=f"Exit Code: {self.exit_code}\nSTDOUT:\nfake build\n",
         )

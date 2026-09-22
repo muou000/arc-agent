@@ -15,6 +15,7 @@ import asyncio
 from pathlib import Path
 
 from app_type_handler import web as web_handler
+from app_type_handler.backend_runtime import InMemoryBackendRuntime, _CommandResult
 
 
 _VITEST_FAILURE_OUTPUT = """Exit Code: 1
@@ -28,12 +29,6 @@ Exit Code: 1
 
 
 _VITEST_PASSING_OUTPUT = "Exit Code: 0\nSTDOUT:\n ✓ tests/authApi.test.js > Auth API > registers a new user\n"
-
-
-class _FakeProcess:
-    def __init__(self) -> None:
-        self.pid = 4321
-        self.returncode = None
 
 
 class _ScriptedCommands:
@@ -50,12 +45,12 @@ class _ScriptedCommands:
         timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
         web_port: int | None = None,
-    ) -> web_handler._CommandResult:
+    ) -> _CommandResult:
         self.calls.append(command)
         for needle, (code, text) in self.scripts.items():
             if needle in command:
-                return web_handler._CommandResult(exit_code=code, text=text)
-        return web_handler._CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
+                return _CommandResult(exit_code=code, text=text)
+        return _CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
 
 
 def _make_workspace(tmp_path: Path) -> Path:
@@ -75,33 +70,17 @@ def _make_workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _make_handler(tmp_path: Path) -> web_handler.WebAppType:
+def _make_handler(tmp_path: Path, backend_runtime=None) -> web_handler.WebAppType:
+    kwargs: dict = {}
+    if backend_runtime is not None:
+        kwargs["backend_runtime"] = backend_runtime
     return web_handler.WebAppType(
         workspace_path=str(tmp_path),
         requirement_path=str(tmp_path / "requirements.yaml"),
         interface_designer=None,
         log_cb=lambda *args, **kwargs: None,
+        **kwargs,
     )
-
-
-def _patch_e2e_harness(monkeypatch, commands: _ScriptedCommands) -> list[str]:
-    start_calls: list[str] = []
-
-    async def _fake_start(workspace_path: str, runtime_env: dict, web_port: int | None = None):
-        start_calls.append("start")
-        return _FakeProcess(), "npm run start", "startup ok", "launcher:4321"
-
-    async def _fake_http(host: str, port: int, timeout: float = 20.0) -> bool:
-        return True
-
-    async def _fake_terminate(process, port=None) -> str:
-        return "released"
-
-    monkeypatch.setattr(web_handler, "_start_backend_runtime", _fake_start)
-    monkeypatch.setattr(web_handler, "_wait_for_http_server", _fake_http)
-    monkeypatch.setattr(web_handler, "_terminate_process", _fake_terminate)
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", commands)
-    return start_calls
 
 
 def test_vitest_batch_result_carries_exit_code_and_partitions(tmp_path, monkeypatch) -> None:
@@ -150,14 +129,14 @@ def test_e2e_result_carries_build_and_served_verdicts(tmp_path, monkeypatch) -> 
     """A real E2E run states what was built and served, as object fields."""
 
     workspace = _make_workspace(tmp_path)
-    handler = _make_handler(workspace)
+    handler = _make_handler(workspace, backend_runtime=InMemoryBackendRuntime())
     commands = _ScriptedCommands(
         {
             "db:prepare:e2e": (0, "Exit Code: 0\nSTDOUT:\nprepared\n"),
             "npx playwright test": (1, _VITEST_FAILURE_OUTPUT),
         }
     )
-    _patch_e2e_harness(monkeypatch, commands)
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", commands)
     dist_dir = workspace / "frontend" / "dist"
     dist_dir.mkdir(parents=True)
     (dist_dir / "index.html").write_text("<html>built</html>\n", encoding="utf-8")
@@ -176,7 +155,7 @@ def test_e2e_environment_failure_is_a_structural_verdict(tmp_path, monkeypatch) 
     """A missing-dependency E2E failure classifies as environmental on the object."""
 
     workspace = _make_workspace(tmp_path)
-    handler = _make_handler(workspace)
+    handler = _make_handler(workspace, backend_runtime=InMemoryBackendRuntime())
     commands = _ScriptedCommands(
         {
             "db:prepare:e2e": (0, "Exit Code: 0\nSTDOUT:\nprepared\n"),
@@ -186,7 +165,7 @@ def test_e2e_environment_failure_is_a_structural_verdict(tmp_path, monkeypatch) 
             ),
         }
     )
-    _patch_e2e_harness(monkeypatch, commands)
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", commands)
     dist_dir = workspace / "frontend" / "dist"
     dist_dir.mkdir(parents=True)
     (dist_dir / "index.html").write_text("<html>built</html>\n", encoding="utf-8")
@@ -201,14 +180,14 @@ def test_structural_exit_code_agrees_with_the_transcription(tmp_path, monkeypatc
     """The structural verdict matches the run's own nested command codes."""
 
     workspace = _make_workspace(tmp_path)
-    handler = _make_handler(workspace)
+    handler = _make_handler(workspace, backend_runtime=InMemoryBackendRuntime())
     commands = _ScriptedCommands(
         {
             "db:prepare:e2e": (0, "Exit Code: 0\nSTDOUT:\nprepared\n"),
             "npx playwright test": (2, "Exit Code: 2\nSTDOUT:\ncrashed\n"),
         }
     )
-    _patch_e2e_harness(monkeypatch, commands)
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", commands)
     dist_dir = workspace / "frontend" / "dist"
     dist_dir.mkdir(parents=True)
     (dist_dir / "index.html").write_text("<html>built</html>\n", encoding="utf-8")

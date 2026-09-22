@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from app_type_handler import backend_runtime
 from app_type_handler import web as web_handler
 
 
@@ -54,17 +55,17 @@ def test_failed_startup_echoes_backend_stderr(tmp_path) -> None:
     )
 
     async def _run() -> tuple:
-        return await web_handler._start_backend_runtime(
+        return await backend_runtime.spawn_backend_process(
             str(workspace), {}, web_port=_free_port()
         )
 
-    process, _command, detail, _fingerprint = asyncio.run(_run())
+    spawn = asyncio.run(_run())
 
-    assert process is None
-    assert "within 20 seconds" in detail
-    assert "=== Backend Process Output ===" in detail
-    assert "STDERR:" in detail
-    assert "TypeError: Cannot read properties of undefined" in detail
+    assert spawn.handle is None
+    assert "within 20 seconds" in spawn.detail
+    assert "=== Backend Process Output ===" in spawn.detail
+    assert "STDERR:" in spawn.detail
+    assert "TypeError: Cannot read properties of undefined" in spawn.detail
 
 
 @pytest.mark.slow
@@ -78,16 +79,16 @@ def test_failed_startup_reports_placeholder_when_no_output(tmp_path) -> None:
     )
 
     async def _run() -> tuple:
-        return await web_handler._start_backend_runtime(
+        return await backend_runtime.spawn_backend_process(
             str(workspace), {}, web_port=_free_port()
         )
 
-    process, _command, detail, _fingerprint = asyncio.run(_run())
+    spawn = asyncio.run(_run())
 
-    assert process is None
-    assert "=== Backend Process Output ===" in detail
+    assert spawn.handle is None
+    assert "=== Backend Process Output ===" in spawn.detail
     # The npm banner ("> start") is the only stdout; no STDERR section.
-    assert "STDERR:" not in detail
+    assert "STDERR:" not in spawn.detail
 
 
 @pytest.mark.slow
@@ -118,14 +119,14 @@ def test_successful_startup_survives_chatty_output(tmp_path) -> None:
     port = _free_port()
 
     async def _start_and_probe() -> None:
-        process, _command, detail, _fingerprint = await web_handler._start_backend_runtime(
+        spawn = await backend_runtime.spawn_backend_process(
             str(workspace), {"ARC_WEB_PORT": str(port)}, web_port=port
         )
-        assert process is not None, detail
+        assert spawn.handle is not None, spawn.detail
         try:
-            assert await web_handler._wait_for_http_server("127.0.0.1", port, timeout=10.0)
+            assert await backend_runtime._wait_for_http_server("127.0.0.1", port, timeout=10.0)
         finally:
-            await web_handler._terminate_process(process, port=port)
+            await backend_runtime.terminate_backend_process(spawn.handle, port=port)
 
     asyncio.run(_start_and_probe())
 
@@ -139,59 +140,65 @@ def test_runtime_contract_warns_about_express5_wildcard_routes() -> None:
     assert "'/{*splat}'" in text
 
 
-def test_every_backend_runtime_call_site_teardowns_through_terminate_process() -> None:
-    """Structural guard: `_start_backend_runtime` products must funnel to `_terminate_process`.
+def test_every_spawn_call_site_teardowns_through_the_runtime_module() -> None:
+    """Structural guard: ``spawn_backend_process`` products must funnel teardown.
 
-    The anchored pipe drains are only awaited on the `_terminate_process`
-    path. A call site that kills its backend some other way (or drops the
-    Process handle without teardown) would leave drains pending on a dead
-    process. Two legal shapes exist: a direct ``_terminate_process`` call in
-    the same function, or handing the process to ``_E2EBackendSession``
-    (whose ``_terminate_e2e_session`` teardown calls ``_terminate_process``).
-    This AST check fails when a new call site uses neither.
+    The anchored pipe drains are only awaited on the
+    ``terminate_backend_process`` path. A call site that kills its backend
+    some other way (or drops the handle without teardown) would leave drains
+    pending on a dead process. Legal shapes: a direct
+    ``terminate_backend_process`` call in the same function (the merge-gate
+    health probe), or being inside the backend_runtime module's own session
+    funnel (the ``_spawn`` primitive whose handle the ``ensure`` policy
+    registers on the session, torn down by ``terminate``). This AST check
+    fails when a new call site uses neither.
     """
 
     import ast
 
-    source_path = Path(web_handler.__file__)
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    modules = (backend_runtime.__file__, web_handler.__file__)
+    funnel_functions = {"_spawn", "ensure", "terminate", "spawn_backend_process"}
 
     offenders: list[str] = []
-    for function_node in ast.walk(tree):
-        if not isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        starts = [
-            node
-            for node in ast.walk(function_node)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_start_backend_runtime"
-        ]
-        if not starts:
-            continue
-        has_terminate = any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_terminate_process"
-            for node in ast.walk(function_node)
-        )
-        # The session route: the started process is stored on the session
-        # state whose teardown method funnels to _terminate_process.
-        stores_session = any(
-            isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Attribute) and target.attr == "_e2e_runtime_session"
-                for target in node.targets
+    for source_path in modules:
+        tree = ast.parse(Path(source_path).read_text(encoding="utf-8"))
+        for function_node in ast.walk(tree):
+            if not isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            spawns = [
+                node
+                for node in ast.walk(function_node)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "spawn_backend_process"
+            ]
+            if not spawns:
+                continue
+            if function_node.name in funnel_functions:
+                continue
+            has_terminate = any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "terminate_backend_process"
+                for node in ast.walk(function_node)
             )
-            for node in ast.walk(function_node)
-        )
-        if not has_terminate and not stores_session:
-            offenders.append(f"{function_node.name} (line {function_node.lineno})")
+            # The session route: the spawned handle is stored on the runtime's
+            # session state whose terminate funnels teardown through the module.
+            stores_session = any(
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute) and target.attr == "_session"
+                    for target in node.targets
+                )
+                for node in ast.walk(function_node)
+            )
+            if not has_terminate and not stores_session:
+                offenders.append(f"{Path(source_path).name}:{function_node.name} (line {function_node.lineno})")
 
     assert not offenders, (
-        "these _start_backend_runtime call sites neither call _terminate_process "
-        "nor store the process on the E2E session; they must funnel teardown "
-        "through it so the anchored drains are awaited: " + ", ".join(offenders)
+        "these spawn_backend_process call sites neither call terminate_backend_process "
+        "nor register the handle on a BackendRuntime session; they must funnel teardown "
+        "through the module so the anchored drains are awaited: " + ", ".join(offenders)
     )
 
 
@@ -210,7 +217,7 @@ def test_output_tail_drains_are_anchored_to_the_process() -> None:
         process = await _asyncio.create_subprocess_exec(
             "cmd", "/c", "echo hi", stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE
         )
-        stdout_tail, stderr_tail = web_handler._start_output_tails(process)
+        stdout_tail, stderr_tail = backend_runtime._start_output_tails(process)
         anchored = getattr(process, "_arc_output_tails", None)
         await process.wait()
         return [stdout_tail, stderr_tail, anchored]
@@ -234,7 +241,7 @@ def test_output_tail_ring_cut_does_not_lead_with_garbage() -> None:
     """
 
     char = "你".encode("utf-8")  # 3 bytes each
-    tail = web_handler._ProcessOutputTail()
+    tail = backend_runtime._ProcessOutputTail()
     # Simulate the post-cut ring state: the buffer begins with the trailing
     # 2 bytes of a character whose first byte was dropped by the ring cut.
     with tail._lock:
@@ -261,7 +268,7 @@ def test_output_tail_cancel_propagates() -> None:
             stderr=_asyncio.subprocess.PIPE,
         )
         try:
-            _stdout_tail, _stderr_tail = web_handler._start_output_tails(process)
+            _stdout_tail, _stderr_tail = backend_runtime._start_output_tails(process)
             drains = getattr(process, "_arc_output_tails")[2]
             assert drains
             drains[0].cancel()
@@ -301,12 +308,12 @@ def test_terminate_process_awaits_drain_tasks(tmp_path) -> None:
     port = _free_port()
 
     async def _start_terminate_and_check() -> bool:
-        process, _command, _detail, _fingerprint = await web_handler._start_backend_runtime(
+        spawn = await backend_runtime.spawn_backend_process(
             str(workspace), {"ARC_WEB_PORT": str(port)}, web_port=port
         )
-        assert process is not None
-        await web_handler._terminate_process(process, port=port)
-        drains = getattr(process, "_arc_output_tails", (None, None, []))[2]
+        assert spawn.handle is not None
+        await backend_runtime.terminate_backend_process(spawn.handle, port=port)
+        drains = getattr(spawn.handle, "_arc_output_tails", (None, None, []))[2]
         return all(task.done() for task in drains)
 
     assert asyncio.run(_start_terminate_and_check())
@@ -334,14 +341,14 @@ def test_second_terminate_is_safe_and_anchors_survive(tmp_path) -> None:
     port = _free_port()
 
     async def _terminate_twice_and_check() -> tuple[bool, bool, str]:
-        process, _command, _detail, _fingerprint = await web_handler._start_backend_runtime(
+        spawn = await backend_runtime.spawn_backend_process(
             str(workspace), {"ARC_WEB_PORT": str(port)}, web_port=port
         )
-        assert process is not None
-        await web_handler._terminate_process(process, port=port)
-        anchor_after_first = getattr(process, "_arc_output_tails", None)
-        await web_handler._terminate_process(process, port=port)
-        anchor_after_second = getattr(process, "_arc_output_tails", None)
+        assert spawn.handle is not None
+        await backend_runtime.terminate_backend_process(spawn.handle, port=port)
+        anchor_after_first = getattr(spawn.handle, "_arc_output_tails", None)
+        await backend_runtime.terminate_backend_process(spawn.handle, port=port)
+        anchor_after_second = getattr(spawn.handle, "_arc_output_tails", None)
         all_done = all(task.done() for task in anchor_after_second[2])
         # The stderr tail still holds the boot marker recorded before teardown.
         return all_done, anchor_after_first is anchor_after_second, anchor_after_second[1].text()

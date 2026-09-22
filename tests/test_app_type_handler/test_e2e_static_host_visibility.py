@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 
 from app_type_handler import web as web_handler
+from app_type_handler.backend_runtime import InMemoryBackendRuntime, _CommandResult
 
 
 # The exact stack shape from the 2026-09-20 run (paths shortened).
@@ -55,12 +56,6 @@ Exit Code: 1
 """
 
 
-class _FakeProcess:
-    def __init__(self, returncode: int | None = None) -> None:
-        self.pid = 4321
-        self.returncode = returncode
-
-
 class _RecoveryRecorder:
     """Stands in for shell commands; fails the first Playwright run with the
     dead-static-host signature and passes the second."""
@@ -77,12 +72,12 @@ class _RecoveryRecorder:
         timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
         web_port: int | None = None,
-    ) -> web_handler._CommandResult:
+    ) -> _CommandResult:
         if "playwright" in command:
             self.playwright_calls += 1
             if self.playwright_calls == 1:
-                return web_handler._CommandResult(exit_code=1, text=self.failure_output)
-            return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nall green\n")
+                return _CommandResult(exit_code=1, text=self.failure_output)
+            return _CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nall green\n")
         if "npm run build" in command:
             # `_build_frontend_dist` passes force_rebuild only when bypassing
             # the cache; the reuse path never reaches the command.
@@ -90,8 +85,8 @@ class _RecoveryRecorder:
             dist_dir = Path(cwd) / "dist"
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-            return web_handler._CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nvite build\n")
-        return web_handler._CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
+            return _CommandResult(exit_code=0, text="Exit Code: 0\nSTDOUT:\nvite build\n")
+        return _CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
 
 
 def _make_workspace(tmp_path: Path) -> Path:
@@ -111,39 +106,38 @@ def _make_workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _make_handler(tmp_path: Path) -> web_handler.WebAppType:
+def _make_handler(tmp_path: Path, backend_runtime=None) -> web_handler.WebAppType:
+    kwargs: dict = {}
+    if backend_runtime is not None:
+        kwargs["backend_runtime"] = backend_runtime
     return web_handler.WebAppType(
         workspace_path=str(tmp_path),
         requirement_path=str(tmp_path / "requirements.yaml"),
         interface_designer=None,
         log_cb=lambda *args, **kwargs: None,
+        **kwargs,
     )
 
 
-def _patch_recovery_harness(monkeypatch, recorder: _RecoveryRecorder) -> list[str]:
-    """Wire a fresh-start harness that records backend restarts."""
+def _make_fresh_start_runtime() -> InMemoryBackendRuntime:
+    """A session runtime scripted for the recovery scenarios.
 
-    start_calls: list[str] = []
+    Every attempt starts fresh (the reuse probe reports not-serving) and every
+    start succeeds; restarts are read off ``runtime.started``.
+    """
 
-    async def _fake_prepare(workspace_path: str, runtime_env: dict) -> tuple[bool, int | None, str]:
-        return True, 0, "prepared"
+    runtime = InMemoryBackendRuntime()
+    runtime.serving = False
+    return runtime
 
-    async def _fake_start(workspace_path: str, runtime_env: dict, web_port: int | None = None):
-        start_calls.append("start")
-        return _FakeProcess(), "npm run start", "startup ok", "launcher:4321"
 
-    async def _fake_http(host: str, port: int, timeout: float = 20.0) -> bool:
-        return False  # disable session reuse: every attempt starts fresh
+class _FailingStopRuntime(InMemoryBackendRuntime):
+    """Every teardown reports a cleanup failure (injected via the interface)."""
 
-    async def _fake_terminate(process, port=None) -> str:
-        return "released"
+    async def _stop(self, session, context: str) -> str:
+        self.stopped.append(context)
+        return "Backend runtime cleanup failed: test injected"
 
-    monkeypatch.setattr(web_handler, "_prepare_e2e_database", _fake_prepare)
-    monkeypatch.setattr(web_handler, "_start_backend_runtime", _fake_start)
-    monkeypatch.setattr(web_handler, "_wait_for_http_server", _fake_http)
-    monkeypatch.setattr(web_handler, "_terminate_process", _fake_terminate)
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
-    return start_calls
 
 
 def test_e2e_result_carries_serving_verdict_present(tmp_path, monkeypatch) -> None:
@@ -154,9 +148,9 @@ def test_e2e_result_carries_serving_verdict_present(tmp_path, monkeypatch) -> No
     dist_dir.mkdir(parents=True)
     (dist_dir / "index.html").write_text("<html>built</html>\n", encoding="utf-8")
 
-    handler = _make_handler(workspace)
+    handler = _make_handler(workspace, backend_runtime=_make_fresh_start_runtime())
     recorder = _RecoveryRecorder("Exit Code: 1\nSTDOUT:\nunrelated\n")
-    _patch_recovery_harness(monkeypatch, recorder)
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
@@ -185,7 +179,7 @@ def test_e2e_result_carries_serving_verdict_absent(tmp_path, monkeypatch) -> Non
     # recorded build is created, then the artifact is removed before the
     # result assembly checks it.
 
-    handler = _make_handler(workspace)
+    handler = _make_handler(workspace, backend_runtime=_make_fresh_start_runtime())
 
     async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
         # Build "succeeds" but the artifact vanishes right after: this is the
@@ -200,7 +194,7 @@ def test_e2e_result_carries_serving_verdict_absent(tmp_path, monkeypatch) -> Non
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
     recorder = _RecoveryRecorder("Exit Code: 1\nSTDOUT:\nunrelated\n")
-    _patch_recovery_harness(monkeypatch, recorder)
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
@@ -243,7 +237,8 @@ def test_dead_static_host_triggers_exactly_one_recovery(tmp_path, monkeypatch) -
     """
 
     workspace = _make_workspace(tmp_path)
-    handler = _make_handler(workspace)
+    runtime = _make_fresh_start_runtime()
+    handler = _make_handler(workspace, backend_runtime=runtime)
 
     build_calls: list[bool] = []
 
@@ -263,13 +258,13 @@ def test_dead_static_host_triggers_exactly_one_recovery(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
     recorder = _RecoveryRecorder(_SPA_DEAD_HOST_OUTPUT)
-    start_calls = _patch_recovery_harness(monkeypatch, recorder)
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     # One recovery: two playwright runs, two backend starts, second build forced.
     assert recorder.playwright_calls == 2
-    assert start_calls == ["start", "start"]
+    assert runtime.started == [4321, 4321]
     assert build_calls == [False, True]
     # The recovery is visible; the retried attempt leads and the failed one
     # survives as the superseded appendix.
@@ -287,7 +282,8 @@ def test_plain_not_found_failure_gets_no_recovery(tmp_path, monkeypatch) -> None
     """A NotFoundError without the send/sendFile frames is the agent's problem."""
 
     workspace = _make_workspace(tmp_path)
-    handler = _make_handler(workspace)
+    runtime = _make_fresh_start_runtime()
+    handler = _make_handler(workspace, backend_runtime=runtime)
 
     async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
         dist_dir = Path(workspace_path) / "frontend" / "dist"
@@ -302,12 +298,12 @@ def test_plain_not_found_failure_gets_no_recovery(tmp_path, monkeypatch) -> None
 
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
     recorder = _RecoveryRecorder(_PLAIN_NOT_FOUND_OUTPUT)
-    start_calls = _patch_recovery_harness(monkeypatch, recorder)
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     assert recorder.playwright_calls == 1
-    assert start_calls == ["start"]
+    assert runtime.started == [4321]
     assert "SPA Static-Host Recovery Retry" not in result.output
     assert handler._spa_static_host_recovery_used is False
     assert result.exit_code == 1
@@ -317,7 +313,8 @@ def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
     """A second dead-host failure in the same handler gets no second recovery."""
 
     workspace = _make_workspace(tmp_path)
-    handler = _make_handler(workspace)
+    runtime = _make_fresh_start_runtime()
+    handler = _make_handler(workspace, backend_runtime=runtime)
 
     async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
         dist_dir = Path(workspace_path) / "frontend" / "dist"
@@ -337,11 +334,11 @@ def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
             result = await super().__call__(command, cwd, timeout, extra_env, web_port)
             if "playwright" in command:
                 # Every playwright run fails with the signature.
-                return web_handler._CommandResult(exit_code=1, text=self.failure_output)
+                return _CommandResult(exit_code=1, text=self.failure_output)
             return result
 
     recorder = _AlwaysDeadHost(_SPA_DEAD_HOST_OUTPUT)
-    _patch_recovery_harness(monkeypatch, recorder)
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
     asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
     assert handler._spa_static_host_recovery_used is True
@@ -363,7 +360,9 @@ def test_recovery_retried_pass_with_failed_cleanup_reports_failure(tmp_path, mon
     """
 
     workspace = _make_workspace(tmp_path)
-    handler = _make_handler(workspace)
+    runtime = _FailingStopRuntime()
+    runtime.serving = False
+    handler = _make_handler(workspace, backend_runtime=runtime)
 
     async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
         dist_dir = Path(workspace_path) / "frontend" / "dist"
@@ -379,20 +378,7 @@ def test_recovery_retried_pass_with_failed_cleanup_reports_failure(tmp_path, mon
     monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
 
     recorder = _RecoveryRecorder(_SPA_DEAD_HOST_OUTPUT)
-    start_calls = _patch_recovery_harness(monkeypatch, recorder)
-    terminate_calls: list[str] = []
-
-    async def _fake_terminate(process, port=None) -> str:
-        # Every teardown after the FIRST backend start fails; the recovery
-        # re-run's session teardown (second start's cleanup at the end of
-        # run_test_group... there is none - cleanup is deferred - so inject the
-        # failure via the session-reset path is not available. Instead the
-        # recovery block's own `_terminate_e2e_session` call carries it into
-        # the retried body's "Previous runtime cleanup" section.
-        terminate_calls.append("called")
-        return "Backend runtime cleanup failed: test injected"
-
-    monkeypatch.setattr(web_handler, "_terminate_process", _fake_terminate)
+    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
