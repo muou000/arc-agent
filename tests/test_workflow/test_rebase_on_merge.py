@@ -329,13 +329,18 @@ def test_conflicted_replay_annotation_and_completion_at_boundaries(
     assert "merge conflicts" in result.content
     assert "backend/shared.js" in result.content
 
-    # While the markers remain, a file call outside the conflict set is
-    # refused (forced resolution).
+    # While the markers remain, a write outside the conflict set is refused
+    # (forced resolution); reads are exempt so the resolver can consult
+    # merge-clean sibling files.
     blocked = gate.wrap_tool_call(
-        _make_request("read_file", {"file_path": "/workspace/backend/own.js"}), _ok_tool
+        _make_request("write_file", {"file_path": "/workspace/backend/own.js"}), _ok_tool
     )
     assert blocked.content.startswith("Error: ARC rebase-on-merge")
     assert "unresolved merge conflicts" in blocked.content
+    served_read = gate.wrap_tool_call(
+        _make_request("read_file", {"file_path": "/workspace/backend/own.js"}), _ok_tool
+    )
+    assert served_read.content.startswith("ok")
 
     # The resolving edit (on the conflicted path) completes the replay at
     # its own boundary.
@@ -450,9 +455,11 @@ def test_soft_guard_disables_after_three_conflict_rounds() -> None:
         seen.append(result.content)
     # Rounds 1-3 carry the conflict notice; round 4 is disarmed (plain ok).
     assert seen[:3] == ["ok\n[ARC rebase-on-merge: replaying the sibling merge left merge conflicts in: a.js. "
-                        "Resolve them with edit_file/write_file (keep both sides' behavior where "
-                        "they are compatible, prefer your node's contract for what your "
-                        "requirement owns); other file work may continue while conflicts remain.]"] * 3
+                        "Resolve every conflict with edit_file/write_file (keep both sides' "
+                        "behavior where they are compatible, prefer your node's contract "
+                        "for what your requirement owns); reads stay available to inform "
+                        "the resolution, and writes outside the conflicted files resume "
+                        "once the last conflict is resolved.]"] * 3
     assert seen[3] == "ok"
 
 
@@ -957,3 +964,54 @@ def test_resume_pending_records_are_process_local_and_consistent(
     _record_pending(resumed_manager, resumed_handle, ["backend/shared.js"])
     second = resumed_manager.replay_pending_merges(resumed_handle)
     assert second.status == ReplayOutcome.REPLAYED
+
+
+def test_forced_resolution_gates_writes_but_not_reads(tmp_path: Path) -> None:
+    """A coordinating resolution may need to read merge-clean sibling files
+    (renamed exports, changed signatures) before it can resolve the markers;
+    reads endanger nothing mid-rebase and must be served, while writes
+    outside the conflict set stay blocked until the markers clear."""
+
+    manager, handle, shared, repo = _conflicted_replay_scenario(tmp_path)
+    # A merge-clean sibling file the resolver may need to consult.
+    sibling_clean = Path(handle.path) / "backend" / "sibling_clean.js"
+    sibling_clean.write_text("export function siblingApi() {}\n", encoding="utf-8")
+
+    gate = RebaseOnMergeMiddleware(
+        handle=handle,
+        replay=manager.replay_pending_merges,
+        pending_files=lambda: manager.pending_merges_for(handle),
+        is_mid_rebase=manager.is_mid_rebase,
+        continue_replay=manager.continue_replay,
+        conflict_paths_reader=manager.unresolved_conflict_paths,
+        enabled=True,
+    )
+    # Read on a path outside the conflict set: served (the resolving agent
+    # consults it), and it does not advance or consume anything.
+    served_read = gate.wrap_tool_call(
+        _make_request("read_file", {"file_path": "/workspace/backend/sibling_clean.js"}),
+        _ok_tool,
+    )
+    assert served_read.content.startswith("ok")
+    assert "Error" not in served_read.content
+    assert manager.is_mid_rebase(handle)
+    # Write outside the conflict set: still blocked.
+    blocked_write = gate.wrap_tool_call(
+        _make_request("write_file", {"file_path": "/workspace/backend/sibling_clean.js"}),
+        _ok_tool,
+    )
+    assert blocked_write.content.startswith("Error: ARC rebase-on-merge")
+    # The blocked message points at the reads-too escape hatch.
+    assert "read any file" in blocked_write.content
+    # Resolving the conflicted path completes the replay; the coordinating
+    # write lands as an ordinary post-replay edit right after.
+    shared.write_text("base;\nagent;\nsibling;\n", encoding="utf-8")
+    completed = gate.wrap_tool_call(
+        _make_request("edit_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
+    )
+    assert "were applied to this workspace" in completed.content
+    coordinated = gate.wrap_tool_call(
+        _make_request("edit_file", {"file_path": "/workspace/backend/sibling_clean.js"}),
+        _ok_tool,
+    )
+    assert coordinated.content == "ok"

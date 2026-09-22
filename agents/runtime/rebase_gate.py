@@ -51,6 +51,14 @@ REBASE_ON_MERGE_ENV = "ARC_REBASE_ON_MERGE"
 # ADR 0003 pins the trigger to tool calls with a single well-defined path
 # (scans over stale content are explicitly out of scope).
 _FILE_PATH_TOOLS = frozenset({"read_file", "edit_file", "write_file", "append_file", "delete"})
+# Writes are what endanger a mid-rebase tree: unstaged edits outside the
+# conflict set collide with ``rebase --continue`` or the next WIP commit
+# ("local changes would be overwritten"), turning a resolvable round into a
+# mechanical abort. Reads touch neither the index nor the disk, and the
+# resolving agent legitimately needs to read merge-clean sibling files (a
+# renamed export, a changed signature) to produce a correct resolution - so
+# only writes are gated, never reads.
+_MUTATING_FILE_TOOLS = _FILE_PATH_TOOLS - {"read_file"}
 
 # After this many consecutive conflict-carrying replays in one pass, the
 # mid-phase replay stands down for the rest of the pass (soft guard).
@@ -177,8 +185,10 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
                 f"conflicts in: {listed}. Resolve every one of them first with "
                 "edit_file/write_file (keep both sides' behavior where they are "
                 "compatible, prefer your node's contract for what your "
-                "requirement owns); file work outside the conflicted files "
-                "resumes once the last conflict is resolved. Validation tools "
+                "requirement owns); you may read any file (including "
+                "merge-clean sibling files) to inform the resolution, and "
+                "writes to files outside the conflicted set resume once the "
+                "last conflict is resolved. Validation tools "
                 "(run_tests/run_build) stay available."
             ),
             name=str(request.tool_call.get("name", "tool")),
@@ -191,13 +201,15 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
     def _before_call(self, request: ToolCallRequest) -> ReplayOutcome | None:
         """The forced-resolution gate: ``CONFLICTS`` blocks the call.
 
-        While the worktree sits mid-rebase, every call on a path outside the
-        conflict set is refused until the agent resolves the markers - the
-        conflict set itself stays writable, so the resolving edits are exactly
-        the calls that get through. Returns the ``CONFLICTS`` outcome the
-        caller turns into a blocked tool result, or ``None`` when the call may
-        proceed (nothing mid-rebase, the call resolves a conflict path, or the
-        replay already completed at this boundary).
+        While the worktree sits mid-rebase, every *write* on a path outside
+        the conflict set is refused until the agent resolves the markers -
+        the conflict set itself stays writable, so the resolving edits are
+        exactly the writes that get through. Reads are never gated: the
+        resolving agent may need to read merge-clean sibling files (a
+        renamed export, a changed signature) to produce a correct
+        resolution, and reads endanger nothing. Returns the ``CONFLICTS``
+        outcome the caller turns into a blocked tool result, or ``None``
+        when the call may proceed.
         """
 
         if not self._enabled:
@@ -205,7 +217,7 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         if self._is_mid_rebase is None or not self._is_mid_rebase(self._handle):
             return None
         name = str(request.tool_call.get("name", ""))
-        if name not in _FILE_PATH_TOOLS:
+        if name not in _MUTATING_FILE_TOOLS:
             return None
         args = request.tool_call.get("args", {}) or {}
         rel_path = normalize_repo_path(args.get("file_path", ""))
@@ -389,9 +401,11 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
             listed = ", ".join(outcome.files[:8])
             notice = (
                 f"[ARC rebase-on-merge: replaying the sibling merge left merge conflicts in: {listed}. "
-                "Resolve them with edit_file/write_file (keep both sides' behavior where "
-                "they are compatible, prefer your node's contract for what your "
-                "requirement owns); other file work may continue while conflicts remain.]"
+                "Resolve every conflict with edit_file/write_file (keep both sides' "
+                "behavior where they are compatible, prefer your node's contract "
+                "for what your requirement owns); reads stay available to inform "
+                "the resolution, and writes outside the conflicted files resume "
+                "once the last conflict is resolved.]"
             )
             cards = self._conflict_cards(outcome.files)
             if cards:
