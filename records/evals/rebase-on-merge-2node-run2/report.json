@@ -1,0 +1,154 @@
+{
+  "schema": "arc.eval.report/1",
+  "set_name": "rebase-on-merge-2node",
+  "generated_at": "2026-09-22 04:07:41",
+  "repetitions": 1,
+  "arm_order": "baseline-first",
+  "requirement_path": "D:\\code\\arc-rebase-benchmark\\reb2\\requirements\\requirements.yaml",
+  "app_type": "web",
+  "web_port": 3311,
+  "runner_command": [
+    "C:\\Python314\\python.exe",
+    "D:\\code\\arc-rebase-on-merge\\arc_main.py",
+    "compile"
+  ],
+  "baseline": {
+    "label": "rebase-off",
+    "env": {
+      "ARC_REBASE_ON_MERGE": "0"
+    },
+    "argv": []
+  },
+  "candidate": {
+    "label": "rebase-on",
+    "env": {
+      "ARC_REBASE_ON_MERGE": "1"
+    },
+    "argv": []
+  },
+  "comparison": {
+    "pairs": 1,
+    "repetitions": 1,
+    "pass_rate": {
+      "baseline": 100.0,
+      "candidate": 0.0,
+      "n": {
+        "baseline": 1,
+        "candidate": 1
+      },
+      "delta_pp": -100.0
+    },
+    "tokens": {
+      "baseline": 9024136.0,
+      "candidate": 4821966.0,
+      "delta": -4202170.0,
+      "n": {
+        "baseline": 1,
+        "candidate": 1
+      }
+    },
+    "cache_hit_rate": {
+      "baseline": 92.63668408313576,
+      "candidate": 90.12583128391086,
+      "delta": -2.5108527992249066,
+      "n": {
+        "baseline": 1,
+        "candidate": 1
+      }
+    },
+    "latency_ms": {
+      "baseline": 1652308.7659000012,
+      "candidate": 1406576.8226,
+      "delta": -245731.9433000011,
+      "n": {
+        "baseline": 1,
+        "candidate": 1
+      }
+    },
+    "latency_distribution": {
+      "baseline": {
+        "n": 1,
+        "mean": 1652308.7659000012,
+        "median": 1652308.7659000012,
+        "p95": 1652308.7659000012,
+        "min": 1652308.7659000012,
+        "max": 1652308.7659000012
+      },
+      "candidate": {
+        "n": 1,
+        "mean": 1406576.8226,
+        "median": 1406576.8226,
+        "p95": 1406576.8226,
+        "min": 1406576.8226,
+        "max": 1406576.8226
+      },
+      "paired_delta": {
+        "n": 1,
+        "mean": -245731.9433000011,
+        "median": -245731.9433000011,
+        "p95": -245731.9433000011,
+        "min": -245731.9433000011,
+        "max": -245731.9433000011
+      }
+    },
+    "est_cost": {
+      "baseline": 8.1703,
+      "candidate": 6.369580400000001,
+      "delta": -1.800719599999998,
+      "n": {
+        "baseline": 1,
+        "candidate": 1
+      }
+    }
+  },
+  "diagnostics": {
+    "by_arm": {
+      "baseline": {
+        "runs": 1,
+        "outcomes": {
+          "passed": 1
+        },
+        "failure_events": 0,
+        "llm": {
+          "calls": 106,
+          "total_tokens": 9024136,
+          "cost_total": 8.1703
+        },
+        "tools": {
+          "calls": 201,
+          "blocked": 5,
+          "errors": 3,
+          "empty_results": 0,
+          "unpaged_reads": 22
+        }
+      },
+      "candidate": {
+        "runs": 1,
+        "outcomes": {
+          "node_failed": 1
+        },
+        "failure_events": 1,
+        "llm": {
+          "calls": 65,
+          "total_tokens": 4821966,
+          "cost_total": 6.369580400000001
+        },
+        "tools": {
+          "calls": 142,
+          "blocked": 0,
+          "errors": 4,
+          "empty_results": 0,
+          "unpaged_reads": 25
+        }
+      }
+    }
+  },
+  "artifacts": {
+    "runs_jsonl": "records\\evals\\rebase-on-merge-2node-run2\\runs.jsonl",
+    "sessions_dir": "records\\evals\\rebase-on-merge-2node-run2\\sessions"
+  },
+  "run_ids": [
+    "baseline-rep001",
+    "candidate-rep001"
+  ]
+}

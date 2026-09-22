@@ -1,0 +1,23 @@
+{
+  "node_id": "REQ-A",
+  "phase_status": {
+    "design": "skipped",
+    "test": "skipped",
+    "implement": "completed"
+  },
+  "requirement_snapshot": {
+    "name": "Feature A",
+    "description": "Feature A subtree. Adds a notes area backed by a notes table and a GET API.",
+    "visual_reference": [],
+    "children_ids": [
+      "REQ-A.1"
+    ],
+    "dependencies": []
+  },
+  "recent_failure_summary": "",
+  "interfaces": [],
+  "materialized_files": [],
+  "test_artifacts": [],
+  "resume_context": {},
+  "result_state": "CONVERGED"
+}

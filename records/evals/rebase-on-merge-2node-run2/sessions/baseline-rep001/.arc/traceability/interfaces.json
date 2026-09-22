@@ -1,0 +1,327 @@
+{
+  "REQ-A.1-API-Notes": {
+    "interface_id": "REQ-A.1-API-Notes",
+    "req_ids": [
+      "REQ-A.1"
+    ],
+    "type": "API",
+    "content": "{\"interface_id\": \"REQ-A.1-API-Notes\", \"req_id\": \"REQ-A.1\", \"type\": \"API\", \"name\": \"Notes\", \"file_path\": \"backend/src/routes/notes.js\", \"first_line\": \"const express = require('express');\", \"responsibility\": \"Express router for GET /api/notes that delegates to notes_repo.listNotes and responds with the JSON payload.\", \"specification\": \"GET / responds 200 with body { notes: Array<{id:number,title:string}> } ordered by id; errors forwarded to next(error) for the central handler.\", \"callers\": [\"REQ-A.1-FUNC-App\"], \"callees\": [\"REQ-A.1-FUNC-NotesRepo\"], \"inputs\": \"none\", \"outputs\": \"{ notes: [...] } JSON\", \"test_focus\": \"supertest: empty DB -> { notes: [] }; seeded DB -> titled rows in id order\", \"relation\": \"owned\"}",
+    "file_path": "backend/src/routes/notes.js",
+    "first_line": "const express = require('express');",
+    "implemented": true,
+    "callers": [
+      "REQ-A.1-FUNC-App"
+    ],
+    "callees": [
+      "REQ-A.1-FUNC-NotesRepo"
+    ]
+  },
+  "REQ-A.1-DB-NotesTable": {
+    "interface_id": "REQ-A.1-DB-NotesTable",
+    "req_ids": [
+      "REQ-A.1"
+    ],
+    "type": "DB",
+    "content": "{\"interface_id\": \"REQ-A.1-DB-NotesTable\", \"req_id\": \"REQ-A.1\", \"type\": \"DB\", \"name\": \"NotesTable\", \"file_path\": \"backend/src/database/init_db.js\", \"first_line\": \"CREATE TABLE notes\", \"responsibility\": \"Idempotent CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL) added to the shared init lifecycle.\", \"specification\": \"Table `notes` with id and non-null title exists after initializeDatabase(); created via CREATE TABLE IF NOT EXISTS so schema evolution stays idempotent.\", \"callers\": [\"REQ-A.1-FUNC-NotesRepo\", \"backend/src/database/seed_db.js\"], \"callees\": [], \"inputs\": \"SQL DDL\", \"outputs\": \"notes table\", \"test_focus\": \"harness setup creates notes table; rows readable via db_runtime helpers\", \"relation\": \"owned\"}",
+    "file_path": "backend/src/database/init_db.js",
+    "first_line": "CREATE TABLE notes",
+    "implemented": true,
+    "callers": [
+      "REQ-A.1-FUNC-NotesRepo",
+      "backend/src/database/seed_db.js"
+    ],
+    "callees": []
+  },
+  "REQ-A.1-FUNC-App": {
+    "interface_id": "REQ-A.1-FUNC-App",
+    "req_ids": [
+      "REQ-A.1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-A.1-FUNC-App\", \"req_id\": \"REQ-A.1\", \"type\": \"FUNC\", \"name\": \"App\", \"file_path\": \"backend/src/app.js\", \"first_line\": \"const express = require('express');\", \"responsibility\": \"Express app entry that registers the notes router under /api/notes, additively wired at the established route registration mount point.\", \"specification\": \"app.use('/api/notes', notesRouter) registered after /api/health; notesRouter imported from ./routes/notes; existing static/SPA handling untouched.\", \"callers\": [\"backend/src/index.js\"], \"callees\": [\"REQ-A.1-API-Notes\"], \"inputs\": \"HTTP requests to /api/notes\", \"outputs\": \"JSON notes payload, Express app\", \"test_focus\": \"supertest GET /api/notes returns 200 with { notes: [...] } on the real app\", \"relation\": \"owned\"}",
+    "file_path": "backend/src/app.js",
+    "first_line": "const express = require('express');",
+    "implemented": true,
+    "callers": [
+      "backend/src/index.js"
+    ],
+    "callees": [
+      "REQ-A.1-API-Notes"
+    ]
+  },
+  "REQ-A.1-FUNC-Notes": {
+    "interface_id": "REQ-A.1-FUNC-Notes",
+    "req_ids": [
+      "REQ-A.1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-A.1-FUNC-Notes\", \"req_id\": \"REQ-A.1\", \"type\": \"FUNC\", \"name\": \"Notes\", \"file_path\": \"frontend/src/api/notes.ts\", \"first_line\": \"import apiClient from './index';\", \"responsibility\": \"Frontend API client exposing fetchNotes() that GETs /notes through the shared axios apiClient and returns the note list.\", \"specification\": \"fetchNotes(): Promise<Note[]> via apiClient.get<NotesResponse>('/notes') returning data.notes; Note = {id:number, title:string}.\", \"callers\": [\"REQ-A.1-UI-useNotes\"], \"callees\": [\"frontend/src/api/index.ts\"], \"inputs\": \"none\", \"outputs\": \"Promise<Note[]>\", \"test_focus\": \"unit with mocked apiClient: resolves notes array from { notes: [...] }\", \"relation\": \"owned\"}",
+    "file_path": "frontend/src/api/notes.ts",
+    "first_line": "import apiClient from './index';",
+    "implemented": true,
+    "callers": [
+      "REQ-A.1-UI-useNotes"
+    ],
+    "callees": [
+      "frontend/src/api/index.ts"
+    ]
+  },
+  "REQ-A.1-FUNC-NotesRepo": {
+    "interface_id": "REQ-A.1-FUNC-NotesRepo",
+    "req_ids": [
+      "REQ-A.1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-A.1-FUNC-NotesRepo\", \"req_id\": \"REQ-A.1\", \"type\": \"FUNC\", \"name\": \"NotesRepo\", \"file_path\": \"backend/src/database/notes_repo.js\", \"first_line\": \"const { all, withTransaction } = require('./db_runtime');\", \"responsibility\": \"DB access layer for notes: listNotes returns all note rows ordered by id; seedDefaultNotes inserts default titles only when the table is empty.\", \"specification\": \"listNotes(): Promise<Array<{id:number,title:string}>> via all('SELECT id, title FROM notes ORDER BY id ASC'). seedDefaultNotes(tx?): idempotent insert of default titled notes when table has no rows.\", \"callers\": [\"REQ-A.1-API-Notes\", \"REQ-A.1-FUNC-SeedDb\"], \"callees\": [\"REQ-A.1-DB-NotesTable\", \"backend/src/database/db_runtime.js\"], \"inputs\": \"none / optional tx facade\", \"outputs\": \"note rows, seed result\", \"test_focus\": \"integration: empty table returns []; seeded rows returned ordered by id\", \"relation\": \"owned\"}",
+    "file_path": "backend/src/database/notes_repo.js",
+    "first_line": "const { all, withTransaction } = require('./db_runtime');",
+    "implemented": true,
+    "callers": [
+      "REQ-A.1-API-Notes",
+      "REQ-A.1-FUNC-SeedDb"
+    ],
+    "callees": [
+      "REQ-A.1-DB-NotesTable",
+      "backend/src/database/db_runtime.js"
+    ]
+  },
+  "REQ-A.1-FUNC-SeedDb": {
+    "interface_id": "REQ-A.1-FUNC-SeedDb",
+    "req_ids": [
+      "REQ-A.1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-A.1-FUNC-SeedDb\", \"req_id\": \"REQ-A.1\", \"type\": \"FUNC\", \"name\": \"SeedDb\", \"file_path\": \"backend/src/database/seed_db.js\", \"first_line\": \"const { closeDb } = require('./init_db');\", \"responsibility\": \"Shared seed entrypoint extended to call seedDefaultNotes inside its transaction so default titled notes exist after normal startup/reset.\", \"specification\": \"seedDatabase() runs seedDefaultNotes({run,get,all,exec}) inside withTransaction; deterministic and idempotent so empty-state seeding still works.\", \"callers\": [\"backend/src/database/prepare_e2e.js\", \"test harness\", \"npm run db:seed\"], \"callees\": [\"REQ-A.1-FUNC-NotesRepo\", \"backend/src/database/db_runtime.js\"], \"inputs\": \"none\", \"outputs\": \"seeded notes rows\", \"test_focus\": \"seeding twice yields identical rows; seeded titles visible through listNotes\", \"relation\": \"owned\"}",
+    "file_path": "backend/src/database/seed_db.js",
+    "first_line": "const { closeDb } = require('./init_db');",
+    "implemented": true,
+    "callers": [
+      "backend/src/database/prepare_e2e.js",
+      "test harness",
+      "npm run db:seed"
+    ],
+    "callees": [
+      "REQ-A.1-FUNC-NotesRepo",
+      "backend/src/database/db_runtime.js"
+    ]
+  },
+  "REQ-A.1-UI-HomePage": {
+    "interface_id": "REQ-A.1-UI-HomePage",
+    "req_ids": [
+      "REQ-A.1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-A.1-UI-HomePage\", \"req_id\": \"REQ-A.1\", \"type\": \"UI\", \"name\": \"HomePage\", \"file_path\": \"frontend/src/pages/HomePage.tsx\", \"first_line\": \"import NotesSection from '../components/NotesSection';\", \"responsibility\": \"Home page mount point extended additively to render NotesSection inside its existing layout container.\", \"specification\": \"HomePage renders <NotesSection /> inside the max-w-7xl container; existing shell lines untouched; route registration in App.tsx unchanged.\", \"callers\": [\"frontend/src/App.tsx\"], \"callees\": [\"REQ-A.1-UI-NotesSection\"], \"inputs\": \"none\", \"outputs\": \"React page element\", \"test_focus\": \"RTL: rendering HomePage shows the `Notes` heading and empty state (or note titles via mocked fetch)\", \"relation\": \"owned\"}",
+    "file_path": "frontend/src/pages/HomePage.tsx",
+    "first_line": "import NotesSection from '../components/NotesSection';",
+    "implemented": true,
+    "callers": [
+      "frontend/src/App.tsx"
+    ],
+    "callees": [
+      "REQ-A.1-UI-NotesSection"
+    ]
+  },
+  "REQ-A.1-UI-NotesSection": {
+    "interface_id": "REQ-A.1-UI-NotesSection",
+    "req_ids": [
+      "REQ-A.1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-A.1-UI-NotesSection\", \"req_id\": \"REQ-A.1\", \"type\": \"UI\", \"name\": \"NotesSection\", \"file_path\": \"frontend/src/components/NotesSection.tsx\", \"first_line\": \"import { useNotes } from '../hooks/useNotes';\", \"responsibility\": \"Home-page notes area: section headed with the exact literal `Notes` listing one row per note title, with loading/error and the exact empty-state literal `No notes yet.`.\", \"specification\": \"Renders <h2>Notes</h2>; when notes empty and not loading renders exact text `No notes yet.`; otherwise <ul> with each note title; fetch error surfaced via role=alert. No hardcoded sample rows.\", \"callers\": [\"REQ-A.1-UI-HomePage\"], \"callees\": [\"REQ-A.1-UI-useNotes\"], \"inputs\": \"none\", \"outputs\": \"React section element\", \"test_focus\": \"RTL: heading `Notes`; seeded titles rendered as rows; empty -> `No notes yet.`; error -> alert\", \"relation\": \"owned\"}",
+    "file_path": "frontend/src/components/NotesSection.tsx",
+    "first_line": "import { useNotes } from '../hooks/useNotes';",
+    "implemented": true,
+    "callers": [
+      "REQ-A.1-UI-HomePage"
+    ],
+    "callees": [
+      "REQ-A.1-UI-useNotes"
+    ]
+  },
+  "REQ-A.1-UI-useNotes": {
+    "interface_id": "REQ-A.1-UI-useNotes",
+    "req_ids": [
+      "REQ-A.1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-A.1-UI-useNotes\", \"req_id\": \"REQ-A.1\", \"type\": \"UI\", \"name\": \"useNotes\", \"file_path\": \"frontend/src/hooks/useNotes.ts\", \"first_line\": \"import { useCallback, useEffect, useState } from 'react';\", \"responsibility\": \"State hook owning the notes fetch lifecycle: notes, loading, error, and reload, calling fetchNotes on mount.\", \"specification\": \"Returns { notes: Note[], loading: boolean, error: string|null, reload: () => void }; fetch runs on mount via useEffect; empty result leaves notes as [].\", \"callers\": [\"REQ-A.1-UI-NotesSection\"], \"callees\": [\"REQ-A.1-FUNC-Notes\"], \"inputs\": \"none\", \"outputs\": \"UseNotesResult\", \"test_focus\": \"RTL hook test: success populates notes; empty -> notes []; failure sets error and clears loading\", \"relation\": \"owned\"}",
+    "file_path": "frontend/src/hooks/useNotes.ts",
+    "first_line": "import { useCallback, useEffect, useState } from 'react';",
+    "implemented": true,
+    "callers": [
+      "REQ-A.1-UI-NotesSection"
+    ],
+    "callees": [
+      "REQ-A.1-FUNC-Notes"
+    ]
+  },
+  "REQ-B.1-API-Tasks": {
+    "interface_id": "REQ-B.1-API-Tasks",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "API",
+    "content": "{\"interface_id\": \"REQ-B.1-API-Tasks\", \"req_id\": \"REQ-B.1\", \"type\": \"API\", \"name\": \"Tasks\", \"file_path\": \"backend/src/routes/tasks.js\", \"first_line\": \"const express = require('express');\", \"responsibility\": \"Express router for GET /api/tasks returning the task list fetched through the service layer.\", \"specification\": \"GET / -> 200 { tasks: [{ id, title, created_at }] }; failures forwarded via next(error).\", \"callers\": [\"REQ-B.1-FUNC-App\"], \"callees\": [\"REQ-B.1-FUNC-Tasks\"], \"inputs\": \"none\", \"outputs\": \"JSON { tasks: TaskItem[] }\", \"test_focus\": \"Supertest GET /api/tasks returns seeded titles in order.\", \"relation\": \"owned\"}",
+    "file_path": "backend/src/routes/tasks.js",
+    "first_line": "const express = require('express');",
+    "implemented": true,
+    "callers": [
+      "REQ-B.1-FUNC-App"
+    ],
+    "callees": [
+      "REQ-B.1-FUNC-Tasks"
+    ]
+  },
+  "REQ-B.1-DB-TasksTable": {
+    "interface_id": "REQ-B.1-DB-TasksTable",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "DB",
+    "content": "{\"interface_id\": \"REQ-B.1-DB-TasksTable\", \"req_id\": \"REQ-B.1\", \"type\": \"DB\", \"name\": \"TasksTable\", \"file_path\": \"backend/src/database/init_db.js\", \"first_line\": \"CREATE TABLE tasks\", \"responsibility\": \"Defines the tasks table idempotently during database initialization so the list endpoint has a real persisted source.\", \"specification\": \"CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))).\", \"callers\": [\"REQ-B.1-FUNC-App\"], \"callees\": [], \"inputs\": \"none\", \"outputs\": \"tasks table\", \"test_focus\": \"Schema exists after initializeDatabase(); rows insertable with title.\", \"relation\": \"owned\"}",
+    "file_path": "backend/src/database/init_db.js",
+    "first_line": "CREATE TABLE tasks",
+    "implemented": true,
+    "callers": [
+      "REQ-B.1-FUNC-App"
+    ],
+    "callees": []
+  },
+  "REQ-B.1-FUNC-ApiClient": {
+    "interface_id": "REQ-B.1-FUNC-ApiClient",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-B.1-FUNC-ApiClient\", \"req_id\": \"REQ-B.1\", \"type\": \"FUNC\", \"name\": \"SharedApiClient\", \"file_path\": \"frontend/src/api/index.ts\", \"first_line\": \"import axios from 'axios';\", \"relation\": \"reused-dependency\", \"responsibility\": \"Reused shared axios instance with baseURL /api used by the tasks client.\", \"specification\": \"default export axios instance: baseURL '/api', timeout 5000, JSON content type.\", \"inputs\": \"request config\", \"outputs\": \"axios response\", \"callers\": [\"REQ-B.1-FUNC-Tasks\"], \"callees\": [], \"test_focus\": \"fetchTasks targets '/tasks' on the shared client.\"}",
+    "file_path": "frontend/src/api/index.ts",
+    "first_line": "import axios from 'axios';",
+    "implemented": true,
+    "callers": [
+      "REQ-B.1-FUNC-Tasks"
+    ],
+    "callees": []
+  },
+  "REQ-B.1-FUNC-App": {
+    "interface_id": "REQ-B.1-FUNC-App",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-B.1-FUNC-App\", \"req_id\": \"REQ-B.1\", \"type\": \"FUNC\", \"name\": \"App\", \"file_path\": \"backend/src/app.js\", \"first_line\": \"const express = require('express');\", \"responsibility\": \"Express app entry that hosts the built frontend and registers the /api/tasks router additively beside /api/health.\", \"specification\": \"Imports tasksRouter and must register app.use('/api/tasks', tasksRouter) before static/SPA fallback; existing lines untouched.\", \"callers\": [\"backend/src/index.js\"], \"callees\": [\"REQ-B.1-API-Tasks\"], \"inputs\": \"HTTP requests\", \"outputs\": \"HTTP responses\", \"test_focus\": \"GET /api/tasks returns 200 JSON with tasks after seed.\", \"relation\": \"owned\"}",
+    "file_path": "backend/src/app.js",
+    "first_line": "const express = require('express');",
+    "implemented": true,
+    "callers": [
+      "backend/src/index.js"
+    ],
+    "callees": [
+      "REQ-B.1-API-Tasks"
+    ]
+  },
+  "REQ-B.1-FUNC-DbRuntime": {
+    "interface_id": "REQ-B.1-FUNC-DbRuntime",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-B.1-FUNC-DbRuntime\", \"req_id\": \"REQ-B.1\", \"type\": \"FUNC\", \"name\": \"DbRuntime\", \"file_path\": \"backend/src/database/db_runtime.js\", \"first_line\": \"const { getDb, initializeDatabase } = require('./init_db');\", \"relation\": \"reused-dependency\", \"responsibility\": \"Reused shared SQLite query helpers (run/get/all/exec/withTransaction) powering task reads and seeding.\", \"specification\": \"exports run/get/all/exec/withTransaction over the initialized database handle.\", \"inputs\": \"sql, params\", \"outputs\": \"rows/results\", \"callers\": [\"REQ-B.1-FUNC-Tasks\", \"REQ-B.1-FUNC-SeedDb\"], \"callees\": [\"REQ-B.1-DB-TasksTable\"], \"test_focus\": \"Queries against isolated harness DB return seeded rows.\"}",
+    "file_path": "backend/src/database/db_runtime.js",
+    "first_line": "const { getDb, initializeDatabase } = require('./init_db');",
+    "implemented": true,
+    "callers": [
+      "REQ-B.1-FUNC-Tasks",
+      "REQ-B.1-FUNC-SeedDb"
+    ],
+    "callees": [
+      "REQ-B.1-DB-TasksTable"
+    ]
+  },
+  "REQ-B.1-FUNC-SeedDb": {
+    "interface_id": "REQ-B.1-FUNC-SeedDb",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-B.1-FUNC-SeedDb\", \"req_id\": \"REQ-B.1\", \"type\": \"FUNC\", \"name\": \"SeedDb\", \"file_path\": \"backend/src/database/seed_db.js\", \"first_line\": \"const { closeDb } = require('./init_db');\", \"responsibility\": \"Deterministic idempotent bootstrap of two tasks so the home page lists database titles on a fresh runtime.\", \"specification\": \"seedDatabase() runs INSERT OR IGNORE INTO tasks (id, title) VALUES (1, 'Finish the landing page'), (2, 'Schedule team sync') inside a transaction.\", \"callers\": [\"REQ-B.1-FUNC-App\", \"backend/src/database/test_harness.js\"], \"callees\": [\"REQ-B.1-FUNC-DbRuntime\"], \"inputs\": \"none\", \"outputs\": \"seeded tasks rows\", \"test_focus\": \"Seeding twice leaves exactly the two deterministic rows.\", \"relation\": \"owned\"}",
+    "file_path": "backend/src/database/seed_db.js",
+    "first_line": "const { closeDb } = require('./init_db');",
+    "implemented": true,
+    "callers": [
+      "REQ-B.1-FUNC-App",
+      "backend/src/database/test_harness.js"
+    ],
+    "callees": [
+      "REQ-B.1-FUNC-DbRuntime"
+    ]
+  },
+  "REQ-B.1-FUNC-Tasks": {
+    "interface_id": "REQ-B.1-FUNC-Tasks",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-B.1-FUNC-Tasks\", \"req_id\": \"REQ-B.1\", \"type\": \"FUNC\", \"name\": \"ListTasksService\", \"file_path\": \"backend/src/services/tasks.js\", \"first_line\": \"const { all } = require('../database/db_runtime');\", \"relation\": \"owned\", \"responsibility\": \"Service reading all task rows from the tasks table ordered by id for the API layer.\", \"specification\": \"listTasks(): Promise<Array<{id,title,created_at}>> via db_runtime all() over 'SELECT id, title, created_at FROM tasks ORDER BY id ASC'.\", \"inputs\": \"none\", \"outputs\": \"task rows\", \"callers\": [\"REQ-B.1-API-Tasks\"], \"callees\": [\"REQ-B.1-FUNC-DbRuntime\"], \"test_focus\": \"Returns rows matching seeded titles; empty array for empty table.\"}",
+    "file_path": "backend/src/services/tasks.js",
+    "first_line": "const { all } = require('../database/db_runtime');",
+    "implemented": true,
+    "callers": [
+      "REQ-B.1-API-Tasks"
+    ],
+    "callees": [
+      "REQ-B.1-FUNC-DbRuntime"
+    ]
+  },
+  "REQ-B.1-UI-HomePage": {
+    "interface_id": "REQ-B.1-UI-HomePage",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-B.1-UI-HomePage\", \"req_id\": \"REQ-B.1\", \"type\": \"UI\", \"name\": \"HomePage\", \"file_path\": \"frontend/src/pages/HomePage.tsx\", \"first_line\": \"import TasksSection from '../features/tasks/TasksSection';\", \"responsibility\": \"Home page shell (parent-owned route entry) extended additively to mount the tasks area.\", \"specification\": \"Renders <TasksSection /> inside the existing max-w-7xl container; existing layout untouched.\", \"callers\": [\"frontend/src/App.tsx\"], \"callees\": [\"REQ-B.1-UI-TasksSection\"], \"inputs\": \"none\", \"outputs\": \"home page\", \"test_focus\": \"Home page render shows TasksSection content.\", \"relation\": \"owned\"}",
+    "file_path": "frontend/src/pages/HomePage.tsx",
+    "first_line": "import TasksSection from '../features/tasks/TasksSection';",
+    "implemented": true,
+    "callers": [
+      "frontend/src/App.tsx"
+    ],
+    "callees": [
+      "REQ-B.1-UI-TasksSection"
+    ]
+  },
+  "REQ-B.1-UI-TasksSection": {
+    "interface_id": "REQ-B.1-UI-TasksSection",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-B.1-UI-TasksSection\", \"req_id\": \"REQ-B.1\", \"type\": \"UI\", \"name\": \"TasksSection\", \"file_path\": \"frontend/src/features/tasks/TasksSection.tsx\", \"first_line\": \"import { useTasks } from './useTasks';\", \"responsibility\": \"Home page tasks area rendering the Tasks heading, per-row titles, and the empty state from the hook.\", \"specification\": \"Heading text exactly 'Tasks'; each row shows its title; when no rows and not loading, exact text 'No tasks yet.'; loading status and error role=alert states present.\", \"callers\": [\"REQ-B.1-UI-HomePage\"], \"callees\": [\"REQ-B.1-UI-useTasks\"], \"inputs\": \"none\", \"outputs\": \"rendered section\", \"test_focus\": \"getByRole heading 'Tasks'; rows render titles; empty table shows 'No tasks yet.'\", \"relation\": \"owned\"}",
+    "file_path": "frontend/src/features/tasks/TasksSection.tsx",
+    "first_line": "import { useTasks } from './useTasks';",
+    "implemented": true,
+    "callers": [
+      "REQ-B.1-UI-HomePage"
+    ],
+    "callees": [
+      "REQ-B.1-UI-useTasks"
+    ]
+  },
+  "REQ-B.1-UI-useTasks": {
+    "interface_id": "REQ-B.1-UI-useTasks",
+    "req_ids": [
+      "REQ-B.1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-B.1-UI-useTasks\", \"req_id\": \"REQ-B.1\", \"type\": \"UI\", \"name\": \"useTasks\", \"file_path\": \"frontend/src/features/tasks/useTasks.ts\", \"first_line\": \"import { useEffect, useState } from 'react';\", \"responsibility\": \"Hook owning the fetch lifecycle for the tasks area: loading, success, and error state.\", \"specification\": \"useTasks(): TasksState { tasks: TaskItem[]; loading: boolean; error: string | null } fetching via fetchTasks() on mount.\", \"callers\": [\"REQ-B.1-UI-TasksSection\"], \"callees\": [\"REQ-B.1-FUNC-Tasks\"], \"inputs\": \"none\", \"outputs\": \"TasksState\", \"test_focus\": \"Render-hook test: resolves tasks, rejects to error, no double fetch.\", \"relation\": \"owned\"}",
+    "file_path": "frontend/src/features/tasks/useTasks.ts",
+    "first_line": "import { useEffect, useState } from 'react';",
+    "implemented": true,
+    "callers": [
+      "REQ-B.1-UI-TasksSection"
+    ],
+    "callees": [
+      "REQ-B.1-FUNC-Tasks"
+    ]
+  }
+}

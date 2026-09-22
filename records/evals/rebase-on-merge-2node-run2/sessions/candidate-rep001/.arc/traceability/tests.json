@@ -1,0 +1,83 @@
+{
+  "REQ-A.1-api-notes-integration": {
+    "test_id": "REQ-A.1-api-notes-integration",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-API-Notes",
+      "REQ-A.1-FUNC-App",
+      "REQ-A.1-FUNC-SeedDb",
+      "REQ-A.1-DB-NotesTable"
+    ],
+    "type": "Integration",
+    "file_path": "backend/tests/notes_api.test.js",
+    "passed": true,
+    "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-A.1-notes-e2e": {
+    "test_id": "REQ-A.1-notes-e2e",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-UI-NotesPanel",
+      "REQ-A.1-API-Notes"
+    ],
+    "type": "E2E",
+    "file_path": "backend/test-e2e/notes.e2e.spec.js",
+    "passed": true,
+    "first_line": "const { test, expect } = require('@playwright/test');",
+    "scenario_id": null
+  },
+  "REQ-A.1-notes-panel-unit": {
+    "test_id": "REQ-A.1-notes-panel-unit",
+    "req_id": "REQ-A.1",
+    "interface_ids": [
+      "REQ-A.1-UI-NotesPanel",
+      "REQ-A.1-UI-HomePage"
+    ],
+    "type": "Unit",
+    "file_path": "frontend/tests/features/NotesPanel.test.tsx",
+    "passed": true,
+    "first_line": "import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-B.1-INTEGRATION-TasksApi": {
+    "test_id": "REQ-B.1-INTEGRATION-TasksApi",
+    "req_id": "REQ-B.1",
+    "interface_ids": [
+      "REQ-B.1-API-Tasks",
+      "REQ-B.1-FUNC-App"
+    ],
+    "type": "Integration",
+    "file_path": "backend/tests/tasksApi.test.js",
+    "passed": null,
+    "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-B.1-INTEGRATION-TasksSection": {
+    "test_id": "REQ-B.1-INTEGRATION-TasksSection",
+    "req_id": "REQ-B.1",
+    "interface_ids": [
+      "REQ-B.1-UI-TasksSection",
+      "REQ-B.1-UI-useTasks",
+      "REQ-B.1-FUNC-TasksApi"
+    ],
+    "type": "Integration",
+    "file_path": "frontend/tests/tasks/TasksSection.test.tsx",
+    "passed": null,
+    "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-B.1-UNIT-SeedDb": {
+    "test_id": "REQ-B.1-UNIT-SeedDb",
+    "req_id": "REQ-B.1",
+    "interface_ids": [
+      "REQ-B.1-FUNC-SeedDb",
+      "REQ-B.1-DB-TasksTable"
+    ],
+    "type": "Unit",
+    "file_path": "backend/tests/seedDb.test.js",
+    "passed": null,
+    "first_line": "import { describe, it, expect, beforeEach, afterEach } from 'vitest';",
+    "scenario_id": null
+  }
+}

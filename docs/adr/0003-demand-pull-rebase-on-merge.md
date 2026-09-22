@@ -1,6 +1,6 @@
 # 合并落地不打断执行任务:agent 触碰未应用合并文件时,才在工具边界按需重放
 
-状态:**已实施,默认关闭**——机制由 `ARC_REBASE_ON_MERGE` 门控(默认关闭),实施拆解见 issue #127;回归测试见 `tests/test_workflow/test_rebase_on_merge.py`,mini benchmark 通过前不翻默认。
+状态:**已实施,默认关闭**——机制由 `ARC_REBASE_ON_MERGE` 门控(默认关闭),实施拆解见 issue #127;回归测试见 `tests/test_workflow/test_rebase_on_merge.py`。mini benchmark(2 节点开/关各一次)已运行:懒式触发 0 命中(叶子不重叠触碰)、开/关无回归、candidate 的失败为合并轨道偶发(与重放无关),据此**维持默认关闭、暂不补饿式触发**;报告见 `records/evals/rebase-on-merge-2node-run2/report.md`。
 
 背景:跨组合并冲突走到重排轨道时,已完成阶段的产物被整段丢弃——DESIGN 冲突连设计产物一起清空、IMPLEMENT 冲突至少重跑实现(`reset_branch_to_integration` 路径),这是任务单位浪费的直接来源之一;同时执行中任务读到的集成面可能已过时,语义漂移靠下游 TDD 红灯兜底。决定:兄弟合并落地时只给执行中任务挂一条**未应用合并**(Pending Merge,变更文件集),不主动打断;agent 的文件工具调用(read/edit/write/delete)触碰该集合内路径时,middleware 在该**工具边界静止点**先做 WIP commit(阶段中途无既有 commit,脏树必须先落)再 rebase 到最新 integration HEAD,然后服务本次调用并注入变更清单;冲突以标记落文件、连同对面契约卡交执行中 agent 消解(允许反复;软护栏:同一阶段连续 3 次携带冲突的重放后,停用该阶段剩余时间的 mid-phase 重放),消解后继续原阶段。git 机械操作全部系统侧,agent 无 shell、无 git,只做内容级冲突消解——这是硬边界。全程 fail-open:机械失败(含 Windows 残留 dev server 锁文件)静默跳过落回既有轨道;rebase 的 git 段持 `integration_gate` reader;WIP commit 落节点分支(非 stash),阶段末 integrate 照常合并。
 
