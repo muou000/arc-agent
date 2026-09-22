@@ -410,7 +410,10 @@ def build_stage_agent(
     than starting cold. Pass ``checkpointer=None`` to opt a single agent out.
 
     ``test_manifest_lock`` wires the test_generation stage's manifest-first
-    gate (see ``agents/tools/test_manifest.py``); other stages ignore it.
+    gate (see ``agents/tools/test_manifest.py``). In the implementation stage
+    it is read-only metadata for write-time import validation: the
+    implementation agent may still edit any path its capability table allows,
+    but only manifest-locked test paths receive the static import check.
 
     ``pending_contract_registry`` wires the interface_design stage's
     write-time contract registration (see
@@ -484,10 +487,15 @@ def build_stage_agent(
     stage_discipline = StageDisciplineMiddleware(
         stage=stage,
         file_claim_gate=file_claim_gate,
-        test_manifest_lock=test_manifest_lock if stage == "test_generation" else None,
+        test_manifest_lock=test_manifest_lock if stage in {"test_generation", "implementation"} else None,
         pending_contract_registry=pending_contract_registry if stage == "interface_design" else None,
         template_shared_surfaces=_template_shared_surfaces(app_type),
         max_design_writes=max_design_writes if stage == "interface_design" else None,
+        # The agent's own filesystem root (the /workspace/ backend route):
+        # anchors the write-time test-import validation (issue #156). In
+        # parallel-worktree mode this is the task worktree, so resolution
+        # sees exactly the files the stage's tools see.
+        workspace_root=str(root),
     )
     middleware: list[Any] = [
         ToolUsageMiddleware(),

@@ -33,8 +33,8 @@ Rules:
 
 ```js
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createTestDatabaseHarness } from '../src/database/test_harness';
-import * as domainRepository from '../src/repositories/domainRepository';
+import { createTestDatabaseHarness } from '../src/database/test_harness.js';
+import * as domainRepository from '../src/repositories/domainRepository.js';
 
 describe('DomainRepository (<interface-ids>)', () => {
   let harness;
@@ -59,7 +59,7 @@ describe('DomainRepository (<interface-ids>)', () => {
 ```js
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
-import { createTestDatabaseHarness } from '../src/database/test_harness';
+import { createTestDatabaseHarness } from '../src/database/test_harness.js';
 
 let harness;
 let app;
@@ -70,7 +70,7 @@ beforeAll(async () => {
   // Order contract: harness.setup() must redirect the database path BEFORE
   // anything imports code that initializes the database. Dynamic import is
   // the mechanism that guarantees this ordering.
-  app = (await import('../src/app')).default;
+  app = (await import('../src/app.js')).default;
 });
 
 afterAll(async () => {
@@ -78,7 +78,7 @@ afterAll(async () => {
 });
 ```
 
-11. The ordering contract is `harness.setup()` before any import or call that can trigger database initialization. In the current template that means a dynamic `await import('../src/app')`, because `backend/src/app.js` initializes the database at module load; if initialization ever becomes explicit or lazy, the contract still applies and only the mechanism changes. A static top-level import is the canonical failure — the app binds to the wrong database file and tests silently write outside the isolated database.
+11. The ordering contract is `harness.setup()` before any import or call that can trigger database initialization. In the current template that means a dynamic `await import('../src/app.js')`, because `backend/src/app.js` initializes the database at module load; if initialization ever becomes explicit or lazy, the contract still applies and only the mechanism changes. A static top-level import is the canonical failure — the app binds to the wrong database file and tests silently write outside the isolated database.
 12. Assert `response.status`, the response envelope, and user-visible messages in the requirement's language (for Chinese requirements match `/中文关键词/`), never raw error stack text.
 13. For cookie flows, extract once and replay it: `const cookie = res.headers['set-cookie'].find((c) => c.includes('<cookie-name>=')).split(';')[0];` then `.set('Cookie', cookie)`.
 
@@ -89,7 +89,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import * as domainApi from '../src/api/domain';
+import * as domainApi from '../src/api/domain.js';
 
 function renderPage() {
   return render(
@@ -143,3 +143,4 @@ function uniqueSuffix() {
 - Static `import app` before the database harness redirected the path; sharing one database file across tests in a suite.
 - Mocking the database or service layer to avoid the harness, or mocking fetch internals instead of spying the app's own API module.
 - Fixed identifiers in E2E; asserting error text in a language the requirement does not use.
+- Relative ESM imports without their explicit extension (`'../src/database/test_harness'` instead of `'../src/database/test_harness.js'`), or a relative depth that does not match this file's own directory (from `backend/tests/integration/` the app lives at `'../../src/app.js'`, not `'../src/app'`). Test-file writes are statically validated against the workspace and an import that resolves to no existing file is rejected with the exact correction.

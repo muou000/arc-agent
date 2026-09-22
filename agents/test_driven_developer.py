@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
-from agents.runtime.capabilities import normalize_manifest_path
+from agents.runtime.capabilities import is_test_file_path, normalize_manifest_path
 from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.runtime.rebase_gate import cached_rebase_gate
@@ -20,6 +20,7 @@ from agents.tools.test_failure_digest import (
     build_test_edit_stall_hint,
     format_failure_digest,
 )
+from agents.tools.test_manifest import DeclaredTestFile, TestManifestLock
 from agents.tools.traceability import build_traceability_tools
 from app_type_handler.test_results import TestRunResult
 from core.test_types import canonical_test_type
@@ -77,6 +78,46 @@ class TestDrivenDeveloper:
     def _rebase_gate(self) -> Any | None:
         return cached_rebase_gate(self)
 
+    def _build_import_manifest_lock(self, node_tests: list[dict[str, Any]]) -> TestManifestLock | None:
+        """Build read-only import-check metadata from the current test manifest.
+
+        IMPLEMENT must repair the same test files TestGenerator declared, but
+        its capability table intentionally allows broader product/test edits
+        and must not inherit the generation-stage manifest write lock. The
+        lock passed to ``build_stage_agent`` is therefore metadata only: the
+        discipline consults it for import validation while capability and
+        ownership gates continue to decide which paths TDD may edit.
+
+        An empty/legacy node manifest returns ``None`` (fail-open), preserving
+        diagnostic-probe and older callers that do not carry test rows.
+        """
+
+        rows: list[DeclaredTestFile] = []
+        seen: set[str] = set()
+        for item in node_tests:
+            raw_path = str(item.get("file_path", "") or "").strip()
+            path = normalize_manifest_path(raw_path)
+            if not path or path in seen or not is_test_file_path(path):
+                continue
+            seen.add(path)
+            rows.append(
+                DeclaredTestFile(
+                    file_path=path,
+                    test_type=str(item.get("type", "") or "Unit"),
+                    interface_ids=[
+                        str(value).strip()
+                        for value in item.get("interface_ids", []) or []
+                        if str(value or "").strip()
+                    ],
+                    coverage_scope=str(item.get("coverage_scope", "owned") or "owned"),
+                )
+            )
+        if not rows:
+            return None
+        lock = TestManifestLock()
+        lock.declare(rows)
+        return lock
+
     async def run(
         self,
         *,
@@ -102,6 +143,7 @@ class TestDrivenDeveloper:
         self._current_test_files = [str(path or "").strip() for path in test_files if str(path or "").strip()]
         self._current_test_type = test_type
         current_node_tests = [item for item in (node_tests or []) if isinstance(item, dict)]
+        manifest_lock = self._build_import_manifest_lock(current_node_tests)
         session = StageSession(
             agent_name=self.agent_name,
             node_id=node_id,
@@ -257,6 +299,7 @@ class TestDrivenDeveloper:
             rebase_gate=self._rebase_gate(),
             tools=[run_tests, run_build, install_dependencies, *traceability_tools],
             skills=[SKILLS_SOURCE],
+            test_manifest_lock=manifest_lock,
         )
         # Live handle for the stall hint: the discipline's write-event log is
         # queryable mid-session, while materialized_paths is read only at the

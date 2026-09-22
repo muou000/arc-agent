@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import logging
+import posixpath
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from agents.runtime.capabilities import capability_for, is_test_file_path, normalize_manifest_path
+from agents.runtime.import_checks import (
+    ImportViolation,
+    build_import_block_message,
+    classify_import,
+    extract_relative_esm_imports,
+    is_js_source_path,
+)
 from agents.tools.test_manifest import TestManifestLock
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
@@ -129,6 +139,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         pending_contract_registry: Any | None = None,
         template_shared_surfaces: frozenset[str] | None = None,
         max_design_writes: int | None = None,
+        workspace_root: str | None = None,
     ) -> None:
         self._stage = stage
         self._file_claim_gate = file_claim_gate
@@ -150,6 +161,14 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # nodes default to 8; a non-leaf shell pass may raise it (see
         # ``InterfaceDesigner._max_design_writes``).
         self._max_design_writes = max_design_writes if max_design_writes is not None else _MAX_DESIGN_WRITES
+        # Anchor for the write-time test-import validation (issue #156):
+        # the agent's filesystem root — the same root the ``/workspace/``
+        # backend route maps to — so import resolution can check whether the
+        # imported file exists. ``None`` (direct constructions in tests,
+        # tooling) keeps the checks off entirely; they only ever add
+        # rejections, never permissions, so degrading to off is fail-open.
+        self._import_probe_root = Path(workspace_root) if workspace_root else None
+        self._import_fail_open_count = 0
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._repeated_read_counts: dict[str, int] = {}
         self._written_paths: set[str] = set()
@@ -214,7 +233,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if name in _ADDITIVE_FILE_WRITE_TOOLS:
             return self._validate_append(args)
         if name in _FILE_WRITE_TOOLS:
-            return self._validate_write(args)
+            return self._validate_write(args, tool=name)
         return None
 
     def _validate_delete_channel(self, args: dict[str, Any]) -> str | None:
@@ -341,6 +360,8 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 f"append_file accepts at most {MAX_APPEND_LINES} lines per chunk; received {line_count}. "
                 "Split the next cohesive skeleton section into another append."
             )
+        if import_block := self._validate_test_imports(path, content):
+            return import_block
         if budget_block := self._reserve_design_write(path):
             return budget_block
         if self._file_claim_gate is not None:
@@ -469,7 +490,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return None
         return None
 
-    def _validate_write(self, args: dict[str, Any]) -> str | None:
+    def _validate_write(self, args: dict[str, Any], *, tool: str = "write_file") -> str | None:
         """Runtime gates on the writes the capability table already allowed.
 
         One deliberate, behavior-preserving check-order change from the
@@ -482,7 +503,8 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         verdict firing before the repeated-write check never redirects a
         call the repeated-write check would have caught. The remaining order
         here is the runtime-state ladder: repeated-write lock, manifest
-        declaration, DESIGN content/budget, file-claim gate.
+        declaration, test-import validation, DESIGN content/budget,
+        file-claim gate.
         """
 
         path = _discipline_path(args)
@@ -506,11 +528,27 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             blocked = self._validate_test_manifest_path(args, operation="write")
             if blocked:
                 return blocked
+        # The import check sees the would-be final file for an edit, but the
+        # existing DESIGN content guards must continue to inspect only the
+        # edit payload. Otherwise a small anchor edit on a large existing test
+        # file would be rejected by the DESIGN skeleton line cap.
+        edit_content = str(args.get("content", args.get("new_string", "")) or "")
+        content = edit_content
+        if (
+            tool == "edit_file"
+            and self._import_probe_root is not None
+            and is_test_file_path(path)
+            and is_js_source_path(path)
+        ):
+            merged = self._merged_edit_content(path, args)
+            if merged is not None:
+                content = merged
+        if import_block := self._validate_test_imports(path, content):
+            return import_block
         if self._stage == "interface_design":
-            content = str(args.get("content", args.get("new_string", "")) or "")
-            if violation := self._validate_design_content(content):
+            if violation := self._validate_design_content(edit_content):
                 return violation
-            if content.count("\n") + 1 > _MAX_SKELETON_LINES:
+            if edit_content.count("\n") + 1 > _MAX_SKELETON_LINES:
                 return (
                     f"InterfaceDesigner may only materialize small skeletons (at most {_MAX_SKELETON_LINES} lines per write). "
                     "Record the complete business contract for TDD instead of implementing it now."
@@ -553,6 +591,127 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 "to TestDrivenDeveloper."
             )
         return None
+
+    def _validate_test_imports(self, path: str, content: str) -> str | None:
+        """Static import validation on manifest-locked test writes (issue #156).
+
+        The 2026-09-22 serial run burned an entire IMPLEMENT retry budget
+        fixing two mechanically detectable import defects in a test file:
+        a relative import one ``../`` short and an ESM import without its
+        ``.js`` extension. Both classes are checked here, at write time,
+        for every stage that receives the current node's manifest lock
+        (TestGenerator's declaration lock and TDD's pre-seeded view of that
+        manifest) — the rejection names the exact correction so the fix is
+        one round-trip, not a flip-flop.
+
+        Deliberately fail-open everywhere the check cannot be sure: no
+        manifest lock, a path outside that lock, no workspace root,
+        non-JS test files (the CLI app type's ``test_*.py``), bare
+        specifiers, bundler aliases, and dynamic imports whose argument is
+        not a string literal. A static check must never become the new
+        dead-loop source, so anything unparseable is skipped and counted
+        (:meth:`import_check_fail_opens`).
+
+        Only the *written* content is scanned: existing test files that are
+        never re-touched keep whatever imports they already had.
+        """
+
+        if (
+            self._import_probe_root is None
+            or not content
+            or not is_test_file_path(path)
+            or self._test_manifest_lock is None
+            or not self._test_manifest_lock.contains(normalize_manifest_path(path))
+        ):
+            return None
+        if not is_js_source_path(path):
+            return None
+        try:
+            specifiers, opaque = extract_relative_esm_imports(content)
+        except Exception:
+            # The scanner must never break the write path; anything it
+            # cannot chew is a fail-open, not a tool error.
+            self._record_import_fail_open(path, 1)
+            return None
+        if opaque:
+            self._record_import_fail_open(path, opaque)
+        if not specifiers:
+            return None
+        importer_dir = posixpath.dirname(normalize_manifest_path(path))
+        violations: list[ImportViolation] = []
+        for specifier in specifiers:
+            try:
+                violation = classify_import(specifier, importer_dir, self._import_target_exists)
+            except Exception:
+                self._record_import_fail_open(path, 1)
+                continue
+            if violation is not None:
+                violations.append(violation)
+        if not violations:
+            return None
+        return build_import_block_message(path, violations)
+
+    def _import_target_exists(self, workspace_relative: str) -> bool:
+        """Whether an imported target is real: on disk, or reserved this pass.
+
+        Files written earlier in this session are already on disk, so the
+        probe covers them. The reservation set covers the parallel-batch
+        case the disk cannot: an interface_design batch that writes a
+        skeleton and a test importing it validates both before either
+        handler has materialized a file, so a skeleton already claimed by
+        an in-flight write in the same batch counts as existing.
+        """
+
+        for reservation in self._design_write_reservations:
+            if normalize_manifest_path(reservation) == workspace_relative:
+                return True
+        try:
+            # ``is_file``, not ``exists``: a directory hit would classify a
+            # bare directory import ("../../src/database") as resolved
+            # exactly as written instead of pointing at its index file.
+            return (self._import_probe_root / workspace_relative).is_file()
+        except OSError:
+            return False
+
+    def _merged_edit_content(self, path: str, args: dict[str, Any]) -> str | None:
+        """The file content an ``edit_file`` would produce, when reconstructable.
+
+        Reads the file on disk and applies the edit's replacement so the
+        import scan sees the surviving imports, not just the replaced
+        fragment. ``None`` (missing file, unreadable content, replacement
+        text absent from disk — any divergence from the real edit's
+        semantics) falls back to scanning the ``new_string`` alone.
+        """
+
+        if self._import_probe_root is None:
+            return None
+        relative = normalize_manifest_path(path)
+        if not relative:
+            return None
+        old_string = args.get("old_string")
+        new_string = args.get("new_string")
+        if not isinstance(old_string, str) or not isinstance(new_string, str):
+            return None
+        try:
+            current = (self._import_probe_root / relative).read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            return None
+        if old_string not in current:
+            return None
+        return current.replace(old_string, new_string)
+
+    def _record_import_fail_open(self, path: str, count: int) -> None:
+        self._import_fail_open_count += count
+        logging.getLogger(__name__).info(
+            "test-import check fail-open: %d unparseable import shape(s) in %s passed unvalidated",
+            count,
+            path,
+        )
+
+    def import_check_fail_opens(self) -> int:
+        """How many import shapes the validation skipped as unparseable."""
+
+        return self._import_fail_open_count
 
     def _with_bounded_read(self, request: ToolCallRequest) -> ToolCallRequest:
         if request.tool_call.get("name") != "read_file":
