@@ -80,6 +80,7 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         is_mid_rebase: Callable[[WorktreeHandle], bool] | None = None,
         continue_replay: Callable[[WorktreeHandle], ReplayOutcome] | None = None,
         on_replay: Callable[[ReplayOutcome], None] | None = None,
+        conflict_contract_cards: Callable[[list[str]], dict[str, Any]] | None = None,
         enabled: bool | None = None,
     ) -> None:
         self._handle = handle
@@ -88,6 +89,12 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
         self._is_mid_rebase = is_mid_rebase
         self._continue_replay = continue_replay
         self._on_replay = on_replay
+        # Optional pruned contract cards for the conflict notice (issue #127
+        # item 4): the workflow injects the sibling side's cards through the
+        # same collect_contract_cards pruner the merge arbiter uses, so the
+        # resolving agent sees the other side's declared interfaces next to
+        # the conflict markers.
+        self._conflict_contract_cards = conflict_contract_cards
         self._enabled = rebase_on_merge_enabled() if enabled is None else enabled
         # Soft-guard state: consecutive conflict-carrying replays this pass,
         # and whether the guard has tripped (mid-phase replay stands down).
@@ -210,37 +217,60 @@ class RebaseOnMergeMiddleware(AgentMiddleware):
             return result
         if not isinstance(result.content, str):
             return result
-        notice = _notice_text(outcome)
+        notice = self._notice_text(outcome)
         if not notice:
             return result
         result.content = f"{result.content}\n{notice}"
         return result
 
+    def _notice_text(self, outcome: ReplayOutcome) -> str:
+        """The tool-result notice for one replay outcome (empty when silent)."""
 
-def _notice_text(outcome: ReplayOutcome) -> str:
-    """The tool-result notice for one replay outcome (empty when silent)."""
+        if outcome.status == ReplayOutcome.REPLAYED:
+            if not outcome.files:
+                return ""
+            listed = ", ".join(outcome.files[:8])
+            return (
+                f"[ARC rebase-on-merge: a parallel sibling's merged changes to {listed} "
+                "were applied to this workspace before this call. Re-read any file "
+                "whose content you rely on; the call above was served against the "
+                "updated tree.]"
+            )
+        if outcome.status == ReplayOutcome.CONFLICTS:
+            listed = ", ".join(outcome.files[:8])
+            notice = (
+                f"[ARC rebase-on-merge: replaying the sibling merge left merge conflicts in: {listed}. "
+                "Resolve them with edit_file/write_file (keep both sides' behavior where "
+                "they are compatible, prefer your node's contract for what your "
+                "requirement owns); other file work may continue while conflicts remain.]"
+            )
+            cards = self._conflict_cards(outcome.files)
+            if cards:
+                # The pruned opposite-side interface cards, in the same
+                # payload shape the merge arbiter's input uses (node id ->
+                # interfaces/node_contract rows), so the resolver knows what
+                # the sibling's edits were contractually obligated to keep.
+                import json
 
-    if outcome.status == ReplayOutcome.REPLAYED:
-        if not outcome.files:
+                notice += (
+                    "\n[ARC rebase-on-merge: the other side's registered interface "
+                    f"contracts: {json.dumps(cards, ensure_ascii=False, default=str)[:4000]}]"
+                )
+            return notice
+        if outcome.status == ReplayOutcome.ABORTED:
+            # Fail-open is silent by design: the call was served against the old
+            # tree and the merge rails own the overlap; telling the agent would
+            # only invite it to invent a git workflow it must not have.
             return ""
-        listed = ", ".join(outcome.files[:8])
-        return (
-            f"[ARC rebase-on-merge: a parallel sibling's merged changes to {listed} "
-            "were applied to this workspace before this call. Re-read any file "
-            "whose content you rely on; the call above was served against the "
-            "updated tree.]"
-        )
-    if outcome.status == ReplayOutcome.CONFLICTS:
-        listed = ", ".join(outcome.files[:8])
-        return (
-            f"[ARC rebase-on-merge: replaying the sibling merge left merge conflicts in: {listed}. "
-            "Resolve them with edit_file/write_file (keep both sides' behavior where "
-            "they are compatible, prefer your node's contract for what your "
-            "requirement owns); other file work may continue while conflicts remain.]"
-        )
-    if outcome.status == ReplayOutcome.ABORTED:
-        # Fail-open is silent by design: the call was served against the old
-        # tree and the merge rails own the overlap; telling the agent would
-        # only invite it to invent a git workflow it must not have.
         return ""
-    return ""
+
+    def _conflict_cards(self, conflict_paths: list[str]) -> dict[str, Any]:
+        """Pruned opposite-side contract cards for the conflict notice."""
+
+        if self._conflict_contract_cards is None or not conflict_paths:
+            return {}
+        try:
+            cards = self._conflict_contract_cards(conflict_paths)
+        except Exception:  # noqa: BLE001 - the notice is advisory, never a gate
+            return {}
+        return cards if isinstance(cards, dict) else {}

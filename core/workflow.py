@@ -1144,6 +1144,15 @@ class ARCWorkflowManager:
         def on_replay(outcome: Any) -> None:
             self._emit_rebase_replay_event(node_id, outcome)
 
+        def conflict_contract_cards(conflict_paths: list[str]) -> dict[str, Any]:
+            # The same pruned both-sides cards the merge arbiter's input
+            # uses; a traceability read that fails simply yields no cards
+            # (the notice is advisory).
+            try:
+                return self._arbitration_contract_cards(node_id, conflict_paths)
+            except Exception:  # noqa: BLE001 - advisory only
+                return {}
+
         return RebaseOnMergeMiddleware(
             handle=handle,
             replay=manager.replay_pending_merges,
@@ -1151,6 +1160,7 @@ class ARCWorkflowManager:
             is_mid_rebase=manager.is_mid_rebase,
             continue_replay=manager.continue_replay,
             on_replay=on_replay,
+            conflict_contract_cards=conflict_contract_cards,
         )
 
     def _emit_rebase_replay_event(self, node_id: str, outcome: Any) -> None:

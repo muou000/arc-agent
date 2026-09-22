@@ -764,3 +764,43 @@ def test_task_runner_gate_provider_builds_a_middleware(tmp_path: Path) -> None:
             os.environ.pop(REBASE_ON_MERGE_ENV, None)
         else:
             os.environ[REBASE_ON_MERGE_ENV] = previous
+
+
+def test_conflict_notice_includes_opposite_side_contract_cards() -> None:
+    """Issue #127 item 4: the conflict notice carries the other side's
+    registered interface cards (the arbiter's pruned card shape)."""
+
+    handle = WorktreeHandle("REQ-A", "arc-node/REQ-A", "/tmp/x", "/tmp/x")
+    conflicts = ReplayOutcome(status=ReplayOutcome.CONFLICTS, files=["backend/shared.js"])
+    cards = {"REQ-B": {"interfaces": [{"interface_id": "REQ-B-api", "type": "API"}]}}
+    gate = RebaseOnMergeMiddleware(
+        handle=handle,
+        replay=lambda _h: conflicts,
+        pending_files=lambda: [PendingMerge("REQ-B", "abc", ["backend/shared.js"])],
+        conflict_contract_cards=lambda paths: cards if "backend/shared.js" in paths else {},
+        enabled=True,
+    )
+    result = gate.wrap_tool_call(
+        _make_request("edit_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
+    )
+    assert "merge conflicts" in result.content
+    assert "REQ-B" in result.content and "REQ-B-api" in result.content
+
+
+def test_conflict_notice_survives_a_failing_card_provider() -> None:
+    """The cards are advisory: a provider failure never breaks the notice."""
+
+    handle = WorktreeHandle("REQ-A", "arc-node/REQ-A", "/tmp/x", "/tmp/x")
+    conflicts = ReplayOutcome(status=ReplayOutcome.CONFLICTS, files=["backend/shared.js"])
+    gate = RebaseOnMergeMiddleware(
+        handle=handle,
+        replay=lambda _h: conflicts,
+        pending_files=lambda: [PendingMerge("REQ-B", "abc", ["backend/shared.js"])],
+        conflict_contract_cards=lambda paths: (_ for _ in ()).throw(RuntimeError("store down")),
+        enabled=True,
+    )
+    result = gate.wrap_tool_call(
+        _make_request("edit_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
+    )
+    assert "merge conflicts" in result.content
+    assert "interface contracts" not in result.content
