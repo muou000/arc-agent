@@ -20,7 +20,7 @@
 
 ## 判读
 
-1. **重放从未触发**：candidate 的 runner 事件中 `rebase_replay` 为 0 条。REQ-A.1 与 REQ-B.1 的 DESIGN 相继完成，两个 agent 对共享表面的触碰在时间上不重叠（REQ-A.1 已合并后 REQ-B.1 才写 HomePage/app.js），懒式触发没有命中窗口。这符合 ADR 0003 的边界声明：「grep/glob 扫过陈旧内容不触发；从未触碰的漂移是合并轨道的领地」。
+1. **重放从未触发**：candidate 的 runner 事件中 `rebase_replay` 为 0 条。时间线（debug.log）：REQ-B.1 于 11:47 编辑共享表面（HomePage.tsx / app.js / seed_db.js），REQ-A.1 的 DESIGN 于 11:55:41 合并落地，此后 REQ-B.1 再未触碰任何共享文件（11:56 的三个 delete 针对自己新建的测试文件，不在 A1 的变更集内）——即「写完即不再触碰」形态，挂上的 PendingMerge 没有任何后续触碰去消费它。这符合 ADR 0003 的边界声明：「grep/glob 扫过陈旧内容不触发；从未触碰的漂移是合并轨道的领地」。
 2. **candidate 的失败与重放无关**：REQ-B.1 的 DESIGN 合并走了既有合并轨道——4 个共享文件的纯追加机械消解（app.js/seed_db.js/HomePage.tsx/.last-run.json）后，**合并后健康门禁失败**（merged workspace 后端起不来），LLM 仲裁（2 次触发均记录）未能修复，按既有轨道终判失败。这是与本特性 flag 无关的合并轨道偶发（baseline 同样存在 2 次 merge_arbitration 记录，只是它的健康门禁通过）。
 3. **REQ-A.1 在 candidate 全绿**（Unit/Integration/E2E 全过）——特性开启下并行执行、门禁、合并无回归。
 4. **run1 事故（已修复）**：首跑 candidate 28s 崩溃，`NameError: name 'node_id' is not defined`——`_build_task_phase_runner` 的 provider 闭包引用了任务作用域外的名字。已修复（`handle.node_id`）并加回归测试 `test_task_runner_gate_provider_builds_a_middleware` 钉住；该 bug 单测层不可见（闭包只在真实 agent 构建路径执行），mini benchmark 是唯一暴露面，这本身印证了验收标准要求 benchmark 的价值。
