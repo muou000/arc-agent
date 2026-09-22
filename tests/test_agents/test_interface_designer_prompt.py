@@ -101,6 +101,8 @@ def test_interface_designer_prompt_drops_chunking_teaching() -> None:
     assert "DESIGN skeleton limit" not in user_prompt
     # The user prompt carries the same one-compact-write escape hatch.
     assert "is not a skeleton" in user_prompt
+    assert "do not split it into chunks or append continuations" in user_prompt
+    assert "put the complete behavior description in your stage response for TestDrivenDeveloper" in user_prompt
     # The response contract must not send behavior detail back into skeleton
     # files - that contradiction is what made the escape hatch unreachable.
     assert "put implementation detail into the skeleton files, not into the response" not in prompt
