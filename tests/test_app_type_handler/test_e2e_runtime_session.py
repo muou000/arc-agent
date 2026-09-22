@@ -859,8 +859,11 @@ def test_process_teardown_surfaces_retained_crash_output(tmp_path) -> None:
     handle = _DeadHandle()
     handle._arc_output_tails = (stdout_tail, stderr_tail, [])
     _seed_live_session(
-    runtime,
-        port=_free_port(), db_path="unused.sqlite", fingerprint="fp", handle=handle
+        runtime,
+        port=_free_port(),
+        db_path="unused.sqlite",
+        fingerprint="fp",
+        handle=handle,
     )
 
     note = asyncio.run(runtime.terminate("Session teardown"))
@@ -874,8 +877,11 @@ def test_process_teardown_without_retained_output_keeps_plain_note(tmp_path) -> 
     runtime = ProcessBackendRuntime(str(tmp_path))
     handle = _DeadHandle()
     _seed_live_session(
-    runtime,
-        port=_free_port(), db_path="unused.sqlite", fingerprint="fp", handle=handle
+        runtime,
+        port=_free_port(),
+        db_path="unused.sqlite",
+        fingerprint="fp",
+        handle=handle,
     )
 
     note = asyncio.run(runtime.terminate("Session teardown"))
@@ -890,8 +896,11 @@ def test_process_serving_skips_the_http_probe_for_a_dead_process(tmp_path) -> No
     runtime = ProcessBackendRuntime(str(tmp_path))
     handle = _DeadHandle()
     session = _seed_live_session(
-    runtime,
-        port=_free_port(), db_path="unused.sqlite", fingerprint="fp", handle=handle
+        runtime,
+        port=_free_port(),
+        db_path="unused.sqlite",
+        fingerprint="fp",
+        handle=handle,
     )
 
     assert asyncio.run(runtime._serving(session)) is False
