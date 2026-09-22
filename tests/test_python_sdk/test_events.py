@@ -411,6 +411,54 @@ class TestToolUsageEvents:
         assert lines[0]["phase"] == ""
 
 
+class TestLayerReverifyEvents:
+    """Pin the ``layer_reverify`` schema: trigger + outcome of the TDD
+    late-fix re-verification (issue #116)."""
+
+    @pytest.mark.parametrize("status", ["triggered", "passed", "failed"])
+    def test_record_layer_reverify_writes_canonical_schema(
+        self,
+        events: EventClient,
+        event_paths: RuntimePaths,
+        status: str,
+    ) -> None:
+        events.record_layer_reverify(
+            node_id=" REQ-2 ",
+            layer=" Integration ",
+            status=status,
+            files=["tests/integration/test_flow.py", "  "],
+            used=10,
+            message="AssertionError: boom" if status == "failed" else None,
+        )
+
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "layer_reverify",
+            "node_id": "REQ-2",
+            "layer": "Integration",
+            "status": status,
+            "files": ["tests/integration/test_flow.py"],
+            "used": 10,
+            "message": "AssertionError: boom" if status == "failed" else None,
+            "timestamp": lines[0]["timestamp"],
+        }
+
+    def test_defaults_and_invalid_values_are_normalized(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_layer_reverify(node_id="REQ-2", layer="Unit", status="triggered", used=-3)
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["files"] == []
+        assert lines[0]["used"] == 0
+        assert lines[0]["message"] is None
+
+    def test_string_used_is_coerced(self, events: EventClient, event_paths: RuntimePaths) -> None:
+        events.record_layer_reverify(node_id="REQ-2", layer="Unit", status="passed", used="7")
+        lines = _read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["used"] == 7
+
+
 class TestDemoTestStatus:
     """Demo helpers are documented as no-op with respect to disk state."""
 

@@ -23,10 +23,17 @@ needs no adapter on deepagents >= 0.7: the upstream read_file body is emitted
 verbatim (``_format_source_block``). The former process-level patch rewrote a
 formatter that no longer exists; tests pin the verbatim-output contract
 through the build path instead (``tests/test_agents/test_permission_denied_hint.py``).
+
+A fifth behavior, new rather than historical: the ``write_file``/``edit_file``
+success receipts gain an integrity trailer (``bytes_written`` plus the first 8
+hex chars of the content's sha256) built on the same upstream tool factory
+seams as the delete tool, plus a standing note that the context echo's
+``...(argument truncated)`` marker is display truncation only.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -35,7 +42,12 @@ from typing import TYPE_CHECKING, Any
 from deepagents import __version__ as _deepagents_version
 from deepagents.backends import FilesystemBackend
 from deepagents.backends.utils import validate_path
-from deepagents.middleware.filesystem import DeleteSchema, FilesystemMiddleware
+from deepagents.middleware.filesystem import (
+    DeleteSchema,
+    EditFileSchema,
+    FilesystemMiddleware,
+    WriteFileSchema,
+)
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
@@ -163,6 +175,69 @@ def _delete_deny_pattern_resolver() -> "Callable[..., list[str]] | None":
     return helper
 
 
+# Ground truth appended to successful write_file/edit_file receipts. Models
+# misread the context echo's `...(argument truncated)` marker as "my arguments
+# were cut off, the file now holds a truncated placeholder" (easy-ticketbooking
+# 2026-09-21: TestGenerator burned ~11 minutes on a delete-rewrite loop plus
+# budget workarounds triggered by that misread). The trailer lets the model
+# mechanically self-verify what landed without re-reading the file; the note
+# kills the misread at the first step. Upstream receipt lines are kept verbatim
+# as the first line — log scanners and tests match on them.
+_WRITE_RECEIPT_NOTE = (
+    "Note: `...(argument truncated)` in the context echo is display truncation "
+    "of long tool arguments only; it does not affect the actual written content."
+)
+
+# `read()` is a line-window API with no "everything" sentinel, so the edit
+# receipt's read-back asks for every line with this cap. Only used against the
+# just-edited file, never surfaced to the model as a read.
+_WHOLE_FILE_READ_LIMIT = 2**31 - 1
+
+
+def _integrity_lines(content: str) -> "list[str]":
+    """``bytes_written``/``sha256`` receipt lines describing ``content``.
+
+    Upstream persists text with ``encoding="utf-8", newline=""`` on both the
+    write and edit paths, so utf-8 bytes are the exact disk truth; the edit
+    receipt re-reads the file instead of trusting a recomposition.
+    """
+
+    encoded = content.encode("utf-8")
+    return [
+        f"bytes_written: {len(encoded)}",
+        f"sha256: {hashlib.sha256(encoded).hexdigest()[:8]}",
+    ]
+
+
+def _success_text(tool_result: Any) -> "str | None":
+    """The receipt text of a successful ToolMessage, else ``None``.
+
+    Only string-content success receipts are trailer-eligible; anything else
+    (errors, non-text payloads) passes through untouched.
+    """
+
+    if isinstance(tool_result, ToolMessage) and tool_result.status == "success":
+        content = tool_result.content
+        if isinstance(content, str):
+            return content
+    return None
+
+
+def _with_receipt_trailer(tool_result: Any, lines: "list[str]") -> Any:
+    """Append trailer lines to a *successful* receipt; pass everything else.
+
+    Error receipts keep upstream's exact text — failure diagnosis and log
+    scanners match on it, and a successful write must never be reshaped into
+    (or accompanied by) an error-shaped message.
+    """
+
+    content = _success_text(tool_result)
+    if content is None or not lines:
+        return tool_result
+    tool_result.content = content + "\n" + "\n".join(lines)
+    return tool_result
+
+
 class ARCFilesystemMiddleware(FilesystemMiddleware):
     """Stock filesystem middleware with ARC's delete not-found precedence.
 
@@ -190,6 +265,16 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
     (first matching deny rule), so delete cannot be used to probe which
     protected files exist. Any other ``ls`` outcome keeps upstream's
     conservative descendant check.
+
+    The write_file and edit_file tools are likewise rebuilt on their upstream
+    factory seams (``_create_write_file_tool``/``_create_edit_file_tool``),
+    keeping upstream's validation, permission and backend behavior and only
+    appending an integrity trailer to *successful* receipts: the model that
+    just wrote sees ``bytes_written`` and a short sha256 of the content
+    actually on disk, plus the standing note that the context echo's
+    ``...(argument truncated)`` marker is display truncation only — without
+    which a long write's echo truncation reads as "the file holds a truncated
+    placeholder" and triggers delete-rewrite loops.
     """
 
     # Matches the stock core-stack entry so ``create_deep_agent`` replaces it
@@ -305,6 +390,146 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
         if denying_patterns:
             return self._deny_message(validated_path, denying_patterns, tool_call_id)
         return self._delete_outcome_message(await self.backend.adelete(validated_path), tool_call_id)
+
+    # ------------------------------------------------------------------
+    # write_file / edit_file receipts with an integrity trailer.
+    # The upstream tools keep doing the work; these wrappers only append
+    # ground-truth lines to the success receipt (see _WRITE_RECEIPT_NOTE).
+    # ------------------------------------------------------------------
+
+    def _create_write_file_tool(self) -> "BaseTool":
+        upstream_write = super()._create_write_file_tool()
+        return StructuredTool.from_function(
+            name="write_file",
+            description=upstream_write.description,
+            func=self._write_with_integrity_trailer(upstream_write.func),
+            coroutine=self._awrite_with_integrity_trailer(upstream_write.coroutine),
+            infer_schema=False,
+            args_schema=WriteFileSchema,
+        )
+
+    def _write_with_integrity_trailer(
+        self,
+        upstream_write: "Callable[..., Any]",
+    ) -> "Callable[..., ToolMessage]":
+        def sync_write(file_path: str, content: str, runtime: ToolRuntime) -> ToolMessage:
+            result = upstream_write(file_path=file_path, content=content, runtime=runtime)
+            return _with_receipt_trailer(result, [*_integrity_lines(content), _WRITE_RECEIPT_NOTE])
+
+        return sync_write
+
+    def _awrite_with_integrity_trailer(
+        self,
+        upstream_write: "Callable[..., Any]",
+    ) -> "Callable[..., Any]":
+        async def async_write(file_path: str, content: str, runtime: ToolRuntime) -> ToolMessage:
+            result = await upstream_write(file_path=file_path, content=content, runtime=runtime)
+            return _with_receipt_trailer(result, [*_integrity_lines(content), _WRITE_RECEIPT_NOTE])
+
+        return async_write
+
+    def _create_edit_file_tool(self) -> "BaseTool":
+        upstream_edit = super()._create_edit_file_tool()
+        return StructuredTool.from_function(
+            name="edit_file",
+            description=upstream_edit.description,
+            func=self._edit_with_integrity_trailer(upstream_edit.func),
+            coroutine=self._aedit_with_integrity_trailer(upstream_edit.coroutine),
+            infer_schema=False,
+            args_schema=EditFileSchema,
+        )
+
+    def _edit_with_integrity_trailer(
+        self,
+        upstream_edit: "Callable[..., Any]",
+    ) -> "Callable[..., ToolMessage]":
+        def sync_edit(
+            file_path: str,
+            old_string: str,
+            new_string: str,
+            runtime: ToolRuntime,
+            *,
+            replace_all: bool = False,
+        ) -> ToolMessage:
+            result = upstream_edit(
+                file_path=file_path,
+                old_string=old_string,
+                new_string=new_string,
+                runtime=runtime,
+                replace_all=replace_all,
+            )
+            return _with_receipt_trailer(result, self._edit_trailer_lines(result, self._read_back(file_path)))
+
+        return sync_edit
+
+    def _aedit_with_integrity_trailer(
+        self,
+        upstream_edit: "Callable[..., Any]",
+    ) -> "Callable[..., Any]":
+        async def async_edit(
+            file_path: str,
+            old_string: str,
+            new_string: str,
+            runtime: ToolRuntime,
+            *,
+            replace_all: bool = False,
+        ) -> ToolMessage:
+            result = await upstream_edit(
+                file_path=file_path,
+                old_string=old_string,
+                new_string=new_string,
+                runtime=runtime,
+                replace_all=replace_all,
+            )
+            return _with_receipt_trailer(result, self._edit_trailer_lines(result, await self._aread_back(file_path)))
+
+        return async_edit
+
+    def _read_back(self, file_path: str) -> Any:
+        """Whole-file read-back of a just-edited path, or ``None`` on any surprise."""
+
+        try:
+            return self.backend.read(validate_path(file_path), offset=0, limit=_WHOLE_FILE_READ_LIMIT)
+        except Exception:
+            return None
+
+    async def _aread_back(self, file_path: str) -> Any:
+        try:
+            return await self.backend.aread(validate_path(file_path), offset=0, limit=_WHOLE_FILE_READ_LIMIT)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _edit_trailer_lines(tool_result: Any, read_back: Any) -> "list[str]":
+        """Integrity trailer for an edit receipt, hashed from the file on disk.
+
+        Unlike write_file, the edited content is upstream's internal
+        composition (its universal-newline read plus replacement), so the only
+        truthful source is the file itself. After a successful edit the disk
+        bytes are LF-only (upstream rewrites the whole file with
+        ``newline=""``), so the line-window read-back is byte-faithful — pinned
+        by test in ``tests/test_agents/test_write_receipt_integrity.py``.
+
+        A windowed or non-text read-back (error, binary payload; empty or
+        whitespace-only files carry no pagination metadata and a reminder
+        string instead of content) degrades to the note-only trailer: a
+        successful edit must never produce a missing or lying receipt.
+        """
+
+        if _success_text(tool_result) is None:
+            return []
+        if read_back is None:
+            return [_WRITE_RECEIPT_NOTE]
+        file_data = getattr(read_back, "file_data", None)
+        body = file_data.get("content") if isinstance(file_data, dict) else None
+        if (
+            getattr(read_back, "error", None) is not None
+            or not isinstance(body, str)
+            or (isinstance(file_data, dict) and file_data.get("encoding") != "utf-8")
+            or getattr(read_back, "total_lines", None) is None
+        ):
+            return [_WRITE_RECEIPT_NOTE]
+        return [*_integrity_lines(body), _WRITE_RECEIPT_NOTE]
 
 
 class WindowsCompatFilesystemBackend(FilesystemBackend):
