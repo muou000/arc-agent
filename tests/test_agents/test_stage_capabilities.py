@@ -249,14 +249,24 @@ def test_test_generator_prompt_boundary_matches_table() -> None:
 
 
 def test_interface_designer_prompt_append_file_statement_matches_table() -> None:
+    """Issue #158: the skeleton chunking teaching is gone; the system prompt's
+    only append guidance is the escape hatch, while `append_file` stays
+    table-allowed for DESIGN because the user prompt still routes
+    shared-surface wiring through `edit_file`/`append_file`."""
     prompt = interface_designer_prompts.get_system_prompt()
-    assert "then use append_file for each cohesive continuation" in prompt
+    assert "do not split it into chunks or append continuations" in prompt
     assert capability_for("interface_design", "append_file").allowed
     assert all(
         not capability_for(stage, "append_file").allowed
         for stage in STAGES
         if stage != "interface_design"
     )
+    user_prompt = interface_designer_prompts.get_user_prompt(
+        node_id="REQ-1",
+        requirement_data={"id": "REQ-1", "name": "Notes", "description": "Notes list.", "children_ids": []},
+        dynamic_context="",
+    )
+    assert "wire it into those files with `edit_file`/`append_file`" in user_prompt
 
 
 def test_tdd_prompt_delete_channel_statement_matches_table() -> None:
