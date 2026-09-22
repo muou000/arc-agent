@@ -825,6 +825,71 @@ def test_process_reset_db_reports_seed_failure(tmp_path) -> None:
     assert "re-seeding" in note
 
 
+@pytest.mark.slow
+def test_process_ensure_falls_back_to_fresh_start_when_the_wipe_is_refused(tmp_path) -> None:
+    """A real sqlite wipe refusal (trigger schema) must not strand the session.
+
+    The row-level reset refuses schemas with user triggers (a wipe would fire
+    them and diverge from a fresh prepare). On main this refusal was pinned at
+    the web-handler level (`test_falls_back_to_fresh_start_when_schema_has_triggers`);
+    after the extraction the owner is the runtime, so the same scenario is
+    pinned here end to end: a genuinely live server is running against a
+    trigger-schema database, `ensure` hits the refused wipe on the reuse path,
+    tears the stale session down, and still delivers a fresh-started session —
+    the refusal survives only as the cleanup-note reason.
+
+    The whole lifecycle runs in one event loop (an asyncio subprocess is bound
+    to its creating loop; production keeps a session on one loop). The port is
+    a live free one — a fixed port can be held by an unrelated outside
+    process, and the teardown's unknown-owner refusal (correct behavior) would
+    then mask the scenario under test.
+    """
+
+    _require_node()
+    workspace, fingerprint = _make_workspace(tmp_path)
+    (workspace / "backend" / "src" / "index.js").write_text(
+        (
+            "const http = require('http');\n"
+            "http.createServer((req, res) => res.end('ok'))"
+            ".listen(process.env.ARC_WEB_PORT, '127.0.0.1');\n"
+        ),
+        encoding="utf-8",
+    )
+    port = _free_port()
+    env = _build_e2e_runtime_env(str(workspace), ["test-e2e/login.spec.ts"], web_port=port)
+    _make_sqlite(env["ARC_E2E_DB_PATH"])
+    connection = sqlite3.connect(env["ARC_E2E_DB_PATH"])
+    try:
+        connection.execute(
+            "CREATE TRIGGER users_audit AFTER DELETE ON users BEGIN INSERT INTO users (name) VALUES ('ghost'); END"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    runner = _RecordingRunner()
+    runtime = ProcessBackendRuntime(str(workspace), command_runner=runner)
+
+    async def _lifecycle() -> None:
+        # Boot the live server the reuse path will find (with the trigger
+        # schema already in place, so its row-level reset must refuse).
+        first = await runtime.ensure(port, env["ARC_E2E_DB_PATH"], fingerprint, runtime_env=env)
+        assert first.session is not None
+        stale = first.session
+
+        second = await runtime.ensure(port, env["ARC_E2E_DB_PATH"], fingerprint, runtime_env=env)
+
+        # The refusal surfaced as the fallback reason, not as a failure.
+        assert not second.reused
+        assert second.session is not None
+        assert "fell back to a fresh start" in second.cleanup_note
+        assert "trigger" in second.cleanup_note
+        # The stale session was torn down on the way; a fresh one took over.
+        assert second.session is not stale
+
+    asyncio.run(_lifecycle())
+
+
 # --------------------------------------------------------------------------
 # Process adapter teardown
 # --------------------------------------------------------------------------
