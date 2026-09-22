@@ -42,9 +42,18 @@ class ScriptedRunner:
     def __init__(self, results: list[TestRunResult]) -> None:
         self._results = list(results)
         self.calls: list[tuple[str, list[str]]] = []
+        # Parallel to ``calls``: the failed-case filter each call carried
+        # (None = unfiltered full run) - the executor-side seam for #115.
+        self.case_filters: list[list[str] | None] = []
 
-    async def __call__(self, test_type: str, file_paths: list[str]) -> TestRunResult:
+    async def __call__(
+        self,
+        test_type: str,
+        file_paths: list[str],
+        failed_case_names: list[str] | None = None,
+    ) -> TestRunResult:
         self.calls.append((test_type, list(file_paths)))
+        self.case_filters.append(list(failed_case_names) if failed_case_names else None)
         if not self._results:
             raise RuntimeError(
                 f"ScriptedRunner ran out of scripted results after {len(self.calls)} call(s)."
@@ -301,3 +310,116 @@ def test_seed_file_states_reuses_design_baseline(tmp_path: Path) -> None:
     executor.seed_file_states({UNIT_TEST_FILE: "red"})
 
     assert executor.file_states("Unit") == {UNIT_TEST_FILE: "red"}
+
+
+# ---------------------------------------------------------------------------
+# Retry-round case filter (#115): red rounds re-run only the digest's failed
+# cases through the handler seam; the closing round stays full.
+# ---------------------------------------------------------------------------
+
+
+E2E_DIGEST_FAILURE = (
+    "Exit Code: 1\n"
+    "\n"
+    "Running 2 tests using 1 worker\n"
+    "\n"
+    "  1) test-e2e\\register.e2e.spec.js:20:3 › register › rejects invalid input ─────\n"
+    "\n"
+    "    Error: expect(locator).toBeVisible() failed\n"
+    "\n"
+    "    Locator: getByLabel('用户名')\n"
+    "    Expected: visible\n"
+    "\n"
+    "Exit Code: 1\n"
+)
+
+
+def test_retry_round_filters_to_digest_failed_cases(tmp_path: Path) -> None:
+    runner = ScriptedRunner(
+        [
+            run_of(E2E_DIGEST_FAILURE),
+            run_of(E2E_DIGEST_FAILURE),
+            passing_run(),
+            passing_run(),
+        ]
+    )
+    executor = make_executor(tmp_path, runner, manifest(("E2E", "test-e2e/register.e2e.spec.js")))
+    executor.pin_active_layer("E2E")
+
+    first = asyncio.run(executor.run_requested())
+    assert first.exit_code == 1
+    # The first round is a full (unfiltered) run; the next one filters to the
+    # digest's parsed failed case.
+    assert runner.case_filters == [None]
+    second = asyncio.run(executor.run_requested())
+    assert second.exit_code == 1
+    assert runner.case_filters == [None, ["register › rejects invalid input"]]
+
+    # A filtered green round cannot close the layer, and the round after it
+    # runs unfiltered again - only that full green run closes the layer.
+    third = asyncio.run(executor.run_requested())
+    assert third.exit_code == 0
+    assert not executor.layer_passed("E2E")
+    assert "ARC_RETRY_FILTER_NOTE" in third.output
+    # Round 3 was itself filtered (round 2 failed again, so the parsed names
+    # carried over); its green run resets the filter for the closing round.
+    assert runner.case_filters == [
+        None,
+        ["register › rejects invalid input"],
+        ["register › rejects invalid input"],
+    ]
+    fourth = asyncio.run(executor.run_requested())
+    assert fourth.exit_code == 0
+    assert executor.layer_passed("E2E")
+    assert runner.case_filters[-1] is None
+
+
+def test_retry_filter_falls_back_to_full_run(tmp_path: Path) -> None:
+    runner = ScriptedRunner([failing_run(), passing_run()])
+    executor = make_executor(tmp_path, runner, manifest(("E2E", "test-e2e/register.e2e.spec.js")))
+    executor.pin_active_layer("E2E")
+
+    first = asyncio.run(executor.run_requested())
+    assert first.exit_code == 1
+    # The digest parsed nothing (unstructured failure): the retry stays full.
+    second = asyncio.run(executor.run_requested())
+    assert second.exit_code == 0
+    assert runner.case_filters == [None, None]
+    assert executor.layer_passed("E2E")
+
+
+def test_environment_failure_clears_the_retry_filter(tmp_path: Path) -> None:
+    env_digest_failure = E2E_DIGEST_FAILURE + "\nError: Cannot find module 'db-helper'\n"
+    runner = ScriptedRunner([run_of(env_digest_failure), passing_run()])
+    executor = make_executor(tmp_path, runner, manifest(("E2E", "test-e2e/register.e2e.spec.js")))
+    executor.pin_active_layer("E2E")
+
+    first = asyncio.run(executor.run_requested())
+    assert first.exit_code == 1
+    assert first.environment_failure
+    # The workspace-repair contract must revalidate broadly: no filter.
+    second = asyncio.run(executor.run_requested())
+    assert second.exit_code == 0
+    assert runner.case_filters == [None, None]
+
+
+def test_non_e2e_layers_stay_full_even_when_the_digest_parses(tmp_path: Path) -> None:
+    vitest_digest_failure = (
+        "Exit Code: 1\n"
+        "\n=== Backend Vitest Batch ===\n"
+        " FAIL tests/unit/test_calc.py > Calc > adds two numbers\n"
+        "AssertionError: expected 2 got 1\n"
+        "Exit Code: 1\n"
+    )
+    runner = ScriptedRunner([run_of(vitest_digest_failure), passing_run()])
+    executor = make_executor(tmp_path, runner, manifest(("Unit", UNIT_TEST_FILE)))
+    executor.pin_active_layer("Unit")
+
+    first = asyncio.run(executor.run_requested())
+    assert first.exit_code == 1
+    # Per-case filtering is an E2E-runner capability: the unit retry runs
+    # full, and its green run closes the layer directly.
+    second = asyncio.run(executor.run_requested())
+    assert second.exit_code == 0
+    assert runner.case_filters == [None, None]
+    assert executor.layer_passed("Unit")

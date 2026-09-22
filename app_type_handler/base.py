@@ -242,11 +242,19 @@ class AppTypeHandler(ABC):
         """Run one concrete test file through the system-side test executor."""
         raise NotImplementedError
 
-    async def run_test_group(self, test_type: str, file_paths: list[str]) -> TestRunResult:
+    async def run_test_group(
+        self,
+        test_type: str,
+        file_paths: list[str],
+        failed_case_names: list[str] | None = None,
+    ) -> TestRunResult:
         """Run a batch of test files through the system-side test executor.
 
         App types can override this with a real grouped runner. The default
         implementation preserves compatibility by running files one by one.
+        ``failed_case_names`` is the TDD retry round's parsed failed-case list;
+        it only narrows the run for runners that support per-case filtering
+        (the web E2E executor), and this default path always runs full files.
         """
         if not file_paths:
             return TestRunResult(

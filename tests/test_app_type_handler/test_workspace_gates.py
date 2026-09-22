@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -744,7 +745,11 @@ SHIPPED_TEMPLATE_ROOT = (
 def _patched_file_contents(workspace: Path) -> dict[str, str]:
     return {
         name: (workspace / name).read_text(encoding="utf-8")
-        for name in ("backend/src/database/init_db.js", "README.md")
+        for name in (
+            "backend/src/database/init_db.js",
+            "backend/src/database/test_harness.js",
+            "README.md",
+        )
     }
 
 
@@ -774,6 +779,11 @@ def test_post_template_setup_applies_the_shipped_template_fixes(tmp_path, monkey
     assert "function startInit() {" in bootstrap
     assert "return initPromise;" not in bootstrap
 
+    harness = (workspace / "backend" / "src" / "database" / "test_harness.js").read_text(
+        encoding="utf-8"
+    )
+    assert "const scopeDir = path.join(rootDir," in harness
+
 
 def test_shipped_template_fixes_are_idempotent(tmp_path) -> None:
     """A resumed compile must neither re-apply nor rewrite anything."""
@@ -782,11 +792,15 @@ def test_shipped_template_fixes_are_idempotent(tmp_path) -> None:
     shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
 
     first = apply_template_patches(str(workspace), "web-react-express")
-    assert [outcome.status for outcome in first] == [APPLIED, APPLIED]
+    assert [outcome.status for outcome in first] == [APPLIED, APPLIED, APPLIED]
     after_first = _patched_file_contents(workspace)
 
     second = apply_template_patches(str(workspace), "web-react-express")
-    assert [outcome.status for outcome in second] == [ALREADY_APPLIED, ALREADY_APPLIED]
+    assert [outcome.status for outcome in second] == [
+        ALREADY_APPLIED,
+        ALREADY_APPLIED,
+        ALREADY_APPLIED,
+    ]
     assert _patched_file_contents(workspace) == after_first
 
 
@@ -795,7 +809,9 @@ def test_shipped_template_fixes_refuse_an_unknown_shape_atomically(tmp_path) -> 
 
     The unrecognized file must stay byte-for-byte as it was, and a sibling file
     edited by the same patch must not be touched either: a half-applied patch
-    would leave a workspace that is neither the old nor the new state.
+    would leave a workspace that is neither the old nor the new state. An
+    independent patch with intact targets (the harness guard) still applies -
+    one unrecognizable file stops its own patch, not the registration.
     """
 
     workspace = tmp_path / "workspace"
@@ -807,9 +823,33 @@ def test_shipped_template_fixes_refuse_an_unknown_shape_atomically(tmp_path) -> 
 
     outcomes = apply_template_patches(str(workspace), "web-react-express")
 
-    assert [outcome.status for outcome in outcomes] == [UNRECOGNIZED, UNRECOGNIZED]
+    assert [outcome.status for outcome in outcomes] == [
+        UNRECOGNIZED,
+        UNRECOGNIZED,
+        APPLIED,
+    ]
     assert bootstrap.read_text(encoding="utf-8") == "// rewritten upstream\n"
     assert readme.read_text(encoding="utf-8") == readme_before
+
+
+def test_harness_fix_refuses_an_unknown_shape_and_keeps_the_file(tmp_path) -> None:
+    """The harness guard reports an evolved test_harness.js instead of clobbering it.
+
+    The same refusal contract as the bootstrap patches, pinned for their own
+    target file: the unrecognized file stays byte-for-byte as it was while the
+    independent bootstrap patches still apply.
+    """
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
+    harness = workspace / "backend" / "src" / "database" / "test_harness.js"
+    harness.write_text("// rewritten upstream\n", encoding="utf-8")
+
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+
+    assert [outcome.status for outcome in outcomes] == [APPLIED, APPLIED, UNRECOGNIZED]
+    assert "test_harness.js" in outcomes[2].detail
+    assert harness.read_text(encoding="utf-8") == "// rewritten upstream\n"
 
 
 def test_templates_without_registered_fixes_are_untouched(tmp_path) -> None:
@@ -854,6 +894,26 @@ def test_repo_template_tracks_the_official_prefix_shapes() -> None:
     assert "const MAX_INIT_ATTEMPTS" not in mirror
 
 
+def test_repo_template_harness_tracks_the_official_prefix_shape() -> None:
+    """The harness guard patch searches for shapes the official template ships.
+
+    Same drift contract as ``test_repo_template_tracks_the_official_prefix_shapes``
+    pinned for its own target file: the mirror must carry the pre-fix harness -
+    a single mkdir in ``setup()``, no scope directory - or the guard's search
+    shapes no longer match the provisioned template and every online run would
+    report the patch as unrecognized at scaffold time.
+    """
+
+    mirror = (SHIPPED_TEMPLATE_ROOT / "backend" / "src" / "database" / "test_harness.js").read_text(
+        encoding="utf-8"
+    ).replace("\r\n", "\n")
+
+    assert "scopeDir" not in mirror
+    assert "Re-create the root directory before reopening sqlite" not in mirror
+    assert mirror.count("fs.mkdirSync(rootDir, { recursive: true });") == 1
+    assert "    removeRootDirWhenEmpty: true,\n" in mirror
+
+
 def test_patch_dependencies_must_be_registered_in_order() -> None:
     """A dependent registered before its prerequisite is a broken registration.
 
@@ -892,7 +952,11 @@ def test_a_dependent_patch_is_unrecognized_when_its_prerequisite_fails(tmp_path)
 
     outcomes = apply_template_patches(str(workspace), "web-react-express")
 
-    assert [outcome.status for outcome in outcomes] == [UNRECOGNIZED, UNRECOGNIZED]
+    assert [outcome.status for outcome in outcomes] == [
+        UNRECOGNIZED,
+        UNRECOGNIZED,
+        APPLIED,
+    ]
     assert "prerequisite" in outcomes[1].detail
     assert bootstrap.read_text(encoding="utf-8") == "// rewritten upstream\n"
 
@@ -909,9 +973,10 @@ def test_a_template_without_the_target_files_skips_instead_of_failing(tmp_path) 
 
     outcomes = apply_template_patches(str(workspace), "web-react-express")
 
-    assert [outcome.status for outcome in outcomes] == [SKIPPED, SKIPPED]
+    assert [outcome.status for outcome in outcomes] == [SKIPPED, SKIPPED, SKIPPED]
     assert "no target files" in outcomes[0].detail
     assert "prerequisite" in outcomes[1].detail
+    assert "no target files" in outcomes[2].detail
 
 
 def test_post_template_setup_fails_when_a_patch_cannot_be_classified(tmp_path) -> None:
@@ -960,7 +1025,11 @@ def test_shipped_template_fixes_recognize_a_crlf_copy_that_already_has_them(tmp_
 
     workspace = tmp_path / "workspace"
     shutil.copytree(SHIPPED_TEMPLATE_ROOT, workspace)
-    for name in ("backend/src/database/init_db.js", "README.md"):
+    for name in (
+        "backend/src/database/init_db.js",
+        "backend/src/database/test_harness.js",
+        "README.md",
+    ):
         path = workspace / name
         path.write_text(
             path.read_text(encoding="utf-8").replace("\n", "\r\n"),
@@ -969,10 +1038,14 @@ def test_shipped_template_fixes_recognize_a_crlf_copy_that_already_has_them(tmp_
         )
 
     first = apply_template_patches(str(workspace), "web-react-express")
-    assert [outcome.status for outcome in first] == [APPLIED, APPLIED]
+    assert [outcome.status for outcome in first] == [APPLIED, APPLIED, APPLIED]
 
     second = apply_template_patches(str(workspace), "web-react-express")
-    assert [outcome.status for outcome in second] == [ALREADY_APPLIED, ALREADY_APPLIED]
+    assert [outcome.status for outcome in second] == [
+        ALREADY_APPLIED,
+        ALREADY_APPLIED,
+        ALREADY_APPLIED,
+    ]
 
 
 def test_fix_markers_are_single_lines_so_line_endings_cannot_hide_them() -> None:
@@ -1001,7 +1074,11 @@ def test_shipped_template_fixes_refuse_a_half_repaired_file(tmp_path) -> None:
 
     outcomes = apply_template_patches(str(workspace), "web-react-express")
 
-    assert [outcome.status for outcome in outcomes] == [UNRECOGNIZED, UNRECOGNIZED]
+    assert [outcome.status for outcome in outcomes] == [
+        UNRECOGNIZED,
+        UNRECOGNIZED,
+        APPLIED,
+    ]
     assert "init_db.js" in outcomes[0].detail
     assert bootstrap.read_text(encoding="utf-8") == pre_fix_with_stray_marker
 
@@ -1026,7 +1103,11 @@ def test_shipped_template_fixes_leave_no_trace_when_staging_fails(
 
     def flaky_write(path: str, text: str) -> None:
         written.append(path)
-        if len(written) == 1:
+        # Fail the first staging write of every patch that reaches one: the
+        # bootstrap chain (init_db.js) and the harness guard (test_harness.js).
+        # Staged paths carry the `.arc-patch-tmp` suffix, hence the substring
+        # match.
+        if any(name in os.path.basename(path) for name in ("init_db.js", "test_harness.js")):
             raise OSError("disk full")
         real_write(path, text)
 
@@ -1034,6 +1115,10 @@ def test_shipped_template_fixes_leave_no_trace_when_staging_fails(
 
     outcomes = apply_template_patches(str(workspace), "web-react-express")
 
-    assert [outcome.status for outcome in outcomes] == [UNRECOGNIZED, UNRECOGNIZED]
+    assert [outcome.status for outcome in outcomes] == [
+        UNRECOGNIZED,
+        UNRECOGNIZED,
+        UNRECOGNIZED,
+    ]
     assert _patched_file_contents(workspace) == before
     assert list(workspace.rglob("*.arc-patch-tmp")) == []

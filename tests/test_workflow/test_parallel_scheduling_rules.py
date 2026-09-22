@@ -12,6 +12,8 @@ from __future__ import annotations
 from core.config import build_web_runtime_env, get_web_base_url
 from core.workflow import (
     ARCWorkflowManager,
+    NODE_FAILED,
+    NODE_IMPLEMENTING,
     PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS,
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
@@ -20,6 +22,7 @@ from core.workflow import (
     TASK_PENDING,
     TASK_RUNNING,
 )
+from tests.test_workflow.queue_faker import queue_with_states, settle
 from app_type_handler.web import _build_e2e_runtime_env, _build_web_group_execution
 
 
@@ -28,7 +31,11 @@ def _task(node_id: str, phase: str, status: str = TASK_PENDING, order: int = 0) 
 
 
 def _queue(tasks: list[dict], descendants: dict[str, list[str]]) -> dict:
-    return {"tasks": tasks, "descendants": descendants}
+    # The typed queue derives task statuses from node states; the helper
+    # converts the task statuses above into the equivalent node maps.
+    queue = queue_with_states(tasks)
+    queue["descendants"] = descendants
+    return queue
 
 
 def _tree() -> dict:
@@ -561,7 +568,7 @@ def test_implement_requires_a_successful_dependency() -> None:
     queue["dependencies"] = {"RB": ["RA"]}
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
 
-    queue["tasks"][0]["status"] = TASK_FAILED
+    settle(queue, "RA", NODE_FAILED)
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
@@ -597,7 +604,7 @@ def test_design_requires_a_successful_dependency() -> None:
     queue["dependencies"] = {"RB": ["RA"]}
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
 
-    queue["tasks"][1]["status"] = TASK_FAILED
+    settle(queue, "RA", NODE_FAILED)
     assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
@@ -654,8 +661,8 @@ def test_next_affinity_task_prefers_a_group_other_groups_depend_on() -> None:
     pick = ARCWorkflowManager._next_affinity_task(queue, [])
 
     assert pick["node_id"] == "RB1", "the larger independent group still goes first while it outweighs the hub"
-    queue["tasks"][0]["status"] = TASK_RUNNING
-    queue["tasks"][1]["status"] = TASK_RUNNING
+    settle(queue, "RB1", NODE_IMPLEMENTING, design_done=True)
+    settle(queue, "RB2", NODE_IMPLEMENTING, design_done=True)
     pick = ARCWorkflowManager._next_affinity_task(queue, [queue["tasks"][0], queue["tasks"][1]])
 
     assert pick["node_id"] == "RA", "1 own + 2 dependent pending tasks outweigh the remaining independent group"

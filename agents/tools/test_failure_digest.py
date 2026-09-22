@@ -294,6 +294,22 @@ def build_test_edit_stall_hint(
     )
 
 
+def digest_failed_test_names(digest: dict[str, Any]) -> list[str]:
+    """Return the non-empty failed-test names a parsed digest carries, in order.
+
+    The layer-retry case filter consumes this list. An empty result means the
+    digest recognized no per-test structure in the output, and the caller must
+    fall back to running the full layer instead of filtering.
+    """
+
+    names: list[str] = []
+    for item in digest.get("failed_tests") or []:
+        name = str((item or {}).get("name", "") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
 def format_failure_digest(
     digest: dict[str, Any],
     *,
