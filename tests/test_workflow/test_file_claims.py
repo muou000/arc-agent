@@ -267,14 +267,18 @@ def test_middleware_without_gate_keeps_historical_behaviour() -> None:
 
 def test_discipline_rejection_does_not_claim_the_path() -> None:
     registry = FileClaimRegistry("unused-root")
-    # The path is untracked, but the interface_design skeleton-line limit
-    # rejects the write before the claim gate records ownership.
+    # The path is untracked, but the interface_design mutation sniff rejects
+    # the write before the claim gate records ownership (the per-write line
+    # limit that used to trigger this rejection was removed in issue #158).
     middleware = StageDisciplineMiddleware(
         stage="interface_design",
         file_claim_gate=make_gate(registry, "REQ-1", tracked=set()),
     )
-    big_write = {"file_path": "/workspace/frontend/big.ts", "content": "\n".join(f"line {i}" for i in range(400))}
-    result = middleware.wrap_tool_call(make_request("write_file", big_write), ok_tool)
+    mutating_write = {
+        "file_path": "/workspace/frontend/repository.ts",
+        "content": "export function createNote(db, note) {\n  return db.insert(note);\n}\n",
+    }
+    result = middleware.wrap_tool_call(make_request("write_file", mutating_write), ok_tool)
     assert isinstance(result, ToolMessage) and result.status == "error"
-    assert "small skeletons" in result.content
-    assert registry.claim("frontend/big.ts", "REQ-2") is None, "the rejected write claimed nothing"
+    assert "contract skeletons" in result.content
+    assert registry.claim("frontend/repository.ts", "REQ-2") is None, "the rejected write claimed nothing"
