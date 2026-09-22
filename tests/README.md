@@ -66,6 +66,10 @@ python -m pytest -p no:anyio
 python -m pytest -p no:anyio -n0 -m "not slow"   # 串行运行快速路径
 ```
 
+invalid escape 序列（如 `"\d"`、`"\/"`）由 `pytest.ini` 的 `filterwarnings =
+error::SyntaxWarning` 全局拦截，测试模块在收集期直接报错，不再依赖逐模块
+钉子测试；该门禁不覆盖 pytest 启动阶段（conftest 链顶层导入）的编译告警。
+
 也可以使用 Make 目标：
 
 ```bash
