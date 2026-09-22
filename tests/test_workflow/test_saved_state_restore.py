@@ -23,8 +23,10 @@ from core.queue_state import (
     NODE_CONVERGED,
     NODE_CONVERGED_WITH_FAILED_CHILDREN,
     NODE_DESIGNED,
+    NODE_DESIGNING,
     NODE_FAILED,
     NODE_PASSED,
+    NODE_UNSEEN,
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
     TASK_BLOCKED,
@@ -32,8 +34,10 @@ from core.queue_state import (
     TASK_FAILED,
     TASK_PENDING,
     TASK_RUNNING,
+    begin_task,
     load_or_create_queue,
     recover_interrupted,
+    save_queue,
     task_status,
 )
 
@@ -312,6 +316,77 @@ def test_migration_lifts_legacy_running_task_into_an_interrupted_state(tmp_path:
     assert [record["node_id"] for record in recovered] == ["RA"]
     assert recovered[0]["phase"] == PHASE_IMPLEMENT
     assert queue["node_states"]["RA"] == NODE_DESIGNED
+
+
+def test_begin_task_records_last_task_id_and_in_flight_state() -> None:
+    """begin_task owns last_task_id (the resume pointer) and moves the node
+    into the phase's in-flight state (PR review: pin what the workflow
+    wrapper delegates)."""
+    queue_state = _queue_state(NODE_UNSEEN)
+    task = queue_state["tasks"][0]
+
+    begin_task(queue_state, task)
+
+    assert queue_state["last_task_id"] == "R:DESIGN"
+    assert queue_state["node_states"]["R"] == NODE_DESIGNING
+    assert task["status"] == TASK_RUNNING
+
+
+def test_save_queue_writes_the_derived_status_projection(tmp_path: Path) -> None:
+    """tasks[*].status in the file is the derived projection, not a stale
+    in-memory value (PR review: pin the save-side half of the projection
+    contract that core.evals reads)."""
+    queue_state = _queue_state(NODE_DESIGNED)
+    # Simulate a stale in-memory task status to prove the file projection
+    # is derived, never copied.
+    queue_state["tasks"][1]["status"] = "STALE"
+
+    save_queue(queue_state, str(tmp_path / ".arc" / "processing_queue.json"))
+
+    persisted = json.loads((tmp_path / ".arc" / "processing_queue.json").read_text(encoding="utf-8"))
+    assert [task["status"] for task in persisted["tasks"]] == [
+        TASK_COMPLETED,
+        TASK_PENDING,
+    ]
+
+
+def test_node_maps_from_tasks_round_trips_the_task_status_projection() -> None:
+    """The test helper's inverse mapping stays aligned with the production
+    projection (PR review: enforce the inverse contract). Terminal-success
+    states deliberately collapse to PASSED: the inverse cannot distinguish
+    them from task statuses alone."""
+    from tests.test_workflow.queue_faker import node_maps_from_tasks
+
+    equivalence = {
+        NODE_PASSED: NODE_PASSED,
+        NODE_CONVERGED: NODE_PASSED,
+        NODE_CONVERGED_WITH_FAILED_CHILDREN: NODE_PASSED,
+    }
+    cases = [
+        ("UNSEEN", False),
+        ("DESIGNING", False),
+        (NODE_DESIGNED, True),
+        ("IMPLEMENTING", True),
+        (NODE_PASSED, True),
+        (NODE_CONVERGED, True),
+        (NODE_CONVERGED_WITH_FAILED_CHILDREN, True),
+        (NODE_FAILED, True),
+        (NODE_FAILED, False),
+        ("BLOCKED_BY_DEPENDENCY", True),
+        ("BLOCKED_BY_DEPENDENCY", False),
+    ]
+    for state, design_done in cases:
+        queue_state = _queue_state(state, design_done=design_done)
+        tasks = [
+            {**task, "status": task_status(queue_state, task)}
+            for task in queue_state["tasks"]
+        ]
+
+        states, done = node_maps_from_tasks(tasks)
+
+        expected_state = equivalence.get(state, state)
+        assert states == {"R": expected_state}, (state, design_done, states)
+        assert done == {"R": design_done}, (state, design_done, done)
 
 
 def test_migration_of_legacy_states_is_idempotent_on_a_second_load(tmp_path: Path) -> None:

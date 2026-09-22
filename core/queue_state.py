@@ -76,6 +76,14 @@ _DESIGN_FINISHED_STATES = frozenset(
 
 # Called after every node-state write so the traceability ``node_states``
 # table stays current; the queue module itself stays runtime-agnostic.
+#
+# Callback contract: the module invokes it only AFTER it has written the
+# node state and re-synced that node's task-status projection, so the
+# callback observes a fully consistent queue. The callback must not
+# mutate ``queue_state``: the transition walkers (block propagation,
+# release, recovery) iterate over it to a fixpoint and re-derive every
+# decision from it, so a re-entrant write would corrupt the walk. It is
+# for runtime-side effects only (traceability writes, event marks).
 StateChangeCallback = Callable[[str, str], None]
 
 

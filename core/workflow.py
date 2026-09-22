@@ -1482,10 +1482,10 @@ class ARCWorkflowManager:
                 conflict_paths=conflict_paths,
                 on_state_change=self._upsert_node_state,
             )
-        except ValueError:
+        except ValueError as exc:
             await self._log(
                 "Compiler",
-                f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete.",
+                f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete ({exc}).",
                 "error",
                 node_id,
             )
@@ -1590,10 +1590,10 @@ class ARCWorkflowManager:
                 conflict_paths=conflict_paths,
                 on_state_change=self._upsert_node_state,
             )
-        except ValueError:
+        except ValueError as exc:
             await self._log(
                 "Compiler",
-                f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete.",
+                f"Re-queueing {node_id} after its merge conflict failed: its queue tasks are incomplete ({exc}).",
                 "error",
                 node_id,
             )
@@ -1713,7 +1713,13 @@ class ARCWorkflowManager:
                 plan = reset_node_for_retry(
                     queue_state, node_id, on_state_change=self._upsert_node_state
                 )
-            except ValueError:
+            except ValueError as exc:
+                await self._log(
+                    "Compiler",
+                    f"[tdd-retry] {node_id} stays failed without a retry: {exc}",
+                    "warning",
+                    node_id,
+                )
                 continue
             self._apply_reset_side_effects(node_id, plan)
             retry_node_ids.append(node_id)
