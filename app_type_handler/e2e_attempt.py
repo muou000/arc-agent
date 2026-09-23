@@ -4,9 +4,8 @@ The full per-attempt pipeline used to live on ``WebAppType``: a private
 attempt method with the frontend-build verdict, the served-artifact verdicts,
 the failure-body renderer, the Playwright command assembly and the stage
 timer scattered around it in the same file. This module owns all of it, so
-``run_test_group``'s e2e branch is a thin app-type adapter that launches
-attempts (and, on the dead-static-host signature, the one recovery re-run)
-instead of hosting the pipeline.
+``run_test_group``'s e2e branch is a thin app-type adapter that launches one
+group call instead of hosting the pipeline.
 
 The interface follows the ``BackendRuntime`` precedent - policy in the
 module, mechanics injected:
@@ -21,10 +20,15 @@ module, mechanics injected:
 Output bodies are byte-for-byte the pre-extraction assemblies; the move is
 mechanical and every rendering quirk (section order, blank-line counts, the
 backend-startup body's Database-Prepare-before-runtime-env order) is
-preserved on purpose. Deliberately out of scope here: the SPA static-host
-recovery orchestration and the cleanup-failure verdict flip still live in the
-web handler's ``run_test_group`` - they consume this module's failure
-signature detector and read the stage timing through the runner.
+preserved on purpose. Attempt-level recovery policy lives here as well:
+``E2EAttemptRunner.run_group`` detects the dead-static-host signature, spends
+the one-shot recovery budget (forced rebuild + backend restart + re-run,
+rendered with the failed attempt as a superseded appendix), and flips a
+green attempt whose backend-runtime cleanup failed to a failure. The web
+handler holds no attempt-level state: it builds one runner per handler
+instance and reuses it across ``run_test_group`` calls, so the one-shot
+recovery budget spans the handler's lifetime exactly like the
+pre-extraction handler flag did.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -48,6 +53,8 @@ from .backend_runtime import (
 )
 from .test_results import TestRunResult, parse_test_run
 from core.config import build_web_runtime_env
+
+logger = logging.getLogger(__name__)
 
 # The single timeout source for the E2E test-runner command (the Playwright
 # batch). The helper's own npm-script invocations inside the E2E attempt
@@ -561,8 +568,14 @@ def _render_e2e_failure_body(
 
 
 # ---------------------------------------------------------------------------
-# The attempt runner: one attempt, one call
+# The attempt runner: one attempt, one call; one group, its recovery policy
 # ---------------------------------------------------------------------------
+
+
+# Marker carried by a backend-runtime cleanup that itself failed (the teardown
+# exception note). A run whose cleanup failed is a failure for the agent even
+# when the tests passed, so the exit verdict flips when this marker is present.
+_CLEANUP_FAILURE_MARKER = "Backend runtime cleanup failed:"
 
 
 @dataclass
@@ -571,7 +584,7 @@ class E2EAttemptOutcome:
 
     ``backend_cleanup_note`` is the accumulated cleanup evidence (the prior
     attempt's note plus this attempt's stale-session teardown) — the material
-    a recovery re-run carries forward and the handler's verdict flips read.
+    a recovery re-run carries forward and the group-level verdict flips read.
     """
 
     result: TestRunResult
@@ -592,10 +605,24 @@ class E2EAttemptRunner:
     mechanics injected: the session lifecycle arrives as a ``BackendRuntime``
     (the process adapter in production, ``InMemoryBackendRuntime`` in tests);
     the shell-command edge is the module-level ``_execute_web_test_command``
-    runner, stubbed on this module by tests. One runner per ``run_test_group``
-    call: the stage timer it owns accumulates across the call's attempts so a
-    recovery re-run reports cumulative costs, exactly like the pre-extraction
-    pipeline.
+    runner, stubbed on this module by tests.
+
+    Attempt-level recovery policy lives here too:
+
+    - ``run_group`` is the one entry ``run_test_group``'s e2e branch calls.
+      It launches the first attempt and, when that attempt dies on the dead
+      static-host signature, spends the one-shot recovery budget (forced
+      rebuild + backend restart + re-run) and renders the retried body with
+      the failed attempt as a superseded appendix;
+    - the recovery budget is per runner instance. The web handler builds one
+      runner per handler and reuses it across ``run_test_group`` calls, so
+      the one-shot semantics match the pre-extraction handler flag exactly;
+    - a green attempt whose backend-runtime cleanup failed is flipped to a
+      failure, on the recovery path and the plain path alike.
+
+    One runner per ``run_test_group`` call would reset the budget per call;
+    the handler therefore caches the runner (see ``WebAppType``), and tests
+    drive the same runner the handler drives.
     """
 
     def __init__(self, workspace_path: str, *, backend_runtime: BackendRuntime) -> None:
@@ -608,6 +635,11 @@ class E2EAttemptRunner:
         # still surface it: an attempt that dies mid-acquisition has already
         # paid stale teardowns whose notes must reach the failure body.
         self._cleanup_note = ""
+        # One-shot budget for the SPA static-host self-heal (dead `send`
+        # NotFoundError in a sendFile frame): a second occurrence of the same
+        # signature means the rebuild did not cure it, and the failure must go
+        # to the agent instead of looping system-side.
+        self._spa_static_host_recovery_used: bool = False
 
     def accumulated_cleanup_note(self) -> str:
         """The cleanup evidence gathered across this runner's attempts so far.
@@ -625,6 +657,12 @@ class E2EAttemptRunner:
             return f"{self._cleanup_note}\n{runtime_note}"
         return self._cleanup_note or runtime_note
 
+    @property
+    def spa_static_host_recovery_used(self) -> bool:
+        """Whether the one-shot dead-static-host recovery budget is spent."""
+
+        return self._spa_static_host_recovery_used
+
     def render_stage_timing(self) -> str:
         """The stage-timing block accumulated so far.
 
@@ -633,6 +671,112 @@ class E2EAttemptRunner:
         """
 
         return self._stage_timer.render()
+
+    async def run_group(
+        self,
+        execution: dict[str, str],
+        resolved_port: int,
+    ) -> TestRunResult:
+        """Run the group's attempts: one attempt plus at most one recovery.
+
+        This is the whole attempt-level recovery policy: signature detection,
+        the one-shot budget, the forced-rebuild retry, the superseded-appendix
+        rendering and the cleanup-failure verdict flips (both the retried
+        attempt's own flip and the group-level flip across both attempts'
+        cleanup notes). The caller only decides whether to launch a group.
+        """
+
+        try:
+            attempt = await self.run_attempt(
+                execution,
+                resolved_port,
+                force_rebuild=False,
+                prior_cleanup_note="",
+            )
+        except Exception as exc:
+            return TestRunResult(
+                exit_code=1,
+                output=(
+                    f"Failed to start grouped E2E execution: {str(exc)}"
+                    + self.render_stage_timing()
+                ),
+            )
+        result = attempt.result
+        backend_cleanup_note = attempt.backend_cleanup_note
+
+        # Self-heal the dead static host once (the 2026-09-20 arc-output1 run
+        # burned 22 agent minutes on this failure): the backend could not stat
+        # an artifact the build cache vouched for, so distrust the cache and
+        # the live runtime this once — force a rebuild, restart the backend,
+        # rerun the batch. The retried body leads; the failed attempt survives
+        # as a superseded appendix for the failure evidence.
+        retried_cleanup_note = backend_cleanup_note
+        if (
+            result.exit_code != 0
+            and not self._spa_static_host_recovery_used
+            and _is_spa_static_host_failure(result.output)
+        ):
+            self._spa_static_host_recovery_used = True
+            logger.info(
+                "E2E failure matches the SPA static-host signature (send NotFoundError in sendFile); "
+                "forcing one frontend rebuild + backend restart retry."
+            )
+            recovery_note = await self._backend_runtime.terminate(
+                "SPA static-host recovery cleanup"
+            )
+            try:
+                retried_attempt = await self.run_attempt(
+                    execution,
+                    resolved_port,
+                    force_rebuild=True,
+                    prior_cleanup_note=recovery_note or backend_cleanup_note,
+                )
+                retried_result = retried_attempt.result
+                retried_cleanup_note = retried_attempt.backend_cleanup_note
+            except Exception as exc:
+                retried_result = TestRunResult(
+                    exit_code=1,
+                    output=(
+                        f"Failed to retry grouped E2E execution after SPA static-host recovery: {str(exc)}"
+                        + self.render_stage_timing()
+                    ),
+                )
+            # Same self-check the non-recovery path applies below, on the
+            # retried attempt alone: a retried pass whose cleanup failed is
+            # still a failure for the agent.
+            if _CLEANUP_FAILURE_MARKER in retried_cleanup_note and retried_result.exit_code == 0:
+                retried_result.exit_code = 1
+                retried_result.output = retried_result.output.replace("Exit Code: 0", "Exit Code: 1", 1)
+            # The retried attempt leads so exit-code parsing and the agent both
+            # read the retried verdict first; the failed attempt survives as an
+            # appendix for the failure evidence (the NotFoundError stack).
+            first_attempt_exit = result.exit_code
+            appendix = result.output
+            appendix = appendix.replace(
+                f"Exit Code: {first_attempt_exit}",
+                f"Exit Code (superseded by the recovery retry): {first_attempt_exit}",
+                1,
+            )
+            retried_result.output = (
+                f"{retried_result.output.rstrip()}\n\n"
+                f"=== SPA Static-Host Recovery Retry ===\n"
+                "The first attempt of this batch failed with the dead static-host signature "
+                "(the backend could not stat `frontend/dist/index.html` at request time "
+                "even though the build cache vouched for it). The system forced one "
+                "frontend rebuild and backend restart, then re-ran the batch; the result "
+                "above is the retried attempt.\n\n"
+                "First attempt (superseded, kept for the failure evidence):\n\n"
+                f"{appendix}"
+            )
+            result = retried_result
+
+        if (
+            _CLEANUP_FAILURE_MARKER in (backend_cleanup_note + "\n" + retried_cleanup_note)
+            and result.exit_code == 0
+        ):
+            result.exit_code = 1
+            result.output = result.output.replace("Exit Code: 0", "Exit Code: 1", 1)
+        return result
 
     async def run_attempt(
         self,
@@ -644,16 +788,16 @@ class E2EAttemptRunner:
     ) -> E2EAttemptOutcome:
         """Run one grouped E2E attempt end to end and return its outcome.
 
-        ``run_test_group`` calls this once, and a second time with
+        ``run_group`` calls this once, and a second time with
         ``force_rebuild=True`` when the first attempt died on the SPA
         static-host signature (see the recovery block there). The runtime env
         is rebuilt per attempt so each carries its own database label.
 
-        Raises on unexpected execution errors — the caller renders them with
-        :meth:`render_stage_timing`, and its fallback message differs per call
-        site (the recovery re-run's fallback names the retry). The outcome's
-        ``backend_cleanup_note`` lets the recovery re-run carry the teardown
-        evidence of the attempt before it.
+        Raises on unexpected execution errors — the group-level caller renders
+        them with :meth:`render_stage_timing`, and its fallback message
+        differs per call site (the recovery re-run's fallback names the
+        retry). The outcome's ``backend_cleanup_note`` lets the recovery
+        re-run carry the teardown evidence of the attempt before it.
         """
 
         build = await self._stage_timer.measure(

@@ -275,8 +275,8 @@ def test_dead_static_host_triggers_exactly_one_recovery(tmp_path, monkeypatch) -
     # The overall exit code comes from the retried (passing) attempt.
     assert result.exit_code == 0
     assert "all green" in result.output
-    # The one-shot budget is spent for this handler instance.
-    assert handler._spa_static_host_recovery_used is True
+    # The one-shot budget is spent on the runner the handler drives.
+    assert handler._e2e_attempt_runner_or_default().spa_static_host_recovery_used is True
 
 
 def test_plain_not_found_failure_gets_no_recovery(tmp_path, monkeypatch) -> None:
@@ -306,7 +306,7 @@ def test_plain_not_found_failure_gets_no_recovery(tmp_path, monkeypatch) -> None
     assert recorder.playwright_calls == 1
     assert runtime.started == [4321]
     assert "SPA Static-Host Recovery Retry" not in result.output
-    assert handler._spa_static_host_recovery_used is False
+    assert handler._e2e_attempt_runner_or_default().spa_static_host_recovery_used is False
     assert result.exit_code == 1
 
 
@@ -342,7 +342,7 @@ def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
-    assert handler._spa_static_host_recovery_used is True
+    assert handler._e2e_attempt_runner_or_default().spa_static_host_recovery_used is True
     assert recorder.playwright_calls == 2  # first attempt + one recovery re-run
 
     asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))

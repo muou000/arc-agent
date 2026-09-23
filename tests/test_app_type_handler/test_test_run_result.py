@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from app_type_handler import e2e_attempt
 from app_type_handler import web as web_handler
 from app_type_handler import e2e_attempt
 from app_type_handler.backend_runtime import InMemoryBackendRuntime, _CommandResult
@@ -137,6 +138,9 @@ def test_e2e_result_carries_build_and_served_verdicts(tmp_path, monkeypatch) -> 
             "npx playwright test": (1, _VITEST_FAILURE_OUTPUT),
         }
     )
+    # The E2E attempt pipeline's command edge (frontend build + Playwright)
+    # lives on the attempt module; the handler's own edge serves only the
+    # Vitest batch paths.
     monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", commands)
     dist_dir = workspace / "frontend" / "dist"
     dist_dir.mkdir(parents=True)
