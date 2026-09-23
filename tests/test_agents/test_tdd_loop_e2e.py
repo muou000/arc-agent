@@ -363,6 +363,104 @@ def test_run_implement_phase_marks_node_completed(tmp_project_dir: Path, arc_run
     assert fake.shutdown_calls == 1
 
 
+def _zero_test_leaf_events(runtime) -> list[dict]:
+    return [
+        event
+        for event in read_jsonl(runtime.paths.runner_events_path)
+        if event["type"] == "zero_test_leaf"
+    ]
+
+
+def test_zero_test_leaf_with_owned_interfaces_emits_observation_event(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """Leaf + owned interfaces + empty manifest: TDD is skipped, the event
+    records the shape, and the empty manifest stays legal (issue #187)."""
+    node_id = "REQ-TDD-ZERO"
+    seed_node(arc_runtime, node_id, [])
+    arc_runtime.traceability.upsert_interface(
+        interface_id="IF-SHELL",
+        req_ids=[node_id],
+        type="UI",
+        content='{"interface_id": "IF-SHELL", "name": "shell"}',
+        file_path="src/Shell.tsx",
+        first_line="export function Shell() {",
+        implemented=False,
+        callers=[],
+        callees=[],
+    )
+    sessions.merge_node_session(
+        node_id, {"test_summary": "Pure visual shell; no local behavior to test."}
+    )
+    fake = FakeAppHandler()
+    runner = make_runner(
+        tmp_project_dir, make_tdd(tmp_project_dir, FauxChatModel(responses=[]), fake), fake
+    )
+
+    ok = asyncio.run(runner.run_implement_phase(node_id, {"children_ids": []}))
+
+    assert ok is True
+    events = _zero_test_leaf_events(arc_runtime)
+    assert len(events) == 1
+    assert events[0]["node_id"] == node_id
+    assert events[0]["interface_count"] == 1
+    assert events[0]["summary"] == "Pure visual shell; no local behavior to test."
+    # Legality unchanged: no gate, no retry — the node completes without any
+    # TDD session and its owned interface is marked implemented.
+    assert arc_runtime.traceability.get_interface("IF-SHELL")["implemented"] is True
+    assert sessions.load_node_session(node_id)["phase_status"]["implement"] == "completed"
+    assert fake.calls == []
+
+
+def test_zero_test_leaf_without_owned_interfaces_emits_no_event(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A leaf with no interfaces is the legal visual-only shape; it must not
+    be flagged (issue #187)."""
+    node_id = "REQ-TDD-VISUAL"
+    seed_node(arc_runtime, node_id, [])
+    fake = FakeAppHandler()
+    runner = make_runner(
+        tmp_project_dir, make_tdd(tmp_project_dir, FauxChatModel(responses=[]), fake), fake
+    )
+
+    ok = asyncio.run(runner.run_implement_phase(node_id, {"children_ids": []}))
+
+    assert ok is True
+    assert _zero_test_leaf_events(arc_runtime) == []
+
+
+def test_non_leaf_implement_emits_no_zero_test_event(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """Composition nodes complete directly after interface materialization;
+    their zero-test state is structural, not an observation target."""
+    node_id = "REQ-TDD-PARENT"
+    seed_node(arc_runtime, node_id, [])
+    arc_runtime.traceability.upsert_interface(
+        interface_id="IF-PARENT",
+        req_ids=[node_id],
+        type="FUNC",
+        content='{"interface_id": "IF-PARENT", "name": "compose"}',
+        file_path="src/compose.py",
+        first_line="def compose():",
+        implemented=False,
+        callers=[],
+        callees=[],
+    )
+    fake = FakeAppHandler()
+    runner = make_runner(
+        tmp_project_dir, make_tdd(tmp_project_dir, FauxChatModel(responses=[]), fake), fake
+    )
+
+    ok = asyncio.run(
+        runner.run_implement_phase(node_id, {"children_ids": ["REQ-TDD-PARENT-1"]})
+    )
+
+    assert ok is True
+    assert _zero_test_leaf_events(arc_runtime) == []
+
+
 # ---------------------------------------------------------------------------
 # Adapter-level guard: IMPLEMENTED without a passing run_tests is rejected
 # ---------------------------------------------------------------------------

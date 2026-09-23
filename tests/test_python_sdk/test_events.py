@@ -573,6 +573,40 @@ class TestStraySweepEvents:
         assert lines[0]["message"] is None
 
 
+class TestZeroTestLeafEvents:
+    """Pin the ``zero_test_leaf`` schema: the observation-only event for leaf
+    nodes that own interface contracts yet registered an empty test manifest
+    (issue #187). The event records the shape for later gating decisions —
+    no gate, no retry; an empty manifest stays a legal DESIGN result."""
+
+    def test_record_zero_test_leaf_writes_canonical_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_zero_test_leaf(
+            node_id=" REQ-3 ",
+            interface_count=2,
+            summary="Node renders a static chart; no local behavior to test.",
+        )
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "zero_test_leaf",
+            "node_id": "REQ-3",
+            "interface_count": 2,
+            "summary": "Node renders a static chart; no local behavior to test.",
+            "timestamp": lines[0]["timestamp"],
+        }
+
+    def test_defaults_and_invalid_values_are_normalized(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_zero_test_leaf(node_id="REQ-3", interface_count=-3)
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["interface_count"] == 0
+        assert lines[0]["summary"] is None
+
+
 class TestTraceabilityRowEvents:
     """Pin the row-event schemas ``TraceabilityStore`` emits through the
     public channel (issue #163): the payload mirrors the persisted row and

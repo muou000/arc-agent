@@ -296,7 +296,7 @@ class WorkflowPhaseRunner:
         )
 
         await self._log("TestGenerator", "Generating tests from agent-selected coverage strategy.", node_id=node_id)
-        tests, _ = await self.test_generator.run(
+        tests, testgen_output = await self.test_generator.run(
             node_id=node_id,
             requirement_data=requirement_data,
         )
@@ -308,6 +308,9 @@ class WorkflowPhaseRunner:
                 node_id=node_id,
             )
             return False
+        # The model's own reason prose; the IMPLEMENT zero-test observation
+        # event quotes it when this node ends up implementing without tests.
+        testgen_summary_text = testgen_summary(testgen_output)
 
         try:
             stored_tests = self.registry.prepare_tests(node_id=node_id, tests=tests)
@@ -397,6 +400,7 @@ class WorkflowPhaseRunner:
             {
                 "interfaces": prepared_interfaces,
                 "test_artifacts": stored_tests,
+                "test_summary": testgen_summary_text,
                 "phase_status": {"design": "completed", "test": "completed"},
                 "design_baseline": baseline["file_state"],
             },
@@ -442,6 +446,18 @@ class WorkflowPhaseRunner:
         interfaces = self.traceability.list_interfaces(req_id=node_id)
         tests = self.traceability.list_tests(req_id=node_id)
         if not tests:
+            if interfaces:
+                # Observation-only (issue #187): a leaf node that owns
+                # interface contracts but registered zero tests skips TDD
+                # below. An empty manifest is a legal DESIGN result (the
+                # baseline gate's "no tests" early return), so this stays a
+                # pure observation — no gate, no retry — until run data says
+                # whether the shape deserves a gate.
+                self.events.record_zero_test_leaf(
+                    node_id=node_id,
+                    interface_count=len(interfaces),
+                    summary=str(sessions.load_node_session(node_id).get("test_summary") or "").strip() or None,
+                )
             await self._log(
                 "TestDrivenDeveloper",
                 "No node-local tests were registered; skipping TDD implementation for this node.",
@@ -1913,6 +1929,25 @@ def summarize_batch_output(batch_output: str, max_lines: int = 30) -> str:
     if len(lines) > max_lines:
         lines = ["...[truncated]", *lines[-max_lines:]]
     return "\n".join(lines)
+
+
+def testgen_summary(output_text: str | None) -> str:
+    """Extract the TestGenerator response's own ``summary`` prose.
+
+    ``run`` returns the raw payload re-serialized as JSON; the ``summary``
+    field is the model's reason text (the empty-manifest rationale a
+    zero-test leaf event quotes, issue #187). Unreadable payloads yield ""
+    rather than failing the phase that produced them.
+    """
+    if not output_text:
+        return ""
+    try:
+        payload = json.loads(output_text)
+    except ValueError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("summary") or "").strip()
 
 
 
