@@ -65,7 +65,7 @@ def faux_tool_calls(*calls: Any, response_metadata: dict[str, Any] | None = None
     return AIMessage(content="", tool_calls=normalized, response_metadata=response_metadata or {})
 
 
-def _tool_display_name(tool: Any) -> str:
+def tool_display_name(tool: Any) -> str:
     """The name a tool carries into ``bind_tools`` (BaseTool, dict, callable)."""
 
     if isinstance(tool, dict):
@@ -133,7 +133,7 @@ class FauxChatModel(BaseChatModel):
         return {"ls_provider": "faux", "ls_model_name": "faux-1"}
 
     def bind_tools(self, tools: Any, **kwargs: Any) -> "FauxChatModel":
-        self._bound_tool_name_sets.append([_tool_display_name(tool) for tool in (tools or [])])
+        self._bound_tool_name_sets.append([tool_display_name(tool) for tool in (tools or [])])
         return self
 
     def bind(self, **kwargs: Any) -> "FauxChatModel":

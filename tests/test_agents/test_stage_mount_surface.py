@@ -31,11 +31,14 @@ from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
 from agents.tools.traceability import build_traceability_tools
 
-from tests.helpers.faux import FauxChatModel, faux_text
+from tests.helpers.faux import FauxChatModel, faux_text, tool_display_name
 
 # deepagents' default filesystem suite (the FilesystemMiddleware tool set).
 # Deliberately hardcoded, not derived: the pin exists to catch deepagents
-# upgrades that change the default suite.
+# upgrades that change the default suite. The suite may also carry `execute`
+# (CompositeBackend implements SandboxBackendProtocol); it never reaches
+# bind_tools because DISABLED_BUILTIN_TOOLS excludes it, and the exact-set
+# equality below keeps that exclusion load-bearing.
 FILESYSTEM_BUILTIN_TOOLS = frozenset({"ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep"})
 
 _STAGE_PHASES = {
@@ -48,10 +51,13 @@ _STAGE_PHASES = {
 # agents/test_generator.py, agents/test_driven_developer.py). The traceability
 # builders produce real closures here; the stage-specific system tools are
 # name-bearing stubs — the pin judges the mount surface, not the tool bodies.
+# The trailing *_NOT_MOUNTED names are tools other stages mount but this stage
+# must never see: the mount-time capability filter (factory) has to drop them
+# for the exact-set equality to hold, so a filter regression turns the pin red.
 _STAGE_MOUNTED_TOOLS: dict[str, list[str]] = {
     "interface_design": [],
-    "test_generation": ["declare_test_manifest"],
-    "implementation": ["run_tests", "run_build", "install_dependencies"],
+    "test_generation": ["declare_test_manifest", "append_file_NOT_MOUNTED"],
+    "implementation": ["run_tests", "run_build", "install_dependencies", "append_file_NOT_MOUNTED"],
 }
 
 
@@ -115,7 +121,7 @@ def test_bound_tool_surface_matches_capability_table(stage: str, tmp_project_dir
         assert set(names) == set(bound_sets[0])
 
     bound = set(bound_sets[0])
-    assert bound == _expected_tool_names(stage, [getattr(tool, "__name__", "") for tool in mounted])
+    assert bound == _expected_tool_names(stage, [tool_display_name(tool) for tool in mounted])
 
     # The always-disabled builtins must be absent from every stage's surface —
     # exact-set equality above already implies it; spelled out so a failure
