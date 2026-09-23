@@ -9,6 +9,7 @@ from pathlib import Path
 from .base import AppTypeHandler
 from .path_validation import normalize_safe_relative_path
 from .test_results import TestRunResult, parse_test_run
+from core.processes import build_subprocess_env
 
 
 def _normalize_cli_test_path(file_path: str) -> str:
@@ -40,7 +41,7 @@ async def _run_python_command(
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            env=build_subprocess_env({"PYTHONIOENCODING": "utf-8"}),
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         output = stdout.decode("utf-8", errors="replace")

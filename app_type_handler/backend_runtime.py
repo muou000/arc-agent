@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from core.config import build_web_runtime_env, get_web_port
-from core.processes import finalize_subprocess
+from core.processes import build_subprocess_env, finalize_subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -88,13 +88,14 @@ async def _execute_web_test_command(
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={
-                **os.environ,
-                "PYTHONIOENCODING": "utf-8",
-                "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8",
-                **build_web_runtime_env(web_port=web_port),
-                **(extra_env or {}),
-            },
+            env=build_subprocess_env(
+                {
+                    "PYTHONIOENCODING": "utf-8",
+                    "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8",
+                    **build_web_runtime_env(web_port=web_port),
+                    **(extra_env or {}),
+                }
+            ),
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         output = stdout.decode("utf-8", errors="replace")
@@ -413,6 +414,7 @@ async def _force_kill_pid(pid: int) -> None:
                 "/F",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                env=build_subprocess_env(),
             )
             await process.communicate()
             return
@@ -984,10 +986,7 @@ async def spawn_backend_process(
             cwd=backend_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={
-                **os.environ,
-                **runtime_env,
-            },
+            env=build_subprocess_env(runtime_env),
         )
     except Exception as exc:
         return BackendSpawn(
