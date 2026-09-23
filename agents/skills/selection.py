@@ -21,6 +21,9 @@ from typing import Any
 
 
 SKILLS_SOURCE = "/skills/"
+# Chinese requirements (ARC-Bench requirement trees are Chinese-first) must hit
+# the same floor: keep every term multi-character — single characters like 户
+# or 号 would false-positive across unrelated words (用户名 aside, 户口/开户…).
 _AUTH_TERMS = (
     "login",
     "log in",
@@ -35,6 +38,17 @@ _AUTH_TERMS = (
     "authorization",
     "current user",
     "account state",
+    "登录",
+    "登陆",
+    "注册",
+    "登出",
+    "注销",
+    "会话",
+    "认证",
+    "授权",
+    "当前用户",
+    "账户",
+    "账号",
 )
 
 
