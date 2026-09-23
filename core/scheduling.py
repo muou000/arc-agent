@@ -33,8 +33,6 @@ from core.queue_state import (
 )
 from core.scheduling_switches import ARC_DESIGN_GATE_PIPELINE
 
-DESIGN_GATE_PIPELINE_ENV = ARC_DESIGN_GATE_PIPELINE
-
 
 def design_pipelining_enabled() -> bool:
     """Whether a dependent's DESIGN waits only for its dependencies' DESIGNs.
@@ -52,7 +50,7 @@ def design_pipelining_enabled() -> bool:
     implementation creates).
     """
 
-    return os.environ.get(DESIGN_GATE_PIPELINE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    return os.environ.get(ARC_DESIGN_GATE_PIPELINE, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def task_dependencies_met(queue_state: dict[str, Any], task: dict[str, Any]) -> bool:
