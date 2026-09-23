@@ -402,7 +402,7 @@ class TraceabilityStore:
         }
         self._upsert_row("interfaces", normalized_interface_id, payload)
         if emit_event:
-            self.events._emit_traceability_event(
+            self.events.record_traceability_row_event(
                 {
                     "type": "interface_upsert",
                     "interface_id": normalized_interface_id,
@@ -448,7 +448,7 @@ class TraceabilityStore:
         current["implemented"] = bool(implemented)
         self._upsert_row("interfaces", interface_id, current)
         if emit_event:
-            self.events._emit_traceability_event(
+            self.events.record_traceability_row_event(
                 {
                     "type": "interface_status",
                     "interface_id": str(interface_id or "").strip(),
@@ -508,7 +508,7 @@ class TraceabilityStore:
             },
         )
         if emit_event:
-            self.events._emit_traceability_event(
+            self.events.record_traceability_row_event(
                 {
                     "type": "test_upsert",
                     "test_id": normalized_test_id,

@@ -319,6 +319,95 @@ class EventClient:
             },
         )
 
+    def record_traceability_row_event(self, payload: dict[str, Any]) -> None:
+        """Append one pre-shaped traceability row event (``interface_upsert`` /
+        ``interface_status`` / ``test_upsert``).
+
+        The row events mirror the persisted traceability row field-for-field
+        and are emitted by :class:`TraceabilityStore` right after the row
+        lands. The payload is the store's own normalized row projection plus
+        its ``type`` discriminator; this method only stamps the timestamp, so
+        the store never formats runner-event envelopes itself.
+        """
+        self._emit_traceability_event(payload)
+
+    def record_git_identity_configured(self, user_name: str, user_email: str) -> None:
+        """Append the ``git_identity_configured`` signal from ``GitClient``.
+
+        A commit-history refresh signal carrying the configured identity in
+        ``message``; emitted once per ``ensure_repo``.
+        """
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "signal",
+                "reason": "git_identity_configured",
+                "refresh": {
+                    "submission": False,
+                    "logs": False,
+                    "commit_history": True,
+                    "traceability_selected": False,
+                    "traceability_all": False,
+                    "preview": False,
+                },
+                "message": f"{user_name} <{user_email}>",
+                "timestamp": utc_timestamp(),
+            },
+        )
+
+    def record_contract_drift(
+        self,
+        *,
+        node_id: str = "",
+        drift: list[dict[str, Any]] | None = None,
+        arbitration: bool = False,
+        outcome: str | None = None,
+    ) -> None:
+        """Append one ``contract_drift`` event (DESIGN gate pipelining).
+
+        Emitted when a merged IMPLEMENT no longer honors the anchors its
+        DESIGN registered: once with ``arbitration`` naming whether the
+        escalation path is enabled, and - after a successful arbitration
+        repair - once more with ``outcome="repaired"``. ``drift`` carries the
+        per-anchor drift payloads. An empty ``node_id`` attributes the event
+        to the run as a whole.
+        """
+        payload: dict[str, Any] = {
+            # Field order matches the pre-refactor emitter exactly: the
+            # timestamp leads, the discriminator and fields follow, and the
+            # optional outcome trails (ticket #163 pins the order).
+            "timestamp": utc_timestamp(),
+            "type": "contract_drift",
+            "node_id": str(node_id or "").strip(),
+            "drift": drift if drift is not None else [],
+            "arbitration": bool(arbitration),
+        }
+        if outcome is not None:
+            payload["outcome"] = outcome
+        append_jsonl(self.paths.runner_events_path, payload)
+
+    def record_merge_arbitration(
+        self, record: dict[str, Any], *, timestamp: bool = True
+    ) -> None:
+        """Append one ``merge_arbitration`` audit record.
+
+        ``record`` is the arbiter's compact summary (node/phase/trigger/
+        outcome/detail and friends) without the envelope; this method stamps
+        the ``type`` discriminator and - by default - the timestamp, in that
+        order, so the audit stream's field order stays stable for the
+        frontend reader.
+
+        The workflow's post-reverify audit path predates the envelope
+        stamping and historically emitted without a timestamp; byte
+        compatibility pins that shape (issue #163), so that caller passes
+        ``timestamp=False``.
+        """
+        payload: dict[str, Any] = {"type": "merge_arbitration"}
+        if timestamp:
+            payload["timestamp"] = utc_timestamp()
+        payload.update(record)
+        append_jsonl(self.paths.runner_events_path, payload)
+
     def _emit_runner_state(self, state: str, message: str | None = None) -> None:
         append_jsonl(
             self.paths.runner_events_path,
