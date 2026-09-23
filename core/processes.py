@@ -264,7 +264,14 @@ def _attach_kill_scope(process: Any, *, tree_enabled: bool = True) -> None:
                 else:
                     # Assignment failed (nested-job policy, exited launcher):
                     # release the unused job and fall back to the taskkill
-                    # sweep via the pid-only scope.
+                    # sweep via the pid-only scope. Logged: a silent degrade
+                    # here would look identical to a working Job Object until
+                    # a teardown actually needs the sweep.
+                    logger.debug(
+                        "Job Object assignment failed for PID %s; tree cleanup "
+                        "falls back to the taskkill sweep",
+                        process.pid,
+                    )
                     if close_job is not None:
                         close_job()
         else:
@@ -385,6 +392,7 @@ async def _taskkill_tree(pid: int) -> None:
     that makes the Job Object the primary mechanism rather than this fallback.
     """
 
+    killer = None
     try:
         killer = await asyncio.create_subprocess_exec(
             "taskkill",
@@ -396,10 +404,16 @@ async def _taskkill_tree(pid: int) -> None:
             stderr=asyncio.subprocess.DEVNULL,
             env=build_subprocess_env(),
         )
-    except Exception:
-        return
-    with suppress(Exception):
         await asyncio.wait_for(killer.wait(), timeout=5.0)
+    except Exception as exc:
+        logger.debug("taskkill /T /F sweep for PID %s failed: %s", pid, exc)
+    finally:
+        # A hung taskkill must not become the next stray process; it is a
+        # bare executable, so the direct kill suffices (no tree of its own).
+        if killer is not None and killer.returncode is None:
+            _kill_process_quietly(killer)
+            with suppress(Exception):
+                await killer.wait()
 
 
 async def finalize_subprocess(process: Any, *, force_kill: bool = False) -> None:
