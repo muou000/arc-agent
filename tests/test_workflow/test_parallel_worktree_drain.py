@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 
+from core.scheduling import task_dependencies_met
 from core.workflow import (
     ARCWorkflowManager,
     NODE_BLOCKED_BY_DEPENDENCY,
@@ -1604,16 +1605,16 @@ def test_design_gate_blocks_until_the_parent_design_settles() -> None:
     state = {"tasks": [parent, child], "parents": {"RA": "R"}}
     state["node_states"], state["node_design_done"] = node_maps_from_tasks([parent, child])
 
-    assert ARCWorkflowManager._task_dependencies_met(state, child) is False, "parent still running"
+    assert task_dependencies_met(state, child) is False, "parent still running"
 
     settle(state, "R", NODE_UNSEEN)
-    assert ARCWorkflowManager._task_dependencies_met(state, child) is False, "parent still pending"
+    assert task_dependencies_met(state, child) is False, "parent still pending"
 
     settle(state, "R", NODE_DESIGNED)
-    assert ARCWorkflowManager._task_dependencies_met(state, child) is True
+    assert task_dependencies_met(state, child) is True
 
     settle(state, "R", NODE_FAILED, design_done=False)
-    assert ARCWorkflowManager._task_dependencies_met(state, child) is True, (
+    assert task_dependencies_met(state, child) is True, (
         "a failed parent must not deadlock its children"
     )
 
@@ -1621,16 +1622,16 @@ def test_design_gate_blocks_until_the_parent_design_settles() -> None:
 def test_design_gate_lets_the_root_and_unmapped_nodes_through() -> None:
     state = _gate_queue_state(TASK_PENDING)
     root = state["tasks"][0]
-    assert ARCWorkflowManager._task_dependencies_met(state, root) is True, "the root has no parent"
+    assert task_dependencies_met(state, root) is True, "the root has no parent"
 
     orphan = {"task_id": "X:DESIGN", "node_id": "X", "phase": PHASE_DESIGN, "status": TASK_PENDING}
-    assert ARCWorkflowManager._task_dependencies_met(state, orphan) is True
+    assert task_dependencies_met(state, orphan) is True
 
 
 def test_design_gate_fails_open_for_queues_saved_before_parents() -> None:
     state = _gate_queue_state(TASK_RUNNING, with_parents=False)
     child = state["tasks"][1]
-    assert ARCWorkflowManager._task_dependencies_met(state, child) is True
+    assert task_dependencies_met(state, child) is True
 
 
 def test_design_gate_combines_parent_and_dependency_rules(
@@ -1651,13 +1652,13 @@ def test_design_gate_combines_parent_and_dependency_rules(
     state["node_states"], state["node_design_done"] = node_maps_from_tasks(state["tasks"])
     state["dependencies"] = {"RA": ["RB"]}
     child = next(t for t in state["tasks"] if t["task_id"] == "RA:DESIGN")
-    assert ARCWorkflowManager._task_dependencies_met(state, child) is True, (
+    assert task_dependencies_met(state, child) is True, (
         "failed parent unblocks; completed dependency unblocks"
     )
 
     # Parent failed but the dependency is still implementing: still blocked.
     settle(state, "RB", NODE_DESIGNED)
-    assert ARCWorkflowManager._task_dependencies_met(state, child) is False, (
+    assert task_dependencies_met(state, child) is False, (
         "a failed parent must not let the dependency check pass the child through"
     )
 
@@ -1665,7 +1666,7 @@ def test_design_gate_combines_parent_and_dependency_rules(
     state["node_states"]["R"] = NODE_DESIGNED
     state["node_design_done"]["R"] = True
     state["tasks"][0]["status"] = TASK_COMPLETED
-    assert ARCWorkflowManager._task_dependencies_met(state, child) is False
+    assert task_dependencies_met(state, child) is False
 
 
 def test_design_gate_applies_declared_dependencies_to_the_root() -> None:
@@ -1685,13 +1686,13 @@ def test_design_gate_applies_declared_dependencies_to_the_root() -> None:
     state["node_states"], state["node_design_done"] = node_maps_from_tasks(tasks)
 
     root = state["tasks"][0]
-    assert ARCWorkflowManager._task_dependencies_met(state, root) is False
+    assert task_dependencies_met(state, root) is False
 
     settle(state, "RB", NODE_PASSED)
-    assert ARCWorkflowManager._task_dependencies_met(state, root) is True
+    assert task_dependencies_met(state, root) is True
 
     settle(state, "RB", NODE_FAILED, design_done=True)
-    assert ARCWorkflowManager._task_dependencies_met(state, root) is False, (
+    assert task_dependencies_met(state, root) is False, (
         "a failed dependency must block the dependent root"
     )
 
@@ -1703,7 +1704,7 @@ def test_design_gate_blocks_when_the_parent_design_task_is_missing() -> None:
     state = _gate_queue_state(TASK_COMPLETED)
     state["tasks"] = [state["tasks"][1]]  # drop R:DESIGN, keep RA:DESIGN
     child = state["tasks"][0]
-    assert ARCWorkflowManager._task_dependencies_met(state, child) is False
+    assert task_dependencies_met(state, child) is False
 
 
 def test_child_design_waits_for_parent_design_and_leaves_stay_parallel(

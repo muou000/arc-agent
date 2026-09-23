@@ -34,6 +34,7 @@ import pytest
 
 from agents.runtime import rebase_gate
 from core import merge_arbitration, workflow
+from core.scheduling import design_pipelining_enabled
 from core.scheduling_switches import SCHEDULING_SWITCH_ENV_VARS
 from tests.conftest import MODEL_ENV_VARS_TO_CLEAR
 
@@ -60,7 +61,7 @@ def test_scheduling_helpers_fall_back_to_defaults() -> None:
 
     assert workflow._worktrees_enabled() is True
     assert workflow._affinity_depth() == 1
-    assert workflow._design_pipelining_enabled() is False
+    assert design_pipelining_enabled() is False
     assert workflow.ARCWorkflowManager._auto_tdd_retry_enabled() is True
     assert merge_arbitration.arbitration_enabled() is False
     assert rebase_gate.rebase_on_merge_enabled() is False
@@ -72,7 +73,7 @@ def test_explicit_test_override_still_wins(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("ARC_AFFINITY_DEPTH", "2")
     monkeypatch.setenv("ARC_DESIGN_GATE_PIPELINE", "1")
     assert workflow._affinity_depth() == 2
-    assert workflow._design_pipelining_enabled() is True
+    assert design_pipelining_enabled() is True
 
 
 # --- Mechanical teeth for the isolation fixtures (issue #153) ---------------

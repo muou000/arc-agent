@@ -54,6 +54,7 @@ from pydantic import Field, PrivateAttr
 from core import config as core_config
 from core.files import load_requirements
 from core.service import configure_runtime, reset_runtime_for_tests
+from core.scheduling import task_dependencies_met
 from core.workflow import ARCWorkflowManager, NODE_CONVERGED, NODE_PASSED
 from tests.helpers.faux import (
     FakeAppHandler,
@@ -531,7 +532,7 @@ def test_keep_req2_pipeline_mode_starts_dependent_design_before_dependency_imple
                 ),
                 None,
             )
-            if rb_design is not None and self._task_dependencies_met(queue_state, rb_design):
+            if rb_design is not None and task_dependencies_met(queue_state, rb_design):
                 pipeline_runnable_before_dependency_implement = True
         original_begin(self, task, queue_state)
 
