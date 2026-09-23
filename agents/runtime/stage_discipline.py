@@ -926,4 +926,15 @@ def _tool_result_failed(result: ToolMessage | Any) -> bool:
     if isinstance(result, ToolMessage) and result.status == "error":
         return True
     content = str(getattr(result, "content", "") or "")
-    return "Exit Code: 0" not in content and ("Exit Code:" in content or content.lstrip().startswith("Error:"))
+    if "Exit Code:" in content:
+        # One tool result can carry several exit-code segments (run_build
+        # renders the frontend and backend builds back to back), so "any
+        # Exit Code: 0 present" let a failed half hide behind a passing one.
+        # Judge the text by the test-run contract's aggregate rule: a leading
+        # aggregate line wins, otherwise every nested segment must be 0.
+        # Deferred import: this module sits at the bottom of the bootstrap
+        # order and must not pull in the app_type_handler package eagerly.
+        from app_type_handler.test_results import extract_overall_exit_code
+
+        return extract_overall_exit_code(content) != 0
+    return content.lstrip().startswith("Error:")

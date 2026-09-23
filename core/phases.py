@@ -296,7 +296,7 @@ class WorkflowPhaseRunner:
         )
 
         await self._log("TestGenerator", "Generating tests from agent-selected coverage strategy.", node_id=node_id)
-        tests, _ = await self.test_generator.run(
+        tests, testgen_output = await self.test_generator.run(
             node_id=node_id,
             requirement_data=requirement_data,
         )
@@ -308,6 +308,9 @@ class WorkflowPhaseRunner:
                 node_id=node_id,
             )
             return False
+        # The model's own reason prose; the IMPLEMENT zero-test observation
+        # event quotes it when this node ends up implementing without tests.
+        testgen_summary_text = testgen_summary(testgen_output)
 
         try:
             stored_tests = self.registry.prepare_tests(node_id=node_id, tests=tests)
@@ -397,6 +400,7 @@ class WorkflowPhaseRunner:
             {
                 "interfaces": prepared_interfaces,
                 "test_artifacts": stored_tests,
+                "test_summary": testgen_summary_text,
                 "phase_status": {"design": "completed", "test": "completed"},
                 "design_baseline": baseline["file_state"],
             },
@@ -442,6 +446,18 @@ class WorkflowPhaseRunner:
         interfaces = self.traceability.list_interfaces(req_id=node_id)
         tests = self.traceability.list_tests(req_id=node_id)
         if not tests:
+            if interfaces:
+                # Observation-only (issue #187): a leaf node that owns
+                # interface contracts but registered zero tests skips TDD
+                # below. An empty manifest is a legal DESIGN result (the
+                # baseline gate's "no tests" early return), so this stays a
+                # pure observation — no gate, no retry — until run data says
+                # whether the shape deserves a gate.
+                self.events.record_zero_test_leaf(
+                    node_id=node_id,
+                    interface_count=len(interfaces),
+                    summary=str(sessions.load_node_session(node_id).get("test_summary") or "").strip() or None,
+                )
             await self._log(
                 "TestDrivenDeveloper",
                 "No node-local tests were registered; skipping TDD implementation for this node.",
@@ -705,6 +721,13 @@ class WorkflowPhaseRunner:
         implementation; recording the state without rejection is the only
         truthful signal, and the IMPLEMENT tautology fast path is the
         intended outcome there).
+
+        A repair round distinguishes three answer states: a parseable
+        manifest list (re-baselined), an explicit ``tests: []`` (the loop
+        exits and the final owned-witness check decides), and a payload with
+        no parseable manifest at all (``None`` from the generator) — the
+        last is a rejected round that consumes its rejection budget and
+        re-asks, so only budget exhaustion fails the node.
         """
         # requirement_data is only read by the repair pass (the skill floor of
         # its agent build must match the first pass's, or the shared thread's
@@ -901,13 +924,20 @@ class WorkflowPhaseRunner:
                 previous_manifest=current_tests,
             )
             if revised_tests is None:
+                # The rework payload carried no manifest structure at all
+                # (prose fallback, damaged JSON): a rejected round, not a
+                # model decision to return zero tests. An owned-interface
+                # node with an empty manifest is illegal at the final check
+                # anyway, so spend this round's rejection budget and ask
+                # again; only budget exhaustion fails the node.
                 await self._log(
                     "TestGenerator",
-                    "Green baseline rework did not return a valid test manifest.",
-                    status="error",
+                    "Green baseline rework did not return a parseable test manifest; "
+                    "the round is rejected and the repair will be asked again.",
+                    status="warning",
                     node_id=node_id,
                 )
-                return None
+                continue
             try:
                 current_tests = self.registry.prepare_tests(node_id=node_id, tests=revised_tests)
                 manifest_revised = True
@@ -915,9 +945,12 @@ class WorkflowPhaseRunner:
                 await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
                 return None
             if not revised_tests and not current_tests:
-                # The repair explicitly returned an empty manifest: every
-                # test was tautological and got deleted. An empty manifest
-                # is a valid DESIGN result (the node owns no local tests).
+                # The repair explicitly returned an empty manifest (a real
+                # `tests: []` answer - unparseable payloads never reach
+                # here): every test was tautological and got deleted. An
+                # empty manifest is a valid DESIGN result for a node with no
+                # owned interfaces; the final owned-witness check below
+                # still guards nodes that own interface contracts.
                 break
             if not current_tests:
                 # The repair claimed tests but every item was dropped by
@@ -1896,6 +1929,25 @@ def summarize_batch_output(batch_output: str, max_lines: int = 30) -> str:
     if len(lines) > max_lines:
         lines = ["...[truncated]", *lines[-max_lines:]]
     return "\n".join(lines)
+
+
+def testgen_summary(output_text: str | None) -> str:
+    """Extract the TestGenerator response's own ``summary`` prose.
+
+    ``run`` returns the raw payload re-serialized as JSON; the ``summary``
+    field is the model's reason text (the empty-manifest rationale a
+    zero-test leaf event quotes, issue #187). Unreadable payloads yield ""
+    rather than failing the phase that produced them.
+    """
+    if not output_text:
+        return ""
+    try:
+        payload = json.loads(output_text)
+    except ValueError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("summary") or "").strip()
 
 
 

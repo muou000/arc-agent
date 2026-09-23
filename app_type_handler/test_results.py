@@ -77,7 +77,7 @@ def parse_test_run(
     output = test_output or ""
     passed, failed = _partition_lines(output)
     return TestRunResult(
-        exit_code=_extract_overall_exit_code(output) if exit_code is None else exit_code,
+        exit_code=extract_overall_exit_code(output) if exit_code is None else exit_code,
         output=output,
         passed=passed,
         failed=failed,
@@ -106,7 +106,7 @@ def _partition_lines(output: str) -> tuple[list[str], list[str]]:
     return passed, failed
 
 
-def _extract_overall_exit_code(output: str) -> int:
+def extract_overall_exit_code(output: str) -> int:
     """Prefer an explicit aggregate status, otherwise combine nested commands.
 
     When several nested stages fail, the first failing stage's code wins so the
@@ -328,7 +328,7 @@ def failure_fingerprint(test_output: str) -> str:
     """
 
     output = _ANSI_PATTERN.sub("", test_output or "")
-    exit_code = _extract_overall_exit_code(output)
+    exit_code = extract_overall_exit_code(output)
     key_line = ""
     for line in output.splitlines():
         stripped = line.strip()

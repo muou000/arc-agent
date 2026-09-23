@@ -319,6 +319,34 @@ class EventClient:
             },
         )
 
+    def record_zero_test_leaf(
+        self,
+        *,
+        node_id: str = "",
+        interface_count: int = 0,
+        summary: str | None = None,
+    ) -> None:
+        """Append one ``zero_test_leaf`` event for the zero-test leaf observation.
+
+        Emitted when a leaf node that owns interface contracts registered an
+        empty test manifest, so IMPLEMENT skips TDD and marks the interfaces
+        implemented directly (issue #187). Observation-only: an empty manifest
+        stays a legal DESIGN result — no gate, no retry — until run data says
+        otherwise. ``interface_count`` counts the node's owned interfaces;
+        ``summary`` quotes the TestGenerator's own reason text when it supplied
+        one. An empty ``node_id`` attributes the event to the run as a whole.
+        """
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "zero_test_leaf",
+                "node_id": str(node_id or "").strip(),
+                "interface_count": _nonneg_int(interface_count),
+                "summary": summary,
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def record_traceability_row_event(self, payload: dict[str, Any]) -> None:
         """Append one pre-shaped traceability row event (``interface_upsert`` /
         ``interface_status`` / ``test_upsert``).

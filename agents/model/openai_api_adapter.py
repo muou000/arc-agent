@@ -76,9 +76,10 @@ _PROBE_ROUNDS_PER_ATTEMPT = 3
 #
 # Modes (ARC_MODEL_STREAM_TRANSPORT):
 #   stream (default) - first attempt already streams; a provider that rejects
-#                      streaming with a 4xx permanently falls back to plain
-#                      non-streaming for the process (cached per endpoint),
-#                      without consuming the retry budget.
+#                      the streamed request with a capability-proof 4xx
+#                      permanently falls back to plain non-streaming for the
+#                      process (cached per endpoint), without consuming the
+#                      retry budget.
 #   retry            - first attempt stays non-streaming; only retries after a
 #                      connection-class failure switch transport (the original
 #                      PR #44 behaviour, useful for providers whose streaming
@@ -96,8 +97,9 @@ def _stream_transport_mode() -> str:
     return "stream"
 
 
-# Providers that answered a streamed request with a client error: streaming is
-# unsupported there, so every later call goes plain without paying the failed
+# Providers that answered a streamed request with a capability-proof client
+# error (_STREAMING_CAPABILITY_STATUS_CODES): streaming is unsupported there,
+# so every later call goes plain without paying the failed
 # streamed attempt again. Keyed by (model, base_url); a process-wide cache
 # like the model-client cache because the capability is an endpoint property.
 # The mark expires after ``_STREAMING_UNSUPPORTED_TTL_SECONDS``: a 4xx can also
@@ -299,7 +301,7 @@ def _has_stream_chunk_timeout_type(exc: BaseException | None) -> bool:
 
 # Recorded reasons for falling back from the streamed to the plain transport
 # (the "when to drop streaming" decisions, observable on ModelCallOutcome).
-FALLBACK_CLIENT_ERROR = "client_error"  # the provider answered the streamed request with 4xx
+FALLBACK_CLIENT_ERROR = "client_error"  # the provider answered the streamed request with a capability-proof 4xx
 FALLBACK_CHUNK_TIMEOUT = "chunk_timeout"  # the streamed attempt stalled between SSE chunks
 FALLBACK_CONNECTION_FAILURE = "connection_failure"  # a connection-class failure alternated transports
 
@@ -1154,10 +1156,14 @@ async def acall_model_with_retries(
     default) the very first attempt streams — a non-streaming response carries
     zero bytes while the model thinks, which gateways with an idle timeout
     (observed ~120s) drop mid generation, while SSE chunks keep the connection
-    alive. A streamed attempt answered by a client error (4xx: the provider
-    rejects streaming) marks the endpoint streaming-unsupported for the whole
-    process and immediately re-attempts plain, without consuming the retry
-    budget. Without ``stream_first`` (mode ``retry``) the first attempt stays
+    alive. A streamed attempt answered by a capability-proof client error
+    (the ``_STREAMING_CAPABILITY_STATUS_CODES`` subset of 4xx) marks the
+    endpoint streaming-unsupported for the whole process and immediately
+    re-attempts plain, without consuming the retry budget. Auth and transient
+    statuses are not streaming evidence: they fall through to the generic
+    classification — auth fails fast, transients retry on the streamed
+    transport with ``Retry-After`` honored.
+    Without ``stream_first`` (mode ``retry``) the first attempt stays
     plain and only a connection-class failure switches transport; transports
     alternate on further connection failures and any non-connection error
     returns to plain attempts. Every stream→plain fallback is recorded on the
@@ -1212,11 +1218,14 @@ async def acall_model_with_retries(
         try:
             result = await _await_if_needed(attempt())
         except Exception as exc:
-            if stream_retry and _is_client_error(exc):
-                # The provider rejected the streamed request itself (4xx):
-                # not transient, and not the plain transport's fault. Switch
-                # the endpoint to plain for the rest of the process and
-                # re-attempt immediately without spending the retry budget.
+            if stream_retry and _is_streaming_capability_rejection(exc):
+                # The provider rejected the streamed request itself with a
+                # capability-proof status: not transient, and not the plain
+                # transport's fault. Switch the endpoint to plain for the rest
+                # of the process and re-attempt immediately without spending
+                # the retry budget. Auth/transient 4xx statuses are not caught
+                # here (see _STREAMING_CAPABILITY_STATUS_CODES): they fall
+                # through to the generic classification below.
                 _mark_streaming_unsupported(model, base_url)
                 fallbacks.append(
                     StreamFallback(reason=FALLBACK_CLIENT_ERROR, attempt=attempt_count)
@@ -1593,16 +1602,21 @@ def _is_connection_failure(exc: Exception) -> bool:
     )
 
 
-def _is_client_error(exc: Exception) -> bool:
-    """Whether the provider rejected the request itself (HTTP 4xx).
+# The streamed-fallback branch marks the endpoint streaming-unsupported only
+# for statuses that prove the provider rejected the streamed request shape
+# itself (unsupported/malformed streaming request, missing route). Auth
+# (401/403) says nothing about streaming, and 408/409/429 are transient
+# classes the generic retry classification already handles — intercepting
+# them here would bypass quota/Retry-After handling with an extra plain
+# request and poison this capability mark for the TTL.
+_STREAMING_CAPABILITY_STATUS_CODES = frozenset({400, 404, 405, 415, 422})
 
-    Used on the streamed path only: a 4xx there means the provider does not
-    accept streaming for this request shape, which is a capability gap, not a
-    transient failure.
-    """
+
+def _is_streaming_capability_rejection(exc: Exception) -> bool:
+    """Whether the streamed failure proves streaming is unsupported (4xx subset)."""
 
     status_code = getattr(exc, "status_code", None)
-    return isinstance(status_code, int) and 400 <= status_code < 500
+    return isinstance(status_code, int) and status_code in _STREAMING_CAPABILITY_STATUS_CODES
 
 
 def probe_endpoint_reachable(

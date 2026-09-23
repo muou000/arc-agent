@@ -53,7 +53,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 
 流式传输三开关：
 
-- `ARC_MODEL_STREAM_TRANSPORT`：`stream`（默认，首次尝试即流式——SSE chunk 持续流动，可穿过网关对非流式响应的 ~120s 空闲切断；端点对流式请求回 4xx 时自动回退纯非流式并进程内记住该端点）/ `retry`（首次非流式，仅连接类失败后的重试切流式）/ `0/false/no/off`（完全关闭）。
+- `ARC_MODEL_STREAM_TRANSPORT`：`stream`（默认，首次尝试即流式——SSE chunk 持续流动，可穿过网关对非流式响应的 ~120s 空闲切断；端点对流式请求回 400/404/405/415/422 这类证明拒绝流式请求形状的状态码时，自动回退纯非流式并进程内记住该端点；认证（401/403）与瞬时（408/409/429）状态不算流式能力证据，走常规重试分类，不写该缓存）/ `retry`（首次非流式，仅连接类失败后的重试切流式）/ `0/false/no/off`（完全关闭）。
 - `ARC_MODEL_STREAM_CHUNK_TIMEOUT`：流式看门狗。流中途静默卡死（TCP 存活但零字节）在该时限内被发现并按连接类失败换传输方式重试，而不是等到读超时或把整个 agent 会话回退重放；有效值钳制到 `ARC_MODEL_TIMEOUT`。设 0 关闭。
 - `ARC_MODEL_STREAM_USAGE`：开启后流式 chat.completions 请求携带 `include_usage`，末个 SSE chunk 携带端点真实 usage（含缓存命中），token 用量从 tiktoken 估算转为 reported 口径。某网关 4xx 拒绝该选项时设 0 恢复旧行为（端点会整体回退纯非流式——非流式响应自带 usage，计费不受影响，只失去流式对网关空闲切断的防护）。
 

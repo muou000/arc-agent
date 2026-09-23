@@ -35,6 +35,10 @@ agent 的每次工具往返（含被 stage discipline 拦截的调用）同样�
 
 IMPLEMENT 阶段成功收尾时，系统会清理"游离重复文件"：路径在模板 `agent_guidance` 声明的全部骨架根之外、且内容与某个已提交的骨架内文件指纹相同（换行归一化后的 sha256，CRLF 副本视为同一文本）的文件会被删除——典型来源是 DESIGN 写错位置后又在正确位置重写的副本（如工作区根级 `src/api/auth.ts` 与 `frontend/src/api/auth.ts` 并存）。只满足单条件（内容重复但在骨架内 / 骨架外但内容不重复 / 孪生副本双方都在骨架外）的文件一律不动；不做通用"未引用文件"检测。删除写入一条 `stray_sweep` 事件（字段含 `node_id`、`files`（删除的相对路径清单）与 `message`（含每个文件与其骨架内孪生路径的对应关系）），并记入节点会话的 `swept_stray_files`。模板清单缺失或不可解析时清理静默跳过（fail-open）。`usage` 命令不聚合该事件；它会出现在评测报告 `events` 诊断的按类型事件计数中，用于解释工作区文件清单的收缩来源。
 
+### `zero_test_leaf` 事件与零测试叶节点观测
+
+叶节点声明了 owned 接口契约、但 TestGenerator 返回空 manifest 时，IMPLEMENT 会静默跳过 TDD 直接把接口标记为 implemented——空 manifest 是合法 DESIGN 结果（无本地行为的节点），但这与"漏检了 manifest"当前不可区分。为积累数据决定是否升级为门禁，该形态写入一条 `zero_test_leaf` 事件（字段含 `node_id`、`interface_count`（owned 接口数）与 `summary`（TestGenerator 响应自带的理由文本，未提供时为 `null`））。纯观测：不加门禁、不重试、不改变空 manifest 的合法性；无接口的叶节点与非叶节点不产生该事件。`usage` 命令不聚合该事件；它会出现在评测报告 `events` 诊断的按类型事件计数中，用于把零测试叶节点的分布与这些节点的评测通过率对照。
+
 ### 成本单价目录
 
 内置单价取自基准评测模型目录（DeepSeek / Z.AI / Moonshot / MiniMax / Qwen，CNY 每百万 token，2026-09，见 `agents/model/costing.py`）。目录是封闭集合：模型名匹配不区分大小写（`MiniMax-M3` 与 `minimax-m3` 同价），表外模型一律不计成本（报表中显示为 unpriced），目录调整时直接更新 `costing.py` 中的 `_BUILTIN_MODEL_COSTS` 表。

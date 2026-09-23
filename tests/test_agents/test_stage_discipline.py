@@ -24,6 +24,7 @@ from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 
 from agents.runtime.stage_discipline import BLOCKED_RESULT_PREFIX, StageDisciplineMiddleware, append_line_limit_message
+from tests.helpers.tool_result_texts import ALL_ZERO_BUILD_RESULT, MIXED_BUILD_RESULT
 
 
 def make_request(
@@ -658,6 +659,90 @@ def test_run_tests_exit_code_zero_does_not_unlock() -> None:
     middleware._record_result(
         make_request("run_tests"),
         ToolMessage(content="Exit Code: 0\nall good", name="run_tests", tool_call_id="t1"),
+    )
+    blocked = run(middleware, make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c2"))
+    assert blocked.status == "error" and "Repeated write blocked" in blocked.content
+
+
+# ---------------------------------------------------------------------------
+# multi-segment exit-code results (run_build renders two builds back to back)
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_exit_code_build_result_unlocks_written_paths() -> None:
+    # A failed frontend next to a passing backend must read as a failure —
+    # the TDD fail->fix loop unlocks on it — not as a success because one
+    # segment printed "Exit Code: 0".
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
+    blocked = run(middleware, make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c2"))
+    assert blocked.status == "error" and "Repeated write blocked" in blocked.content
+
+    middleware._record_result(
+        make_request("run_build"),
+        ToolMessage(content=MIXED_BUILD_RESULT, name="run_build", tool_call_id="b1"),
+    )
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "fix\n"}, call_id="c3")).content == "ok"
+
+
+def test_all_zero_exit_code_build_result_keeps_write_lock() -> None:
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
+    middleware._record_result(
+        make_request("run_build"),
+        ToolMessage(content=ALL_ZERO_BUILD_RESULT, name="run_build", tool_call_id="b1"),
+    )
+    blocked = run(middleware, make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c2"))
+    assert blocked.status == "error" and "Repeated write blocked" in blocked.content
+
+
+def test_text_without_exit_code_keeps_write_lock() -> None:
+    # Fail-open: text with no parseable exit-code segment keeps the old
+    # semantics — only an Error-prefixed result (or a real failure) unlocks.
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
+    middleware._record_result(
+        make_request("run_build"),
+        ToolMessage(
+            content="Command timed out after 120.0 seconds.",
+            name="run_build",
+            tool_call_id="b1",
+        ),
+    )
+    blocked = run(middleware, make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c2"))
+    assert blocked.status == "error" and "Repeated write blocked" in blocked.content
+
+
+def test_leading_aggregate_exit_code_outranks_superseded_evidence() -> None:
+    # E2E SPA static-host recovery (#196): the retried attempt leads with its
+    # own aggregate "Exit Code: 0" and the failed first attempt survives only
+    # as an appendix. A live non-zero segment inside that appendix must not
+    # flip the retried verdict back to failed.
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
+    middleware._record_result(
+        make_request("run_tests"),
+        ToolMessage(
+            content=(
+                "Exit Code: 0\n"
+                "\n"
+                "=== SPA Static-Host Recovery Retry ===\n"
+                "The system forced one frontend rebuild and backend restart, then re-ran the batch.\n"
+                "\n"
+                "First attempt (superseded, kept for the failure evidence):\n"
+                "\n"
+                "Exit Code (superseded by the recovery retry): 1\n"
+                "\n"
+                "=== Frontend Vitest Batch ===\n"
+                "Exit Code: 1\n"
+            ),
+            name="run_tests",
+            tool_call_id="t1",
+        ),
     )
     blocked = run(middleware, make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c2"))
     assert blocked.status == "error" and "Repeated write blocked" in blocked.content

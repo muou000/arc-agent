@@ -11,7 +11,7 @@ from core import sessions
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import json_block, stage_skill_activation_policy
 from agents.context.prompts.test_generator import get_system_prompt, get_user_prompt
-from agents.results import normalize_test_manifest_payload
+from agents.results import normalize_test_manifest_payload, payload_declares_test_manifest
 from agents.runtime.capabilities import normalize_manifest_path
 from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
@@ -331,6 +331,13 @@ class TestGenerator:
         disabled or a cold repair thread the first pass's history is gone, and
         judging which assertions are node-owned needs the requirement text
         (issue #184).
+
+        Returns ``(tests, output_text)``. ``tests`` is ``None`` when the
+        answer carried no parseable manifest structure at all (prose fallback,
+        damaged JSON) — distinct from a declared-empty manifest, which returns
+        ``[]``. The caller treats ``None`` as a rejected round and re-asks
+        within its rejection budget instead of reading parse damage as "every
+        test was deleted".
         """
         session = StageSession(
             agent_name=self.agent_name,
@@ -400,6 +407,18 @@ class TestGenerator:
         raw_payload = await session.invoke(built, message=message)
         tests = normalize_test_manifest_payload(raw_payload)
         output_text = json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
+        if not payload_declares_test_manifest(raw_payload):
+            # The payload carries no manifest structure at all: that is not
+            # the model deciding to return zero tests, so it must not be
+            # collapsed into a declared-empty manifest. Returning None lets
+            # the caller spend a rejection round re-asking instead of
+            # terminal-failing on parse damage.
+            await self._log(
+                "Green baseline rework returned no parseable test manifest.",
+                status="warning",
+                node_id=node_id,
+            )
+            return None, output_text
         await self._log(f"Green baseline rework returned {len(tests)} test artifact(s).", node_id=node_id)
         return tests, output_text
 
