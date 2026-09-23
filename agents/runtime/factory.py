@@ -20,6 +20,7 @@ from agents.runtime.filesystem_adapters import (
     ARCFilesystemMiddleware,
     ArcCompositeBackend,
     GrepGuidanceMiddleware,
+    MAX_GREP_ALTERNATIVES,
     PermissionDeniedHintMiddleware,
     workspace_filesystem_backend,
 )
@@ -121,8 +122,8 @@ class OpenAIGrepSchema(BaseModel):
         description=(
             "Literal text to search for (not regex). A pattern containing `|` is "
             "expanded as literal alternatives (`foo|bar` matches either text; at "
-            "most 8 per call; `\\|` searches for a literal `|`). Other regex "
-            "metacharacters (`.*`, `\\.`) are searched verbatim."
+            f"most {MAX_GREP_ALTERNATIVES} per call; `\\|` searches for a literal `|`). "
+            "Other regex metacharacters (`.*`, `\\.`) are searched verbatim."
         )
     )
     path: str = Field(default=None, description="Base directory to search from. Defaults to the backend's default root.")

@@ -39,7 +39,7 @@ from agents.runtime.filesystem_adapters import (
     workspace_filesystem_backend,
 )
 from deepagents.backends import StateBackend
-from tests.helpers.faux import FauxChatModel, faux_text, faux_tool_call
+from tests.helpers.faux import drive_scripted_tool_call, drive_scripted_tool_turns
 
 # The upstream advice sentence (deepagents regex_literal_hint) that coaches the
 # per-alternative call loop; no model-facing grep surface may contain it.
@@ -174,14 +174,16 @@ def _tool_message(content: str, *, status: str = "success") -> Any:
     return ToolMessage(content=content, tool_call_id="call-1", name="grep", status=status)
 
 
-def _noop_handler(message: _tool_message) -> Any:  # type: ignore[valid-type]
+def _handler_returning(message: Any) -> Any:
+    """A tool-call handler that always returns the given (pre-built) result."""
+
     return lambda request: message
 
 
 def test_expansion_note_on_matching_alternation_result() -> None:
     middleware = GrepGuidanceMiddleware()
     result = middleware.wrap_tool_call(
-        _grep_request("alpha|beta"), _noop_handler(_tool_message("/workspace/a.txt"))
+        _grep_request("alpha|beta"), _handler_returning(_tool_message("/workspace/a.txt"))
     )
 
     assert result.content.startswith("/workspace/a.txt")
@@ -198,7 +200,9 @@ def test_upstream_regex_note_is_replaced_on_alternation_miss() -> None:
         "text you need instead; for `|` alternation, run a separate search "
         "per alternative."
     )
-    result = middleware.wrap_tool_call(_grep_request("alpha|beta"), _noop_handler(_tool_message(raw)))
+    result = middleware.wrap_tool_call(
+        _grep_request("alpha|beta"), _handler_returning(_tool_message(raw))
+    )
 
     assert result.content.startswith("No matches found")
     assert _BANNED_LOOP_ADVICE not in result.content
@@ -214,7 +218,9 @@ def test_regex_signal_miss_without_pipe_also_gets_arc_note() -> None:
         "text you need instead; for `|` alternation, run a separate search "
         "per alternative."
     )
-    result = middleware.wrap_tool_call(_grep_request("foo.*bar"), _noop_handler(_tool_message(raw)))
+    result = middleware.wrap_tool_call(
+        _grep_request("foo.*bar"), _handler_returning(_tool_message(raw))
+    )
 
     assert _BANNED_LOOP_ADVICE not in result.content
     assert "literal text" in result.content
@@ -224,7 +230,8 @@ def test_error_results_pass_through_untouched() -> None:
     middleware = GrepGuidanceMiddleware()
     raw = "Error: permission denied for read on /workspace/secret"
     result = middleware.wrap_tool_call(
-        _grep_request("alpha|beta"), _noop_handler(_tool_message(raw, status="error"))
+        _grep_request("alpha|beta"),
+        _handler_returning(_tool_message(raw, status="error")),
     )
 
     assert result.content == raw
@@ -240,21 +247,21 @@ def test_non_grep_tools_pass_through_untouched() -> None:
         state={},
         runtime=None,
     )
-    result = middleware.wrap_tool_call(request, _noop_handler(_tool_message("file body")))
+    result = middleware.wrap_tool_call(request, _handler_returning(_tool_message("file body")))
     assert result.content == "file body"
 
 
 # -- no-match budget --------------------------------------------------------------
 
 
-def _miss(pattern: str = "zzz") -> Any:
-    return _noop_handler(_tool_message("No matches found"))
+def _miss() -> Any:
+    return _handler_returning(_tool_message("No matches found"))
 
 
 def test_budget_hint_after_consecutive_misses_on_same_scope() -> None:
     middleware = GrepGuidanceMiddleware()
     for expected_count in range(1, 4):
-        result = middleware.wrap_tool_call(_grep_request("zzz"), _miss("zzz"))
+        result = middleware.wrap_tool_call(_grep_request("zzz"), _miss())
         if expected_count < 3:
             assert "No-match budget" not in result.content
         else:
@@ -264,8 +271,8 @@ def test_budget_hint_after_consecutive_misses_on_same_scope() -> None:
 def test_budget_tiers_escalate() -> None:
     middleware = GrepGuidanceMiddleware()
     sixth = None
-    for count in range(1, 7):
-        sixth = middleware.wrap_tool_call(_grep_request("zzz"), _miss("zzz"))
+    for _ in range(6):
+        sixth = middleware.wrap_tool_call(_grep_request("zzz"), _miss())
     assert sixth is not None
     assert "6 consecutive no-match greps" in sixth.content
     assert "very likely absent" in sixth.content
@@ -274,9 +281,11 @@ def test_budget_tiers_escalate() -> None:
 def test_matching_grep_resets_the_streak() -> None:
     middleware = GrepGuidanceMiddleware()
     for _ in range(2):
-        middleware.wrap_tool_call(_grep_request("zzz"), _miss("zzz"))
-    middleware.wrap_tool_call(_grep_request("alpha"), _noop_handler(_tool_message("/workspace/a.txt")))
-    result = middleware.wrap_tool_call(_grep_request("zzz"), _miss("zzz"))
+        middleware.wrap_tool_call(_grep_request("zzz"), _miss())
+    middleware.wrap_tool_call(
+        _grep_request("alpha"), _handler_returning(_tool_message("/workspace/a.txt"))
+    )
+    result = middleware.wrap_tool_call(_grep_request("zzz"), _miss())
 
     assert "No-match budget" not in result.content
 
@@ -284,11 +293,11 @@ def test_matching_grep_resets_the_streak() -> None:
 def test_streaks_are_tracked_per_scope() -> None:
     middleware = GrepGuidanceMiddleware()
     for _ in range(2):
-        middleware.wrap_tool_call(_grep_request("zzz", path="/workspace/backend"), _miss("zzz"))
-    result = middleware.wrap_tool_call(_grep_request("zzz", path="/workspace/frontend"), _miss("zzz"))
+        middleware.wrap_tool_call(_grep_request("zzz", path="/workspace/backend"), _miss())
+    result = middleware.wrap_tool_call(_grep_request("zzz", path="/workspace/frontend"), _miss())
 
     assert "No-match budget" not in result.content
-    backend_hit = middleware.wrap_tool_call(_grep_request("zzz", path="/workspace/backend"), _miss("zzz"))
+    backend_hit = middleware.wrap_tool_call(_grep_request("zzz", path="/workspace/backend"), _miss())
     assert "3 consecutive no-match greps on /workspace/backend" in backend_hit.content
 
 
@@ -297,85 +306,13 @@ def test_errors_do_not_count_toward_the_budget() -> None:
     for _ in range(3):
         middleware.wrap_tool_call(
             _grep_request("zzz"),
-            _noop_handler(_tool_message("Error: permission denied for read on /workspace", status="error")),
+            _handler_returning(_tool_message("Error: permission denied for read on /workspace", status="error")),
         )
-    result = middleware.wrap_tool_call(_grep_request("zzz"), _miss("zzz"))
+    result = middleware.wrap_tool_call(_grep_request("zzz"), _miss())
     assert "No-match budget" not in result.content
 
 
 # -- build-path nails --------------------------------------------------------------
-
-
-def _drive_scripted_greps(
-    workspace_root: Path,
-    grep_args_list: list[dict[str, Any]],
-    *,
-    stage: str = "implementation",
-) -> list[str]:
-    """Drive scripted grep calls through one real ``build_stage_agent`` agent.
-
-    Same harness as ``tests.helpers.faux.drive_scripted_tool_call`` but with
-    one scripted grep per assistant turn, so consecutive-grep state (the
-    no-match budget) is observed the way a real retry loop produces it —
-    across turns, not inside one parallel batch (parallel tool calls resume
-    concurrently, so within a turn exactly one result carries the budget hint
-    once the shared streak crosses the threshold, but which one is racy).
-    """
-
-    from agents.runtime.contracts import AgentRuntimeContext
-    from agents.runtime.factory import build_stage_agent
-    from agents.runtime.runners import ainvoke_stage_agent
-
-    phase = {"implementation": "IMPLEMENT", "test_generation": "TEST_GENERATION"}.get(stage)
-    if phase is None:
-        raise ValueError(f"unsupported probe stage: {stage!r}")
-
-    responses: list[Any] = [
-        faux_tool_call("grep", args, call_id=f"grep-call-{index}")
-        for index, args in enumerate(grep_args_list)
-    ]
-    model = FauxChatModel(responses=[*responses, faux_text("DONE")])
-    built = build_stage_agent(
-        name="grep_guidance_probe",
-        stage=stage,
-        model=model,
-        system_prompt="You are a test agent.",
-        response_format=None,
-        workspace_root=str(workspace_root),
-        writable_roots=[str(workspace_root)],
-        skills=[],
-        memory=[],
-        tools=[],
-        checkpointer=None,
-    )
-    asyncio.run(
-        ainvoke_stage_agent(
-            built.agent,
-            message="run the scripted grep calls",
-            context=AgentRuntimeContext(
-                node_id="REQ-GREP-PROBE",
-                phase=phase,
-                app_type="web",
-                workspace_root=str(workspace_root),
-                requirement_path="",
-            ),
-            thread_id="REQ-GREP-PROBE:grep",
-            label="GrepGuidanceProbe",
-        )
-    )
-    by_call_id: dict[str, str] = {}
-    for turn in model.calls:
-        for message in turn:
-            if getattr(message, "type", "") == "tool":
-                # Each model call replays the full conversation; keep the
-                # latest content per tool_call_id.
-                by_call_id[str(getattr(message, "tool_call_id", ""))] = str(message.content)
-    contents = [by_call_id[f"grep-call-{index}"] for index in range(len(grep_args_list))]
-    if len(contents) != len(grep_args_list):
-        raise AssertionError(
-            f"expected {len(grep_args_list)} tool result(s), got {len(contents)}"
-        )
-    return contents
 
 
 def test_build_path_alternation_hit_returns_union_with_expansion_note(
@@ -384,9 +321,10 @@ def test_build_path_alternation_hit_returns_union_with_expansion_note(
     (tmp_project_dir / "alpha.txt").write_text("alpha\n", encoding="utf-8")
     (tmp_project_dir / "beta.txt").write_text("beta\n", encoding="utf-8")
 
-    (content,) = _drive_scripted_greps(
+    (content,) = drive_scripted_tool_call(
         tmp_project_dir,
-        [{"pattern": "alpha|beta", "path": "/workspace"}],
+        "grep",
+        {"pattern": "alpha|beta", "path": "/workspace"},
     )
 
     assert "/workspace/alpha.txt" in content
@@ -398,9 +336,10 @@ def test_build_path_alternation_hit_returns_union_with_expansion_note(
 def test_build_path_alternation_miss_gets_arc_note(tmp_project_dir: Path) -> None:
     (tmp_project_dir / "alpha.txt").write_text("alpha\n", encoding="utf-8")
 
-    (content,) = _drive_scripted_greps(
+    (content,) = drive_scripted_tool_call(
         tmp_project_dir,
-        [{"pattern": "zzz1|zzz2", "path": "/workspace"}],
+        "grep",
+        {"pattern": "zzz1|zzz2", "path": "/workspace"},
     )
 
     assert content.startswith("No matches found")
@@ -414,8 +353,12 @@ def test_build_path_budget_hint_on_third_consecutive_miss(
 ) -> None:
     (tmp_project_dir / "alpha.txt").write_text("alpha\n", encoding="utf-8")
     miss_args = {"pattern": "zzz", "path": "/workspace"}
+    # One grep per assistant turn: within a single parallel batch the budget
+    # hint lands on exactly one result but which one depends on resumption
+    # order (see drive_scripted_tool_turns); a retry loop is turn-serial.
+    miss_turns = [[("grep", miss_args)]] * 3
 
-    contents = _drive_scripted_greps(tmp_project_dir, [miss_args, miss_args, miss_args])
+    contents = [turn[0] for turn in drive_scripted_tool_turns(tmp_project_dir, miss_turns)]
 
     assert all(content.startswith("No matches found") for content in contents)
     assert "No-match budget" not in contents[0]
@@ -438,6 +381,8 @@ def test_arc_grep_tool_description_matches_expansion_semantics(tmp_path: Path) -
     assert "\\|" in description
     assert "run a separate grep for each" not in description
     assert ARC_GREP_TOOL_DESCRIPTION == description
+    # The advertised cap is the enforced cap, not a copied literal.
+    assert f"at most {MAX_GREP_ALTERNATIVES} alternatives" in description
 
 
 def test_arc_grep_description_is_the_request_time_override(tmp_path: Path) -> None:
@@ -456,6 +401,7 @@ def test_openai_grep_schema_pattern_description_states_alternation() -> None:
     assert "literal alternatives" in description
     assert "not regex" in description
     assert _BANNED_LOOP_ADVICE not in description
+    assert f"at most {MAX_GREP_ALTERNATIVES} per call" in description
 
 
 def test_tool_policy_teaches_alternation_and_anti_loop() -> None:

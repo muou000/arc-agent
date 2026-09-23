@@ -259,22 +259,29 @@ def passing_test_output(detail: str = "1 passed") -> str:
     return test_result(0, detail)
 
 
-def drive_scripted_tool_call(
+def drive_scripted_tool_turns(
     workspace_root: Path,
-    tool_name: str,
-    tool_args: dict[str, Any],
+    turns: list[list[tuple]],
     *,
     stage: str = "implementation",
-    call_id: str = "call-probe-1",
-) -> list[str]:
-    """Drive exactly one scripted tool call through a real ``build_stage_agent`` agent.
+    node_id: str = "REQ-FS-PROBE",
+    label: str = "FsBehaviorProbe",
+) -> list[list[str]]:
+    """Drive scripted tool-call turns through one real ``build_stage_agent`` agent.
 
     Builds the production stage agent (scripted by ``FauxChatModel``), issues
-    the tool call, then ends the loop with a plain text turn. Returns the
-    ToolMessage contents the model received on the following turn — the same
-    text a real provider would see, middleware chain included. Tests use this
-    to assert filesystem behaviors through the build path instead of applying
-    runtime patches themselves.
+    each turn's tool calls on its own assistant turn, then ends the loop with
+    a plain text turn. Returns, per turn, the ToolMessage contents the model
+    received on the following turn — the same text a real provider would see,
+    middleware chain included. Tests use this to assert filesystem behaviors
+    through the build path instead of applying runtime patches themselves.
+
+    Each turn entry is ``(name, args)`` or ``(name, args, call_id)``; call ids
+    are auto-assigned (``faux-call-<turn>-<index>``) when omitted. Multiple
+    calls within one turn may resume concurrently, so per-call middleware
+    state (e.g. the grep no-match streak) is only deterministic across turns.
+    Per-call ids make the returned contents stable even though every model
+    call replays the full conversation.
 
     Stateless: the agent is built with ``checkpointer=None``.
     """
@@ -289,14 +296,21 @@ def drive_scripted_tool_call(
     if phase is None:
         raise ValueError(f"unsupported probe stage: {stage!r}")
 
-    model = FauxChatModel(
-        responses=[
-            faux_tool_call(tool_name, tool_args, call_id=call_id),
-            faux_text("DONE"),
-        ]
-    )
+    responses: list[BaseMessage] = []
+    turn_call_ids: list[list[str]] = []
+    for turn_index, entries in enumerate(turns):
+        call_ids = []
+        normalized = []
+        for entry_index, entry in enumerate(entries):
+            name, args = entry[0], entry[1]
+            call_id = entry[2] if len(entry) > 2 and entry[2] else f"faux-call-{turn_index}-{entry_index}"
+            call_ids.append(call_id)
+            normalized.append((name, args, call_id))
+        turn_call_ids.append(call_ids)
+        responses.append(faux_tool_calls(*normalized))
+    model = FauxChatModel(responses=[*responses, faux_text("DONE")])
     built = build_stage_agent(
-        name="fs_behavior_probe",
+        name=label.lower(),
         stage=stage,
         model=model,
         system_prompt="You are a test agent.",
@@ -311,25 +325,56 @@ def drive_scripted_tool_call(
     asyncio.run(
         ainvoke_stage_agent(
             built.agent,
-            message="run the scripted tool call",
+            message="run the scripted tool calls",
             context=AgentRuntimeContext(
-                node_id="REQ-FS-PROBE",
+                node_id=node_id,
                 phase=phase,
                 app_type="web",
                 workspace_root=str(workspace_root),
                 requirement_path="",
             ),
-            thread_id=f"REQ-FS-PROBE:{tool_name}:{call_id}",
-            label="FsBehaviorProbe",
+            thread_id=f"{node_id}:{label.lower()}",
+            label=label,
         )
     )
     if model.call_count < 2:
         raise AssertionError(
             f"expected the probe loop to reach a second model turn after the "
-            f"{tool_name} call (call_count={model.call_count})"
+            f"{turns[0][0][0]} call(s) (call_count={model.call_count})"
         )
-    return [
-        str(message.content)
-        for message in model.calls[1]
-        if getattr(message, "type", "") == "tool"
-    ]
+    contents_by_call_id: dict[str, str] = {}
+    for turn_messages in model.calls:
+        for message in turn_messages:
+            if getattr(message, "type", "") == "tool":
+                # Each model call replays the full conversation; the latest
+                # content per tool_call_id is the executed result.
+                contents_by_call_id[str(getattr(message, "tool_call_id", ""))] = str(message.content)
+    per_turn: list[list[str]] = []
+    for call_ids in turn_call_ids:
+        missing = [call_id for call_id in call_ids if call_id not in contents_by_call_id]
+        if missing:
+            raise AssertionError(f"probe turn produced no tool result for call id(s): {missing}")
+        per_turn.append([contents_by_call_id[call_id] for call_id in call_ids])
+    return per_turn
+
+
+def drive_scripted_tool_call(
+    workspace_root: Path,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    *,
+    stage: str = "implementation",
+    call_id: str = "call-probe-1",
+) -> list[str]:
+    """Drive exactly one scripted tool call through a real ``build_stage_agent`` agent.
+
+    Single-turn convenience over :func:`drive_scripted_tool_turns`; see it for
+    the harness contract.
+    """
+
+    (contents,) = drive_scripted_tool_turns(
+        workspace_root,
+        [[(tool_name, tool_args, call_id)]],
+        stage=stage,
+    )
+    return contents

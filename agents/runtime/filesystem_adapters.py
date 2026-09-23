@@ -624,22 +624,23 @@ def workspace_filesystem_backend(root_dir: str) -> FilesystemBackend:
 # -- grep: literal-alternation expansion and no-match guidance (issue #218) -----
 
 
-#: ARC's replacement for upstream's grep tool description. The stock text ends
-#: with "To match any of several strings, run a separate grep for each" — the
-#: per-keyword call loop issue #218 removes — and denies the `|` expansion the
-#: backend now performs, so the injected description must state the actual
-#: semantics on every surface the model reads.
-ARC_GREP_TOOL_DESCRIPTION = """Search for a LITERAL text pattern across files (NOT regex).
-
-The pattern is matched verbatim: regex metacharacters are ordinary characters, not operators (`.*`, `\\.`, `^`, `$` are searched as plain text). A pattern containing `|` is expanded into literal alternatives: `grep(pattern="foo|bar")` matches files containing `foo` OR `bar` (at most 8 alternatives per call; write `\\|` to search for a literal `|` instead). Do not enumerate keyword guesses one grep at a time — when a search misses, read the candidate file (`read_file` with offset/limit) or search one distinctive literal copied from earlier tool output.
-
-Returns matching files or content per `output_mode`. Offloaded large tool results live under the artifacts root (`/large_tool_results/` by default); grep that directory to search them when you do not know the exact path."""
-
-
 #: Upper bound on literal alternatives expanded from one `|` pattern. The
 #: serial-4 run's misuse peaked around three alternatives; 8 leaves generous
 #: headroom while bounding the per-call fan-out (each branch is a full search).
 MAX_GREP_ALTERNATIVES = 8
+
+
+#: ARC's replacement for upstream's grep tool description. The stock text ends
+#: with "To match any of several strings, run a separate grep for each" — the
+#: per-keyword call loop issue #218 removes — and denies the `|` expansion the
+#: backend now performs, so the injected description must state the actual
+#: semantics on every surface the model reads. The cap is interpolated from
+#: MAX_GREP_ALTERNATIVES so the prose cannot drift from the enforced limit.
+ARC_GREP_TOOL_DESCRIPTION = f"""Search for a LITERAL text pattern across files (NOT regex).
+
+The pattern is matched verbatim: regex metacharacters are ordinary characters, not operators (`.*`, `\\.`, `^`, `$` are searched as plain text). A pattern containing `|` is expanded into literal alternatives: `grep(pattern="foo|bar")` matches files containing `foo` OR `bar` (at most {MAX_GREP_ALTERNATIVES} alternatives per call; write `\\|` to search for a literal `|` instead). Do not enumerate keyword guesses one grep at a time — when a search misses, read the candidate file (`read_file` with offset/limit) or search one distinctive literal copied from earlier tool output.
+
+Returns matching files or content per `output_mode`. Offloaded large tool results live under the artifacts root (`/large_tool_results/` by default); grep that directory to search them when you do not know the exact path."""
 
 #: Upstream renders an empty grep result as exactly this sentinel line.
 _GREP_NO_MATCH_SENTINEL = "No matches found"
