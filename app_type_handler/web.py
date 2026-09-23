@@ -37,7 +37,12 @@ from .template_patches import (
     apply_template_patches,
 )
 from core.config import get_web_base_url, get_web_port
-from core.processes import build_subprocess_env, finalize_subprocess
+from core.processes import (
+    build_subprocess_env,
+    finalize_subprocess,
+    start_subprocess_exec,
+    start_subprocess_shell,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +202,7 @@ async def _run_npm_command(
     # surface); a string command keeps the historical shell behavior for
     # the flag-carrying install lines built from module constants.
     if isinstance(command, list):
-        process = await asyncio.create_subprocess_exec(
+        process = await start_subprocess_exec(
             _resolve_executable(command[0]),
             *command[1:],
             cwd=target_dir,
@@ -206,7 +211,7 @@ async def _run_npm_command(
             env=build_subprocess_env(),
         )
     else:
-        process = await asyncio.create_subprocess_shell(
+        process = await start_subprocess_shell(
             command,
             cwd=target_dir,
             stdout=asyncio.subprocess.PIPE,

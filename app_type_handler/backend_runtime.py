@@ -44,7 +44,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from core.config import build_web_runtime_env, get_web_port
-from core.processes import build_subprocess_env, finalize_subprocess
+from core.processes import (
+    build_subprocess_env,
+    finalize_subprocess,
+    start_subprocess_exec,
+    start_subprocess_shell,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +88,7 @@ async def _execute_web_test_command(
 ) -> _CommandResult:
     process = None
     try:
-        process = await asyncio.create_subprocess_shell(
+        process = await start_subprocess_shell(
             command,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
@@ -406,7 +411,7 @@ async def _force_kill_pid(pid: int) -> None:
 
     try:
         if os.name == "nt":
-            process = await asyncio.create_subprocess_exec(
+            process = await start_subprocess_exec(
                 "taskkill",
                 "/PID",
                 str(pid),
@@ -981,7 +986,7 @@ async def spawn_backend_process(
         return BackendSpawn(None, start_command, str(exc), "")
 
     try:
-        backend_process = await asyncio.create_subprocess_shell(
+        backend_process = await start_subprocess_shell(
             start_command,
             cwd=backend_path,
             stdout=asyncio.subprocess.PIPE,
