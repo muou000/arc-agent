@@ -1236,6 +1236,120 @@ def test_streaming_unsupported_mark_expires_after_ttl(
     assert result3.outcome.stream_fallbacks == ()
 
 
+# ---------------------------------------------------------------------------
+# Streamed 4xx classification: only capability-proof statuses mark the cache
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 405, 415, 422])
+def test_stream_first_capability_status_still_falls_back_and_marks(
+    status_code: int,
+) -> None:
+    """400/404/405/415/422 prove the endpoint rejects the streamed request
+    shape itself: immediate plain re-attempt, FALLBACK_CLIENT_ERROR, and the
+    streaming-unsupported mark (later calls start plain)."""
+
+    recorder = _Recorder(streamed_errors=[_status_error(status_code)])
+    result = _call_engine(recorder, stream_first=True, model=f"cap-{status_code}")
+
+    assert result.value == "plain-ok"
+    assert recorder.calls == {"plain": 1, "streamed": 1}
+    assert result.outcome.stream_fallbacks == (StreamFallback(FALLBACK_CLIENT_ERROR, 1),)
+
+    recorder2 = _Recorder()
+    result2 = _call_engine(recorder2, stream_first=True, model=f"cap-{status_code}")
+    assert result2.value == "plain-ok"
+    assert recorder2.calls["streamed"] == 0
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_stream_first_auth_status_fails_fast_without_mark(status_code: int) -> None:
+    """401/403 say nothing about streaming capability: no plain re-attempt
+    (which would bypass auth handling with a duplicate request), no
+    FALLBACK_CLIENT_ERROR, no cache mark — the normalized auth error raises."""
+
+    recorder = _Recorder(streamed_errors=[_status_error(status_code)])
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_engine(recorder, stream_first=True, model=f"auth-{status_code}")
+
+    assert excinfo.value.status_code == status_code
+    assert recorder.calls == {"plain": 0, "streamed": 1}
+
+    # No mark: a later call still tries streaming first.
+    recorder2 = _Recorder()
+    result2 = _call_engine(recorder2, stream_first=True, model=f"auth-{status_code}")
+    assert result2.value == "streamed-ok"
+    assert recorder2.calls["streamed"] == 1
+
+
+@pytest.mark.parametrize("status_code", [408, 409])
+def test_stream_first_transient_status_retries_streamed_without_mark(
+    status_code: int,
+) -> None:
+    """408/409 are transient classes the generic classification already owns:
+    retry on the streamed transport after the policy delay — no plain switch,
+    no cache mark."""
+
+    sleeps: list[float] = []
+    recorder = _Recorder(streamed_errors=[_status_error(status_code)])
+    result = _call_engine(
+        recorder, stream_first=True, model=f"transient-{status_code}", sleeper=sleeps.append
+    )
+
+    assert result.value == "streamed-ok"
+    assert recorder.calls == {"plain": 0, "streamed": 2}
+    assert sleeps == [5.0]  # the generic classification's fixed retry delay
+    assert result.outcome.stream_fallbacks == ()
+
+    recorder2 = _Recorder()
+    result2 = _call_engine(recorder2, stream_first=True, model=f"transient-{status_code}")
+    assert result2.value == "streamed-ok"
+    assert recorder2.calls["streamed"] == 1
+
+
+def test_stream_first_429_retries_streamed_with_retry_after() -> None:
+    """A streamed 429 must keep the plain path's Retry-After semantics: wait
+    the advertised delay, retry streamed (no duplicate plain request fired
+    past the throttle), no cache mark."""
+
+    sleeps: list[float] = []
+    recorder = _Recorder(streamed_errors=[_status_error(429, headers={"retry-after": "7"})])
+    result = _call_engine(
+        recorder, stream_first=True, model="throttle-stream", sleeper=sleeps.append
+    )
+
+    assert result.value == "streamed-ok"
+    assert recorder.calls == {"plain": 0, "streamed": 2}
+    assert sleeps == [7.0]
+    assert result.outcome.stream_fallbacks == ()
+
+    recorder2 = _Recorder()
+    result2 = _call_engine(recorder2, stream_first=True, model="throttle-stream")
+    assert result2.value == "streamed-ok"
+    assert recorder2.calls["streamed"] == 1
+
+
+def test_stream_first_quota_429_fails_fast_without_mark() -> None:
+    """A streamed 429 carrying quota-exhaustion text is deterministic: fail
+    fast exactly like the plain path — no plain re-attempt, no cache mark."""
+
+    recorder = _Recorder(
+        streamed_errors=[
+            _rate_limit_error("Error code: 429 - {'error': {'code': 'insufficient_quota'}}")
+        ]
+    )
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_engine(recorder, stream_first=True, model="quota-stream")
+
+    assert excinfo.value.status_code == 429
+    assert recorder.calls == {"plain": 0, "streamed": 1}
+
+    recorder2 = _Recorder()
+    result2 = _call_engine(recorder2, stream_first=True, model="quota-stream")
+    assert result2.value == "streamed-ok"
+    assert recorder2.calls["streamed"] == 1
+
+
 def test_stream_first_server_error_keeps_streaming_on_retries() -> None:
     """A 5xx from the streamed attempt is transient: retry with the streamed
     transport still selected (unlike a connection failure, which alternates)."""
