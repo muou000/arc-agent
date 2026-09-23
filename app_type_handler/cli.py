@@ -9,7 +9,7 @@ from pathlib import Path
 from .base import AppTypeHandler
 from .path_validation import normalize_safe_relative_path
 from .test_results import TestRunResult, parse_test_run
-from core.processes import build_subprocess_env
+from core.processes import build_subprocess_env, finalize_subprocess, start_subprocess_exec
 
 
 def _normalize_cli_test_path(file_path: str) -> str:
@@ -36,7 +36,7 @@ async def _run_python_command(
 ) -> str:
     process = None
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await start_subprocess_exec(
             *args,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
@@ -53,9 +53,10 @@ async def _run_python_command(
             result += f"STDERR:\n{error}\n"
         return result
     except asyncio.TimeoutError:
-        if process is not None and process.returncode is None:
-            process.kill()
-            await process.wait()
+        # Tree-aware teardown: python test files can spawn their own children,
+        # and a bare kill() used to leave those writing into the workspace.
+        if process is not None:
+            await finalize_subprocess(process, force_kill=True)
         return f"Exit Code: 124\nSTDERR:\nCommand timed out after {timeout} seconds.\n"
     except Exception as exc:
         return f"Exit Code: 1\nSTDERR:\nExecution failed: {str(exc)}\n"

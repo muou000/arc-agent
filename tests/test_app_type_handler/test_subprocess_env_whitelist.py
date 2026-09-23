@@ -403,7 +403,15 @@ def test_backend_spawn_env_is_whitelisted(
 
 _APP_TYPE_HANDLER_ROOT = REPO_ROOT / "app_type_handler"
 
-_SUBPROCESS_SPAWN_NAMES = {"create_subprocess_exec", "create_subprocess_shell"}
+# The tree-aware spawn helpers (issue #181) live in core.processes and are
+# the only spawn shape app_type_handler is allowed to call, so the whitelist
+# guard covers them alongside the raw asyncio names they must never replace.
+_SUBPROCESS_SPAWN_NAMES = {
+    "create_subprocess_exec",
+    "create_subprocess_shell",
+    "start_subprocess_exec",
+    "start_subprocess_shell",
+}
 
 
 def _attribute_chain_matches(node: ast.AST, *names: str) -> bool:

@@ -2202,10 +2202,11 @@ def test_install_tool_converts_handler_crash_into_failed_install() -> None:
 def test_install_command_uses_argv_list() -> None:
     """The install command must bypass the shell (review round-1 hardening).
 
-    ``_run_npm_command`` now accepts argv lists and uses
-    ``create_subprocess_exec`` for them; ``install_package`` passes the
-    validated package name as a single argv element so no shell quoting or
-    injection surface remains even if the name validation is ever relaxed.
+    ``_run_npm_command`` now accepts argv lists and routes them through
+    ``start_subprocess_exec`` (the tree-aware exec wrapper in
+    ``core.processes``; issue #181); ``install_package`` passes the validated
+    package name as a single argv element so no shell quoting or injection
+    surface remains even if the name validation is ever relaxed.
     """
 
     import inspect
@@ -2214,7 +2215,7 @@ def test_install_command_uses_argv_list() -> None:
 
     # The public helper must route list commands through exec, not shell.
     source = inspect.getsource(web_mod._run_npm_command)
-    assert "create_subprocess_exec" in source
+    assert "start_subprocess_exec" in source
     assert "isinstance(command, list)" in source
     # And install_package builds a list command containing the bare name.
     install_source = inspect.getsource(web_mod.WebAppType.install_package)

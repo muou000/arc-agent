@@ -6,7 +6,12 @@ import shutil
 
 from core.service import get_runtime
 from core.config import get_android_package, set_android_package
-from core.processes import build_subprocess_env, finalize_subprocess
+from core.processes import (
+    build_subprocess_env,
+    finalize_subprocess,
+    start_subprocess_exec,
+    start_subprocess_shell,
+)
 
 from .base import AppTypeHandler
 from .path_validation import normalize_safe_relative_path
@@ -110,7 +115,7 @@ async def _run_android_gradle_test(workspace_path: str, file_path: str) -> str:
     )
     process = None
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await start_subprocess_exec(
             *command,
             cwd=workspace_path,
             stdout=asyncio.subprocess.PIPE,
@@ -133,7 +138,7 @@ async def _run_android_gradle_build(workspace_path: str) -> str:
     command = f"{_gradlew_cmd()} assembleDebug compileDebugUnitTestJavaWithJavac --info"
     process = None
     try:
-        process = await asyncio.create_subprocess_shell(
+        process = await start_subprocess_shell(
             command,
             cwd=workspace_path,
             stdout=asyncio.subprocess.PIPE,
@@ -563,7 +568,7 @@ If no app package can be identified, set package_name to "UNKNOWN"."""
 
         try:
             process = None
-            process = await asyncio.create_subprocess_shell(
+            process = await start_subprocess_shell(
                 "java -XshowSettings:properties -version 2>&1 | grep 'java.home'",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

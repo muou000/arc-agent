@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import shutil
+import signal
+import weakref
 from collections.abc import Mapping
+from contextlib import suppress
 from typing import Any, Awaitable, Callable
+
+
+logger = logging.getLogger(__name__)
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -124,18 +131,362 @@ def build_subprocess_env(extra: Mapping[str, str] | None = None) -> dict[str, st
     return env
 
 
+# ---------------------------------------------------------------------------
+# Process-tree spawn and cleanup (issue #181)
+# ---------------------------------------------------------------------------
+#
+# Build/test/install commands run through a shell or an npm wrapper, so the
+# process arc spawns is only the launcher: on timeout the direct PID dies but
+# its children (npm -> node -> Playwright browsers, `cmd /c` -> gradle -> java)
+# survive, keep holding port slots and writing into the generated workspace —
+# the port-conflict and E2E-database-race amplifier. The spawn helpers below
+# pair with `finalize_subprocess` so a timeout tears down the whole tree:
+#
+# - POSIX: the launcher is spawned as a session/process-group leader
+#   (`start_new_session=True`); descendants inherit the group unless they
+#   deliberately `setsid` away, and finalize signals the whole group.
+# - Windows: the launcher is assigned to a kernel Job Object with
+#   ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``; every descendant joins the job
+#   automatically, `TerminateJobObject` kills them all at once, and closing
+#   the last job handle is a final safety net (also when arc itself crashes —
+#   the handle dies with the process). A side effect: a member that
+#   deliberately outlives its command (a Gradle daemon) dies at job close
+#   instead of being reused — workspace hygiene wins over daemon reuse.
+#
+# Every enablement step is best-effort: a failure degrades to the legacy
+# single-PID cleanup (plus a best-effort `taskkill /T /F` sweep on Windows),
+# never to a failed spawn.
+
+_PROCESS_KILL_SCOPE_ATTRIBUTE = "_arc_kill_scope"
+
+# Grace period between the graceful signal (SIGTERM group / launcher
+# terminate) and the forced escalation, mirroring the legacy finalize wait.
+_TREE_KILL_GRACE_SECONDS = 3.0
+
+
+class ProcessKillScope:
+    """The tree-kill anchors attached to one spawned launcher process.
+
+    ``pgid`` is the POSIX process group (the launcher's PID via
+    ``start_new_session``); ``job_handle`` is the Windows Job Object HANDLE.
+    ``close_job`` releases the job handle (idempotent); it is also registered
+    as a ``weakref.finalize`` on the Process object so a normally-completing
+    command releases the job, and KILL_ON_JOB_CLOSE sweeps anything a caller
+    dropped without a teardown.
+    """
+
+    __slots__ = ("pgid", "job_handle", "close_job")
+
+    def __init__(self) -> None:
+        self.pgid: int | None = None
+        self.job_handle: int | None = None
+        self.close_job: Callable[[], None] | None = None
+
+
+async def start_subprocess_exec(
+    program: Any, *args: Any, **kwargs: Any
+) -> asyncio.subprocess.Process:
+    """`asyncio.create_subprocess_exec`, with process-tree cleanup enabled.
+
+    All keyword arguments pass through unchanged (``cwd``/``env``/``stdout``
+    ...), so this is a drop-in for the raw call; the only additions are the
+    platform's tree-cleanup enablement. Callers keep owning the returned
+    ``Process`` and clean it up through ``finalize_subprocess``.
+    """
+
+    _apply_tree_spawn_kwargs(kwargs)
+    process = await asyncio.create_subprocess_exec(program, *args, **kwargs)
+    _attach_kill_scope(process)
+    return process
+
+
+async def start_subprocess_shell(command: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+    """`asyncio.create_subprocess_shell`, with process-tree cleanup enabled.
+
+    Same contract as ``start_subprocess_exec``: pure passthrough kwargs plus
+    the tree-cleanup enablement, no behavior change on the command itself.
+    """
+
+    _apply_tree_spawn_kwargs(kwargs)
+    process = await asyncio.create_subprocess_shell(command, **kwargs)
+    _attach_kill_scope(process)
+    return process
+
+
+def _apply_tree_spawn_kwargs(kwargs: dict[str, Any]) -> None:
+    # POSIX only: make the launcher a session and process group leader so the
+    # whole descendant tree shares one killable group. Windows gets the same
+    # guarantee from the Job Object assigned after the spawn; passing
+    # start_new_session there is a ValueError, hence the platform branch.
+    if os.name != "nt":
+        kwargs.setdefault("start_new_session", True)
+
+
+def _attach_kill_scope(process: Any) -> None:
+    """Attach ``ProcessKillScope`` to a freshly spawned process. Never raises.
+
+    Failure modes degrade, in order of preference: an unassignable Job Object
+    still attaches a pid-only scope (finalize then sweeps with
+    ``taskkill /T /F``); a scope that cannot even be attached leaves the
+    legacy single-PID cleanup in place.
+    """
+
+    try:
+        scope = ProcessKillScope()
+        if os.name == "nt":
+            job_handle, close_job = _create_kill_on_close_job()
+            if job_handle is not None:
+                if _assign_process_to_job(job_handle, process):
+                    scope.job_handle = job_handle
+                    scope.close_job = close_job
+                    # Normal completion never reaches finalize_subprocess:
+                    # release the job when the Process object is collected.
+                    # With KILL_ON_JOB_CLOSE that close also kills members a
+                    # caller dropped without a teardown.
+                    weakref.finalize(process, close_job)
+                else:
+                    # Assignment failed (nested-job policy, exited launcher):
+                    # release the unused job and fall back to the taskkill
+                    # sweep via the pid-only scope.
+                    if close_job is not None:
+                        close_job()
+        else:
+            scope.pgid = int(process.pid)
+        setattr(process, _PROCESS_KILL_SCOPE_ATTRIBUTE, scope)
+    except Exception as exc:
+        logger.debug("process-tree cleanup not enabled for spawn: %s", exc)
+
+
+if os.name == "nt":
+    import ctypes
+    import ctypes.wintypes as _wt
+
+    _ULONG_PTR = ctypes.c_size_t
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _JobObjectExtendedLimitInformation = 9  # JOBOBJECTINFOCLASS enum value
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            (name, ctypes.c_ulonglong)
+            for name in (
+                "ReadOperationCount",
+                "WriteOperationCount",
+                "OtherOperationCount",
+                "ReadTransferCount",
+                "WriteTransferCount",
+                "OtherTransferCount",
+            )
+        ]
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", _wt.DWORD),
+            ("MinimumWorkingSetSize", _ULONG_PTR),
+            ("MaximumWorkingSetSize", _ULONG_PTR),
+            ("ActiveProcessLimit", _wt.DWORD),
+            ("Affinity", _ULONG_PTR),
+            ("PriorityClass", _wt.DWORD),
+            ("SchedulingClass", _wt.DWORD),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", _ULONG_PTR),
+            ("JobMemoryLimit", _ULONG_PTR),
+            ("PeakProcessMemoryUsed", _ULONG_PTR),
+            ("PeakJobMemoryUsed", _ULONG_PTR),
+        ]
+
+
+def _create_kill_on_close_job() -> tuple[int | None, Callable[[], None] | None]:
+    """Create a Windows Job Object that kills every member on last close.
+
+    Returns ``(handle, close)``; ``(None, None)`` when creation failed and the
+    caller should fall back to the taskkill sweep.
+    """
+
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None, None
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+        job,
+        _JobObjectExtendedLimitInformation,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        kernel32.CloseHandle(job)
+        return None, None
+
+    closed = False
+
+    def _close_job() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        with suppress(Exception):
+            kernel32.CloseHandle(job)
+
+    return int(job), _close_job
+
+
+def _assign_process_to_job(job: int, process: Any) -> bool:
+    """Assign the spawned launcher to the job. Failure is non-fatal."""
+
+    try:
+        # asyncio's subprocess Process wraps a subprocess.Popen whose
+        # ``_handle`` is the process HANDLE; ``int()`` unwraps
+        # ``subprocess.Handle`` to the raw value ctypes needs.
+        handle = int(process._transport._proc._handle)  # type: ignore[attr-defined]
+    except Exception:
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.kernel32.AssignProcessToJobObject(job, handle))
+    except Exception:
+        return False
+
+
+def _terminate_job_members(job: int) -> None:
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.TerminateJobObject(job, 1)
+    except Exception:
+        pass
+
+
+async def _taskkill_tree(pid: int) -> None:
+    """Best-effort Windows tree sweep for spawns without a Job Object.
+
+    ``taskkill /T`` walks parent PIDs as observed at call time: children of an
+    already-exited parent were re-parented and are missed — the residual risk
+    that makes the Job Object the primary mechanism rather than this fallback.
+    """
+
+    try:
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/PID",
+            str(pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=build_subprocess_env(),
+        )
+    except Exception:
+        return
+    with suppress(Exception):
+        await asyncio.wait_for(killer.wait(), timeout=5.0)
+
+
 async def finalize_subprocess(process: Any, *, force_kill: bool = False) -> None:
+    """Tear down one spawned subprocess — its whole tree when cleanup was enabled.
+
+    Processes spawned through ``start_subprocess_exec``/``start_subprocess_shell``
+    carry a ``ProcessKillScope``: POSIX signals the process group (SIGTERM,
+    then SIGKILL after the grace period) and Windows terminates the Job Object,
+    so shell/npm/gradle descendants die with the launcher. Any other process
+    keeps the legacy single-PID semantics below, unchanged for existing callers.
+    """
+
     if process is None or getattr(process, "returncode", None) is not None:
         return
+    scope: ProcessKillScope | None = getattr(process, _PROCESS_KILL_SCOPE_ATTRIBUTE, None)
+    if scope is not None:
+        try:
+            if os.name == "nt":
+                await _finalize_process_tree_windows(process, scope, force_kill=force_kill)
+            else:
+                await _finalize_process_tree_posix(process, scope, force_kill=force_kill)
+            return
+        except Exception as exc:
+            # A tree-kill helper failure must not skip the direct kill either.
+            logger.debug("process-tree finalize degraded to direct kill: %s", exc)
     if force_kill:
         process.kill()
     else:
         process.terminate()
     try:
-        await asyncio.wait_for(process.wait(), timeout=3.0)
+        await asyncio.wait_for(process.wait(), timeout=_TREE_KILL_GRACE_SECONDS)
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
+
+
+async def _finalize_process_tree_posix(
+    process: Any, scope: ProcessKillScope, *, force_kill: bool
+) -> None:
+    pgid = scope.pgid
+    if pgid is None:
+        raise RuntimeError("process-tree scope carries no POSIX process group")
+    if not force_kill:
+        _signal_process_group(pgid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_TREE_KILL_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+    # Covers both the timed-out graceful stage and a launcher that died while
+    # descendants (same group) survived the SIGTERM.
+    if _process_group_alive(pgid):
+        _signal_process_group(pgid, signal.SIGKILL)
+    await process.wait()
+
+
+def _signal_process_group(pgid: int, sig: int) -> None:
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, sig)
+
+
+def _process_group_alive(pgid: int) -> bool:
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _finalize_process_tree_windows(
+    process: Any, scope: ProcessKillScope, *, force_kill: bool
+) -> None:
+    if scope.job_handle is not None:
+        _terminate_job_members(scope.job_handle)
+    # The launcher itself: keep the legacy terminate -> wait -> kill escalation
+    # so wait() unblocks even when the job was missing or already closed.
+    if force_kill:
+        _kill_process_quietly(process)
+    else:
+        with suppress(OSError):
+            process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=_TREE_KILL_GRACE_SECONDS)
+    except asyncio.TimeoutError:
+        _kill_process_quietly(process)
+        await process.wait()
+    if scope.job_handle is None:
+        await _taskkill_tree(process.pid)
+    if scope.close_job is not None:
+        scope.close_job()
+
+
+def _kill_process_quietly(process: Any) -> None:
+    with suppress(OSError):
+        process.kill()
 
 
 async def check_prerequisites(app_type: str, log_cb: LogCallback | None = None) -> bool:
