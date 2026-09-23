@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+from langchain_core.messages import AIMessage
+
 from tests.helpers.faux import FauxChatModel, faux_text
 
 from app_type_handler.android import AndroidAppType
@@ -147,3 +149,37 @@ def test_malformed_package_segments_fall_back_with_warning_log(tmp_path) -> None
     assert package.startswith("com.")
     warnings = [record for record in logs.records if record[2] == "warning"]
     assert any("malformed package name" in str(record[1]) for record in warnings)
+
+
+def test_segmented_content_list_response_is_read(tmp_path) -> None:
+    """Multimodal content lists (dict parts) must not become a spurious fallback."""
+
+    model = FauxChatModel(
+        responses=[AIMessage(content=[{"type": "text", "text": _package_response("com.example.reader")}])]
+    )
+    logs = _LogCollector()
+    handler = AndroidAppType(
+        str(tmp_path), _write_requirements(tmp_path, with_resource_ids=False), _FauxDesigner(model), logs
+    )
+
+    package = asyncio.run(handler._extract_android_package_name_via_llm())
+
+    assert package == "com.example.reader"
+    assert all(record[2] != "warning" for record in logs.records)
+
+
+def test_non_string_package_name_falls_back_with_warning_log(tmp_path) -> None:
+    """A numeric package_name must not surface as a bogus 'LLM call failed' error."""
+
+    model = FauxChatModel(responses=[faux_text('{"package_name": 123, "resource_ids": {}}')])
+    logs = _LogCollector()
+    handler = AndroidAppType(
+        str(tmp_path), _write_requirements(tmp_path, with_resource_ids=False), _FauxDesigner(model), logs
+    )
+
+    package = asyncio.run(handler._extract_android_package_name_via_llm())
+
+    assert package.startswith("com.")
+    warnings = [record for record in logs.records if record[2] == "warning"]
+    assert any("no usable package name" in str(record[1]) for record in warnings)
+    assert not any("via LLM failed" in str(record[1]) for record in logs.records)

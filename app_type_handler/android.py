@@ -153,12 +153,30 @@ async def _run_android_gradle_build(workspace_path: str) -> str:
 
 
 def _response_text(response: object) -> str:
-    """Best-effort text extraction from a chat model response."""
+    """Best-effort text extraction from a chat model response.
+
+    Multimodal/segmented responses carry ``content`` as a list of
+    ``{"type": "text", "text": ...}`` dicts (or objects exposing ``text``),
+    not plain strings; dropping those would turn a real answer into a
+    spurious "no JSON" fallback.
+    """
     content = getattr(response, "content", None)
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(part for part in content if isinstance(part, str))
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            else:
+                text = getattr(part, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
     return ""
 
 
@@ -420,8 +438,15 @@ If no app package can be identified, set package_name to "UNKNOWN"."""
                 return self._fallback_package_name_extraction(all_reqs)
 
             parsed = json.loads(json_match.group())
+            # The greedy regex above only ever yields a JSON object (or a
+            # JSONDecodeError), so ``parsed`` is always a dict here; the
+            # field-level coercion below is what is actually reachable.
             package_name = parsed.get("package_name", "UNKNOWN")
+            if not isinstance(package_name, str):
+                package_name = "UNKNOWN"
             resource_ids = parsed.get("resource_ids", {})
+            if not isinstance(resource_ids, dict):
+                resource_ids = {}
             package_name = package_name.strip().strip("`").strip('"').strip("'")
             if package_name == "UNKNOWN" or not package_name or "." not in package_name:
                 await self._log(
