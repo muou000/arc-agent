@@ -84,6 +84,7 @@ from core.worktree import (
     MergeArbitrationError,
     MergeConflictError,
     NodeWorktreeManager,
+    ReplayOutcome,
     WorktreeError,
     WorktreeHandle,
     WorktreeOutcome,
@@ -1061,18 +1062,18 @@ class ARCWorkflowManager:
         def on_replay_started() -> None:
             self._emit_rebase_replay_event(node_id, "started", [], "pending merge touched")
 
-        def on_replay(outcome: Any) -> None:
-            status = str(getattr(outcome, "status", "") or "")
+        def on_replay(outcome: ReplayOutcome) -> None:
             # Issue #127's lifecycle vocabulary: a landed replay (clean or
             # conflict-completed) reports ``resolved``; a conflict round and
             # a fail-open abort keep their own statuses.
-            if status == "replayed":
+            status = outcome.status
+            if status == ReplayOutcome.REPLAYED:
                 status = "resolved"
             self._emit_rebase_replay_event(
                 node_id,
                 status,
-                [str(path) for path in (getattr(outcome, "files", None) or [])],
-                str(getattr(outcome, "detail", "") or "") or None,
+                [str(path) for path in (outcome.files or [])],
+                str(outcome.detail or "") or None,
             )
 
         def conflict_contract_cards(conflict_paths: list[str]) -> dict[str, Any]:
@@ -1097,15 +1098,22 @@ class ARCWorkflowManager:
             conflict_contract_cards=conflict_contract_cards,
         )
 
-    def _emit_rebase_replay_event(self, node_id: str, outcome: Any) -> None:
-        """Persist one ``rebase_replay`` runner event (best effort)."""
+    def _emit_rebase_replay_event(
+        self, node_id: str, status: str, files: list[str], message: str | None
+    ) -> None:
+        """Persist one ``rebase_replay`` runner event (best effort).
+
+        ``status`` is the lifecycle vocabulary (``started`` / ``resolved`` /
+        ``conflicts`` / ``aborted``); ``files`` the applied or conflicted
+        paths; ``message`` the outcome detail or None.
+        """
 
         try:
             self.runtime.events.record_rebase_replay(
                 node_id=node_id,
-                status=str(getattr(outcome, "status", "") or ""),
-                files=[str(path) for path in (getattr(outcome, "files", None) or [])],
-                message=str(getattr(outcome, "detail", "") or "") or None,
+                status=status,
+                files=files,
+                message=message,
             )
         except Exception as exc:  # noqa: BLE001 - audit must never break the tool call
             append_debug_log(
