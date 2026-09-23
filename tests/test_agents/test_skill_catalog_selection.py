@@ -371,20 +371,23 @@ def _capture_generator_build(
     requirement_data: dict[str, Any],
     invoke_payload: dict[str, Any],
     run_repair: bool,
-) -> dict[str, Any]:
-    """Run one TestGenerator pass with the build seam recorded.
+) -> tuple[dict[str, Any], str]:
+    """Run one TestGenerator pass with the build and invoke seams recorded.
 
     Returns the kwargs captured from that pass's single ``build_stage_agent``
-    call (each pass builds exactly one agent).
+    call (each pass builds exactly one agent) and the user message handed to
+    ``ainvoke_stage_agent``.
     """
 
     builds: list[dict[str, Any]] = []
+    messages: list[str] = []
 
     def fake_build_stage_agent(**kwargs: Any) -> StageAgentBuild:
         builds.append(kwargs)
         return StageAgentBuild(agent=object(), stage_discipline=None)
 
     async def fake_ainvoke(agent: Any, **kwargs: Any) -> dict[str, Any]:
+        messages.append(str(kwargs.get("message", "")))
         return invoke_payload
 
     monkeypatch.setattr(stage_session_module, "build_stage_agent", fake_build_stage_agent)
@@ -423,7 +426,7 @@ def _capture_generator_build(
         asyncio.run(generator.run(node_id=node_id, requirement_data=requirement_data))
 
     assert len(builds) == 1
-    return builds[0]
+    return builds[0], messages[0]
 
 
 @pytest.mark.parametrize(
@@ -450,7 +453,7 @@ def test_generator_repair_build_matches_first_pass(
     repair round (issue #173: in=98,008 / cache_read=128 on the repair call
     while the first pass cached normally)."""
     payload = {"summary": "ok", "tests": [], "files_written": []}
-    first_pass = _capture_generator_build(
+    first_pass, _ = _capture_generator_build(
         tmp_project_dir,
         arc_runtime,
         monkeypatch,
@@ -459,7 +462,7 @@ def test_generator_repair_build_matches_first_pass(
         invoke_payload=payload,
         run_repair=False,
     )
-    repair_pass = _capture_generator_build(
+    repair_pass, _ = _capture_generator_build(
         tmp_project_dir,
         arc_runtime,
         monkeypatch,
@@ -476,6 +479,32 @@ def test_generator_repair_build_matches_first_pass(
     # from both.
     has_auth_floor = bool(select_test_generation_skills(requirement_data))
     assert ("Stage Skill Activation" in repair_pass["system_prompt"]) is has_auth_floor
+
+
+def test_generator_repair_message_carries_requirement_snapshot(
+    tmp_project_dir: Path,
+    arc_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #184: the repair round's prompt must carry a non-empty
+    Requirement Snapshot. The rejection message previously named only the
+    green evidence and the old manifest; on a cold thread (checkpointer
+    disabled, or a repair without the first pass's history) the model had no
+    requirement text at all to judge which assertions are node-owned."""
+    requirement_data = {"name": "Login", "description": "user can log in and see their session"}
+    _build, message = _capture_generator_build(
+        tmp_project_dir,
+        arc_runtime,
+        monkeypatch,
+        node_id="REQ-SKILL-2",
+        requirement_data=requirement_data,
+        invoke_payload={"summary": "ok", "tests": [], "files_written": []},
+        run_repair=True,
+    )
+
+    assert "### Requirement Snapshot" in message
+    assert '"Login"' in message
+    assert "user can log in and see their session" in message
 
 
 # -- planner removal ------------------------------------------------------------
