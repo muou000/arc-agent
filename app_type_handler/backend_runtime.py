@@ -1124,6 +1124,20 @@ class BackendRuntime:
 
     def __init__(self) -> None:
         self._session: BackendSession | None = None
+        # Cleanup evidence of the most recent ``ensure`` call, stashed before
+        # its raise-capable awaits (see the stash site in ``ensure``).
+        self._last_cleanup_note: str = ""
+
+    @property
+    def last_cleanup_note(self) -> str:
+        """The cleanup evidence the most recent ``ensure`` had gathered.
+
+        Reads as "" before the first ``ensure`` and after a clean call with
+        nothing to report; on an ``ensure`` that died mid-flight it carries
+        the stale teardown notes already paid for.
+        """
+
+        return self._last_cleanup_note
 
     @property
     def session(self) -> BackendSession | None:
@@ -1180,6 +1194,13 @@ class BackendRuntime:
         stale_note = await self.terminate("Stale E2E runtime cleanup")
         if stale_note:
             cleanup_note = f"{cleanup_note}\n{stale_note}" if cleanup_note else stale_note
+        # Stash the evidence gathered so far before the raise-capable awaits
+        # below (scripted test adapters can raise from _prepare_db/_spawn): a
+        # caller whose ensure call dies mid-flight can still read the stale
+        # teardown notes this call already paid for off ``last_cleanup_note``.
+        # In production the command runner and spawn paths catch their own
+        # errors, so this only matters for injected adapters.
+        self._last_cleanup_note = cleanup_note
 
         db_output = ""
         retry_notes: list[str] = []

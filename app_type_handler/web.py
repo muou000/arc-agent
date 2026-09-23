@@ -1387,13 +1387,19 @@ class WebAppType(AppTypeHandler):
                 prior_cleanup_note="",
             )
         except Exception as exc:
-            return TestRunResult(
-                exit_code=1,
-                output=(
-                    f"Failed to start grouped E2E execution: {str(exc)}"
-                    + attempt_runner.render_stage_timing()
-                ),
+            # The attempt died mid-flight; the fallback still surfaces whatever
+            # teardown evidence it had already accumulated (stale-session
+            # cleanup notes), so the failure body stays diagnosable.
+            accumulated_cleanup = attempt_runner.accumulated_cleanup_note()
+            fallback_body = (
+                f"Failed to start grouped E2E execution: {str(exc)}"
+                + attempt_runner.render_stage_timing()
             )
+            if accumulated_cleanup:
+                fallback_body += (
+                    f"\n\n=== Previous Backend Runtime Cleanup ===\n{accumulated_cleanup}"
+                )
+            return TestRunResult(exit_code=1, output=fallback_body)
         result = attempt.result
         backend_cleanup_note = attempt.backend_cleanup_note
 

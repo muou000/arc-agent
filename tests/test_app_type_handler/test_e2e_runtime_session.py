@@ -591,6 +591,52 @@ def test_e2e_recovery_cleanup_note_survives_into_failure_bodies(tmp_path, monkey
     assert outcome.backend_cleanup_note == "released port 4321 from the previous attempt"
 
 
+def test_exception_fallback_surfaces_teardown_evidence_paid_before_the_raise(tmp_path, monkeypatch) -> None:
+    """A mid-attempt exception must not bury the stale teardown notes.
+
+    An `ensure` call that dies after its stale-session teardown (a scripted
+    adapter raising from `_prepare_db`) has already paid teardown evidence;
+    the handler's exception fallback must surface it in the failure body via
+    the runtime's `last_cleanup_note` instead of losing it with the frame.
+    """
+
+    workspace, _fingerprint = _make_workspace(tmp_path)
+
+    class _ExplodingPrepare(InMemoryBackendRuntime):
+        async def _prepare_db(self, runtime_env):
+            raise RuntimeError("prepare exploded (scripted)")
+
+    runtime = _ExplodingPrepare()
+    runtime.stop_note = "STALE-TEARDOWN-EVIDENCE-xyz"
+    runtime._session = BackendSession(
+        handle=None,
+        port=4321,
+        db_path="old.sqlite",
+        fingerprint="old-fp",
+        start_command="npm run start",
+        startup_detail="started",
+        instance_fingerprint="launcher:1",
+    )
+    handler = _make_handler(workspace, backend_runtime=runtime)
+    # The build must succeed so the attempt reaches the ensure stage, where
+    # the scripted adapter raises.
+    async def _ok_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
+        return e2e_attempt._FrontendBuildOutcome(
+            ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0
+        )
+
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _ok_build)
+
+    result = _run_e2e_group(handler)
+
+    assert result.exit_code == 1
+    assert "Failed to start grouped E2E execution: prepare exploded (scripted)" in result.output
+    assert (
+        "=== Previous Backend Runtime Cleanup ===\nSTALE-TEARDOWN-EVIDENCE-xyz"
+        in result.output
+    )
+
+
 def test_e2e_timeout_has_a_single_source(tmp_path, monkeypatch) -> None:
     """The E2E runner command draws its timeout from one named constant.
 

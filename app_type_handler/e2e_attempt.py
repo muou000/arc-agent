@@ -602,6 +602,28 @@ class E2EAttemptRunner:
         self.workspace_path = workspace_path
         self._backend_runtime = backend_runtime
         self._stage_timer = _StageTimer()
+        # Cleanup evidence accumulated so far (the prior attempt's note plus
+        # any stale-session teardown this runner has already driven). Kept on
+        # the runner, not in a local, so the caller's exception fallback can
+        # still surface it: an attempt that dies mid-acquisition has already
+        # paid stale teardowns whose notes must reach the failure body.
+        self._cleanup_note = ""
+
+    def accumulated_cleanup_note(self) -> str:
+        """The cleanup evidence gathered across this runner's attempts so far.
+
+        The attempt's own bodies embed it already; this accessor exists for
+        the caller's exception fallbacks, where no attempt body was produced.
+        It also folds in the backend runtime's ``last_cleanup_note`` — the
+        evidence an ``ensure`` call had gathered before dying mid-flight,
+        which never reached this runner's accumulation.
+        """
+
+        runtime_note = getattr(self._backend_runtime, "last_cleanup_note", "")
+        runtime_note = runtime_note() if callable(runtime_note) else (runtime_note or "")
+        if self._cleanup_note and runtime_note:
+            return f"{self._cleanup_note}\n{runtime_note}"
+        return self._cleanup_note or runtime_note
 
     def render_stage_timing(self) -> str:
         """The stage-timing block accumulated so far.
@@ -691,6 +713,11 @@ class E2EAttemptRunner:
                 if backend_cleanup_note
                 else acquisition.cleanup_note
             )
+        # Mirror the accumulated evidence onto the runner before any further
+        # await: if a later stage raises, the caller's exception fallback
+        # reads it from here instead of losing the stale teardown notes this
+        # attempt already paid for.
+        self._cleanup_note = backend_cleanup_note
         database_prepare_output = acquisition.db_output
 
         if acquisition.session is None:
