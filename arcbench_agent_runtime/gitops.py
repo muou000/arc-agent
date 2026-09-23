@@ -131,21 +131,7 @@ class GitClient:
                 self.events.notify_commit_history_changed("git_init_commit", preview=True)
             elif "nothing to commit" not in (result.stdout + result.stderr):
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git init commit failed")
-        self.events._emit_traceability_event(
-            {
-                "type": "signal",
-                "reason": "git_identity_configured",
-                "refresh": {
-                    "submission": False,
-                    "logs": False,
-                    "commit_history": True,
-                    "traceability_selected": False,
-                    "traceability_all": False,
-                    "preview": False,
-                },
-                "message": f"{user_name} <{user_email}>",
-            }
-        )
+        self.events.record_git_identity_configured(user_name, user_email)
 
     def status_porcelain(self) -> str:
         return self.run(["status", "--short"], check=False).stdout

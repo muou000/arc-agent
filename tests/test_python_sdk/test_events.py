@@ -571,3 +571,173 @@ class TestStraySweepEvents:
         lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["files"] == []
         assert lines[0]["message"] is None
+
+
+class TestTraceabilityRowEvents:
+    """Pin the row-event schemas ``TraceabilityStore`` emits through the
+    public channel (issue #163): the payload mirrors the persisted row and
+    the envelope only adds a trailing timestamp."""
+
+    def test_record_traceability_row_event_stamps_timestamp_at_the_end(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        row = {
+            "type": "interface_upsert",
+            "interface_id": "IF-1",
+            "req_ids": ["REQ-1"],
+            "interface_type": "API",
+            "content": "GET /a",
+        }
+        events.record_traceability_row_event(row)
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        event = lines[0]
+        assert event["type"] == "interface_upsert"
+        assert event["interface_id"] == "IF-1"
+        assert list(event.keys())[-1] == "timestamp"
+        # The caller's payload dict is not mutated (no envelope leaks back).
+        assert "timestamp" not in row
+
+    def test_record_traceability_row_event_preserves_a_caller_timestamp(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_traceability_row_event(
+            {"type": "interface_status", "interface_id": "IF-1", "implemented": True, "timestamp": "2026-01-01 00:00:00"}
+        )
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["timestamp"] == "2026-01-01 00:00:00"
+
+
+class TestGitIdentityEvent:
+    """Pin the ``git_identity_configured`` signal ``GitClient`` emits once per
+    ``ensure_repo`` (issue #163)."""
+
+    def test_record_git_identity_configured_writes_canonical_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_git_identity_configured("ARC Bench Agent", "arcbench@example.com")
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "signal",
+            "reason": "git_identity_configured",
+            "refresh": {
+                "submission": False,
+                "logs": False,
+                "commit_history": True,
+                "traceability_selected": False,
+                "traceability_all": False,
+                "preview": False,
+            },
+            "message": "ARC Bench Agent <arcbench@example.com>",
+            "timestamp": lines[0]["timestamp"],
+        }
+
+
+class TestContractDriftEvents:
+    """Pin the ``contract_drift`` schema (DESIGN gate pipelining, issue #83;
+    public channel per issue #163)."""
+
+    def test_record_contract_drift_writes_canonical_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        drift_payload = {
+            "interface_id": "RA-FUNC-Auth",
+            "file_path": "backend/src/features/auth.js",
+            "registered_first_line": "export const auth",
+            "landed_first_line": "export const session",
+        }
+        events.record_contract_drift(
+            node_id=" RA ",
+            drift=[drift_payload],
+            arbitration=False,
+        )
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "timestamp": lines[0]["timestamp"],
+            "type": "contract_drift",
+            "node_id": "RA",
+            "drift": [drift_payload],
+            "arbitration": False,
+        }
+
+    def test_record_contract_drift_repair_adds_outcome(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_contract_drift(
+            node_id="RA",
+            drift=[{"interface_id": "IF-1"}],
+            arbitration=True,
+            outcome="repaired",
+        )
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["arbitration"] is True
+        assert lines[0]["outcome"] == "repaired"
+        assert list(lines[0].keys())[-1] == "outcome"
+
+    def test_record_contract_drift_defaults(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_contract_drift(node_id="RA")
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["drift"] == []
+        assert lines[0]["arbitration"] is False
+        assert "outcome" not in lines[0]
+
+
+class TestMergeArbitrationEvents:
+    """Pin the ``merge_arbitration`` audit envelope (issue #81; public
+    channel per issue #163): the arbiter supplies the compact record, the
+    EventClient stamps ``type`` and ``timestamp`` first."""
+
+    def test_record_merge_arbitration_writes_canonical_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        record = {
+            "node_id": "REQ-3",
+            "phase": "IMPLEMENT",
+            "trigger": "conflict",
+            "outcome": "applied",
+            "conflict_files": ["backend/src.js"],
+        }
+        events.record_merge_arbitration(record)
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        event = lines[0]
+        assert list(event.keys())[:2] == ["type", "timestamp"]
+        assert event["type"] == "merge_arbitration"
+        assert event["node_id"] == "REQ-3"
+        assert event["outcome"] == "applied"
+        assert event["conflict_files"] == ["backend/src.js"]
+        # The caller's record dict is not mutated.
+        assert "type" not in record and "timestamp" not in record
+
+    def test_timestamp_flag_off_keeps_the_pre_funnel_reverified_shape(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        """The workflow's post-reverify path emitted without a timestamp
+        before the funnel; byte compatibility pins that shape (issue #163)."""
+        events.record_merge_arbitration(
+            {
+                "node_id": "REQ-3",
+                "phase": "IMPLEMENT",
+                "trigger": "health-gate",
+                "outcome": "reverified-passed",
+                "detail": "",
+            },
+            timestamp=False,
+        )
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0] == {
+            "type": "merge_arbitration",
+            "node_id": "REQ-3",
+            "phase": "IMPLEMENT",
+            "trigger": "health-gate",
+            "outcome": "reverified-passed",
+            "detail": "",
+        }
