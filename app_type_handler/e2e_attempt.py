@@ -694,13 +694,19 @@ class E2EAttemptRunner:
                 prior_cleanup_note="",
             )
         except Exception as exc:
-            return TestRunResult(
-                exit_code=1,
-                output=(
-                    f"Failed to start grouped E2E execution: {str(exc)}"
-                    + self.render_stage_timing()
-                ),
+            # The attempt died mid-flight; the fallback still surfaces whatever
+            # teardown evidence it had already accumulated (stale-session
+            # cleanup notes), so the failure body stays diagnosable.
+            accumulated_cleanup = self.accumulated_cleanup_note()
+            fallback_body = (
+                f"Failed to start grouped E2E execution: {str(exc)}"
+                + self.render_stage_timing()
             )
+            if accumulated_cleanup:
+                fallback_body += (
+                    f"\n\n=== Previous Backend Runtime Cleanup ===\n{accumulated_cleanup}"
+                )
+            return TestRunResult(exit_code=1, output=fallback_body)
         result = attempt.result
         backend_cleanup_note = attempt.backend_cleanup_note
 
@@ -734,13 +740,18 @@ class E2EAttemptRunner:
                 retried_result = retried_attempt.result
                 retried_cleanup_note = retried_attempt.backend_cleanup_note
             except Exception as exc:
-                retried_result = TestRunResult(
-                    exit_code=1,
-                    output=(
-                        f"Failed to retry grouped E2E execution after SPA static-host recovery: {str(exc)}"
-                        + self.render_stage_timing()
-                    ),
+                # Same evidence rule as the first-attempt fallback: the retried
+                # attempt may have paid stale teardowns before dying.
+                accumulated_cleanup = self.accumulated_cleanup_note()
+                fallback_body = (
+                    f"Failed to retry grouped E2E execution after SPA static-host recovery: {str(exc)}"
+                    + self.render_stage_timing()
                 )
+                if accumulated_cleanup:
+                    fallback_body += (
+                        f"\n\n=== Previous Backend Runtime Cleanup ===\n{accumulated_cleanup}"
+                    )
+                retried_result = TestRunResult(exit_code=1, output=fallback_body)
             # Same self-check the non-recovery path applies below, on the
             # retried attempt alone: a retried pass whose cleanup failed is
             # still a failure for the agent.
