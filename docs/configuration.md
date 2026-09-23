@@ -87,7 +87,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 子进程只拿到三类变量：
 
 - 工具链白名单：`PATH`/`HOME`/`USERPROFILE`/`TEMP`/`TMP`/`TMPDIR`、Windows 系统变量（`SystemRoot`/`SystemDrive`/`COMSPEC`/`windir`/`PATHEXT`/`APPDATA`/`LOCALAPPDATA`）、`NODE_ENV`、Python 编码（`PYTHONIOENCODING`/`PYTHONUTF8`）、Java/Android（`JAVA_HOME`/`JAVA_TOOL_OPTIONS`/`ANDROID_SDK_ROOT`/`ANDROID_HOME`/`GRADLE_USER_HOME`）、Playwright（`PLAYWRIGHT_BROWSERS_PATH`/`PLAYWRIGHT_DOWNLOAD_HOST`/`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD`/`PLAYWRIGHT_SKIP_BROWSER_VALIDATION`）、代理（`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`，大小写两种拼写都会传递）。
-- `ARC_*` 前缀：arc 的运行时契约命名空间（端口、包名等），生成代码可读。
+- 显式枚举的 `ARC_*` 运行时契约键：`ARC_WEB_PORT`/`ARC_WEB_BASE_URL`/`ARC_DB_FILE`/`ARC_E2E_DB_LABEL`（生成代码实际读取的契约面；不做前缀通配，避免未来的凭据形状 `ARC_*` 变量被静默透传）。逐次计算的运行时值（`PORT`/`PLAYWRIGHT_BASE_URL`/E2E 数据库路径等）由调用方作为附加项显式层叠，不经宿主透传。
 - 调用方显式附加项：如 web 运行时契约（`PORT`/`ARC_WEB_PORT`/`BASE_URL`/`VITE_API_BASE_URL`）与 E2E 数据库路径。
 
 白名单漏传的失败模式是"构建失败、可诊断后按名补入白名单"；新增变量须在 `core/processes.py` 的 `_SUBPROCESS_ENV_ALLOWLIST` 登记并附理由。运行 arc 自身的子进程（编译入口、git 操作）不受此白名单约束。

@@ -93,16 +93,36 @@ def test_runtime_basics_survive(monkeypatch: pytest.MonkeyPatch) -> None:
         assert env.get("TMPDIR") == os.environ.get("TMPDIR")
 
 
-def test_arc_namespace_passes_through(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ARC_* is arc's runtime-contract namespace (ports, package names)."""
+def test_arc_contract_keys_pass_through_and_secret_shaped_names_do_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the enumerated ARC_* contract keys reach the child, never a wildcard.
+
+    The runtime-contract names are explicit (issue review: a prefix wildcard
+    would also auto-pass a future credential-shaped ARC_* variable); extras
+    layered by the callers cover the per-attempt values.
+    """
 
     monkeypatch.setenv("ARC_WEB_PORT", "4599")
-    monkeypatch.setenv("ARC_ANDROID_PACKAGE", "com.example.contract")
+    monkeypatch.setenv("ARC_MODEL_TIMEOUT", "600")
+    monkeypatch.setenv("ARC_PROVIDER_API_KEY", "arc-needle-secret-value")
 
     env = build_subprocess_env()
 
     assert env.get("ARC_WEB_PORT") == "4599"
-    assert env.get("ARC_ANDROID_PACKAGE") == "com.example.contract"
+    assert "ARC_MODEL_TIMEOUT" not in env
+    assert "ARC_PROVIDER_API_KEY" not in env
+    assert not any("arc-needle-secret-value" in value for value in env.values())
+
+
+def test_lowercase_host_contract_key_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract keys emit in canonical casing however the host spelled them."""
+
+    monkeypatch.setenv("arc_web_port", "4599")
+
+    env = build_subprocess_env()
+
+    assert env.get("ARC_WEB_PORT") == "4599"
 
 
 def test_extra_env_wins_over_host_and_whitelist(
@@ -119,7 +139,12 @@ def test_extra_env_wins_over_host_and_whitelist(
 def test_proxy_vars_are_emitted_under_both_cases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """npm/node/git read different cases; emit both when the host sets one."""
+    """npm/node/git read different cases; emit both when the host sets one.
+
+    Either host casing feeds the emission: the lookup runs through the
+    upper-cased host map, so a lowercase-only host (a common Linux default)
+    still reaches children under both spellings.
+    """
 
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
 
@@ -127,6 +152,17 @@ def test_proxy_vars_are_emitted_under_both_cases(
 
     assert env.get("HTTP_PROXY") == "http://proxy.example:8080"
     assert env.get("http_proxy") == "http://proxy.example:8080"
+
+
+def test_lowercase_only_host_proxy_still_emits_both_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("https_proxy", "http://proxy.example:8443")
+
+    env = build_subprocess_env()
+
+    assert env.get("HTTPS_PROXY") == "http://proxy.example:8443"
+    assert env.get("https_proxy") == "http://proxy.example:8443"
 
 
 # --- The web command runner (build/test path shared by web + e2e_attempt) ----
@@ -382,15 +418,12 @@ def _attribute_chain_matches(node: ast.AST, *names: str) -> bool:
     return tuple(reversed(parts)) == tuple(names)
 
 
-def _contains_build_subprocess_env_call(node: ast.AST) -> bool:
-    for inner in ast.walk(node):
-        if (
-            isinstance(inner, ast.Call)
-            and isinstance(inner.func, (ast.Name, ast.Attribute))
-            and getattr(inner.func, "id", getattr(inner.func, "attr", None)) == "build_subprocess_env"
-        ):
-            return True
-    return False
+def _is_build_subprocess_env_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, (ast.Name, ast.Attribute))
+        and getattr(node.func, "id", getattr(node.func, "attr", None)) == "build_subprocess_env"
+    )
 
 
 def _spawn_calls(tree: ast.AST) -> list[ast.Call]:
@@ -408,8 +441,12 @@ def test_every_app_type_spawn_site_uses_the_whitelist_constructor() -> None:
 
     An omitted ``env=`` kwarg inherits the full host environment implicitly —
     the exact shape ``_run_npm_command`` used to have. Every spawn site in
-    ``app_type_handler`` must pass an ``env=`` built (at least in part) by
-    ``core.processes.build_subprocess_env``.
+    ``app_type_handler`` must pass an ``env=`` whose value IS a direct
+    ``build_subprocess_env(...)`` call: a subtree search would let a
+    hand-built dict (``{**build_subprocess_env(), **os.environ}``-style
+    mixing) slip through because it contains a qualifying call somewhere
+    among its nodes, so the constructor must own the whole expression and
+    caller extras ride in as its argument.
     """
 
     offenders: list[str] = []
@@ -419,8 +456,11 @@ def test_every_app_type_spawn_site_uses_the_whitelist_constructor() -> None:
             env_keyword = next((kw for kw in call.keywords if kw.arg == "env"), None)
             if env_keyword is None:
                 offenders.append(f"{path.name}:{call.lineno} (no env= kwarg)")
-            elif not _contains_build_subprocess_env_call(env_keyword.value):
-                offenders.append(f"{path.name}:{call.lineno} (env not built by build_subprocess_env)")
+            elif not _is_build_subprocess_env_call(env_keyword.value):
+                offenders.append(
+                    f"{path.name}:{call.lineno} (env= is not a direct build_subprocess_env(...) call"
+                    "; pass extras as its argument)"
+                )
     assert not offenders, (
         "app_type_handler spawn sites must build their environment through "
         f"core.processes.build_subprocess_env: {offenders}"

@@ -74,19 +74,31 @@ _SUBPROCESS_ENV_ALLOWLIST: tuple[str, ...] = (
 # any network operation.
 _PROXY_ENV_NAMES: tuple[str, ...] = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
 
-# arc's own runtime-contract namespace (ports, package names, template
-# wiring). Generated app code legitimately reads these
-# (``process.env.ARC_WEB_PORT`` in the template's vite/playwright configs);
-# provider credentials live in non-ARC names.
-_ARC_ENV_PREFIX = "ARC_"
+# arc's own runtime-contract keys, explicitly enumerated (review round on
+# PR #201: a prefix wildcard would also auto-pass a future credential-shaped
+# ``ARC_*`` name, which is exactly the unprovable leak mode the whitelist
+# exists to prevent). These are the names generated-app code actually reads
+# (``process.env.ARC_WEB_PORT`` in the template's vite/playwright configs,
+# ``ARC_DB_FILE``/``ARC_E2E_DB_LABEL`` in the database scaffold); provider
+# credentials live in non-ARC names. The per-attempt values are layered as
+# caller extras (``build_web_runtime_env``/``_build_e2e_runtime_env``); this
+# set only governs what may arrive from the host environment. A newly needed
+# contract key is added here with a one-line reason, same as the allowlist.
+_ARC_CONTRACT_ENV_KEYS: tuple[str, ...] = (
+    "ARC_WEB_PORT",
+    "ARC_WEB_BASE_URL",
+    "ARC_DB_FILE",
+    "ARC_E2E_DB_LABEL",
+)
 
 
 def build_subprocess_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """Build the environment for a generated-app build/test/install subprocess.
 
-    Layers, later wins: the host whitelist, every host ``ARC_*`` variable,
-    then ``extra`` (runtime-contract values like the web port and fixed
-    encoding/tool overrides the caller pins).
+    Layers, later wins: the host whitelist, arc's enumerated runtime-contract
+    keys, then ``extra`` (runtime-contract values like the web port and fixed
+    encoding/tool overrides the caller pins). Every emitted name is canonical
+    (list) casing regardless of how the host spelled it.
     """
 
     host_by_upper: dict[str, str] = {}
@@ -103,8 +115,9 @@ def build_subprocess_env(extra: Mapping[str, str] | None = None) -> dict[str, st
         if value is not None:
             env[proxy] = value
             env[proxy.lower()] = value
-    for name, value in os.environ.items():
-        if name.startswith(_ARC_ENV_PREFIX):
+    for name in _ARC_CONTRACT_ENV_KEYS:
+        value = host_by_upper.get(name)
+        if value is not None:
             env[name] = value
     if extra:
         env.update(extra)
