@@ -1161,12 +1161,9 @@ class ARCWorkflowManager:
 
         drift_paths = sorted({item.file_path for item in drift})
         await self._emit_contract_drift_event(
-            {
-                "type": "contract_drift",
-                "node_id": node_id,
-                "drift": [item.to_payload() for item in drift],
-                "arbitration": arbitration_enabled(),
-            }
+            node_id=node_id,
+            drift=[item.to_payload() for item in drift],
+            arbitration=arbitration_enabled(),
         )
         await self._log(
             "Compiler",
@@ -1198,13 +1195,10 @@ class ARCWorkflowManager:
                 node_id,
             )
             await self._emit_contract_drift_event(
-                {
-                    "type": "contract_drift",
-                    "node_id": node_id,
-                    "drift": [item.to_payload() for item in drift],
-                    "arbitration": True,
-                    "outcome": "repaired",
-                }
+                node_id=node_id,
+                drift=[item.to_payload() for item in drift],
+                arbitration=True,
+                outcome="repaired",
             )
         else:
             await self._log(
@@ -1307,16 +1301,23 @@ class ARCWorkflowManager:
             return False
         return True
 
-    async def _emit_contract_drift_event(self, payload: dict[str, Any]) -> None:
+    async def _emit_contract_drift_event(
+        self,
+        *,
+        node_id: str,
+        drift: list[dict[str, Any]],
+        arbitration: bool,
+        outcome: str | None = None,
+    ) -> None:
         """Persist one contract-drift audit record (best effort)."""
 
         try:
-            from arcbench_agent_runtime.events import utc_timestamp
-
-            payload = {"timestamp": utc_timestamp(), **payload}
-            from arcbench_agent_runtime.jsonio import append_jsonl
-
-            append_jsonl(self.runtime.paths.runner_events_path, payload)
+            self.runtime.events.record_contract_drift(
+                node_id=node_id,
+                drift=drift,
+                arbitration=arbitration,
+                outcome=outcome,
+            )
         except Exception as exc:  # noqa: BLE001 - audit must never break the merge
             append_debug_log(
                 "ContractDrift",
@@ -1400,15 +1401,17 @@ class ARCWorkflowManager:
         def on_reverified(gate_result: str | None) -> None:
             """Persist the post-repair re-verification result (audit trail)."""
 
+            # Pre-funnel these events carried no timestamp; byte compat pins
+            # that shape (issue #163).
             self._emit_merge_arbitration_event(
                 {
-                    "type": "merge_arbitration",
                     "node_id": node_id,
                     "phase": phase,
                     "trigger": TRIGGER_HEALTH_GATE,
                     "outcome": "reverified-passed" if not gate_result else "reverified-failed",
                     "detail": gate_result or "",
-                }
+                },
+                timestamp=False,
             )
 
         return ArbitrationHooks(
@@ -1478,13 +1481,13 @@ class ARCWorkflowManager:
         model_name = os.environ.get("MODEL", "openai:gpt-5.4")
         return create_arc_chat_model(model_name)
 
-    def _emit_merge_arbitration_event(self, payload: dict[str, Any]) -> None:
+    def _emit_merge_arbitration_event(
+        self, record: dict[str, Any], *, timestamp: bool = True
+    ) -> None:
         """Persist one audit record as a runner event (best effort)."""
 
         try:
-            from arcbench_agent_runtime.jsonio import append_jsonl
-
-            append_jsonl(self.runtime.paths.runner_events_path, payload)
+            self.runtime.events.record_merge_arbitration(record, timestamp=timestamp)
         except Exception as exc:  # noqa: BLE001 - audit must never break the merge
             append_debug_log(
                 "MergeArbiter",

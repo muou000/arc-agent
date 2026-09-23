@@ -185,9 +185,14 @@ def test_workflow_run_hook_emits_audit_runner_events(
         log_cb=lambda *args, **kwargs: None,
     )
     events_path = workspace / ".arc" / "runner-events.jsonl"
+    from arcbench_agent_runtime.events import EventClient
+
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    events_path.touch()
     manager.runtime = SimpleNamespace(
         traceability=_NoCardsTraceability(),
         paths=SimpleNamespace(runner_events_path=events_path),
+        events=EventClient(SimpleNamespace(runner_events_path=events_path)),
     )
     model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": "ok;\n"}))])
     monkeypatch.setattr(manager, "_build_arbitration_model", lambda: model)
@@ -427,7 +432,9 @@ def test_arbitration_applies_in_set_rewrites_and_emits_audit(tmp_path: Path) -> 
     assert (tmp_path / "backend" / "src.js").read_text(encoding="utf-8") == "merged both sides;\n"
     assert result.applied == {"backend/src.js": "merged both sides;\n"}
     record = events[-1]
-    assert record["type"] == "merge_arbitration"
+    # The envelope (type/timestamp) is stamped by EventClient at the workflow
+    # boundary; the arbiter's callback record is the compact summary alone.
+    assert "type" not in record
     assert record["outcome"] == "applied"
     assert record["node_id"] == "REQ-3"
     assert record["trigger"] == TRIGGER_CONFLICT
@@ -562,6 +569,11 @@ def test_production_hooks_drive_a_semantic_conflict_merge_over_real_git(
         web_port=4000,
         log_cb=lambda *args, **kwargs: None,
     )
+    from arcbench_agent_runtime.events import EventClient
+
+    events_path = workspace / ".arc" / "runner-events.jsonl"
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    events_path.touch()
     manager.runtime = SimpleNamespace(
         traceability=_ContractTraceability(
             {
@@ -596,7 +608,8 @@ def test_production_hooks_drive_a_semantic_conflict_merge_over_real_git(
                 ],
             }
         ),
-        paths=SimpleNamespace(runner_events_path=workspace / ".arc" / "runner-events.jsonl"),
+        paths=SimpleNamespace(runner_events_path=events_path),
+        events=EventClient(SimpleNamespace(runner_events_path=events_path)),
     )
     resolved_content = "console.log('v1 both sides');\nroute('/a', a);\nroute('/b', b);\n"
     model = FauxChatModel(responses=[faux_text(json.dumps({"backend/src.js": resolved_content}))])

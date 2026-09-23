@@ -306,14 +306,11 @@ class MergeArbiter:
     def _emit(self, record: dict[str, Any]) -> None:
         if self.emit_event is None:
             return
-        # Same public timestamp helper the runtime's EventClient uses, so the
-        # new event's shape stays consistent with the existing stream.
-        from arcbench_agent_runtime.events import utc_timestamp
-
-        payload = {"type": "merge_arbitration", "timestamp": utc_timestamp()}
-        payload.update(record)
+        # The workflow's emitter routes the record through
+        # ``EventClient.record_merge_arbitration``, which stamps the envelope
+        # (``type`` + ``timestamp``); the record here is the compact summary.
         try:
-            self.emit_event(payload)
+            self.emit_event(record)
         except Exception:  # noqa: BLE001 - audit emission must not break the merge
             pass
 

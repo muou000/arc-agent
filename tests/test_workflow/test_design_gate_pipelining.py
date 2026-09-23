@@ -516,10 +516,15 @@ def _make_drain_manager(tmp_path: Path, node_ids: list[str], with_events_file: b
         events=_Events(),
     )
     if with_events_file:
+        # The audit emitters route through a real EventClient (issue #163),
+        # so the drift records land in the file through the public interface.
+        from arcbench_agent_runtime.events import EventClient
+
         events_path = workspace / ".arc" / "runner-events.jsonl"
         events_path.parent.mkdir(parents=True, exist_ok=True)
         events_path.touch()
         runtime.paths = SimpleNamespace(runner_events_path=events_path)
+        runtime.events = EventClient(runtime.paths)
     manager.runtime = runtime
     return manager
 
