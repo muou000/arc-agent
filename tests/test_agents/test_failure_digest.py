@@ -22,7 +22,7 @@ from agents.tools.test_failure_digest import (
     format_failure_digest,
     persist_run_output,
 )
-from app_type_handler.web import (
+from app_type_handler.e2e_attempt import (
     SERVED_VERDICT_FINGERPRINT_CHARS,
     _frontend_serving_note,
     _frontend_serving_verdict,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from app_type_handler import web as web_handler
+from app_type_handler import e2e_attempt
 from app_type_handler.backend_runtime import _CommandResult
 
 
@@ -28,11 +28,11 @@ def test_rebuilds_when_frontend_build_environment_changes(tmp_path: Path, monkey
     (frontend / "package.json").write_text('{"name": "frontend"}\n', encoding="utf-8")
     recorder = _BuildRecorder()
     build_env = {"VITE_API_BASE_URL": "http://localhost:3301"}
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
-    monkeypatch.setattr(web_handler, "build_web_runtime_env", lambda: dict(build_env))
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "build_web_runtime_env", lambda: dict(build_env))
 
-    asyncio.run(web_handler._build_frontend_dist(str(tmp_path)))
+    asyncio.run(e2e_attempt._build_frontend_dist(str(tmp_path)))
     build_env["VITE_API_BASE_URL"] = "http://localhost:4401"
-    asyncio.run(web_handler._build_frontend_dist(str(tmp_path)))
+    asyncio.run(e2e_attempt._build_frontend_dist(str(tmp_path)))
 
     assert recorder.calls == ["npm run build", "npm run build"]

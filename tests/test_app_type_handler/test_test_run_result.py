@@ -15,6 +15,7 @@ import asyncio
 from pathlib import Path
 
 from app_type_handler import web as web_handler
+from app_type_handler import e2e_attempt
 from app_type_handler.backend_runtime import InMemoryBackendRuntime, _CommandResult
 
 
@@ -136,7 +137,7 @@ def test_e2e_result_carries_build_and_served_verdicts(tmp_path, monkeypatch) -> 
             "npx playwright test": (1, _VITEST_FAILURE_OUTPUT),
         }
     )
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", commands)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", commands)
     dist_dir = workspace / "frontend" / "dist"
     dist_dir.mkdir(parents=True)
     (dist_dir / "index.html").write_text("<html>built</html>\n", encoding="utf-8")
@@ -147,7 +148,7 @@ def test_e2e_result_carries_build_and_served_verdicts(tmp_path, monkeypatch) -> 
     assert result.build_note.startswith("rebuilt frontend/dist from current sources")
     assert result.served_verdict.startswith("frontend/dist/index.html present at result time")
     # The structured verdicts agree with the transcription's own verdict line.
-    fingerprint = web_handler._frontend_dist_fingerprint(str(workspace / "frontend"))
+    fingerprint = e2e_attempt._frontend_dist_fingerprint(str(workspace / "frontend"))
     assert f"fingerprint {fingerprint[:12]}" in result.served_verdict
 
 
@@ -165,7 +166,7 @@ def test_e2e_environment_failure_is_a_structural_verdict(tmp_path, monkeypatch) 
             ),
         }
     )
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", commands)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", commands)
     dist_dir = workspace / "frontend" / "dist"
     dist_dir.mkdir(parents=True)
     (dist_dir / "index.html").write_text("<html>built</html>\n", encoding="utf-8")
@@ -187,7 +188,7 @@ def test_structural_exit_code_agrees_with_the_transcription(tmp_path, monkeypatc
             "npx playwright test": (2, "Exit Code: 2\nSTDOUT:\ncrashed\n"),
         }
     )
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", commands)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", commands)
     dist_dir = workspace / "frontend" / "dist"
     dist_dir.mkdir(parents=True)
     (dist_dir / "index.html").write_text("<html>built</html>\n", encoding="utf-8")
