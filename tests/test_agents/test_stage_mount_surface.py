@@ -67,7 +67,11 @@ def _stub_tool(name: str):
 
         return text
 
+    # Both name carriers: `__name__` for the callable path and `name` for any
+    # BaseTool-style introspection, so the stub's identity survives either
+    # reading of `tool_display_name`.
     tool.__name__ = name
+    tool.name = name
     return tool
 
 
