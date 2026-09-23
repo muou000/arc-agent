@@ -20,7 +20,7 @@ from agents.interface_designer import InterfaceDesigner
 from agents.test_driven_developer import TestDrivenDeveloper
 from agents.test_generator import TestGenerator
 from agents.tools.test_manifest import DeclaredTestFile, TestManifestLock
-from tests.helpers.faux import FauxChatModel, faux_tool_call
+from tests.helpers.faux import FauxChatModel, faux_text, faux_tool_call
 
 
 def seed_requirement(runtime, node_id: str) -> None:
@@ -1657,6 +1657,94 @@ def test_test_generator_repair_pass_cannot_introduce_new_test_paths(
     assert tests[0]["file_path"] == "backend/tests/unit/green.test.js"
     assert not (tmp_project_dir / "backend" / "tests" / "unit" / "greenV2.test.js").exists()
     assert current_interface_id_calls == 1
+
+
+def test_test_generator_repair_prose_answer_is_none_not_empty_manifest(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A repair session that ends in prose (no parseable manifest structure)
+    returns ``None`` — distinct from a declared-empty manifest — so the caller
+    spends rejection budget retrying instead of reading parse damage as "the
+    model deleted every test" (issue #172)."""
+    node_id = "REQ-GEN-REPAIR-PROSE"
+    seed_requirement(arc_runtime, node_id)
+
+    previous_manifest = [
+        {
+            "test_id": "T-GREEN",
+            "req_id": node_id,
+            "interface_ids": [],
+            "type": "Unit",
+            "file_path": "backend/tests/unit/green.test.js",
+            "first_line": "test('tautology', () => {",
+        }
+    ]
+    green_file = tmp_project_dir / "backend" / "tests" / "unit" / "green.test.js"
+    green_file.parent.mkdir(parents=True, exist_ok=True)
+    green_file.write_text("test('tautology', () => { expect(true).toBe(true); });\n", encoding="utf-8")
+
+    # Prose ending: no structured response and no JSON the runner could
+    # parse, so the normalized payload carries no tests structure at all.
+    model = FauxChatModel(responses=[faux_text("I removed the tautological test file.")])
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).repair_green_baseline(
+            node_id,
+            {"name": "", "description": ""},
+            green_evidence=[
+                {"file_path": "backend/tests/unit/green.test.js", "type": "Unit", "output_summary": "1 passed"}
+            ],
+            previous_manifest=previous_manifest,
+        )
+    )
+
+    assert tests is None
+
+
+def test_test_generator_repair_structured_empty_manifest_is_declared_empty(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A structured ``tests: []`` answer IS a manifest decision: repair
+    returns ``[]`` (legitimate empty), not ``None`` (unparseable)."""
+    node_id = "REQ-GEN-REPAIR-DECLARED-EMPTY"
+    seed_requirement(arc_runtime, node_id)
+
+    previous_manifest = [
+        {
+            "test_id": "T-GREEN",
+            "req_id": node_id,
+            "interface_ids": [],
+            "type": "Unit",
+            "file_path": "backend/tests/unit/green.test.js",
+            "first_line": "test('tautology', () => {",
+        }
+    ]
+    green_file = tmp_project_dir / "backend" / "tests" / "unit" / "green.test.js"
+    green_file.parent.mkdir(parents=True, exist_ok=True)
+    green_file.write_text("test('tautology', () => { expect(true).toBe(true); });\n", encoding="utf-8")
+
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "TestGenerationResponse",
+                {"summary": "Every test was tautological; deleted them all.", "tests": [], "files_written": []},
+                call_id="c1",
+            )
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).repair_green_baseline(
+            node_id,
+            {"name": "", "description": ""},
+            green_evidence=[
+                {"file_path": "backend/tests/unit/green.test.js", "type": "Unit", "output_summary": "1 passed"}
+            ],
+            previous_manifest=previous_manifest,
+        )
+    )
+
+    assert tests == []
 
 
 # ---------------------------------------------------------------------------

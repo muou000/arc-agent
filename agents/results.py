@@ -5,12 +5,19 @@ from typing import Any
 from agents.runtime.runners import salvage_json_objects, text_from_raw_dump
 
 
-def normalize_test_manifest_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Normalize structured or fallback agent output into test manifest items."""
+def _manifest_candidates(payload: dict[str, Any]) -> Any:
+    """The payload's declared test-manifest container, if any."""
 
     candidates = payload.get("tests")
     if candidates is None:
         candidates = payload.get("items")
+    return candidates
+
+
+def normalize_test_manifest_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize structured or fallback agent output into test manifest items."""
+
+    candidates = _manifest_candidates(payload)
     if candidates is None and _looks_like_test_item(payload):
         candidates = [payload]
     if candidates is None:
@@ -22,6 +29,32 @@ def normalize_test_manifest_payload(payload: dict[str, Any]) -> list[dict[str, A
     if not isinstance(candidates, list):
         return []
     return [item for item in candidates if isinstance(item, dict) and _looks_like_test_item(item)]
+
+
+def payload_declares_test_manifest(payload: dict[str, Any]) -> bool:
+    """True when the payload itself carries a parseable test-manifest structure.
+
+    ``normalize_test_manifest_payload`` collapses "the payload carries no
+    manifest structure at all" (prose fallback, damaged JSON) and "the model
+    returned an explicit empty manifest" into the same ``[]``. Callers that
+    must treat those differently — an unparseable answer is a retryable
+    defect, a declared-empty manifest is the model's decision — ask this
+    first. Undeclared shapes: no ``tests``/``items`` container at all, a
+    container that is not a list, and a list none of whose items parse as
+    test entries (a declared-one-parsed-zero answer is parse damage, not a
+    decision to return zero tests). Salvage rows recovered from the final
+    message do NOT count as declared: they are parser recovery, not a
+    manifest the model itself answered with.
+    """
+
+    candidates = _manifest_candidates(payload)
+    if candidates is None:
+        return _looks_like_test_item(payload)
+    if not isinstance(candidates, list):
+        return False
+    return not candidates or any(
+        isinstance(item, dict) and _looks_like_test_item(item) for item in candidates
+    )
 
 
 def _salvage_test_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:

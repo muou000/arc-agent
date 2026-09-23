@@ -705,6 +705,13 @@ class WorkflowPhaseRunner:
         implementation; recording the state without rejection is the only
         truthful signal, and the IMPLEMENT tautology fast path is the
         intended outcome there).
+
+        A repair round distinguishes three answer states: a parseable
+        manifest list (re-baselined), an explicit ``tests: []`` (the loop
+        exits and the final owned-witness check decides), and a payload with
+        no parseable manifest at all (``None`` from the generator) — the
+        last is a rejected round that consumes its rejection budget and
+        re-asks, so only budget exhaustion fails the node.
         """
         # requirement_data is only read by the repair pass (the skill floor of
         # its agent build must match the first pass's, or the shared thread's
@@ -901,13 +908,20 @@ class WorkflowPhaseRunner:
                 previous_manifest=current_tests,
             )
             if revised_tests is None:
+                # The rework payload carried no manifest structure at all
+                # (prose fallback, damaged JSON): a rejected round, not a
+                # model decision to return zero tests. An owned-interface
+                # node with an empty manifest is illegal at the final check
+                # anyway, so spend this round's rejection budget and ask
+                # again; only budget exhaustion fails the node.
                 await self._log(
                     "TestGenerator",
-                    "Green baseline rework did not return a valid test manifest.",
-                    status="error",
+                    "Green baseline rework did not return a parseable test manifest; "
+                    "the round is rejected and the repair will be asked again.",
+                    status="warning",
                     node_id=node_id,
                 )
-                return None
+                continue
             try:
                 current_tests = self.registry.prepare_tests(node_id=node_id, tests=revised_tests)
                 manifest_revised = True
@@ -915,9 +929,12 @@ class WorkflowPhaseRunner:
                 await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
                 return None
             if not revised_tests and not current_tests:
-                # The repair explicitly returned an empty manifest: every
-                # test was tautological and got deleted. An empty manifest
-                # is a valid DESIGN result (the node owns no local tests).
+                # The repair explicitly returned an empty manifest (a real
+                # `tests: []` answer - unparseable payloads never reach
+                # here): every test was tautological and got deleted. An
+                # empty manifest is a valid DESIGN result for a node with no
+                # owned interfaces; the final owned-witness check below
+                # still guards nodes that own interface contracts.
                 break
             if not current_tests:
                 # The repair claimed tests but every item was dropped by
