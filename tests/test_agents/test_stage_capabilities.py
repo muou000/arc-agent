@@ -66,10 +66,12 @@ def test_derived_disabled_builtin_set_matches_the_table() -> None:
     assert DISABLED_BUILTIN_TOOLS == frozenset({"execute", "write_todos"})
     for tool in ("execute", "write_todos"):
         assert all(not capability_for(stage, tool).allowed for stage in STAGES)
-    # Tools with path-scoped allowances must never land in the set even
-    # though an empty path misses their predicate (the regression the
-    # derivation once had: `delete` was misderived from its empty-path
-    # verdict and stopped being mounted).
+    # Tools with path-scoped allowances or an allowed stage must never land in
+    # the set even though an empty path misses their predicate (the regression
+    # the derivation once had: `delete` was misderived from its empty-path
+    # verdict and stopped being mounted). `run_build`/`run_tests` are denied
+    # in two stages but mounted and allowed in implementation, so they stay
+    # harness-mountable; their DESIGN/test_generation denial is call-time.
     for tool in ("delete", "write_file", "edit_file", "append_file", "run_build", "run_tests"):
         assert tool not in DISABLED_BUILTIN_TOOLS
 
@@ -112,15 +114,22 @@ def test_append_file_is_only_allowed_in_interface_design() -> None:
         assert verdict.message == "append_file is only available during the interface_design stage."
 
 
-def test_validation_tools_are_denied_in_test_generation_only() -> None:
+def test_validation_tools_are_denied_outside_implementation() -> None:
+    # Only the implementation stage runs builds/tests, and only that stage has
+    # the tools mounted; the other two stages carry explicit deny rows whose
+    # wording names the stage that owns validation instead (issue #182).
     for tool in ("run_build", "run_tests"):
         verdict = capability_for("test_generation", tool)
         assert not verdict.allowed
         assert verdict.message == (
             "TestGenerator only creates tests and its manifest; it must not run validation."
         )
-        for stage in ("interface_design", "implementation"):
-            assert capability_for(stage, tool).allowed, (stage, tool)
+        design_verdict = capability_for("interface_design", tool)
+        assert not design_verdict.allowed, (tool,)
+        assert design_verdict.message == (
+            "InterfaceDesigner only designs skeletons and contracts; validation belongs to TestDrivenDeveloper."
+        )
+        assert capability_for("implementation", tool).allowed, tool
 
 
 def test_test_generation_writes_and_edits_require_test_assets() -> None:
@@ -189,6 +198,11 @@ def test_middleware_blocks_exactly_where_the_table_denies() -> None:
     )
     assert "must not run validation" in _blocked_message(
         StageDisciplineMiddleware(stage="test_generation"), "run_tests", {}
+    )
+    # Issue #182: the DESIGN deny row is enforced at call time too, even
+    # though no adapter mounts the validation tools for the stage.
+    assert "validation belongs to TestDrivenDeveloper" in _blocked_message(
+        StageDisciplineMiddleware(stage="interface_design"), "run_build", {}
     )
     assert "append_file is only available during the interface_design stage." in _blocked_message(
         StageDisciplineMiddleware(stage="test_generation"), "append_file", {"file_path": "/workspace/src/x.py"}

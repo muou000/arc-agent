@@ -124,11 +124,10 @@ _WRITE_BLOCK_EXITS = {
 }
 
 _INTERFACE_DESIGN_FIRST_WRITE_BLOCK_EXIT = (
-    "Unlock condition: only a failed file operation on this path or a failing "
-    "`run_build`/`run_tests` validation unlocks it. `delete` is disabled in "
-    "DESIGN; do not invoke validation merely to unlock it. Do not retry this "
-    "path; keep the skeleton and put its contract in the final response's "
-    "`interfaces` array."
+    "Unlock condition: only a failed file operation on this path unlocks it. "
+    "DESIGN has no build or test validation to trigger that unlock, and "
+    "`delete` is disabled too. Do not retry this path; keep the skeleton and "
+    "put its contract in the final response's `interfaces` array."
 )
 
 

@@ -162,6 +162,10 @@ _NO_VALIDATION_IN_TESTGEN = Verdict(
     allowed=False,
     message="TestGenerator only creates tests and its manifest; it must not run validation.",
 )
+_NO_VALIDATION_IN_DESIGN = Verdict(
+    allowed=False,
+    message="InterfaceDesigner only designs skeletons and contracts; validation belongs to TestDrivenDeveloper.",
+)
 _NOT_A_TEST_ASSET = Verdict(
     allowed=False,
     message=(
@@ -193,11 +197,18 @@ def _build_rules() -> dict[tuple[Stage, str], tuple[CapabilityRule, ...]]:
             CapabilityRule(path_matches=None, verdict=_disabled("delete")),
         )
 
-    # Validation tools: TestGenerator only creates tests and its manifest.
-    for tool in ("run_build", "run_tests"):
-        rules[("test_generation", tool)] = (
-            CapabilityRule(path_matches=None, verdict=_NO_VALIDATION_IN_TESTGEN),
-        )
+    # Validation tools: only the implementation stage runs builds/tests, and
+    # only that stage has the tools mounted. The explicit rows for the other
+    # two stages keep "no rule = allow" from answering for tools the stage
+    # never sees — the table must reflect the real mount surface, not the
+    # absence of a rule (issue #182).
+    _validation_denials: dict[Stage, Verdict] = {
+        "interface_design": _NO_VALIDATION_IN_DESIGN,
+        "test_generation": _NO_VALIDATION_IN_TESTGEN,
+    }
+    for stage, verdict in _validation_denials.items():
+        for tool in ("run_build", "run_tests"):
+            rules[(stage, tool)] = (CapabilityRule(path_matches=None, verdict=verdict),)
 
     # append_file: the DESIGN-only additive continuation tool.
     for stage in ("test_generation", "implementation"):

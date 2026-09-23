@@ -172,9 +172,12 @@ def test_interface_design_first_repeated_write_explains_unlock_condition() -> No
     assert first_block.status == "error"
     assert "Unlock condition" in first_block.content
     assert "failed file operation" in first_block.content
-    assert "run_build" in first_block.content and "run_tests" in first_block.content
+    # Issue #182: DESIGN mounts no validation tools, so the exit text must not
+    # offer them as an unlock path (ADR 0006: wording follows the mount
+    # surface — the model cannot trigger a validation failure in DESIGN).
+    assert "run_build" not in first_block.content
+    assert "run_tests" not in first_block.content
     assert "delete" in first_block.content
-    assert "do not invoke validation merely to unlock it" in first_block.content
     assert "Do not retry this path" in first_block.content
     assert "final response's `interfaces` array" in first_block.content
 
