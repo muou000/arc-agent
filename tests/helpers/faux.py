@@ -65,12 +65,24 @@ def faux_tool_calls(*calls: Any, response_metadata: dict[str, Any] | None = None
     return AIMessage(content="", tool_calls=normalized, response_metadata=response_metadata or {})
 
 
+def _tool_display_name(tool: Any) -> str:
+    """The name a tool carries into ``bind_tools`` (BaseTool, dict, callable)."""
+
+    if isinstance(tool, dict):
+        inner = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = inner.get("name") if isinstance(inner, dict) else None
+        return str(name) if name else ""
+    name = getattr(tool, "name", None) or getattr(tool, "__name__", None)
+    return str(name) if name else str(tool)
+
+
 class FauxChatModel(BaseChatModel):
     """Scripted chat model: each model call consumes the next queued response."""
 
     responses: list[BaseMessage] = Field(default_factory=list)
     _queue: deque = PrivateAttr(default_factory=deque)
     _calls: list = PrivateAttr(default_factory=list)
+    _bound_tool_name_sets: list[list[str]] = PrivateAttr(default_factory=list)
 
     def model_post_init(self, __context: Any) -> None:
         self.set_responses(self.responses)
@@ -97,6 +109,18 @@ class FauxChatModel(BaseChatModel):
 
         return self._calls
 
+    @property
+    def bound_tool_name_sets(self) -> list[list[str]]:
+        """Tool names bound on each model call, in bind order.
+
+        ``bind_tools`` receives the post-middleware tool list — after the
+        mount-time capability filter, the harness-profile tool exclusion and
+        ``DisableToolsMiddleware`` — so this is the tool surface the model
+        actually sees on every turn (issue #182 mount-surface pins).
+        """
+
+        return [list(names) for names in self._bound_tool_name_sets]
+
     # -- BaseChatModel plumbing ---------------------------------------------
 
     @property
@@ -109,7 +133,7 @@ class FauxChatModel(BaseChatModel):
         return {"ls_provider": "faux", "ls_model_name": "faux-1"}
 
     def bind_tools(self, tools: Any, **kwargs: Any) -> "FauxChatModel":
-        del tools, kwargs
+        self._bound_tool_name_sets.append([_tool_display_name(tool) for tool in (tools or [])])
         return self
 
     def bind(self, **kwargs: Any) -> "FauxChatModel":
