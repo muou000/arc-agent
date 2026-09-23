@@ -125,6 +125,26 @@ def test_spawn_failure_propagates_without_a_scope(
         asyncio.run(start_subprocess_shell("anything"))
 
 
+@pytest.mark.skipif(_IS_WINDOWS, reason="the session-opt-out hazard is POSIX-only")
+def test_posix_session_opt_out_stays_on_the_legacy_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """start_new_session=False must not attach a pgid scope.
+
+    A launcher that did not become a group leader shares arc's own process
+    group; signaling the scope's pgid would then kill arc itself, so the
+    explicit opt-out keeps the legacy single-PID cleanup.
+    """
+
+    _capture_asyncio_spawns(monkeypatch)
+
+    process = asyncio.run(
+        start_subprocess_shell("npm install", start_new_session=False)
+    )
+
+    assert getattr(process, "_arc_kill_scope", None) is None
+
+
 # ---------------------------------------------------------------------------
 # Fast: finalize semantics
 # ---------------------------------------------------------------------------
@@ -324,10 +344,46 @@ def test_timeout_finalization_sweeps_the_windows_process_tree(tmp_path: Path) ->
     """cmd /c -> python -> python(port owner): the tree dies with the launcher.
 
     Mirrors the production shape (a shell command whose descendants outlive a
-    timeout): the command is left running past its wait budget, then torn down
-    through the same ``finalize_subprocess`` call the runners use. The
-    grandchild owns a TCP port — the acceptance signal is that the port is
-    released and the descendant PID is gone.
+    timeout); the scope assertion additionally pins that a real Windows spawn
+    is assigned to a kill-on-close Job Object.
+    """
+
+    def _assert_scope(scope: object) -> None:
+        assert getattr(scope, "job_handle", None) is not None, (
+            "a real Windows spawn must be assigned to a kill-on-close Job Object"
+        )
+
+    _run_tree_teardown_scenario(tmp_path, _assert_scope, _windows_pid_alive)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(_IS_WINDOWS, reason="the process-group teardown runs on POSIX")
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="POSIX process groups required")
+def test_timeout_finalization_sweeps_the_posix_process_tree(tmp_path: Path) -> None:
+    """sh -> python -> python(port owner): the group dies with the launcher.
+
+    The launcher is spawned as a process-group leader (``start_new_session``);
+    the grandchild inherits the group, so the same ``finalize_subprocess`` the
+    runners use must release its port and leave the PID unkillable-alive.
+    """
+
+    def _assert_scope(scope: object) -> None:
+        assert scope is not None and getattr(scope, "pgid", None) is not None
+
+    _run_tree_teardown_scenario(tmp_path, _assert_scope, _posix_pid_alive)
+
+
+def _run_tree_teardown_scenario(
+    tmp_path: Path,
+    assert_scope: "callable[[object], None]",
+    pid_alive: "callable[[int], bool]",
+) -> None:
+    """Shared teardown scenario: shell -> child -> grandchild owning a port.
+
+    The command is left running past its wait budget and torn down through the
+    same ``finalize_subprocess`` call the runners use. The grandchild owns a
+    TCP port — the acceptance signal is that the port is released and the
+    descendant PID is gone.
     """
 
     child, grandchild = _write_tree_scripts(tmp_path)
@@ -341,10 +397,7 @@ def test_timeout_finalization_sweeps_the_windows_process_tree(tmp_path: Path) ->
             stderr=asyncio.subprocess.PIPE,
             env=processes.build_subprocess_env(),
         )
-        scope = getattr(process, "_arc_kill_scope", None)
-        assert scope is not None and scope.job_handle is not None, (
-            "a real Windows spawn must be assigned to a kill-on-close Job Object"
-        )
+        assert_scope(getattr(process, "_arc_kill_scope", None))
 
         deadline = time.monotonic() + 30
         while not marker.exists() and time.monotonic() < deadline:
@@ -368,64 +421,9 @@ def test_timeout_finalization_sweeps_the_windows_process_tree(tmp_path: Path) ->
             f"the grandchild still holds port {info['port']} after the tree teardown"
         )
         deadline = time.monotonic() + 10
-        while _windows_pid_alive(info["pid"]) and time.monotonic() < deadline:
-            await asyncio.sleep(0.5)
-        assert not _windows_pid_alive(info["pid"]), (
-            f"grandchild PID {info['pid']} survived the tree teardown"
-        )
-
-    asyncio.run(_run())
-
-
-@pytest.mark.slow
-@pytest.mark.skipif(_IS_WINDOWS, reason="the process-group teardown runs on POSIX")
-@pytest.mark.skipif(not hasattr(os, "killpg"), reason="POSIX process groups required")
-def test_timeout_finalization_sweeps_the_posix_process_tree(tmp_path: Path) -> None:
-    """sh -> python -> python(port owner): the group dies with the launcher.
-
-    The launcher is spawned as a process-group leader (``start_new_session``);
-    the grandchild inherits the group, so the same ``finalize_subprocess`` the
-    runners use must release its port and leave the PID unkillable-alive.
-    """
-
-    child, grandchild = _write_tree_scripts(tmp_path)
-    marker = tmp_path / "grandchild.json"
-
-    async def _run() -> None:
-        process = await start_subprocess_shell(
-            f'"{sys.executable}" "{child}" "{grandchild}" "{marker}"',
-            cwd=str(tmp_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=processes.build_subprocess_env(),
-        )
-        scope = getattr(process, "_arc_kill_scope", None)
-        assert scope is not None and scope.pgid == process.pid
-
-        deadline = time.monotonic() + 30
-        while not marker.exists() and time.monotonic() < deadline:
-            await asyncio.sleep(0.2)
-        assert marker.exists(), "the grandchild never came up (no marker file)"
-        info = json.loads(marker.read_text(encoding="utf-8"))
-
-        assert await _port_is_open(info["port"]), "the grandchild must own the port before teardown"
-
-        try:
-            await asyncio.wait_for(process.communicate(), timeout=0.5)
-        except asyncio.TimeoutError:
-            pass
-        assert process.returncode is None, "the launcher must still be alive at teardown"
-
-        await finalize_subprocess(process, force_kill=True)
-
-        assert process.returncode is not None, "the launcher itself must be terminated"
-        assert await _wait_port_closed(info["port"], timeout=10.0), (
-            f"the grandchild still holds port {info['port']} after the tree teardown"
-        )
-        deadline = time.monotonic() + 10
-        while _posix_pid_alive(info["pid"]) and time.monotonic() < deadline:
-            await asyncio.sleep(0.25)
-        assert not _posix_pid_alive(info["pid"]), (
+        while pid_alive(info["pid"]) and time.monotonic() < deadline:
+            await asyncio.sleep(0.5 if _IS_WINDOWS else 0.25)
+        assert not pid_alive(info["pid"]), (
             f"grandchild PID {info['pid']} survived the tree teardown"
         )
 

@@ -194,9 +194,9 @@ async def start_subprocess_exec(
     ``Process`` and clean it up through ``finalize_subprocess``.
     """
 
-    _apply_tree_spawn_kwargs(kwargs)
+    tree_enabled = _apply_tree_spawn_kwargs(kwargs)
     process = await asyncio.create_subprocess_exec(program, *args, **kwargs)
-    _attach_kill_scope(process)
+    _attach_kill_scope(process, tree_enabled=tree_enabled)
     return process
 
 
@@ -207,30 +207,47 @@ async def start_subprocess_shell(command: Any, **kwargs: Any) -> asyncio.subproc
     the tree-cleanup enablement, no behavior change on the command itself.
     """
 
-    _apply_tree_spawn_kwargs(kwargs)
+    tree_enabled = _apply_tree_spawn_kwargs(kwargs)
     process = await asyncio.create_subprocess_shell(command, **kwargs)
-    _attach_kill_scope(process)
+    _attach_kill_scope(process, tree_enabled=tree_enabled)
     return process
 
 
-def _apply_tree_spawn_kwargs(kwargs: dict[str, Any]) -> None:
-    # POSIX only: make the launcher a session and process group leader so the
-    # whole descendant tree shares one killable group. Windows gets the same
-    # guarantee from the Job Object assigned after the spawn; passing
-    # start_new_session there is a ValueError, hence the platform branch.
-    if os.name != "nt":
-        kwargs.setdefault("start_new_session", True)
+def _apply_tree_spawn_kwargs(kwargs: dict[str, Any]) -> bool:
+    """Enable the platform's tree-cleanup spawn mode. False = stay legacy.
+
+    POSIX only: make the launcher a session and process group leader so the
+    whole descendant tree shares one killable group. A caller that explicitly
+    opted out of the new session keeps the legacy path — signaling a pgid the
+    launcher does not lead would reach arc's own process group. Windows gets
+    the same guarantee from the Job Object assigned after the spawn (passing
+    start_new_session there is a ValueError, hence the platform branch).
+    """
+
+    if os.name == "nt":
+        return True
+    if kwargs.get("start_new_session") is False:
+        return False
+    kwargs.setdefault("start_new_session", True)
+    return True
 
 
-def _attach_kill_scope(process: Any) -> None:
+def _attach_kill_scope(process: Any, *, tree_enabled: bool = True) -> None:
     """Attach ``ProcessKillScope`` to a freshly spawned process. Never raises.
 
     Failure modes degrade, in order of preference: an unassignable Job Object
     still attaches a pid-only scope (finalize then sweeps with
     ``taskkill /T /F``); a scope that cannot even be attached leaves the
     legacy single-PID cleanup in place.
+
+    Known residual window: the job is assigned after the spawn returns, so a
+    launcher that spawns a descendant inside that microseconds-wide gap
+    escapes the job; the unconditional taskkill sweep at finalize closes it
+    in practice (see ``_finalize_process_tree_windows``).
     """
 
+    if not tree_enabled:
+        return
     try:
         scope = ProcessKillScope()
         if os.name == "nt":
@@ -309,8 +326,6 @@ def _create_kill_on_close_job() -> tuple[int | None, Callable[[], None] | None]:
     caller should fall back to the taskkill sweep.
     """
 
-    import ctypes
-
     kernel32 = ctypes.windll.kernel32
     job = kernel32.CreateJobObjectW(None, None)
     if not job:
@@ -350,8 +365,6 @@ def _assign_process_to_job(job: int, process: Any) -> bool:
     except Exception:
         return False
     try:
-        import ctypes
-
         return bool(ctypes.windll.kernel32.AssignProcessToJobObject(job, handle))
     except Exception:
         return False
@@ -359,8 +372,6 @@ def _assign_process_to_job(job: int, process: Any) -> bool:
 
 def _terminate_job_members(job: int) -> None:
     try:
-        import ctypes
-
         ctypes.windll.kernel32.TerminateJobObject(job, 1)
     except Exception:
         pass
@@ -399,6 +410,16 @@ async def finalize_subprocess(process: Any, *, force_kill: bool = False) -> None
     then SIGKILL after the grace period) and Windows terminates the Job Object,
     so shell/npm/gradle descendants die with the launcher. Any other process
     keeps the legacy single-PID semantics below, unchanged for existing callers.
+
+    Shape of the grace period: on POSIX the group gets a SIGTERM stage; on
+    Windows ``TerminateProcess`` is the only termination primitive, so the
+    tree (unlike the launcher's terminate→wait→kill escalation) is hard-killed
+    immediately — there is no graceful stage for tree members.
+
+    An already-reaped launcher (``returncode`` set) returns immediately and
+    sweeps nothing: descendants that outlived a dead launcher are the caller's
+    second-line machinery's job (e.g. the backend port capture in
+    ``app_type_handler.backend_runtime``).
     """
 
     if process is None or getattr(process, "returncode", None) is not None:
@@ -478,8 +499,12 @@ async def _finalize_process_tree_windows(
     except asyncio.TimeoutError:
         _kill_process_quietly(process)
         await process.wait()
-    if scope.job_handle is None:
-        await _taskkill_tree(process.pid)
+    # The sweep runs even with a live job: a descendant spawned in the
+    # pre-assignment window between spawn and AssignProcessToJobObject is not
+    # a job member, and /T walks the launcher's parent-PID tree (still intact
+    # here — the launcher is only now being reaped). Best-effort with the
+    # re-parenting limitation documented on ``_taskkill_tree``.
+    await _taskkill_tree(process.pid)
     if scope.close_job is not None:
         scope.close_job()
 
