@@ -682,7 +682,9 @@ class WorkflowPhaseRunner:
         truthful signal, and the IMPLEMENT tautology fast path is the
         intended outcome there).
         """
-        del requirement_data
+        # requirement_data is only read by the repair pass (the skill floor of
+        # its agent build must match the first pass's, or the shared thread's
+        # provider prefix cache is lost — issue #173).
         # DESIGN gate as an executor adapter: baseline runs and the
         # red/green/unverified classification flow through the same
         # TddTestExecutor primitives the IMPLEMENT loop uses (the gate never
@@ -870,7 +872,7 @@ class WorkflowPhaseRunner:
             )
             revised_tests, _ = await self.test_generator.repair_green_baseline(
                 node_id,
-                {"name": "", "description": ""},
+                requirement_data,
                 green_evidence=green_evidence,
                 previous_manifest=current_tests,
             )

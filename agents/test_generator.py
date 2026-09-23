@@ -322,6 +322,11 @@ class TestGenerator:
         generated suite must be RED against the DESIGN skeleton: a test that
         passes now verifies nothing about the node's own behavior and would be
         silently waved through by the tautology fast path at IMPLEMENT time.
+
+        The agent is built exactly like ``run`` (system prompt including the
+        stage skill activation policy, same skills source): both passes share
+        one thread, and a differing prompt prefix would forfeit the provider
+        prefix cache for the whole repair round (issue #173).
         """
         session = StageSession(
             agent_name=self.agent_name,
@@ -334,6 +339,7 @@ class TestGenerator:
             app_type=self.app_type,
             context_workspace_root=self.context_workspace_root,
         )
+        required_skill_names = test_generation_skills(requirement_data)
         current_interfaces = self._current_node_interfaces(node_id)
         current_interface_ids = self._current_interface_ids(node_id, current_interfaces)
         # Pre-seed the manifest lock with the previous manifest's paths: a
@@ -352,7 +358,9 @@ class TestGenerator:
         built = session.build_agent(
             name="test_generator",
             stage="test_generation",
-            system_prompt=get_system_prompt(),
+            system_prompt="\n\n".join(
+                [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
+            ),
             response_format=TestGenerationResponse,
             rebase_gate=self._rebase_gate(),
             tools=[
@@ -370,7 +378,7 @@ class TestGenerator:
                     require_interface_coverage=bool(current_interface_ids),
                 ),
             ],
-            skills=[],
+            skills=[SKILLS_SOURCE],
             test_manifest_lock=manifest_lock,
         )
         message = self._green_rejection_message(

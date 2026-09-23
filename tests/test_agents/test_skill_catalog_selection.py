@@ -316,6 +316,125 @@ def test_tdd_run_requires_repair_skill_after_failure(
     assert captured["skills"] == [SKILLS_SOURCE]
 
 
+# -- repair pass shares the first pass's agent build (issue #173) ----------------
+
+
+def _capture_generator_build(
+    tmp_project_dir: Path,
+    arc_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    node_id: str,
+    requirement_data: dict[str, Any],
+    invoke_payload: dict[str, Any],
+    run_repair: bool,
+) -> dict[str, Any]:
+    """Run one TestGenerator pass with the build seam recorded.
+
+    Returns the kwargs captured from that pass's single ``build_stage_agent``
+    call (each pass builds exactly one agent).
+    """
+
+    builds: list[dict[str, Any]] = []
+
+    def fake_build_stage_agent(**kwargs: Any) -> StageAgentBuild:
+        builds.append(kwargs)
+        return StageAgentBuild(agent=object(), stage_discipline=None)
+
+    async def fake_ainvoke(agent: Any, **kwargs: Any) -> dict[str, Any]:
+        return invoke_payload
+
+    monkeypatch.setattr(stage_session_module, "build_stage_agent", fake_build_stage_agent)
+    monkeypatch.setattr(stage_session_module, "ainvoke_stage_agent", fake_ainvoke)
+    arc_runtime.traceability.store_requirement_tree(
+        {"id": node_id, "name": requirement_data.get("name", ""), "description": ""}
+    )
+    generator = TestGenerator(
+        model=FauxChatModel(responses=[]),
+        workspace_root=str(tmp_project_dir),
+        requirement_path=str(tmp_project_dir / "requirements" / "req.md"),
+        app_type="web",
+    )
+
+    if run_repair:
+        asyncio.run(
+            generator.repair_green_baseline(
+                node_id,
+                requirement_data,
+                green_evidence=[
+                    {"file_path": "backend/tests/unit/green.test.js", "type": "Unit", "output_summary": "1 passed"}
+                ],
+                previous_manifest=[
+                    {
+                        "test_id": "T-GREEN",
+                        "req_id": node_id,
+                        "interface_ids": [],
+                        "type": "Unit",
+                        "file_path": "backend/tests/unit/green.test.js",
+                        "first_line": "test('tautology', () => {",
+                    }
+                ],
+            )
+        )
+    else:
+        asyncio.run(generator.run(node_id=node_id, requirement_data=requirement_data))
+
+    assert len(builds) == 1
+    return builds[0]
+
+
+@pytest.mark.parametrize(
+    "requirement_data",
+    [
+        # No auth trigger: activation policy is empty, the joined prompt is the
+        # bare system prompt with a trailing joiner.
+        {"name": "Counter", "description": "Add two numbers"},
+        # Auth trigger: the activation section must ride along on the repair
+        # build too, or the shared thread's prefix cache is lost.
+        {"name": "Login", "description": "user can log in and see their session"},
+    ],
+    ids=["no-auth-floor", "auth-floor"],
+)
+def test_generator_repair_build_matches_first_pass(
+    tmp_project_dir: Path,
+    arc_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+    requirement_data: dict[str, Any],
+) -> None:
+    """The green-baseline repair round re-asks the first pass's thread: its
+    ``build_agent`` system prompt and skills must be byte-identical to the
+    first pass's, or the provider-side prefix cache is forfeited for the whole
+    repair round (issue #173: in=98,008 / cache_read=128 on the repair call
+    while the first pass cached normally)."""
+    payload = {"summary": "ok", "tests": [], "files_written": []}
+    first_pass = _capture_generator_build(
+        tmp_project_dir,
+        arc_runtime,
+        monkeypatch,
+        node_id="REQ-SKILL-2",
+        requirement_data=requirement_data,
+        invoke_payload=payload,
+        run_repair=False,
+    )
+    repair_pass = _capture_generator_build(
+        tmp_project_dir,
+        arc_runtime,
+        monkeypatch,
+        node_id="REQ-SKILL-2",
+        requirement_data=requirement_data,
+        invoke_payload=payload,
+        run_repair=True,
+    )
+
+    assert repair_pass["system_prompt"] == first_pass["system_prompt"]
+    assert repair_pass["skills"] == first_pass["skills"] == [SKILLS_SOURCE]
+    # The parity is real, not vacuous: with an auth-triggering requirement the
+    # activation section is present in both prompts; without one it is absent
+    # from both.
+    has_auth_floor = bool(select_test_generation_skills(requirement_data))
+    assert ("Stage Skill Activation" in repair_pass["system_prompt"]) is has_auth_floor
+
+
 # -- planner removal ------------------------------------------------------------
 
 
