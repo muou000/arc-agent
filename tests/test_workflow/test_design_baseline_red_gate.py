@@ -11,6 +11,7 @@ phase instead of being waved through by the IMPLEMENT tautology fast path.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -165,6 +166,36 @@ def test_design_baseline_all_red_passes_without_rejection(tmp_project_dir, arc_r
     # The per-file states are persisted for the IMPLEMENT baseline seeding.
     baseline = sessions.load_node_session(node_id).get("design_baseline")
     assert baseline == {UNIT_TEST_FILE: "red"}
+
+
+def test_design_empty_manifest_stores_testgen_summary(tmp_project_dir, arc_runtime) -> None:
+    """An empty manifest is a legal DESIGN result, and the TestGenerator's own
+    summary is kept in the node session so the IMPLEMENT zero-test observation
+    event can quote the reason (issue #187)."""
+
+    class _EmptyManifestGenerator:
+        def __init__(self, output_text: str) -> None:
+            self.app_handler = None
+            self._output = output_text
+
+        async def run(self, node_id: str, requirement_data: dict, **kwargs: Any) -> tuple:
+            return ([], self._output)
+
+    node_id = "REQ-BASE-ZERO-SUMMARY"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    output_text = json.dumps(
+        {"summary": "Static marketing shell; nothing to assert locally.", "tests": []}
+    )
+    runner, _logs = _make_runner(
+        tmp_project_dir, _EmptyManifestGenerator(output_text), FakeAppHandler()
+    )
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is True
+    session = sessions.load_node_session(node_id)
+    assert session["test_summary"] == "Static marketing shell; nothing to assert locally."
+    assert session["test_artifacts"] == []
 
 
 def test_design_baseline_green_file_is_rejected_and_repaired(tmp_project_dir, arc_runtime) -> None:
