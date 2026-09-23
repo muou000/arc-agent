@@ -47,6 +47,7 @@ class _StubGenerator:
         self.app_handler = None
         self._manifests = list(manifests)
         self.rejection_calls: list[list[dict[str, Any]]] = []
+        self.rejection_requirements: list[dict[str, Any]] = []
 
     async def run(self, node_id: str, requirement_data: dict, **kwargs: Any) -> tuple:
         return (self._manifests.pop(0), "{}")
@@ -60,6 +61,7 @@ class _StubGenerator:
         previous_manifest: list[dict[str, Any]],
     ) -> tuple:
         self.rejection_calls.append([dict(item) for item in green_evidence])
+        self.rejection_requirements.append(dict(requirement_data))
         if self._manifests:
             return (self._manifests.pop(0), "{}")
         return ([], "{}")
@@ -186,6 +188,11 @@ def test_design_baseline_green_file_is_rejected_and_repaired(tmp_project_dir, ar
     # The rejection carried the exact green file list.
     assert len(generator.rejection_calls) == 1
     assert [item["file_path"] for item in generator.rejection_calls[0]] == [UNIT_TEST_FILE]
+    # The repair call receives the node's real requirement, not a placeholder
+    # (issue #184): the repair prompt renders it as the Requirement Snapshot so
+    # a cold thread can still judge which assertions are node-owned.
+    assert generator.rejection_requirements[0]["name"] == "Calculator"
+    assert generator.rejection_requirements[0]["description"] == "Add two numbers"
     assert any("Green baseline rejection round" in entry[1] for entry in logs)
     # Baseline ran file1 then file2 (manifest order); the repair re-ran only
     # the still-registered rejected file, not file2.

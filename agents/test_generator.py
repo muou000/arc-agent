@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from core import sessions
 from agents.context.pipeline import context_pipeline
-from agents.context.prompts.common import stage_skill_activation_policy
+from agents.context.prompts.common import json_block, stage_skill_activation_policy
 from agents.context.prompts.test_generator import get_system_prompt, get_user_prompt
 from agents.results import normalize_test_manifest_payload
 from agents.runtime.capabilities import normalize_manifest_path
@@ -326,7 +326,11 @@ class TestGenerator:
         The agent is built exactly like ``run`` (system prompt including the
         stage skill activation policy, same skills source): both passes share
         one thread, and a differing prompt prefix would forfeit the provider
-        prefix cache for the whole repair round (issue #173).
+        prefix cache for the whole repair round (issue #173). The repair
+        message also carries the requirement snapshot: with the checkpointer
+        disabled or a cold repair thread the first pass's history is gone, and
+        judging which assertions are node-owned needs the requirement text
+        (issue #184).
         """
         session = StageSession(
             agent_name=self.agent_name,
@@ -383,6 +387,7 @@ class TestGenerator:
         )
         message = self._green_rejection_message(
             node_id=node_id,
+            requirement_data=requirement_data,
             green_evidence=green_evidence,
             previous_manifest=previous_manifest,
         )
@@ -402,6 +407,7 @@ class TestGenerator:
         self,
         *,
         node_id: str,
+        requirement_data: dict[str, Any],
         green_evidence: list[dict[str, Any]],
         previous_manifest: list[dict[str, Any]],
     ) -> str:
@@ -416,6 +422,8 @@ class TestGenerator:
             evidence_lines.append(line)
         return (
             f"### Current Node\n`{node_id}`\n\n"
+            "### Requirement Snapshot\n"
+            f"```json\n{json_block(requirement_data)}\n```\n\n"
             "### System Rejection: GREEN Baseline Tests\n"
             "The system ran every test file you generated against the current workspace, "
             "BEFORE any implementation exists (only the interface design skeletons are in place). "
