@@ -184,6 +184,11 @@ make clean       # 清理 pytest 缓存与 __pycache__
   `test_exit_code_parsing.py`（测试运行器退出码解析）、
   `test_frontend_build_cache_env.py`（构建缓存键包含环境输入）、
   `test_template_database_contract.py`（生成工作区数据库引导的静态契约）。
+- 测试环境隔离：`test_host_env_isolation.py`（conftest 隔离 fixture 的机械守卫）：
+  调度开关名以 `core/scheduling_switches.py` 为单一权威表（conftest scrub 列表与
+  core 读取点共用，注册即自动进隔离范围）；pytester 注入污染环境验证 autouse
+  fixture 在位则内层绿、缺失则红（干净宿主/CI 上有牙，覆盖调度开关与 model env
+  两组）；AST 对账 core 内未登记的 `ARC_*` 字面量与 core 外的调度开关重字面量。
 
 ---
 

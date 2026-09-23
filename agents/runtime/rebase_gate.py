@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 
+from core.scheduling_switches import ARC_REBASE_ON_MERGE as REBASE_ON_MERGE_ENV
 from core.worktree import (
     PendingMerge,
     ReplayOutcome,
@@ -45,7 +46,9 @@ if TYPE_CHECKING:
 
 
 # Env gate: default off; the replay only runs with an explicit truthy value.
-REBASE_ON_MERGE_ENV = "ARC_REBASE_ON_MERGE"
+# REBASE_ON_MERGE_ENV is imported from the authoritative registry
+# (core/scheduling_switches.py) so the read point and the test-isolation
+# scrub list cannot drift apart (issue #153).
 
 # File tools whose paths participate in the touch check. grep/glob do not:
 # ADR 0003 pins the trigger to tool calls with a single well-defined path

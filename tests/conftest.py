@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from arcbench_agent_runtime import AgentRuntime
+from core.scheduling_switches import SCHEDULING_SWITCH_ENV_VARS
 
 
 # Names of environment variables that influence path resolution. They are
@@ -72,24 +73,21 @@ def isolate_model_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 # Scheduling/merge semantics switches (see core/workflow.py). They reach
-# `os.environ` through the same import-time `load_project_env()` call when the
-# host `.env` sets them, but they flip scheduling semantics instead of
-# provider wiring: tests asserting default scheduling behaviour
+# `os.environ` through core.workflow's import-time `load_project_env()` call
+# when the host `.env` sets them, but they flip scheduling semantics instead
+# of provider wiring: tests asserting default scheduling behaviour
 # (test_parallel_scheduling_rules, test_parallel_worktree_drain, ...) do not
 # pin every switch, so a host override false-reds them in a batch (issue
 # #146). Delete them before every test; tests that exercise a switch
 # explicitly monkeypatch.setenv over this fixture (they run later, so the
-# explicit value wins). The names mirror core/workflow.py literals instead of
-# importing its constants (e.g. DESIGN_GATE_PIPELINE_ENV) on purpose: importing
-# core.workflow would run load_project_env() at import time in every test
-# session — the very leak this fixture exists to neutralize.
-SCHEDULING_SWITCH_ENV_VARS = (
-    "ARC_NODE_WORKTREES",
-    "ARC_MAX_CONCURRENT_TASKS",
-    "ARC_AFFINITY_DEPTH",
-    "ARC_DESIGN_GATE_PIPELINE",
-    "ARC_MERGE_ARBITRATION",
-)
+# explicit value wins).
+#
+# The names come from SCHEDULING_SWITCH_ENV_VARS in `core/scheduling_switches.py`
+# — the authoritative registry shared with the core read points (issue #153).
+# That module is a pure-constant leaf with no imports, so importing it here
+# never runs `load_project_env()` (which importing e.g. `core.workflow` would
+# — the very leak this fixture exists to neutralize). Never hand-extend this
+# list; register new switches in the registry instead.
 
 
 @pytest.fixture(autouse=True)

@@ -43,12 +43,15 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
 from core.logging import append_debug_log, format_json_for_log
+from core.scheduling_switches import ARC_MERGE_ARBITRATION as ARBITRATION_ENV
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
 # Env gate: default off; arbitration only runs with an explicit truthy value.
-ARBITRATION_ENV = "ARC_MERGE_ARBITRATION"
+# ARBITRATION_ENV is imported from the authoritative registry
+# (core/scheduling_switches.py) so a renamed/re-registered switch cannot
+# drift between the read point and the test-isolation scrub list.
 
 TRIGGER_CONFLICT = "conflict"
 TRIGGER_HEALTH_GATE = "health-gate"
