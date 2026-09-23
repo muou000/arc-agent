@@ -539,3 +539,35 @@ class TestRebaseReplayEvents:
         lines = read_jsonl(event_paths.runner_events_path)
         assert lines[0]["files"] == []
         assert lines[0]["message"] is None
+
+
+class TestStraySweepEvents:
+    """Pin the ``stray_sweep`` schema: the IMPLEMENT wrap-up cleanup of stray
+    duplicate files (issue #159)."""
+
+    def test_record_stray_sweep_writes_canonical_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_stray_sweep(
+            node_id=" REQ-1 ",
+            files=["src/api/auth.ts", "  "],
+            message="duplicate of frontend/src/api/auth.ts",
+        )
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "stray_sweep",
+            "node_id": "REQ-1",
+            "files": ["src/api/auth.ts"],
+            "message": "duplicate of frontend/src/api/auth.ts",
+            "timestamp": lines[0]["timestamp"],
+        }
+
+    def test_defaults_and_invalid_values_are_normalized(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_stray_sweep(node_id="REQ-1")
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["files"] == []
+        assert lines[0]["message"] is None

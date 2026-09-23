@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+import yaml
 
 from app_type_handler import create_app_type_handler
 from agents.context.pipeline import context_pipeline
@@ -438,6 +441,7 @@ class WorkflowPhaseRunner:
         if final_ok:
             self._mark_interfaces_implemented(interfaces)
             await self._sweep_undeclared_test_files(node_id, tests)
+            await self._sweep_stray_duplicate_files(node_id)
         self._update_node_session(
             node_id,
             {"phase_status": {"implement": "completed" if final_ok else "failed"}},
@@ -516,6 +520,85 @@ class WorkflowPhaseRunner:
                 (
                     f"Undeclared-test-file sweep failed for {node_id} ({type(exc).__name__}: {exc}); "
                     "the checkpoint will include any diagnostic files left in the test tree."
+                ),
+                status="warning",
+                node_id=node_id,
+            )
+
+    def _template_skeleton_roots(self) -> list[str]:
+        try:
+            template_dir = self.app_handler.template_dir()
+        except Exception:
+            return []
+        return load_template_skeleton_roots(template_dir)
+
+    async def _sweep_stray_duplicate_files(self, node_id: str) -> None:
+        """Delete stray workspace files that duplicate committed in-skeleton content.
+
+        The easy-ticketbooking arc-output-serial run (issue #159) shipped a
+        DESIGN-stage wrong-location write (``src/api/auth.ts``) in the DESIGN
+        commit alongside the correct copy written fourteen seconds later; it
+        kept burning tokens, checkpoint surface and merge surface for the rest
+        of the run. Where the undeclared-test sweep above *preserves* what it
+        collects under ``.arc/diagnostics/``, this one deletes — but only on
+        the double condition of ``collect_stray_duplicate_files``: exact
+        (newline-normalized) content equality with a committed in-skeleton
+        file, and a path outside every declared skeleton root. The committed
+        twin keeps the content alive at its declared location.
+
+        Like the test sweep this runs only after a successful IMPLEMENT phase
+        (a failed phase's tree stays as the agent left it, for inspection and
+        retry) and fails open: template, git or deletion failures leave files
+        in place with a warning, never fail the phase.
+        """
+
+        try:
+            strays = collect_stray_duplicate_files(
+                self.workspace_path,
+                skeleton_roots=self._template_skeleton_roots(),
+            )
+            if not strays:
+                return
+            deleted: list[str] = []
+            kept: list[str] = []
+            for stray in strays:
+                source = Path(self.workspace_path) / stray["path"]
+                try:
+                    source.unlink()
+                    deleted.append(stray["path"])
+                except OSError:
+                    kept.append(stray["path"])
+            if not deleted:
+                return
+            self._update_node_session(node_id, {"swept_stray_files": sorted(deleted)})
+            details = "; ".join(
+                f"{stray['path']} (duplicate of {stray['twin']})"
+                for stray in strays
+                if stray["path"] in deleted
+            )
+            message = (
+                f"Deleted {len(deleted)} stray duplicate file(s) outside the template "
+                f"skeleton for {node_id}: {details}."
+                + (
+                    f" Kept {len(kept)} file(s) whose deletion failed."
+                    if kept
+                    else ""
+                )
+            )
+            await self._log(
+                "TestDrivenDeveloper",
+                message,
+                status="warning",
+                node_id=node_id,
+            )
+            self.events.record_stray_sweep(node_id=node_id, files=sorted(deleted), message=message)
+        except Exception as exc:
+            await self._log(
+                "TestDrivenDeveloper",
+                (
+                    f"Stray-duplicate-file sweep failed for {node_id} "
+                    f"({type(exc).__name__}: {exc}); the checkpoint will include any "
+                    "stray duplicate files left in the workspace."
                 ),
                 status="warning",
                 node_id=node_id,
@@ -1680,22 +1763,22 @@ def _is_test_like_relative_path(path: str) -> bool:
     return stem == "test" or stem.startswith("test-") or stem.endswith("-test")
 
 
-def _load_untracked_paths(workspace_root: str) -> set[str]:
-    """Git-untracked paths of ``workspace_root`` (repo-relative, POSIX style).
+def _git_ls_paths(args: list[str], workspace_root: str) -> set[str]:
+    """Paths reported by ``git ls-files <args>`` (repo-relative, POSIX style).
 
-    ``--exclude-standard`` keeps ignored state (``.arc``, ``node_modules``,
-    lockfiles) out of the candidate set, so the sweep only ever considers
-    files git would actually stage. Failures return an empty set: the sweep
-    is a best-effort backstop, not a gate, and a git hiccup must not fail
-    the IMPLEMENT phase. The raw ``subprocess.run`` (rather than the runtime
-    SDK's ``GitClient.run``) is deliberate: the client hardcodes its own
-    ``project_dir`` as cwd and cannot target a task worktree, which is
+    ``--exclude-standard`` variants keep ignored state (``.arc``,
+    ``node_modules``, lockfiles) out of the candidate set, so a sweep only
+    ever considers files git would actually stage. Failures return an empty
+    set: a sweep is a best-effort backstop, not a gate, and a git hiccup must
+    not fail the IMPLEMENT phase. The raw ``subprocess.run`` (rather than the
+    runtime SDK's ``GitClient.run``) is deliberate: the client hardcodes its
+    own ``project_dir`` as cwd and cannot target a task worktree, which is
     exactly where the parallel-mode sweep must run.
     """
 
     try:
         completed = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
+            ["git", "ls-files", *args],
             cwd=str(workspace_root),
             capture_output=True,
             text=True,
@@ -1713,6 +1796,51 @@ def _load_untracked_paths(workspace_root: str) -> set[str]:
         for line in completed.stdout.splitlines()
         if line.strip()
     }
+
+
+def _load_untracked_paths(workspace_root: str) -> set[str]:
+    """Git-untracked paths of ``workspace_root`` (repo-relative, POSIX style)."""
+
+    return _git_ls_paths(["--others", "--exclude-standard"], workspace_root)
+
+
+def _load_tracked_paths(workspace_root: str) -> set[str]:
+    """Git-index paths of ``workspace_root`` (staged or committed)."""
+
+    return _git_ls_paths(["--cached"], workspace_root)
+
+
+def _load_head_paths(workspace_root: str) -> set[str]:
+    """Paths present in the committed ``HEAD`` tree (repo-relative, POSIX style)."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+            cwd=str(workspace_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if completed.returncode != 0:
+        return set()
+    return {
+        line.replace("\\", "/").strip()
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    }
+
+
+def _fingerprint_bytes(raw: bytes) -> str:
+    """Hash bytes after normalizing only line endings."""
+
+    return hashlib.sha256(
+        raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    ).hexdigest()
 
 
 def collect_undeclared_test_files(
@@ -1754,6 +1882,131 @@ def collect_undeclared_test_files(
         if _is_test_like_relative_path(path):
             matches.append(path)
     return sorted(matches)
+
+
+def _normalize_skeleton_root(root: str) -> str:
+    normalized = root.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.rstrip("/")
+
+
+def _is_under_skeleton(path: str, roots: list[str]) -> bool:
+    return any(path == root or path.startswith(root + "/") for root in roots)
+
+
+def _content_fingerprint(path: Path) -> str | None:
+    """sha256 over newline-normalized bytes, so a CRLF copy of a committed LF
+    file still counts as the same content while distinct binaries stay
+    distinct; unreadable files never match."""
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    return _fingerprint_bytes(raw)
+
+
+def load_template_skeleton_roots(template_dir: str) -> list[str]:
+    """Skeleton roots declared by a template manifest's ``agent_guidance``.
+
+    Returns a normalized, deduplicated, sorted path list. Any failure —
+    missing manifest, unreadable YAML, absent or non-string guidance values —
+    yields ``[]``: the stray sweep fails open to a no-op rather than acting
+    on a guessed whitelist.
+    """
+
+    manifest = Path(template_dir) / "template.yaml"
+    try:
+        data = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    guidance = data.get("agent_guidance")
+    if not isinstance(guidance, dict):
+        return []
+    roots = {
+        normalized
+        for item in guidance.values()
+        if isinstance(item, str) and (normalized := _normalize_skeleton_root(item))
+    }
+    return sorted(roots)
+
+
+def collect_stray_duplicate_files(
+    workspace_root: str,
+    *,
+    skeleton_roots: list[str] | set[str],
+) -> list[dict[str, str]]:
+    """Files that duplicate committed in-skeleton content from outside it.
+
+    The IMPLEMENT wrap-up's narrow stray-file backstop (issue #159): the
+    easy-ticketbooking arc-output-serial run delivered ``src/api/auth.ts``
+    from the workspace root — a byte-identical leftover of a DESIGN write to
+    the wrong location whose correct copy (``frontend/src/api/auth.ts``) was
+    committed fourteen seconds later. A file is collected only when *both*
+    hold:
+
+    - its content equals another **committed-path** file's current content
+      (sha256 over newline-normalized bytes), and
+    - its path lies outside every skeleton root, while the twin's path lies
+      inside one — so the content provably survives the deletion at its
+      declared location, and two identical files that are both outside the
+      skeleton are left alone.
+
+    Candidates come from tracked and untracked-but-not-ignored git paths
+    (both would ride the next ``git add -A`` checkpoint); the twin path must
+    already exist in ``HEAD`` (an index-only path is not a durable anchor),
+    while its fingerprint is read from the current worktree so an edited twin
+    no longer matching the stray is not treated as a duplicate. Generic
+    "unreferenced file" detection is deliberately out of scope.
+
+    Returns ``[{"path": ..., "twin": ...}]`` with workspace-relative
+    POSIX-style paths, sorted.
+    """
+
+    root = Path(workspace_root).expanduser().resolve()
+    roots = [
+        normalized
+        for item in skeleton_roots
+        if (normalized := _normalize_skeleton_root(str(item or "")))
+    ]
+    if not roots:
+        return []
+    tracked = _load_tracked_paths(str(root))
+    head_paths = _load_head_paths(str(root))
+    if not tracked or not head_paths:
+        return []
+
+    def _sweepable(paths: set[str]) -> list[str]:
+        sweepable = []
+        for path in sorted(paths):
+            parts = path.split("/")
+            if any(part in _SWEEP_SKIPPED_PARTS for part in parts[:-1]):
+                continue
+            if (root / path).is_file():
+                sweepable.append(path)
+        return sweepable
+
+    inside_fingerprints: dict[str, str] = {}
+    for path in _sweepable(head_paths):
+        if not _is_under_skeleton(path, roots):
+            continue
+        fingerprint = _content_fingerprint(root / path)
+        if fingerprint:
+            inside_fingerprints.setdefault(fingerprint, path)
+    if not inside_fingerprints:
+        return []
+
+    strays: list[dict[str, str]] = []
+    for path in _sweepable(tracked | _load_untracked_paths(str(root))):
+        if _is_under_skeleton(path, roots):
+            continue
+        fingerprint = _content_fingerprint(root / path)
+        if fingerprint and fingerprint in inside_fingerprints:
+            strays.append({"path": path, "twin": inside_fingerprints[fingerprint]})
+    return strays
 
 
 def summarize_interface_artifacts(interfaces: list[dict[str, Any]]) -> dict[str, Any]:

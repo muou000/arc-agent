@@ -53,6 +53,61 @@ def test_interface_designer_prompt_pins_mechanical_read_lock() -> None:
     assert "Never read a file back to verify the final state of your own work" in prompt
 
 
+def test_interface_designer_prompt_pins_shape_only_skeleton_boundary() -> None:
+    """Issue #158 (ADR 0005): the skeleton definition must be mechanical
+    (shape, not length), the Hard boundary must lead the Role section, and
+    the prompt must teach the escape hatch - behavior goes to the stage
+    response - instead of teaching chunked writes."""
+
+    prompt = get_system_prompt()
+
+    # Hard boundary leads the Role section (PR #74 prominence-fronting pattern).
+    assert "Hard boundary: DESIGN designs, it does not implement" in prompt
+    assert prompt.index("Hard boundary: DESIGN designs, it does not implement") < prompt.index(
+        "Position: first agent stage"
+    )
+
+    # Mechanical shape definition: no function bodies, shape checklist, and
+    # the implementation tripwires.
+    assert "shape-only" in prompt
+    assert "`// TODO(TDD): <behavior>` markers" in prompt
+    assert "beyond a single return statement" in prompt
+    assert "Any `if`/loop, SQL, validation logic" in prompt
+
+    # Economic motivation: implementation in DESIGN is thrown-away work.
+    assert "discarded work" in prompt
+
+    # The escape hatch replaces the chunking teaching.
+    assert "it is not a skeleton" in prompt
+    assert "stage response for TestDrivenDeveloper" in prompt
+
+
+def test_interface_designer_prompt_drops_chunking_teaching() -> None:
+    """The three chunk-teaching sites (compact first chunk + append_file
+    continuations + 'overcome the DESIGN skeleton limit') taught the exact
+    bypass that burned the arc-output-serial run; they must be gone."""
+
+    prompt = get_system_prompt()
+    user_prompt = get_user_prompt(
+        node_id="REQ-LEAF-1",
+        requirement_data={"id": "REQ-LEAF-1", "name": "Registration", "description": "Register an account.", "children_ids": []},
+        dynamic_context="",
+    )
+
+    assert "cohesive continuation" not in prompt
+    assert "chunk small enough" not in prompt
+    assert "DESIGN skeleton limit" not in prompt
+    assert "feature-complete business flow" not in prompt
+    assert "DESIGN skeleton limit" not in user_prompt
+    # The user prompt carries the same one-compact-write escape hatch.
+    assert "is not a skeleton" in user_prompt
+    assert "do not split it into chunks or append continuations" in user_prompt
+    assert "put the complete behavior description in your stage response for TestDrivenDeveloper" in user_prompt
+    # The response contract must not send behavior detail back into skeleton
+    # files - that contradiction is what made the escape hatch unreachable.
+    assert "put implementation detail into the skeleton files, not into the response" not in prompt
+
+
 def test_interface_designer_user_prompt_pins_the_node_budget_number() -> None:
     leaf = get_user_prompt(
         node_id="REQ-LEAF-1",

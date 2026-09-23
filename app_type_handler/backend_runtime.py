@@ -733,9 +733,24 @@ def _slugify_identifier(value: str) -> str:
     return normalized or "playwright-e2e"
 
 
+# Cap on the human-readable prefix of the E2E database filename: the joined
+# target list is unbounded, and only the suite hash below carries the
+# isolation semantics (see `_build_e2e_runtime_env`).
+_E2E_DB_SUITE_LABEL_MAX_LENGTH = 24
+
+
 def _build_e2e_runtime_env(workspace_path: str, targets: list[str], web_port: int | None = None) -> dict[str, str]:
     normalized_targets = [target.replace("\\", "/").strip() for target in targets if target and str(target).strip()]
-    suite_label = _slugify_identifier("-".join(normalized_targets) or "playwright-e2e")
+    # The joined target list is unbounded (a handful of E2E specs alone spelled
+    # a ~140-char filename, approaching Windows MAX_PATH once the directory
+    # prefix and sqlite's -wal/-shm siblings are added). The suite hash below
+    # already carries the isolation semantics, so the label only keeps a short
+    # human-readable prefix.
+    suite_label = (
+        _slugify_identifier("-".join(normalized_targets) or "playwright-e2e")[
+            :_E2E_DB_SUITE_LABEL_MAX_LENGTH
+        ].rstrip("-")
+    )
     suite_hash = hashlib.sha1("\n".join(normalized_targets or ["playwright-e2e"]).encode("utf-8")).hexdigest()[:10]
     backend_path = os.path.join(workspace_path, "backend")
     e2e_db_root = os.path.join(backend_path, ".arc-test-db")
@@ -805,6 +820,15 @@ def backend_source_fingerprint(backend_path: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Database preparation for the backend session
 # ---------------------------------------------------------------------------
+
+# A fresh `db:prepare:e2e` right after a stale teardown can hit
+# SQLITE_CANTOPEN: on Windows the force-killed backend's file handles are
+# released asynchronously, so the sqlite file may still be locked for a few
+# hundred milliseconds after the port already reads as released. Retries are
+# bounded and the wait doubles as the handle-release grace period; the port
+# is re-checked between attempts (adapter hook) so a known leftover is
+# cleaned before spending another prepare run.
+_E2E_DB_PREPARE_RETRY_DELAYS_SECONDS: tuple[float, ...] = (0.3, 0.5)
 
 
 async def _prepare_e2e_database(
@@ -1078,6 +1102,13 @@ class BackendRuntime:
     start within the same call and reports the reason in
     ``RuntimeAcquisition.cleanup_note``.
 
+    A failed fresh-start database prepare is retried with short backoffs
+    (``_E2E_DB_PREPARE_RETRY_DELAYS_SECONDS``): on Windows the force-killed
+    stale backend releases its sqlite file handles asynchronously, so an
+    immediately following prepare can fail non-deterministically. Each retry
+    re-checks the port first (``_prepare_retry_cleanup``); exhaustion returns
+    ``failure_stage="database"`` with the retry history in ``cleanup_note``.
+
     Termination semantics (``terminate``), confirmed on this interface: yes —
     teardown waits for the port to be released together with the process.
     One teardown path: graceful finalize of the launcher, await of the
@@ -1151,13 +1182,40 @@ class BackendRuntime:
             cleanup_note = f"{cleanup_note}\n{stale_note}" if cleanup_note else stale_note
 
         db_output = ""
-        started = loop.time()
-        prepare_ok, _prepare_exit, prepare_output = await self._prepare_db(runtime_env)
-        _record("database_prepare", started)
-        db_output = prepare_output
+        retry_notes: list[str] = []
+        prepare_ok = False
+        # One initial attempt plus one retry per configured delay; the sleep
+        # and the port re-check happen before each retry, never before the
+        # first attempt.
+        total_attempts = len(_E2E_DB_PREPARE_RETRY_DELAYS_SECONDS) + 1
+        for attempt in range(total_attempts):
+            if attempt > 0:
+                await asyncio.sleep(_E2E_DB_PREPARE_RETRY_DELAYS_SECONDS[attempt - 1])
+                retry_cleanup_note = await self._prepare_retry_cleanup(port)
+                if retry_cleanup_note:
+                    retry_notes.append(retry_cleanup_note)
+            started = loop.time()
+            prepare_ok, _prepare_exit, prepare_output = await self._prepare_db(runtime_env)
+            _record("database_prepare", started)
+            db_output = prepare_output
+            if prepare_ok:
+                break
+            retry_notes.append(f"prepare attempt {attempt + 1} of {total_attempts} failed")
+        if retry_notes:
+            if prepare_ok:
+                retry_summary = (
+                    "E2E database prepare succeeded on retry after earlier failed attempt(s)."
+                )
+            else:
+                retry_summary = (
+                    f"E2E database prepare failed after {total_attempts} attempts; "
+                    "retries exhausted."
+                )
+            cleanup_note = f"{cleanup_note}\n{retry_summary}" if cleanup_note else retry_summary
+            cleanup_note = f"{cleanup_note}\n" + "\n".join(retry_notes)
         if not prepare_ok:
             return RuntimeAcquisition(
-                db_output=prepare_output,
+                db_output=db_output,
                 cleanup_note=cleanup_note,
                 failure_stage="database",
                 stage_seconds=stage_seconds,
@@ -1230,6 +1288,15 @@ class BackendRuntime:
     async def _prepare_db(self, runtime_env: dict[str, str]) -> tuple[bool, int | None, str]:
         raise NotImplementedError
 
+    async def _prepare_retry_cleanup(self, port: int) -> str:
+        """Best-effort cleanup between database prepare retries. Never raises.
+
+        Default is a no-op; the process adapter re-checks the port and reports
+        its state before the next attempt.
+        """
+
+        return ""
+
 
 class ProcessBackendRuntime(BackendRuntime):
     """Production adapter: real subprocess, HTTP probe, port release, sqlite."""
@@ -1271,6 +1338,20 @@ class ProcessBackendRuntime(BackendRuntime):
 
     async def _prepare_db(self, runtime_env: dict[str, str]) -> tuple[bool, int | None, str]:
         return await _prepare_e2e_database(self.workspace_path, runtime_env, runner=self._runner())
+
+    async def _prepare_retry_cleanup(self, port: int) -> str:
+        # No session survives to this point, so no owned-process set exists;
+        # an occupied port here belongs to an unknown owner that must not be
+        # killed — surface it as a note and let the retry proceed regardless.
+        try:
+            return await _ensure_port_released(
+                port,
+                context="E2E database prepare retry",
+                timeout=1.0,
+                allowed_processes={},
+            )
+        except RuntimeError as exc:
+            return str(exc)
 
     async def reset_db(self, runtime_env: dict[str, str]) -> tuple[bool, str]:
         db_path = runtime_env.get("ARC_E2E_DB_PATH", "")

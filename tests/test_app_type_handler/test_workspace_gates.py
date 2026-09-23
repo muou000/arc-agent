@@ -26,6 +26,7 @@ import pytest
 
 from app_type_handler import base as base_handler
 from app_type_handler import create_app_type_handler, template_patches, web as web_handler
+from app_type_handler import backend_runtime as backend_runtime_module
 from app_type_handler.backend_runtime import _CommandResult
 from app_type_handler.template_patches import (
     ALREADY_APPLIED,
@@ -544,6 +545,41 @@ def test_e2e_runtime_env_points_playwright_at_the_workspace_port(tmp_path) -> No
     assert env["PLAYWRIGHT_BASE_URL"] == f"http://127.0.0.1:{web_handler.get_web_port()}"
     assert env["ARC_WEB_PORT"] == str(web_handler.get_web_port())
     assert env["ARC_E2E_DB_PATH"].endswith(".sqlite")
+
+
+def test_e2e_db_filename_truncates_the_suite_label_and_keeps_the_hash(tmp_path) -> None:
+    """The unbounded target-list label must not walk the file to MAX_PATH.
+
+    A serial run's four E2E specs spelled a ~140-char basename; on Windows the
+    directory prefix and sqlite's `-wal`/`-shm` siblings pushed the full path
+    toward the 260-char limit. The label is a short readability prefix only —
+    the suite hash carries the isolation.
+    """
+
+    long_targets = [
+        f"backend/test-e2e/booking-flow-scenario-{index}-with-a-very-long-descriptive-name.spec.ts"
+        for index in range(4)
+    ]
+
+    env = web_handler._build_e2e_runtime_env(str(tmp_path), long_targets)
+
+    basename = os.path.basename(env["ARC_E2E_DB_PATH"])
+    assert basename.endswith(".sqlite")
+    label, _separator, suite_hash = basename[: -len(".sqlite")].rpartition("-")
+    assert len(label) <= backend_runtime_module._E2E_DB_SUITE_LABEL_MAX_LENGTH
+    assert len(suite_hash) == 10
+
+
+def test_e2e_db_filename_hash_keeps_suite_isolation_after_truncation(tmp_path) -> None:
+    """Target sets truncating to the same label still land on different files."""
+
+    prefix = "backend/test-e2e/booking-flow-scenario-with-a-very-long-descriptive-name"
+    first = web_handler._build_e2e_runtime_env(str(tmp_path), [f"{prefix}-a.spec.ts"])
+    second = web_handler._build_e2e_runtime_env(str(tmp_path), [f"{prefix}-b.spec.ts"])
+    again = web_handler._build_e2e_runtime_env(str(tmp_path), [f"{prefix}-a.spec.ts"])
+
+    assert first["ARC_E2E_DB_PATH"] != second["ARC_E2E_DB_PATH"]
+    assert first["ARC_E2E_DB_PATH"] == again["ARC_E2E_DB_PATH"]
 
 
 @pytest.mark.parametrize(

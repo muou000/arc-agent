@@ -293,6 +293,32 @@ class EventClient:
             },
         )
 
+    def record_stray_sweep(
+        self,
+        *,
+        node_id: str = "",
+        files: list[str] | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Append one ``stray_sweep`` event for the IMPLEMENT wrap-up cleanup.
+
+        Emitted when the sweep deletes stray workspace files (issue #159):
+        paths outside every template skeleton root whose content duplicates a
+        committed in-skeleton file. ``files`` carries the deleted
+        workspace-relative paths. An empty ``node_id`` attributes the event
+        to the run as a whole.
+        """
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "stray_sweep",
+                "node_id": str(node_id or "").strip(),
+                "files": [str(path or "").strip() for path in (files or []) if str(path or "").strip()],
+                "message": message,
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def _emit_runner_state(self, state: str, message: str | None = None) -> None:
         append_jsonl(
             self.paths.runner_events_path,

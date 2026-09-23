@@ -799,16 +799,51 @@ def test_interface_design_non_leaf_budget_can_be_raised() -> None:
     assert seventeenth.status == "error" and "at most 16" in seventeenth.content
 
 
-def test_interface_design_blocks_large_files() -> None:
+def test_interface_design_allows_large_single_writes_without_a_line_gate() -> None:
+    """Issue #158: the per-write 160-line skeleton gate is removed — it was
+    the first driver of the reject/chunk/re-write rework loop (arc-output-serial).
+    A long but shape-only skeleton passes; content is gated by the mutation
+    sniff, not by length."""
+
     middleware = make("interface_design")
+    lines = [
+        "import { Router } from 'express';",
+        "import { NoteHandlers } from '../handlers/notes.js';",
+        "export interface NoteRecord { id: string; body: string; }",
+        "export type CreateNoteResult = { ok: boolean; code?: string };",
+    ]
+    lines += [
+        f"router.get('/notes/{index}', handlers.getNote); // TODO(TDD): load note and shape the response"
+        for index in range(160)
+    ]
+    assert len(lines) > 160
+    result = run(
+        middleware,
+        make_request("write_file", {"file_path": "/workspace/src/routes/notes.ts", "content": "\n".join(lines)}),
+    )
+    assert result.content == "ok"
+
+
+def test_interface_design_sniff_still_gates_large_writes_by_content() -> None:
+    """Removing the line gate must not open a size hole: a large write carrying
+    a mutation body is still blocked, and the rejection points at the escape
+    hatch (behavior goes to the stage response) instead of only listing bans."""
+
+    middleware = make("interface_design")
+    lines = ["// notes repository contract"] + [
+        f"export const NOTE_FIELD_{index} = 'col_{index}';" for index in range(200)
+    ]
+    lines.append("export function createNote(db, note) {\n  return db.insert(note);\n}")
     result = run(
         middleware,
         make_request(
             "write_file",
-            {"file_path": "/workspace/src/big.py", "content": "\n".join(f"line {i}" for i in range(161))},
+            {"file_path": "/workspace/backend/src/repositories/notes.js", "content": "\n".join(lines)},
         ),
     )
-    assert result.status == "error" and "small skeletons (at most 160 lines" in result.content
+    assert result.status == "error"
+    assert "contract skeletons" in result.content
+    assert "stage response for TestDrivenDeveloper" in result.content
 
 
 def test_interface_design_blocks_obvious_business_mutations() -> None:
@@ -825,6 +860,7 @@ def test_interface_design_blocks_obvious_business_mutations() -> None:
     )
     assert result.status == "error"
     assert "contract skeletons" in result.content
+    assert "stage response for TestDrivenDeveloper" in result.content
 
 
 def test_interface_design_blocks_repository_upsert_mutation() -> None:
@@ -937,6 +973,9 @@ def test_interface_design_allows_bounded_append_continuations() -> None:
         make_request("append_file", {"file_path": "/workspace/src/other.ts", "content": "x\n" * 81}),
     )
     assert oversized.status == "error" and "at most 80 lines" in oversized.content
+    # Issue #158: the rejection points at the escape hatch instead of teaching
+    # "split into another append" (the chunk-and-rework loop generator).
+    assert "stage response for TestDrivenDeveloper" in oversized.content
 
     blocked = run(
         make("implementation"),

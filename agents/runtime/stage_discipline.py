@@ -42,6 +42,10 @@ _MAX_DESIGN_WRITES = 12
 MAX_DESIGN_WRITES = _MAX_DESIGN_WRITES
 _MAX_NON_LEAF_DESIGN_WRITES = 16
 MAX_NON_LEAF_DESIGN_WRITES = _MAX_NON_LEAF_DESIGN_WRITES
+# Per-file skeleton ceiling. The DESIGN per-write line gate was removed
+# (issue #158 / ADR 0005: it drove the reject/chunk/re-write rework loop);
+# the constant now only sizes the append_file tool's per-file ceiling
+# (``agents/tools/file_append.py``).
 _MAX_SKELETON_LINES = 160
 MAX_SKELETON_LINES = _MAX_SKELETON_LINES
 MAX_APPEND_LINES = 80
@@ -358,7 +362,9 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if line_count > MAX_APPEND_LINES:
             return (
                 f"append_file accepts at most {MAX_APPEND_LINES} lines per chunk; received {line_count}. "
-                "Split the next cohesive skeleton section into another append."
+                "If the next section does not fit in one compact append, it is not skeleton "
+                "material - put the behavior in your stage response for TestDrivenDeveloper "
+                "instead of extending this file."
             )
         if import_block := self._validate_test_imports(path, content):
             return import_block
@@ -535,9 +541,9 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             if blocked:
                 return blocked
         # The import check sees the would-be final file for an edit, but the
-        # existing DESIGN content guards must continue to inspect only the
-        # edit payload. Otherwise a small anchor edit on a large existing test
-        # file would be rejected by the DESIGN skeleton line cap.
+        # existing DESIGN content guard must continue to inspect only the
+        # edit payload: a small anchor edit on a large existing test file
+        # must not be re-judged against the whole file's content.
         edit_content = str(args.get("content", args.get("new_string", "")) or "")
         content = edit_content
         if (
@@ -554,11 +560,6 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if self._stage == "interface_design":
             if violation := self._validate_design_content(edit_content):
                 return violation
-            if edit_content.count("\n") + 1 > _MAX_SKELETON_LINES:
-                return (
-                    f"InterfaceDesigner may only materialize small skeletons (at most {_MAX_SKELETON_LINES} lines per write). "
-                    "Record the complete business contract for TDD instead of implementing it now."
-                )
             if budget_block := self._reserve_design_write(path):
                 return budget_block
         if self._file_claim_gate is not None:
@@ -592,9 +593,10 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if any(pattern.search(code) for pattern in _DESIGN_MUTATION_PATTERNS):
             return (
                 "InterfaceDesigner may only materialize contract skeletons; this write contains "
-                "an apparent persistence or business mutation. Keep signatures, routes, types, "
-                "and explicit TODO/unsupported boundaries in DESIGN, and leave complete behavior "
-                "to TestDrivenDeveloper."
+                "an apparent persistence or business mutation. A skeleton is shape-only: imports, "
+                "types/constants, typed signature exports, route tables, and TODO(TDD) markers. "
+                "Do not split or append around this rejection - put the complete behavior "
+                "description in your stage response for TestDrivenDeveloper."
             )
         return None
 
