@@ -268,6 +268,22 @@ def test_second_declaration_extends_the_lock_without_reset() -> None:
     assert [row["file_path"] for row in second["manifest"]] == ["tests/unit/a.test.ts", "tests/unit/b.test.ts"]
 
 
+def test_tool_description_documents_redeclaration_merge() -> None:
+    """Issue #183: the tool description itself said "Call this exactly once"
+    while the mechanical contract (pinned above) supports re-declaration
+    merge after a rejection. The docstring is the model-facing tool
+    description, read at exactly the retry-decision point, so it must state
+    the recovery path instead of an absolutist call count.
+    """
+
+    tool = build_declare_test_manifest_tool(node_id="REQ-X", manifest_lock=TestManifestLock())
+
+    doc = " ".join((tool.__doc__ or "").split())
+    assert "exactly once" not in doc
+    assert "re-declare" in doc
+    assert "the lock merges, adding only paths whose earlier declaration failed" in doc
+
+
 def test_declaration_rejects_empty_list() -> None:
     payload = _parse(_declare([]))
     assert payload["status"] == "error"

@@ -32,6 +32,22 @@ def test_system_prompt_pins_read_lock_and_no_probe_retries() -> None:
     )
 
 
+def test_system_prompt_states_redeclaration_merge_protocol() -> None:
+    """Issue #183: "exactly once" contradicted the tool's re-declaration
+    merge protocol — the lock merges a later declaration, adding only paths
+    whose earlier attempt failed validation (mechanical contract pinned by
+    test_second_declaration_extends_the_lock_without_reset). After a
+    rejection the model must know that fixing and re-declaring is the
+    recovery path, not a protocol violation.
+    """
+
+    prompt = get_system_prompt()
+
+    assert "exactly once" not in prompt
+    assert "If the declaration is rejected, fix the reported issues and re-declare" in prompt
+    assert "the lock merges, adding only paths whose earlier declaration failed" in prompt
+
+
 def test_user_prompt_requires_exact_current_contract_ids() -> None:
     prompt = get_user_prompt(
         node_id="REQ-X",

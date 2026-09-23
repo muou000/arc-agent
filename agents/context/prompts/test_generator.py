@@ -57,7 +57,7 @@ def get_system_prompt() -> str:
             section(
                 "Test Manifest Declaration Protocol",
                 [
-                    "Before writing any test file, you MUST call `declare_test_manifest` exactly once with one entry per planned test file: its `file_path`, `type` (Unit/Integration/E2E), and the `interface_ids` it covers.",
+                    "Before writing any test file, declare the complete manifest with `declare_test_manifest` — one entry per planned test file: its `file_path`, `type` (Unit/Integration/E2E), and the `interface_ids` it covers. If the declaration is rejected, fix the reported issues and re-declare: the lock merges, adding only paths whose earlier declaration failed.",
                     "The declaration is validated against the app-type test placement rules and the registered interface ids, then LOCKED for the rest of this stage: `write_file`, `edit_file`, and `delete` on a test-file path outside the declared manifest are rejected by the system.",
                     "When the current interface contract contains one or more interfaces owned by this node, every declared test file that verifies node behavior MUST list one or more exact `interface_ids` from that contract. An empty `interface_ids` list is forbidden for those files; it is not a fallback for a missing or failed lookup.",
                     "If a traceability lookup returns no committed records while the current interface contract is non-empty, use the exact ids shown in the current contract or staged design context. Do not search ROOT, invent ids, or submit `[]` to bypass validation.",

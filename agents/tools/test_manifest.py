@@ -134,7 +134,7 @@ def build_declare_test_manifest_tool(
     async def declare_test_manifest(files: list[dict[str, Any]]) -> str:
         """Declare and lock the test-file manifest for this stage run.
 
-        Call this exactly once, before writing any test file, with one entry
+        Call this before writing any test file, with one entry
         per test file you intend to create or update. ``coverage_scope`` is
         ``owned`` for behavior introduced by this node, ``dependency`` for a
         dependency regression, and ``shared`` for a shared-contract check:
@@ -145,10 +145,11 @@ def build_declare_test_manifest_tool(
         and delete on a test-file path that is not in the declared manifest
         are rejected. Test files are paths with a `.test.`/`.spec.` name, a
         Python `test_*.py`/`*_test.py` name, or any source file under a
-        `test-e2e` directory. Include every planned test file in this one
-        call; a second declaration may only add paths that failed validation
-        earlier. Test helpers and runner configs do not belong in the
-        manifest and stay writable without being declared.
+        `test-e2e` directory. Include every planned test file in the first
+        call; if the declaration is rejected, fix the reported issues and
+        re-declare — the lock merges, adding only paths whose earlier
+        declaration failed. Test helpers and runner configs do not belong in
+        the manifest and stay writable without being declared.
         """
 
         if not isinstance(files, list) or not files:
