@@ -51,6 +51,8 @@ from core.processes import (
     start_subprocess_shell,
 )
 
+from .test_output_filter import filter_output_noise, render_filter_footer
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,13 +108,27 @@ async def _execute_web_test_command(
         output = stdout.decode("utf-8", errors="replace")
         error = stderr.decode("utf-8", errors="replace")
 
+        # #216: filter formatting noise and never truncate — the head+tail
+        # cut used to destroy mid-output failure evidence (assertion diffs,
+        # DOM dumps) that no later read or grep could recover, because the
+        # persisted tdd_runs log held the same truncated text. The footer
+        # makes the filtering observable and tells the model the output is
+        # complete.
+        raw_chars = len(output) + len(error)
+        output, output_removed = filter_output_noise(output)
+        error, error_removed = filter_output_noise(error)
+        removed_by_rule: dict[str, int] = {}
+        for rule_stats in (output_removed, error_removed):
+            for name, chars in rule_stats.items():
+                removed_by_rule[name] = removed_by_rule.get(name, 0) + chars
+
         result = f"Exit Code: {process.returncode}\n"
         if output:
             result += f"STDOUT:\n{output}\n"
         if error:
             result += f"STDERR:\n{error}\n"
-        if len(result) > 4000:
-            result = result[:2000] + "\n...[OUTPUT TRUNCATED]...\n" + result[-2000:]
+        if raw_chars:
+            result += render_filter_footer(raw_chars, removed_by_rule) + "\n"
         return _CommandResult(
             exit_code=process.returncode if process.returncode is not None else -1,
             text=result,

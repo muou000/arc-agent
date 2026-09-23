@@ -452,7 +452,8 @@ class TddTestExecutor:
         if run_log_path:
             result.run_log_path = run_log_path
             result.output += (
-                f"\n\nARC_RUN_OUTPUT_LOG: the complete raw output of this run is saved at "
+                "\n\nARC_RUN_OUTPUT_LOG: the complete output of this run "
+                "(formatting noise filtered, never truncated) is saved at "
                 f"`{run_log_path}`. Read that file for the full output of this attempt "
                 "instead of re-running the tests.\n"
             )
