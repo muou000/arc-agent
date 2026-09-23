@@ -1,28 +1,27 @@
-"""Append-only continuation of a file, so DESIGN can build skeletons in pieces.
+"""Small additive continuation for files DESIGN has already touched.
 
-InterfaceDesigner materializes interface skeletons, and the stage's write rules
-block a second ``write_file``/``edit_file`` on a path it already wrote
-(repeated writes are the stage's main self-review loop). Without an additive
-tool the only way to grow a file is to regenerate all of it in one model turn:
-run8 (2026-09-17) shows the cost — the model was blocked twice at the 160-line
-skeleton cap before it compressed ``RegisterPage.tsx`` into one write, and the
-slowest DESIGN rounds on the ticket-booking benchmark are exactly those
-whole-file generations (153-358 s per turn).
+DESIGN materializes one compact, shape-only skeleton per file in a single
+``write_file`` (issue #158 / ADR 0005: a skeleton that does not fit one
+compact write is not a skeleton — the behavior description goes into the
+stage response for TestDrivenDeveloper, never into chunks). ``append_file``
+exists for the two cases that remain after that rule:
 
-``append_file`` gives the stage a sanctioned continuation: the model opens a
-file with a small ``write_file`` skeleton and then adds sections with
-``append_file``, so a turn only emits its own chunk instead of the whole file.
+- additive wiring into the template's shared runtime surfaces (app entry,
+  server entry, database lifecycle, shared api client), whose whole-file
+  ``write_file`` is rejected by the shared-surface guard; and
+- a small legitimate addition (a route row, a table declaration) to a file
+  this stage already wrote, since a second ``write_file``/``edit_file`` on
+  a written path is locked.
 
 Enforcement split (deliberately not duplicated):
 
 - ``StageDisciplineMiddleware`` owns *ownership* policy. It treats
   ``append_file`` as a write for claims, bookkeeping and the ``materialized
   paths`` ground truth, keeps the repeated-write lock on ``write_file``/
-  ``edit_file`` only, and enforces the per-path append budget.
-- This tool owns *file-size* policy, because it is the only place that can read
-  the current file: the per-file DESIGN skeleton ceiling is checked against the
-  file's real line count, and the result reports the remaining budget so the
-  model can plan the next chunk.
+  ``edit_file`` only, and enforces the per-pass append budget and the
+  content sniffing.
+- This tool owns the per-call line backstop (the only place that sees the
+  raw call) and reuses the agent's own write-permission rules.
 """
 
 from __future__ import annotations
@@ -33,18 +32,18 @@ from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
 
-from agents.runtime.stage_discipline import MAX_APPEND_LINES, MAX_APPENDS_PER_FILE, MAX_SKELETON_LINES
+from agents.runtime.stage_discipline import MAX_APPEND_LINES, MAX_APPENDS_PER_FILE
 from core.file_claims import normalize_claim_path
 
 _LOGGER = logging.getLogger(__name__)
 
-APPEND_FILE_TOOL_DESCRIPTION = f"""Append a chunk to the end of a file, without re-emitting the file.
+APPEND_FILE_TOOL_DESCRIPTION = f"""Append a few lines to the end of a file you already touched, without re-emitting the file.
 
 Usage:
-- Use this tool to grow a file you already started in this stage: `write_file` the skeleton first (imports, types, exported signatures, routes, table declarations, TODO boundaries), then `append_file` each remaining section. A file you already wrote cannot be rewritten (`write_file`/`edit_file` on it are blocked), so appending is the sanctioned way to extend it.
-- Appends are strictly additive: existing lines are never modified, and the tool is capped at {MAX_APPEND_LINES} lines per call, {MAX_SKELETON_LINES} lines per file, and {MAX_APPENDS_PER_FILE} appends per file. Keep each chunk to one cohesive section.
-- Do not append content that is already in the file, and do not use this tool to implement business behavior; DESIGN still only materializes skeletons.
-- `file_path` is a `/workspace/...` path or a workspace-relative path; write the initial skeleton with `write_file` before appending.
+- Use this tool only for small additive continuations: wiring your node-owned module into the template's shared runtime surfaces (whose whole-file `write_file` is rejected), or adding a small piece such as a route row or a table declaration to a file you already wrote this stage. A file you already wrote cannot be rewritten (`write_file`/`edit_file` on it are blocked), so appending is the sanctioned way to extend it.
+- Appends are strictly additive: existing lines are never modified, and the tool is capped at {MAX_APPEND_LINES} lines per call and {MAX_APPENDS_PER_FILE} appends per file.
+- A skeleton that does not fit in one compact `write_file` is not a skeleton: do not split it into chunks or use appends as continuations; put the complete behavior description in your stage response for TestDrivenDeveloper. DESIGN still only materializes skeletons.
+- `file_path` is a `/workspace/...` path or a workspace-relative path; the file must already exist.
 """
 
 
@@ -64,7 +63,7 @@ def build_append_file_tool(
     root = Path(workspace_root).expanduser().resolve()
 
     async def append_file(file_path: str, content: str) -> str:
-        """Append a chunk of text to the end of an existing skeleton file."""
+        """Append a few lines to the end of an existing file."""
 
         target = _resolve_target(root, file_path)
         if isinstance(target, str):
@@ -81,8 +80,8 @@ def build_append_file_tool(
 
         if not path.exists():
             return (
-                f"Error: {virtual_path} does not exist; write the initial DESIGN skeleton with write_file "
-                "before using append_file."
+                f"Error: {virtual_path} does not exist; `append_file` extends an existing file - "
+                "materialize the file first with write_file."
             )
         existing_lines = 0
         needs_separator = False
@@ -100,15 +99,9 @@ def build_append_file_tool(
         if appended_lines > MAX_APPEND_LINES:
             return (
                 f"Error: append_file accepts at most {MAX_APPEND_LINES} lines per chunk; received {appended_lines}. "
-                "Split the next cohesive skeleton section into another append."
-            )
-        total_lines = existing_lines + appended_lines
-        if total_lines > MAX_SKELETON_LINES:
-            return (
-                f"Error: appending {appended_lines} line(s) would put {virtual_path} at {total_lines} line(s), "
-                f"over the {MAX_SKELETON_LINES}-line DESIGN skeleton ceiling. Record the remaining contract detail "
-                "in your design response (for TestDrivenDeveloper) instead of extending this file, or move the "
-                "behavior into one of your other skeleton files."
+                "If the next section does not fit in one compact append, it is not skeleton "
+                "material - put the behavior in your stage response for TestDrivenDeveloper "
+                "instead of extending this file."
             )
 
         try:
@@ -119,10 +112,9 @@ def build_append_file_tool(
         except OSError as exc:
             return f"Error: could not append to {virtual_path} ({exc.__class__.__name__}); nothing was written."
 
-        remaining = MAX_SKELETON_LINES - total_lines
+        total_lines = existing_lines + appended_lines
         return (
-            f"Appended {appended_lines} line(s) to {virtual_path}; the file is now {total_lines} line(s) "
-            f"({remaining} line(s) of the {MAX_SKELETON_LINES}-line DESIGN skeleton budget left)."
+            f"Appended {appended_lines} line(s) to {virtual_path}; the file is now {total_lines} line(s)."
         )
 
     return StructuredTool.from_function(

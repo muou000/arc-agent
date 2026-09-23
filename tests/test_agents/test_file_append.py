@@ -1,4 +1,4 @@
-"""Tests for the DESIGN append-only skeleton tool."""
+"""Tests for the DESIGN append-only continuation tool."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
-from agents.tools.file_append import build_append_file_tool
+from agents.tools.file_append import APPEND_FILE_TOOL_DESCRIPTION, build_append_file_tool
 from tests.helpers.faux import FauxChatModel, faux_text, faux_tool_call
 
 
@@ -25,7 +25,7 @@ def test_append_requires_an_initial_skeleton(tmp_path: Path) -> None:
     assert not (tmp_path / "src" / "missing.ts").exists()
 
 
-def test_append_adds_a_chunk_and_enforces_file_budget(tmp_path: Path) -> None:
+def test_append_adds_lines_without_a_per_file_ceiling(tmp_path: Path) -> None:
     target = tmp_path / "src" / "page.tsx"
     target.parent.mkdir(parents=True)
     target.write_text("export function Page() {\n", encoding="utf-8")
@@ -36,10 +36,21 @@ def test_append_adds_a_chunk_and_enforces_file_budget(tmp_path: Path) -> None:
     assert "Appended 2 line(s)" in result
     assert target.read_text(encoding="utf-8") == "export function Page() {\n  return null;\n}\n"
 
-    target.write_text("x\n" * 160, encoding="utf-8")
+
+def test_append_allows_files_over_the_removed_skeleton_ceiling(tmp_path: Path) -> None:
+    """Issue #161: the per-file 160-line skeleton ceiling is removed (same ADR
+    0005 rationale as the removed per-write gate) — a legal shape-only skeleton
+    written in one compact write may exceed 160 lines and must stay appendable."""
+
+    target = tmp_path / "src" / "page.tsx"
+    target.parent.mkdir(parents=True)
+    target.write_text("x\n" * 165, encoding="utf-8")
+    tool = build_append_file_tool(workspace_root=str(tmp_path))
+
     result = _invoke(tool, file_path="/workspace/src/page.tsx", content="y\n")
-    assert "DESIGN skeleton ceiling" in result
-    assert target.read_text(encoding="utf-8") == "x\n" * 160
+
+    assert "Appended 1 line(s)" in result
+    assert target.read_text(encoding="utf-8") == "x\n" * 165 + "y\n"
 
 
 def test_append_rejects_oversized_chunks_and_path_escape(tmp_path: Path) -> None:
@@ -56,9 +67,25 @@ def test_append_rejects_oversized_chunks_and_path_escape(tmp_path: Path) -> None
     escaped = _invoke(tool, file_path="/workspace/../outside.ts", content="x")
 
     assert "Appended" not in oversized
-    assert "at most 80" in oversized or "skeleton ceiling" in oversized
+    assert "at most 80" in oversized
+    # The rejection points at the #158 escape hatch, not at chunk-and-append.
+    assert "not skeleton material" in oversized
+    assert "Split the next cohesive" not in oversized
     assert "Appended 1 line(s)" in safe_name_result
     assert "traversal" in escaped or "outside the project root" in escaped
+
+
+def test_tool_description_matches_design_only_boundary() -> None:
+    """Issue #161: the tool description must not teach chunked skeleton
+    building — the #158 rule is one compact write per skeleton, with the
+    escape hatch in the stage response."""
+
+    assert "each remaining section" not in APPEND_FILE_TOOL_DESCRIPTION
+    assert "cohesive" not in APPEND_FILE_TOOL_DESCRIPTION
+    assert "not a skeleton" in APPEND_FILE_TOOL_DESCRIPTION
+    assert "stage response" in APPEND_FILE_TOOL_DESCRIPTION
+    assert "80 lines per call" in APPEND_FILE_TOOL_DESCRIPTION
+    assert "3 appends per file" in APPEND_FILE_TOOL_DESCRIPTION
 
 
 def test_interface_design_agent_exposes_append_file(tmp_path: Path) -> None:

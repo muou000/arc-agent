@@ -42,12 +42,10 @@ _MAX_DESIGN_WRITES = 12
 MAX_DESIGN_WRITES = _MAX_DESIGN_WRITES
 _MAX_NON_LEAF_DESIGN_WRITES = 16
 MAX_NON_LEAF_DESIGN_WRITES = _MAX_NON_LEAF_DESIGN_WRITES
-# Per-file skeleton ceiling. The DESIGN per-write line gate was removed
-# (issue #158 / ADR 0005: it drove the reject/chunk/re-write rework loop);
-# the constant now only sizes the append_file tool's per-file ceiling
-# (``agents/tools/file_append.py``).
-_MAX_SKELETON_LINES = 160
-MAX_SKELETON_LINES = _MAX_SKELETON_LINES
+# The DESIGN line gates are both gone (issue #158 removed the per-write
+# gate, issue #161 removed the append tool's per-file ceiling): line counts
+# were the rework-loop generator ADR 0005 rejects; the main defense is the
+# shape-only skeleton definition plus the mutation sniffing below.
 MAX_APPEND_LINES = 80
 MAX_APPENDS_PER_FILE = 3
 _MAX_READ_LIMIT = 200
