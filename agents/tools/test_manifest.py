@@ -114,7 +114,7 @@ def build_declare_test_manifest_tool(
     """Build the ``declare_test_manifest`` tool for the current stage run.
 
     ``validate_test_path`` is the app-type handler's placement validator (the
-    same one ``WorkflowPhaseRunner._prepare_tests`` applies later); declaring
+    same one ``DesignArtifactRegistry.prepare_tests`` applies later); declaring
     runs it up front so an invalid placement is rejected at declaration time
     with the exact rule text, instead of failing the whole DESIGN phase after
     the files were already written. ``None`` disables that early check (unit
