@@ -12,7 +12,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from app_type_handler import web as web_handler
+from app_type_handler import e2e_attempt
 from app_type_handler.backend_runtime import _CommandResult
 
 
@@ -73,14 +73,14 @@ def _try_symlink_to(link: Path, target: Path) -> None:
         pytest.skip("this host silently drops directory symlinks")
 
 
-def _build(workspace_root: Path) -> web_handler._FrontendBuildOutcome:
-    return asyncio.run(web_handler._build_frontend_dist(str(workspace_root)))
+def _build(workspace_root: Path) -> e2e_attempt._FrontendBuildOutcome:
+    return asyncio.run(e2e_attempt._build_frontend_dist(str(workspace_root)))
 
 
 def test_reuses_dist_when_sources_are_unchanged(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     recorder = _BuildRecorder()
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     first = _build(workspace)
     second = _build(workspace)
@@ -94,7 +94,7 @@ def test_reuses_dist_when_sources_are_unchanged(tmp_path, monkeypatch) -> None:
 def test_rebuilds_when_a_source_file_changes(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     recorder = _BuildRecorder()
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     _build(workspace)
     (workspace / "frontend" / "src" / "main.js").write_text("console.log('v2')\n", encoding="utf-8")
@@ -113,12 +113,12 @@ def test_rebuild_output_states_the_verdict_with_source_fingerprint(tmp_path, mon
 
     workspace = _make_workspace(tmp_path)
     recorder = _BuildRecorder()
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
-    fingerprint_v1 = web_handler._frontend_source_fingerprint(str(workspace / "frontend"))
+    fingerprint_v1 = e2e_attempt._frontend_source_fingerprint(str(workspace / "frontend"))
     first = _build(workspace)
     (workspace / "frontend" / "src" / "main.js").write_text("console.log('v2')\n", encoding="utf-8")
-    fingerprint_v2 = web_handler._frontend_source_fingerprint(str(workspace / "frontend"))
+    fingerprint_v2 = e2e_attempt._frontend_source_fingerprint(str(workspace / "frontend"))
     second = _build(workspace)
 
     assert first.ok and second.ok
@@ -135,7 +135,7 @@ def test_rebuild_output_states_the_verdict_with_source_fingerprint(tmp_path, mon
 def test_rebuilds_when_a_dist_artifact_changes(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     recorder = _BuildRecorder()
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     _build(workspace)
     (workspace / "frontend" / "dist" / "index.html").write_text(
@@ -152,7 +152,7 @@ def test_rebuilds_when_a_dist_artifact_changes(tmp_path, monkeypatch) -> None:
 def test_rebuilds_when_the_built_dist_disappears(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     recorder = _BuildRecorder()
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     _build(workspace)
     dist_dir = workspace / "frontend" / "dist"
@@ -168,11 +168,11 @@ def test_rebuilds_when_the_built_dist_disappears(tmp_path, monkeypatch) -> None:
 def test_a_failed_build_records_no_fingerprint(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     recorder = _BuildRecorder(exit_code=1, produce_dist=False)
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     ok = _build(workspace)
     assert ok.ok is False
-    assert web_handler._read_recorded_frontend_fingerprint(str(workspace / "frontend")) is None
+    assert e2e_attempt._read_recorded_frontend_fingerprint(str(workspace / "frontend")) is None
 
     _build(workspace)
     assert len(recorder.calls) == 2
@@ -181,7 +181,7 @@ def test_a_failed_build_records_no_fingerprint(tmp_path, monkeypatch) -> None:
 def test_a_failed_rebuild_clears_the_previous_fingerprint(tmp_path, monkeypatch) -> None:
     workspace = _make_workspace(tmp_path)
     recorder = _BuildRecorder()
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     _build(workspace)
     (workspace / "frontend" / "dist" / "index.html").write_text("partial\n", encoding="utf-8")
@@ -191,7 +191,7 @@ def test_a_failed_rebuild_clears_the_previous_fingerprint(tmp_path, monkeypatch)
     outcome = _build(workspace)
 
     assert outcome.ok is False
-    assert web_handler._read_recorded_frontend_fingerprint(str(workspace / "frontend")) is None
+    assert e2e_attempt._read_recorded_frontend_fingerprint(str(workspace / "frontend")) is None
 
 
 def test_a_stale_dist_without_a_recorded_fingerprint_is_not_reused(tmp_path, monkeypatch) -> None:
@@ -201,7 +201,7 @@ def test_a_stale_dist_without_a_recorded_fingerprint_is_not_reused(tmp_path, mon
     (dist_dir / "index.html").write_text("<html>stale</html>\n", encoding="utf-8")
 
     recorder = _BuildRecorder()
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     outcome = _build(workspace)
 
@@ -215,14 +215,14 @@ def test_a_legacy_source_only_fingerprint_is_not_reused(tmp_path, monkeypatch) -
     dist_dir = frontend / "dist"
     dist_dir.mkdir()
     (dist_dir / "index.html").write_text("<html>legacy</html>\n", encoding="utf-8")
-    source_fingerprint = web_handler._frontend_source_fingerprint(str(frontend))
-    (dist_dir / web_handler.FRONTEND_BUILD_FINGERPRINT_FILENAME).write_text(
+    source_fingerprint = e2e_attempt._frontend_source_fingerprint(str(frontend))
+    (dist_dir / e2e_attempt.FRONTEND_BUILD_FINGERPRINT_FILENAME).write_text(
         json.dumps({"fingerprint": source_fingerprint}) + "\n",
         encoding="utf-8",
     )
 
     recorder = _BuildRecorder()
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     outcome = _build(workspace)
 
@@ -234,18 +234,18 @@ def test_a_legacy_source_only_fingerprint_is_not_reused(tmp_path, monkeypatch) -
 def test_fingerprint_ignores_build_output_and_dependencies(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     frontend = workspace / "frontend"
-    before = web_handler._frontend_source_fingerprint(str(frontend))
+    before = e2e_attempt._frontend_source_fingerprint(str(frontend))
 
     (frontend / "node_modules" / "pkg").mkdir(parents=True)
     (frontend / "node_modules" / "pkg" / "index.js").write_text("x\n", encoding="utf-8")
     (frontend / "dist").mkdir()
     (frontend / "dist" / "index.html").write_text("x\n", encoding="utf-8")
 
-    assert web_handler._frontend_source_fingerprint(str(frontend)) == before
+    assert e2e_attempt._frontend_source_fingerprint(str(frontend)) == before
 
 
 def test_missing_frontend_directory_has_no_fingerprint(tmp_path) -> None:
-    assert web_handler._frontend_source_fingerprint(str(tmp_path / "absent")) is None
+    assert e2e_attempt._frontend_source_fingerprint(str(tmp_path / "absent")) is None
 
 
 def test_linked_source_directory_is_included_in_fingerprint(tmp_path) -> None:
@@ -264,12 +264,12 @@ def test_linked_source_directory_is_included_in_fingerprint(tmp_path) -> None:
     _try_symlink_to(frontend / "src", shared_src)
     (frontend / "package.json").write_text('{"name": "frontend"}\n', encoding="utf-8")
 
-    before = web_handler._frontend_source_fingerprint(str(frontend))
+    before = e2e_attempt._frontend_source_fingerprint(str(frontend))
     assert before is not None
 
     # Editing the file behind the symlink must change the fingerprint.
     (shared_src / "main.js").write_text("console.log('v2')\n", encoding="utf-8")
-    after = web_handler._frontend_source_fingerprint(str(frontend))
+    after = e2e_attempt._frontend_source_fingerprint(str(frontend))
 
     assert after is not None
     assert after != before
@@ -285,7 +285,7 @@ def test_build_rebuilds_when_linked_source_changes(tmp_path, monkeypatch) -> Non
     (frontend / "package.json").write_text('{"name": "frontend"}\n', encoding="utf-8")
 
     recorder = _BuildRecorder()
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     first = _build(tmp_path)
     assert first.ok

@@ -10,12 +10,14 @@ under a live server) with a `db:seed` re-run, and the runtime is shut down
 when the node's IMPLEMENT phase finishes.
 
 The lifecycle is owned by `app_type_handler.backend_runtime.BackendRuntime`;
-the web handler drives it through the three interface actions (`ensure`,
-`reset_db`, `terminate`). These tests inject `InMemoryBackendRuntime` (or the
-process adapter with a stubbed command runner) and assert through the
-interface instead of monkeypatching session privates. The only stubbed web
-handler edges are scenario scaffolding that is not session state: the
-frontend build outcome and the test command runner.
+the E2E attempt pipeline (`app_type_handler.e2e_attempt`) drives it through
+the three interface actions (`ensure`, `reset_db`, `terminate`) on behalf of
+the web handler's `run_test_group`. These tests inject
+`InMemoryBackendRuntime` (or the process adapter with a stubbed command
+runner) and assert through the interface instead of monkeypatching session
+privates. The only stubbed edges are scenario scaffolding that is not session
+state, patched on their owning module: the frontend build outcome and the
+test command runner (both on `e2e_attempt`).
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from app_type_handler import backend_runtime as backend_runtime_module
+from app_type_handler import e2e_attempt
 from app_type_handler import web as web_handler
 from app_type_handler.backend_runtime import (
     BackendSession,
@@ -154,11 +157,11 @@ def _make_handler(tmp_path: Path, backend_runtime=...) -> web_handler.WebAppType
 def _patch_scaffold(monkeypatch, recorder: _CommandRecorder) -> None:
     """Stub the non-session edges of the attempt: build and command runner."""
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
-        return web_handler._FrontendBuildOutcome(ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0)
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
+        return e2e_attempt._FrontendBuildOutcome(ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0)
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _fake_build)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
 
 def _run_e2e_group(handler: web_handler.WebAppType) -> web_handler.TestRunResult:
@@ -482,12 +485,12 @@ def test_e2e_failure_bodies_come_from_one_renderer(tmp_path, monkeypatch) -> Non
 
     workspace, _fingerprint = _make_workspace(tmp_path)
 
-    async def _failing_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
-        return web_handler._FrontendBuildOutcome(
+    async def _failing_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
+        return e2e_attempt._FrontendBuildOutcome(
             ok=False, note="frontend build failed", output="vite: build error", exit_code=1
         )
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _failing_build)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _failing_build)
     build_failed = asyncio.run(_make_handler(workspace).run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     assert build_failed.exit_code == 1
@@ -499,12 +502,12 @@ def test_e2e_failure_bodies_come_from_one_renderer(tmp_path, monkeypatch) -> Non
     assert "=== Database Prepare ===" not in build_failed.output
     assert "=== Backend Runtime Command ===" not in build_failed.output
 
-    async def _ok_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
-        return web_handler._FrontendBuildOutcome(
+    async def _ok_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
+        return e2e_attempt._FrontendBuildOutcome(
             ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0
         )
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _ok_build)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _ok_build)
     monkeypatch.setattr(backend_runtime_module, "_E2E_DB_PREPARE_RETRY_DELAYS_SECONDS", (0.0, 0.0))
     runtime = InMemoryBackendRuntime()
     runtime.prepare_ok = False
@@ -548,39 +551,44 @@ def test_e2e_recovery_cleanup_note_survives_into_failure_bodies(tmp_path, monkey
     into `prior_cleanup_note`; the single renderer must keep surfacing it in
     the "Previous Backend Runtime Cleanup" section no matter which stage the
     new attempt dies on (here: the build, the earliest exit).
+
+    Driven through the attempt module's own interface (`E2EAttemptRunner`),
+    with the InMemoryBackendRuntime injected the same way the handler does.
     """
 
     workspace, _fingerprint = _make_workspace(tmp_path)
-    handler = _make_handler(workspace, backend_runtime=InMemoryBackendRuntime())
+    runtime = InMemoryBackendRuntime()
     recorder = _CommandRecorder()
     _patch_scaffold(monkeypatch, recorder)
 
-    async def _failing_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
-        return web_handler._FrontendBuildOutcome(
+    async def _failing_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
+        return e2e_attempt._FrontendBuildOutcome(
             ok=False, note="frontend build failed", output="vite: build error", exit_code=1
         )
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _failing_build)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _failing_build)
 
-    stage_timer = web_handler._StageTimer()
-    result, _note = asyncio.run(
-        handler._run_e2e_group_attempt(
+    runner = e2e_attempt.E2EAttemptRunner(str(workspace), backend_runtime=runtime)
+    outcome = asyncio.run(
+        runner.run_attempt(
             {
                 "resolved_targets": ["test-e2e/login.spec.ts"],
                 "working_directory": str(workspace / "backend"),
             },
-            stage_timer,
             4321,
             force_rebuild=False,
             prior_cleanup_note="released port 4321 from the previous attempt",
         )
     )
 
-    assert result.exit_code == 1
+    assert outcome.result.exit_code == 1
     assert (
         "=== Previous Backend Runtime Cleanup ===\nreleased port 4321 from the previous attempt"
-        in result.output
+        in outcome.result.output
     )
+    # The teardown evidence rides on the outcome as well, for the recovery
+    # re-run to carry forward.
+    assert outcome.backend_cleanup_note == "released port 4321 from the previous attempt"
 
 
 def test_e2e_timeout_has_a_single_source(tmp_path, monkeypatch) -> None:
@@ -604,18 +612,18 @@ def test_e2e_timeout_has_a_single_source(tmp_path, monkeypatch) -> None:
             seen_timeouts.append(timeout)
         return _CommandResult(exit_code=0, text=f"Exit Code: 0\nSTDOUT:\n{command} ran\n")
 
-    async def _ok_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
-        return web_handler._FrontendBuildOutcome(ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0)
+    async def _ok_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
+        return e2e_attempt._FrontendBuildOutcome(ok=True, note="rebuilt frontend/dist from current sources", output="build ok", exit_code=0)
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _ok_build)
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", _recording_command)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _ok_build)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", _recording_command)
 
     _run_e2e_group(handler)
 
     # The attempt reached the Playwright stage (fresh backend start happened)
     # and its timeout is the one named constant.
     assert runtime.started == [4321]
-    assert seen_timeouts == [web_handler.E2E_RUNNER_TIMEOUT_SECONDS]
+    assert seen_timeouts == [e2e_attempt.E2E_RUNNER_TIMEOUT_SECONDS]
 
 
 def test_single_file_e2e_request_routes_to_the_group_executor(tmp_path, monkeypatch) -> None:
@@ -1225,7 +1233,7 @@ def test_process_runtime_reuses_rebuilds_and_releases_the_port(tmp_path) -> None
 def test_case_grep_pattern_maps_display_titles_to_leaf_names() -> None:
     """Digest display titles become regex-escaped leaf names in an alternation."""
 
-    pattern = web_handler._build_case_grep_pattern(
+    pattern = e2e_attempt._build_case_grep_pattern(
         [
             "register › rejects duplicate username",
             "register › rejects duplicate username",  # deduped
@@ -1240,22 +1248,22 @@ def test_case_grep_pattern_maps_display_titles_to_leaf_names() -> None:
     assert re.search(pattern, "register rejects duplicate username")
     assert re.search(pattern, "register › rejects duplicate username")
     # Vitest-style list names ("suite > case") split on the same separator.
-    assert web_handler._build_case_grep_pattern(["Auth API > rejects duplicate username with 409"]) == re.escape(
+    assert e2e_attempt._build_case_grep_pattern(["Auth API > rejects duplicate username with 409"]) == re.escape(
         "rejects duplicate username with 409"
     )
     # Shell/regex metachars in the title survive as literals: re.escape
     # backslash-escapes the regex-special ones, and the quoting dialect
     # (test_shell_single_arg_quotes_for_the_running_platform) hands the
     # result to Playwright as one argv entry on either shell.
-    metachar_pattern = web_handler._build_case_grep_pattern(
+    metachar_pattern = e2e_attempt._build_case_grep_pattern(
         ["checkout › can't login (guest) $100 off?"]
     )
     assert metachar_pattern == re.escape("can't login (guest) $100 off?")
     assert re.search(metachar_pattern, "checkout can't login (guest) $100 off?")
     # Unusable names degrade to the empty pattern (full run).
-    assert web_handler._build_case_grep_pattern(["", "   "]) == ""
-    assert web_handler._build_case_grep_pattern(None) == ""
-    assert web_handler._build_case_grep_pattern([]) == ""
+    assert e2e_attempt._build_case_grep_pattern(["", "   "]) == ""
+    assert e2e_attempt._build_case_grep_pattern(None) == ""
+    assert e2e_attempt._build_case_grep_pattern([]) == ""
 
 
 def test_shell_single_arg_quotes_for_the_running_platform() -> None:
@@ -1267,17 +1275,17 @@ def test_shell_single_arg_quotes_for_the_running_platform() -> None:
     """
 
     value = "rejects\\ duplicate\\ username|other\\ case"
-    quoted = web_handler._shell_single_arg(value)
+    quoted = e2e_attempt._shell_single_arg(value)
     if os.name == "nt":
         # cmd metachars (space, pipe) force double quotes.
         assert quoted == f'"{value}"'
-        assert web_handler._shell_single_arg("plain-case") == "plain-case"
+        assert e2e_attempt._shell_single_arg("plain-case") == "plain-case"
     else:
         assert quoted == shlex.quote(value)
     # An apostrophe never needs cmd.exe quoting (it is a literal char there)
     # and POSIX shlex.quote handles the embedded-quote dance itself.
     apostrophe = "can't\\ login"
-    assert re.escape("can't login") in web_handler._shell_single_arg(apostrophe)
+    assert re.escape("can't login") in e2e_attempt._shell_single_arg(apostrophe)
 
 
 def test_non_e2e_layers_ignore_the_case_filter(tmp_path, monkeypatch) -> None:
@@ -1293,6 +1301,8 @@ def test_non_e2e_layers_ignore_the_case_filter(tmp_path, monkeypatch) -> None:
     (workspace / "backend" / "tests" / "authApi.test.js").write_text("test('t', () => {});\n", encoding="utf-8")
     handler = _make_handler(workspace)
     recorder = _CommandRecorder()
+    # The Vitest batch path stays in the web handler, so its command edge is
+    # patched there (the attempt module owns only the E2E path).
     monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
 
     result = asyncio.run(

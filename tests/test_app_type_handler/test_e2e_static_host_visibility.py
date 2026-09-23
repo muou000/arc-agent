@@ -20,6 +20,7 @@ import asyncio
 import re
 from pathlib import Path
 
+from app_type_handler import e2e_attempt
 from app_type_handler import web as web_handler
 from app_type_handler.backend_runtime import InMemoryBackendRuntime, _CommandResult
 
@@ -150,14 +151,14 @@ def test_e2e_result_carries_serving_verdict_present(tmp_path, monkeypatch) -> No
 
     handler = _make_handler(workspace, backend_runtime=_make_fresh_start_runtime())
     recorder = _RecoveryRecorder("Exit Code: 1\nSTDOUT:\nunrelated\n")
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
     # The verdict's fingerprint is computed at result time over whatever the
     # build left on disk (the stubbed build rewrites index.html), so derive
     # the expectation from the same on-disk state.
-    fingerprint = web_handler._frontend_dist_fingerprint(str(workspace / "frontend"))
+    fingerprint = e2e_attempt._frontend_dist_fingerprint(str(workspace / "frontend"))
     assert fingerprint is not None
     expected = (
         f"Served index.html: {dist_dir / 'index.html'} (present, fingerprint {fingerprint[:12]})"
@@ -181,20 +182,20 @@ def test_e2e_result_carries_serving_verdict_absent(tmp_path, monkeypatch) -> Non
 
     handler = _make_handler(workspace, backend_runtime=_make_fresh_start_runtime())
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
         # Build "succeeds" but the artifact vanishes right after: this is the
         # exact race the verdict exists to expose (builder says OK, disk says
         # no). The verdict is checked at result-assembly time, after this.
-        return web_handler._FrontendBuildOutcome(
+        return e2e_attempt._FrontendBuildOutcome(
             ok=True,
             note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
             output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
             exit_code=0,
         )
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _fake_build)
     recorder = _RecoveryRecorder("Exit Code: 1\nSTDOUT:\nunrelated\n")
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
@@ -203,10 +204,10 @@ def test_e2e_result_carries_serving_verdict_absent(tmp_path, monkeypatch) -> Non
 
 
 def test_dead_static_host_signature_detected() -> None:
-    assert web_handler._is_spa_static_host_failure(_SPA_DEAD_HOST_OUTPUT)
-    assert not web_handler._is_spa_static_host_failure(_PLAIN_NOT_FOUND_OUTPUT)
-    assert not web_handler._is_spa_static_host_failure("")
-    assert not web_handler._is_spa_static_host_failure("Exit Code: 1\nSTDERR:\nboom\n")
+    assert e2e_attempt._is_spa_static_host_failure(_SPA_DEAD_HOST_OUTPUT)
+    assert not e2e_attempt._is_spa_static_host_failure(_PLAIN_NOT_FOUND_OUTPUT)
+    assert not e2e_attempt._is_spa_static_host_failure("")
+    assert not e2e_attempt._is_spa_static_host_failure("Exit Code: 1\nSTDERR:\nboom\n")
 
 
 def test_signature_does_not_splice_two_error_blocks() -> None:
@@ -226,7 +227,7 @@ def test_signature_does_not_splice_two_error_blocks() -> None:
         "        at sendfile (D:\\ws\\node_modules\\express\\lib\\response.js:1014:8)\n"
         "        at ServerResponse.sendFile (D:\\ws\\node_modules\\express\\lib\\response.js:411:3)\n"
     )
-    assert not web_handler._is_spa_static_host_failure(two_blocks)
+    assert not e2e_attempt._is_spa_static_host_failure(two_blocks)
 
 
 def test_dead_static_host_triggers_exactly_one_recovery(tmp_path, monkeypatch) -> None:
@@ -242,23 +243,23 @@ def test_dead_static_host_triggers_exactly_one_recovery(tmp_path, monkeypatch) -
 
     build_calls: list[bool] = []
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
         build_calls.append(force_rebuild)
         # Second (forced) build produces the artifact.
         if force_rebuild:
             dist_dir = Path(workspace_path) / "frontend" / "dist"
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / "index.html").write_text("<html>rebuilt</html>\n", encoding="utf-8")
-        return web_handler._FrontendBuildOutcome(
+        return e2e_attempt._FrontendBuildOutcome(
             ok=True,
             note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
             output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
             exit_code=0,
         )
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _fake_build)
     recorder = _RecoveryRecorder(_SPA_DEAD_HOST_OUTPUT)
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
@@ -285,20 +286,20 @@ def test_plain_not_found_failure_gets_no_recovery(tmp_path, monkeypatch) -> None
     runtime = _make_fresh_start_runtime()
     handler = _make_handler(workspace, backend_runtime=runtime)
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
         dist_dir = Path(workspace_path) / "frontend" / "dist"
         dist_dir.mkdir(parents=True, exist_ok=True)
         (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-        return web_handler._FrontendBuildOutcome(
+        return e2e_attempt._FrontendBuildOutcome(
             ok=True,
             note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
             output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
             exit_code=0,
         )
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _fake_build)
     recorder = _RecoveryRecorder(_PLAIN_NOT_FOUND_OUTPUT)
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
@@ -316,18 +317,18 @@ def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
     runtime = _make_fresh_start_runtime()
     handler = _make_handler(workspace, backend_runtime=runtime)
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
         dist_dir = Path(workspace_path) / "frontend" / "dist"
         dist_dir.mkdir(parents=True, exist_ok=True)
         (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-        return web_handler._FrontendBuildOutcome(
+        return e2e_attempt._FrontendBuildOutcome(
             ok=True,
             note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
             output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
             exit_code=0,
         )
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _fake_build)
 
     class _AlwaysDeadHost(_RecoveryRecorder):
         async def __call__(self, command, cwd, timeout=60.0, extra_env=None, web_port=None):
@@ -338,7 +339,7 @@ def test_recovery_budget_is_one_across_calls(tmp_path, monkeypatch) -> None:
             return result
 
     recorder = _AlwaysDeadHost(_SPA_DEAD_HOST_OUTPUT)
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
     assert handler._spa_static_host_recovery_used is True
@@ -364,21 +365,21 @@ def test_recovery_retried_pass_with_failed_cleanup_reports_failure(tmp_path, mon
     runtime.serving = False
     handler = _make_handler(workspace, backend_runtime=runtime)
 
-    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> web_handler._FrontendBuildOutcome:
+    async def _fake_build(workspace_path: str, *, force_rebuild: bool = False) -> e2e_attempt._FrontendBuildOutcome:
         dist_dir = Path(workspace_path) / "frontend" / "dist"
         dist_dir.mkdir(parents=True, exist_ok=True)
         (dist_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-        return web_handler._FrontendBuildOutcome(
+        return e2e_attempt._FrontendBuildOutcome(
             ok=True,
             note="rebuilt frontend/dist from current sources (fingerprint abc123def456)",
             output="Built `frontend/dist` from the current sources (fingerprint abc123def456).\n",
             exit_code=0,
         )
 
-    monkeypatch.setattr(web_handler, "_build_frontend_dist", _fake_build)
+    monkeypatch.setattr(e2e_attempt, "_build_frontend_dist", _fake_build)
 
     recorder = _RecoveryRecorder(_SPA_DEAD_HOST_OUTPUT)
-    monkeypatch.setattr(web_handler, "_execute_web_test_command", recorder)
+    monkeypatch.setattr(e2e_attempt, "_execute_web_test_command", recorder)
 
     result = asyncio.run(handler.run_test_group("e2e", ["backend/test-e2e/login.spec.ts"], web_port=4321))
 
