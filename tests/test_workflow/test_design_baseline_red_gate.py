@@ -92,6 +92,7 @@ def _make_runner(
     tmp_project_dir: Path,
     generator: _StubGenerator,
     fake: FakeAppHandler,
+    designer_payload: dict[str, Any] | None = None,
 ) -> tuple[WorkflowPhaseRunner, list[tuple]]:
     logs: list[tuple] = []
 
@@ -105,7 +106,9 @@ def _make_runner(
         requirement_path=str(requirements_dir / "req.md"),
         app_type="web",
         interface_designer=_StubDesigner(
-            {
+            designer_payload
+            if designer_payload is not None
+            else {
                 "summary": "Calculator contract.",
                 "interfaces": [
                     {
@@ -435,9 +438,132 @@ def test_design_baseline_repair_explicitly_empty_manifest_fails_without_owned_wi
     ok = _run_design(runner, node_id)
 
     assert ok is False
+    # A declared-empty manifest is terminal for an owned-interface node: it
+    # must fail through the final witness check WITHOUT consuming the
+    # remaining rejection budget (only one repair round ran, MAX is 2).
+    assert len(generator.rejection_calls) == 1
     stored = arc_runtime.traceability.list_tests(req_id=node_id)
     assert stored == []
     assert any("removed every owned" in entry[1] for entry in logs)
+
+
+def test_design_baseline_repair_explicitly_empty_manifest_passes_without_owned_interfaces(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """A node with no owned interface contracts may land with an empty
+    manifest: the owned-witness check only guards nodes that own interfaces.
+
+    The designer payload carries one interface row WITHOUT an interface_id,
+    so the raw list is non-empty (the leaf fail-fast does not fire) while
+    ``prepared_interfaces`` — and with it ``owned_interface_ids`` — end up
+    empty at the gate.
+    """
+    node_id = "REQ-BASE-REPAIR-EMPTY-NOIF"
+    _seed_leaf_requirement(arc_runtime, node_id)
+
+    class _EmptyDeleteGenerator(_StubGenerator):
+        async def repair_green_baseline(self, *args: Any, **kwargs: Any) -> tuple:
+            await super().repair_green_baseline(*args, **kwargs)
+            return ([], "{}")
+
+    generator = _EmptyDeleteGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
+    fake = FakeAppHandler([passing_test_output()])
+    runner, logs = _make_runner(
+        tmp_project_dir,
+        generator,
+        fake,
+        designer_payload={
+            "summary": "No local contracts.",
+            "interfaces": [
+                {
+                    "name": "unnamed",
+                    "responsibility": "Ambiguous row without an interface_id.",
+                    "file_path": "src/x.py",
+                    "first_line": "def x():",
+                }
+            ],
+            "files_written": [],
+        },
+    )
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is True
+    assert len(generator.rejection_calls) == 1
+    stored = arc_runtime.traceability.list_tests(req_id=node_id)
+    assert stored == []
+    assert any("Baseline RED verification complete: 0 test item(s)" in entry[1] for entry in logs)
+
+
+def test_design_baseline_repair_unparseable_payload_spends_round_and_recovers(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """A repair payload with no parseable manifest structure is a rejected
+    round, not a verdict: the gate consumes the rejection budget and asks
+    again (#172). A recovering second round still passes the node."""
+    node_id = "REQ-BASE-REPAIR-GARBAGE"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    reworked_file = "tests/unit/test_calc_reworked.py"
+
+    class _GarbageThenFixedGenerator(_StubGenerator):
+        async def repair_green_baseline(self, *args: Any, **kwargs: Any) -> tuple:
+            await super().repair_green_baseline(*args, **kwargs)
+            if len(self.rejection_calls) == 1:
+                # Prose fallback / damaged JSON: no manifest structure.
+                return (None, "unparseable payload")
+            return ([_manifest_item("T1-REWORKED", reworked_file)], "{}")
+
+    generator = _GarbageThenFixedGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
+    fake = FakeAppHandler([passing_test_output(), failing_test_output()])
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is True
+    # Both rounds were asked: round 1 spent on the unparseable payload,
+    # round 2 delivered the rework.
+    assert len(generator.rejection_calls) == 2
+    warnings = [entry[1] for entry in logs if entry[2] == "warning"]
+    assert any("did not return a parseable test manifest" in entry for entry in warnings)
+    # The unparseable round changed nothing, so nothing was re-baselined:
+    # only the initial baseline and the round-2 rework re-run.
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE]), ("Unit", [reworked_file])]
+    baseline = sessions.load_node_session(node_id).get("design_baseline")
+    assert baseline == {reworked_file: "red"}
+
+
+def test_design_baseline_repair_unparseable_payload_exhausts_rejection_budget(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """When every repair round returns an unparseable payload, the gate burns
+    the full rejection budget re-asking and only then fails DESIGN with the
+    standard exhaustion message (#172) — never a single-round terminal fail."""
+    node_id = "REQ-BASE-REPAIR-GARBAGE-ALL"
+    _seed_leaf_requirement(arc_runtime, node_id)
+
+    class _AlwaysGarbageGenerator(_StubGenerator):
+        async def repair_green_baseline(self, *args: Any, **kwargs: Any) -> tuple:
+            await super().repair_green_baseline(*args, **kwargs)
+            return (None, "unparseable payload")
+
+    generator = _AlwaysGarbageGenerator([[_manifest_item("T1", UNIT_TEST_FILE)]])
+    fake = FakeAppHandler([passing_test_output()])
+    runner, logs = _make_runner(tmp_project_dir, generator, fake)
+
+    ok = _run_design(runner, node_id)
+
+    assert ok is False
+    # The full budget was spent on re-asking (round 1..MAX), and the
+    # terminal verdict is the standard budget-exhaustion message.
+    assert len(generator.rejection_calls) == DESIGN_BASELINE_MAX_REJECTIONS
+    warnings = [entry[1] for entry in logs if entry[2] == "warning"]
+    assert sum("did not return a parseable test manifest" in entry for entry in warnings) == (
+        DESIGN_BASELINE_MAX_REJECTIONS
+    )
+    errors = [entry for entry in logs if entry[2] == "error"]
+    assert any("DESIGN failed" in entry[1] for entry in errors)
+    assert UNIT_TEST_FILE in next(entry[1] for entry in errors if "DESIGN failed" in entry[1])
+    assert sessions.load_node_session(node_id).get("phase_status", {}).get("design") != "completed"
 
 
 def test_design_baseline_prior_implementation_requires_id_anchor(tmp_project_dir, arc_runtime) -> None:
