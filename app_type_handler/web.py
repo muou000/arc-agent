@@ -37,7 +37,7 @@ from .template_patches import (
     apply_template_patches,
 )
 from core.config import get_web_base_url, get_web_port
-from core.processes import finalize_subprocess
+from core.processes import build_subprocess_env, finalize_subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +203,7 @@ async def _run_npm_command(
             cwd=target_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=build_subprocess_env(),
         )
     else:
         process = await asyncio.create_subprocess_shell(
@@ -210,6 +211,7 @@ async def _run_npm_command(
             cwd=target_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=build_subprocess_env(),
         )
     try:
         stdout, stderr = await asyncio.wait_for(

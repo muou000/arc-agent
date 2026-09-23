@@ -2,11 +2,126 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import shutil
+from collections.abc import Mapping
 from typing import Any, Awaitable, Callable
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
+
+
+# ---------------------------------------------------------------------------
+# Child-process environment whitelist (issue #180)
+# ---------------------------------------------------------------------------
+#
+# Generated-app code (agent-editable npm scripts, test files) runs inside the
+# build/test subprocesses. Handing them ``{**os.environ}`` lets that code read
+# the host's model credentials — ``core.config.load_project_env`` copies the
+# repository ``.env`` into ``os.environ`` — and exfiltrate them through the
+# command output that flows back into the model context. Filesystem deny rules
+# cannot stop environment reads, so child processes get a whitelist.
+#
+# The failure mode of a whitelist miss is a diagnosable build failure (add the
+# variable below with a one-line reason); the failure mode of a blacklist miss
+# is an undiagnosable credential leak. Keep the list minimal and justified.
+
+# Toolchain plumbing the templates' build/test/install commands demonstrably
+# need. Resolution against the host environment is case-insensitive per name,
+# so a Windows host spelling ``Path`` still matches.
+_SUBPROCESS_ENV_ALLOWLIST: tuple[str, ...] = (
+    # Process / executable resolution and the POSIX home directory.
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    # Temp directories (POSIX reads TMPDIR, Windows TEMP/TMP).
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    # Windows process plumbing; Node's crypto breaks without SystemRoot.
+    "SystemRoot",
+    "SystemDrive",
+    "COMSPEC",
+    "windir",
+    "PATHEXT",
+    # Windows per-user dirs: npm prefix/cache and the Playwright browser
+    # cache live under them.
+    "APPDATA",
+    "LOCALAPPDATA",
+    # Node runtime mode flags read by package scripts.
+    "NODE_ENV",
+    # Python child encoding.
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    # Java/Android toolchain: JDK discovery, JVM options, SDK location and
+    # the wrapper's distribution cache.
+    "JAVA_HOME",
+    "JAVA_TOOL_OPTIONS",
+    "ANDROID_SDK_ROOT",
+    "ANDROID_HOME",
+    "GRADLE_USER_HOME",
+    # Playwright browser install/runtime location and download mirrors.
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "PLAYWRIGHT_DOWNLOAD_HOST",
+    "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
+    "PLAYWRIGHT_SKIP_BROWSER_VALIDATION",
+)
+
+# Proxies are emitted under both conventional casings: npm/node/git each read
+# a different one, and without them package installs fail on proxied hosts.
+# They are handled separately from the plain allowlist for that both-case
+# emission; they are not credentials beyond what the host already exposes to
+# any network operation.
+_PROXY_ENV_NAMES: tuple[str, ...] = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
+
+# arc's own runtime-contract keys, explicitly enumerated (review round on
+# PR #201: a prefix wildcard would also auto-pass a future credential-shaped
+# ``ARC_*`` name, which is exactly the unprovable leak mode the whitelist
+# exists to prevent). These are the names generated-app code actually reads
+# (``process.env.ARC_WEB_PORT`` in the template's vite/playwright configs,
+# ``ARC_DB_FILE``/``ARC_E2E_DB_LABEL`` in the database scaffold); provider
+# credentials live in non-ARC names. The per-attempt values are layered as
+# caller extras (``build_web_runtime_env``/``_build_e2e_runtime_env``); this
+# set only governs what may arrive from the host environment. A newly needed
+# contract key is added here with a one-line reason, same as the allowlist.
+_ARC_CONTRACT_ENV_KEYS: tuple[str, ...] = (
+    "ARC_WEB_PORT",
+    "ARC_WEB_BASE_URL",
+    "ARC_DB_FILE",
+    "ARC_E2E_DB_LABEL",
+)
+
+
+def build_subprocess_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Build the environment for a generated-app build/test/install subprocess.
+
+    Layers, later wins: the host whitelist, arc's enumerated runtime-contract
+    keys, then ``extra`` (runtime-contract values like the web port and fixed
+    encoding/tool overrides the caller pins). Every emitted name is canonical
+    (list) casing regardless of how the host spelled it.
+    """
+
+    host_by_upper: dict[str, str] = {}
+    for name, value in os.environ.items():
+        host_by_upper.setdefault(name.upper(), value)
+
+    env: dict[str, str] = {}
+    for name in _SUBPROCESS_ENV_ALLOWLIST:
+        value = host_by_upper.get(name.upper())
+        if value is not None:
+            env[name] = value
+    for proxy in _PROXY_ENV_NAMES:
+        value = host_by_upper.get(proxy)
+        if value is not None:
+            env[proxy] = value
+            env[proxy.lower()] = value
+    for name in _ARC_CONTRACT_ENV_KEYS:
+        value = host_by_upper.get(name)
+        if value is not None:
+            env[name] = value
+    if extra:
+        env.update(extra)
+    return env
 
 
 async def finalize_subprocess(process: Any, *, force_kill: bool = False) -> None:

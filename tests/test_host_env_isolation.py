@@ -180,6 +180,12 @@ _NON_SCHEDULING_CORE_ENV_VARS = frozenset(
         "ARC_ANDROID_PACKAGE",
         "ARC_APP_TYPE",
         "ARC_WEB_PORT",
+        # subprocess env whitelist: the explicit generated-app contract keys
+        # (core/processes.py; the template's vite/playwright configs and
+        # database scaffold read these)
+        "ARC_WEB_BASE_URL",
+        "ARC_DB_FILE",
+        "ARC_E2E_DB_LABEL",
         # debug/logging
         "ARC_DEBUG",
         "ARC_DEBUG_LOG_PATH",

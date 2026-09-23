@@ -79,3 +79,16 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 - `ARC_VISUAL_PRECOMPUTE`：编译前并发预分析需求参考图（DESIGN 前置，避免逐节点串行等待），设 `0/false/no/off` 关闭。
 - `ARC_VISUAL_PRECOMPUTE_CONCURRENCY`：预分析的并发调用数（默认 4）。
 - `ARC_VISUAL_ANALYSIS_CONCURRENCY`：单节点 DESIGN 阶段截图分析的并发上限（1-8，默认 4）。
+
+## 子进程环境白名单
+
+生成应用的 build/test/install/npm 命令以子进程运行（`app_type_handler` 各执行点，环境统一由 `core/processes.py` 的 `build_subprocess_env` 构造）。这些命令执行的是 agent 可编辑的代码，**不继承完整宿主环境**——模型凭据（`OPENAI_API_KEY` 等 `.env` 内容）不会出现在子进程环境里，也就无法经 build/test 输出回流进模型上下文。
+
+子进程只拿到三类变量：
+
+- 工具链白名单：`PATH`/`HOME`/`USERPROFILE`/`TEMP`/`TMP`/`TMPDIR`、Windows 系统变量（`SystemRoot`/`SystemDrive`/`COMSPEC`/`windir`/`PATHEXT`/`APPDATA`/`LOCALAPPDATA`）、`NODE_ENV`、Python 编码（`PYTHONIOENCODING`/`PYTHONUTF8`）、Java/Android（`JAVA_HOME`/`JAVA_TOOL_OPTIONS`/`ANDROID_SDK_ROOT`/`ANDROID_HOME`/`GRADLE_USER_HOME`）、Playwright（`PLAYWRIGHT_BROWSERS_PATH`/`PLAYWRIGHT_DOWNLOAD_HOST`/`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD`/`PLAYWRIGHT_SKIP_BROWSER_VALIDATION`）、代理（`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`，大小写两种拼写都会传递）。
+- 显式枚举的 `ARC_*` 运行时契约键：`ARC_WEB_PORT`/`ARC_WEB_BASE_URL`/`ARC_DB_FILE`/`ARC_E2E_DB_LABEL`（生成代码实际读取的契约面；不做前缀通配，避免未来的凭据形状 `ARC_*` 变量被静默透传）。逐次计算的运行时值（`PORT`/`PLAYWRIGHT_BASE_URL`/E2E 数据库路径等）由调用方作为附加项显式层叠，不经宿主透传。
+- 调用方显式附加项：如 web 运行时契约（`PORT`/`ARC_WEB_PORT`/`BASE_URL`/`VITE_API_BASE_URL`）与 E2E 数据库路径。
+
+白名单漏传的失败模式是"构建失败、可诊断后按名补入白名单"；新增变量须在 `core/processes.py` 的 `_SUBPROCESS_ENV_ALLOWLIST` 登记并附理由。运行 arc 自身的子进程（编译入口、git 操作）不受此白名单约束。
+
