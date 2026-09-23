@@ -32,8 +32,7 @@ from typing import Any
 import pytest
 
 from core.contract_drift import ContractDrift, detect_contract_drift
-from core.workflow import (
-    ARCWorkflowManager,
+from core.queue_state import (
     NODE_DESIGNED,
     NODE_FAILED,
     NODE_PASSED,
@@ -43,8 +42,11 @@ from core.workflow import (
     TASK_FAILED,
     TASK_PENDING,
     TASK_RUNNING,
-    _design_pipelining_enabled,
+    break_dependency_cycles,
+    structural_precedence_edges,
 )
+from core.scheduling import design_pipelining_enabled, task_dependencies_met
+from core.workflow import ARCWorkflowManager
 from tests.helpers.jsonl import read_jsonl
 from tests.test_workflow.queue_faker import queue_with_states, settle
 
@@ -70,15 +72,15 @@ def _queue(tasks: list[dict], dependencies: dict[str, list[str]] | None = None) 
 
 def test_design_pipelining_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ARC_DESIGN_GATE_PIPELINE", raising=False)
-    assert _design_pipelining_enabled() is False
+    assert design_pipelining_enabled() is False
 
     for raw in ("", "0", "false", "no", "off", "garbage"):
         monkeypatch.setenv("ARC_DESIGN_GATE_PIPELINE", raw)
-        assert _design_pipelining_enabled() is False, raw
+        assert design_pipelining_enabled() is False, raw
 
     for raw in ("1", "true", "yes", "on", "ON", "True"):
         monkeypatch.setenv("ARC_DESIGN_GATE_PIPELINE", raw)
-        assert _design_pipelining_enabled() is True, raw
+        assert design_pipelining_enabled() is True, raw
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +104,7 @@ def test_gate_closed_design_still_waits_for_dependency_implement(
         dependencies={"RB": ["RA"]},
     )
 
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
+    assert task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
 def test_gate_closed_implement_gate_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,10 +118,10 @@ def test_gate_closed_implement_gate_unchanged(monkeypatch: pytest.MonkeyPatch) -
         ],
         dependencies={"RB": ["RA"]},
     )
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][3]) is True
+    assert task_dependencies_met(queue, queue["tasks"][3]) is True
 
     settle(queue, "RA", NODE_FAILED)
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][3]) is False
+    assert task_dependencies_met(queue, queue["tasks"][3]) is False
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +145,7 @@ def test_gate_open_design_starts_while_dependency_implement_is_running(
         dependencies={"RB": ["RA"]},
     )
 
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
+    assert task_dependencies_met(queue, queue["tasks"][2]) is True
 
 
 def test_gate_open_design_still_waits_for_dependency_design(
@@ -159,7 +161,7 @@ def test_gate_open_design_still_waits_for_dependency_design(
         dependencies={"RB": ["RA"]},
     )
 
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
+    assert task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
 def test_gate_open_design_blocked_by_failed_dependency_design(
@@ -177,7 +179,7 @@ def test_gate_open_design_blocked_by_failed_dependency_design(
         dependencies={"RB": ["RA"]},
     )
 
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
+    assert task_dependencies_met(queue, queue["tasks"][2]) is False
 
 
 def test_gate_open_design_blocked_when_dependency_design_missing(
@@ -192,7 +194,7 @@ def test_gate_open_design_blocked_when_dependency_design_missing(
         dependencies={"RB": ["RA"]},
     )
 
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][0]) is False
+    assert task_dependencies_met(queue, queue["tasks"][0]) is False
 
 
 def test_gate_open_implement_still_waits_for_dependency_implement(
@@ -212,7 +214,7 @@ def test_gate_open_implement_still_waits_for_dependency_implement(
         dependencies={"RB": ["RA"]},
     )
 
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][3]) is False
+    assert task_dependencies_met(queue, queue["tasks"][3]) is False
 
 
 def test_gate_open_multiple_dependencies_all_designs_required(
@@ -230,10 +232,10 @@ def test_gate_open_multiple_dependencies_all_designs_required(
         dependencies={"RB": ["RA", "RC"]},
     )
 
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][4]) is False
+    assert task_dependencies_met(queue, queue["tasks"][4]) is False
 
     settle(queue, "RC", NODE_DESIGNED)
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][4]) is True
+    assert task_dependencies_met(queue, queue["tasks"][4]) is True
 
 
 def test_gate_open_parent_design_rule_unchanged(
@@ -252,10 +254,10 @@ def test_gate_open_parent_design_rule_unchanged(
     )
     queue["parents"] = {"RB": "R"}
 
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is False
+    assert task_dependencies_met(queue, queue["tasks"][2]) is False
 
     settle(queue, "R", NODE_DESIGNED)
-    assert ARCWorkflowManager._task_dependencies_met(queue, queue["tasks"][2]) is True
+    assert task_dependencies_met(queue, queue["tasks"][2]) is True
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +276,7 @@ def test_cycle_breaking_uses_the_pipelined_edge_when_enabled(
     monkeypatch.setenv("ARC_DESIGN_GATE_PIPELINE", "1")
     # B depends on C; C depends on A; A is B's parent's... no - keep it
     # sibling-shaped: B -> C and C -> B close a plain declared cycle.
-    kept, dropped = ARCWorkflowManager._break_dependency_cycles({"RB": ["RC"], "RC": ["RB"]})
+    kept, dropped = break_dependency_cycles({"RB": ["RC"], "RC": ["RB"]})
 
     assert len(kept) == 1 and len(dropped) == 1
     assert _is_acyclic(kept)
@@ -299,11 +301,11 @@ def test_cycle_breaking_catches_the_pipelined_design_vertex_cycle(
     both modes."""
     monkeypatch.setenv("ARC_DESIGN_GATE_PIPELINE", "1")
     parents = {"B": "A", "C": "R", "A": "R"}
-    structural = ARCWorkflowManager._structural_precedence_edges(parents, ["R", "A", "B", "C"])
+    structural = structural_precedence_edges(parents, ["R", "A", "B", "C"])
     # A depends on C (kept first: D:C -> D:A is not yet reachable), then
     # C depends on B - whose source D:C now reaches D:B through the kept
     # edge plus the structural parent edge D:A -> D:B.
-    kept, dropped = ARCWorkflowManager._break_dependency_cycles(
+    kept, dropped = break_dependency_cycles(
         {"A": ["C"], "C": ["B"]}, structural
     )
 
