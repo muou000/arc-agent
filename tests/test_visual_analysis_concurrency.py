@@ -106,9 +106,23 @@ def test_visual_analyses_fan_out_by_default(
     references = result["visual_reference"]
     assert [payload["image_path"] for payload in references] == names
     assert [payload["analysis"] for payload in references] == [f"analysis:{name}" for name in names]
+    # The persist path (#214) must keep the dict payloads: the requirement row
+    # read back from the store still carries image_path/analysis entries, not
+    # their str() reprs.
+    stored = visual_workspace_runtime_row(str(visual_workspace["workspace"]), "req-1")
+    assert stored["visual_reference"] == [
+        {"image_path": name, "analysis": f"analysis:{name}", "resolved_image_path": str(visual_workspace["requirements_dir"] / name)}
+        for name in names
+    ]
     cache = visual_analysis._load_visual_cache(str(visual_workspace["workspace"]))
     assert len(cache) == len(names)
     assert not [status for _, status in logs if status == "error"]
+
+
+def visual_workspace_runtime_row(workspace_path: str, req_id: str) -> dict[str, Any]:
+    from core.service import get_runtime
+
+    return get_runtime().traceability.get_requirement(req_id) or {}
 
 
 def test_visual_analyses_run_serially_when_concurrency_is_one(

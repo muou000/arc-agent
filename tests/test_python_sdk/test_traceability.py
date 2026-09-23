@@ -190,6 +190,115 @@ class TestRequirements:
 
 
 # ---------------------------------------------------------------------------
+# visual_reference structure preservation (#214)
+# ---------------------------------------------------------------------------
+
+
+class TestVisualReferenceStructure:
+    """Dict-shaped visual references (the visual analysis path's payloads)
+    must round-trip through the table instead of being coerced to Python
+    repr strings, while plain string entries keep the string-list semantics.
+    """
+
+    def test_upsert_round_trips_dict_entries(
+        self, initialized_store: TraceabilityStore, store_paths: RuntimePaths
+    ) -> None:
+        references = [
+            {"image_path": "./reference/login.png", "analysis": "nav bar with auth cluster"},
+            {"image_path": "./register.png", "analysis": "two-column form", "resolved_image_path": "/tmp/x"},
+        ]
+        initialized_store.upsert_requirement(req_id="R1", name="Login", visual_reference=references)
+        row = initialized_store.get_requirement("R1")
+        assert row["visual_reference"] == references
+        # The on-disk payload holds real JSON objects, not repr strings.
+        assert _read_table(store_paths, "requirements")["R1"]["visual_reference"][0]["image_path"] == "./reference/login.png"
+
+    def test_tree_walk_preserves_dict_visual_reference(
+        self, initialized_store: TraceabilityStore
+    ) -> None:
+        tree = {
+            "id": "ROOT",
+            "visual_reference": [{"image_path": "./reference/home.png", "analysis": "hero layout"}],
+            "children": [{"id": "R1", "visual_reference": ["./reference/child.png"]}],
+        }
+        initialized_store.store_requirement_tree(tree)
+        assert initialized_store.get_requirement("ROOT")["visual_reference"] == [
+            {"image_path": "./reference/home.png", "analysis": "hero layout"}
+        ]
+        assert initialized_store.get_requirement("R1")["visual_reference"] == ["./reference/child.png"]
+
+    def test_update_requirement_fields_round_trips_dict_entries(
+        self, initialized_store: TraceabilityStore
+    ) -> None:
+        """The visual precompute path's mount point: analyzed payloads are
+        attached through ``update_requirement_fields``."""
+        initialized_store.store_requirement_tree({"id": "R1", "name": "Login"})
+        initialized_store.update_requirement_fields(
+            "R1",
+            visual_reference=[{"image_path": "./reference/login.png", "analysis": "form on the left"}],
+        )
+        assert initialized_store.get_requirement("R1")["visual_reference"] == [
+            {"image_path": "./reference/login.png", "analysis": "form on the left"}
+        ]
+
+    def test_update_of_other_fields_keeps_dict_entries(
+        self, initialized_store: TraceabilityStore
+    ) -> None:
+        """The merge path must not re-coerce visual_reference when a sibling
+        field is updated."""
+        initialized_store.upsert_requirement(
+            req_id="R1",
+            name="old",
+            visual_reference=[{"image_path": "./reference/login.png", "analysis": "a"}],
+        )
+        initialized_store.update_requirement_fields("R1", name="new")
+        row = initialized_store.get_requirement("R1")
+        assert row["name"] == "new"
+        assert row["visual_reference"] == [{"image_path": "./reference/login.png", "analysis": "a"}]
+
+    def test_mixed_string_and_dict_entries_are_both_kept(
+        self, initialized_store: TraceabilityStore
+    ) -> None:
+        initialized_store.upsert_requirement(
+            req_id="R1",
+            visual_reference=["./reference/home.png", {"image_path": "./login.png", "analysis": "x"}],
+        )
+        assert initialized_store.get_requirement("R1")["visual_reference"] == [
+            "./reference/home.png",
+            {"image_path": "./login.png", "analysis": "x"},
+        ]
+
+    def test_string_entries_keep_strip_and_drop_empty(
+        self, initialized_store: TraceabilityStore
+    ) -> None:
+        initialized_store.upsert_requirement(req_id="R1", visual_reference=["  img.png  ", "", "  "])
+        assert initialized_store.get_requirement("R1")["visual_reference"] == ["img.png"]
+
+    def test_legacy_repr_entries_read_back_without_crash(
+        self, initialized_store: TraceabilityStore, store_paths: RuntimePaths
+    ) -> None:
+        """Old workspaces carry repr-string entries; the read path must
+        surface them as plain strings (forward fix, no migration)."""
+        legacy = {"image_path": "./reference/login.png", "analysis": "old text"}
+        rows = {
+            "R1": {
+                "req_id": "R1",
+                "name": "Login",
+                "description": "",
+                "visual_reference": [repr(legacy)],
+                "scenarios": [],
+                "parent_id": None,
+                "children_ids": [],
+                "dependencies": [],
+            }
+        }
+        path = store_paths.traceability_dir / "requirements.json"
+        path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        row = initialized_store.get_requirement("R1")
+        assert row["visual_reference"] == [repr(legacy)]
+
+
+# ---------------------------------------------------------------------------
 # Requirement tree
 # ---------------------------------------------------------------------------
 

@@ -14,7 +14,9 @@ the encoding data is available, the chars/4 heuristic otherwise — the same
 accounting the usage fallback uses. Printed numbers are therefore
 approximations of any specific provider's tokenizer; shares are what matter.
 Offline runs that degrade to the heuristic still pass: assertions are
-structural only. The recorded numbers live in issue #188.
+structural only. The #188 baseline numbers live in issue #188; the #214
+re-run (dict visual references now round-tripping through the store) lives
+in issue #214.
 
 Deliberate caveats kept honest in the measurements:
 
@@ -28,11 +30,12 @@ Deliberate caveats kept honest in the measurements:
   TestGenerator/TDD receive an empty ``interface_contract`` where production
   passes the current contract;
 - the visual reference is attached through the production path
-  (``update_requirement_fields``), which stringifies dict payloads on
-  persist, so the focus digest's ``<visual_reference>`` block stays empty and
-  the analysis text reaches the model only inside the snapshot - exactly as
-  in a real run. The dict-shaped variant is measured separately as the
-  "intended digest shape" contrast via a monkeypatched requirement row.
+  (``update_requirement_fields``), which since #214 preserves the dict
+  payloads on persist: the row read back carries ``image_path``/``analysis``
+  dicts, so the focus digest's ``<visual_reference>`` block renders the
+  analysis and the snapshot embeds it as structured JSON - exactly as in a
+  real run. The dict-shaped production case is pinned structurally in
+  ``test_production_visual_reference_reaches_focus_digest``.
 """
 
 from __future__ import annotations
@@ -59,6 +62,7 @@ from agents.context.prompts.test_generator import (
 )
 from agents.model.usage_capture import _count_tokens
 from core.files import load_requirements
+from tests.helpers.snapshot_block import extract_snapshot_json
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 EASY_YAML = REPO_ROOT / "arc-bench-test" / "easy-ticketbooking" / "requirements" / "requirements.yaml"
@@ -109,7 +113,7 @@ def pipeline(arc_runtime, tmp_project_dir: Path) -> ContextPipeline:
 def _seed_node(arc_runtime, tree: dict, node_id: str, visual_analysis: str | None) -> dict[str, Any]:
     """Seed the store exactly like production: tree persist, then the visual
     precompute path's ``update_requirement_fields`` attachment (which
-    stringifies dict payloads on persist)."""
+    preserves the dict payloads on persist, #214)."""
 
     arc_runtime.traceability.store_requirement_tree(tree)
     if visual_analysis:
@@ -223,7 +227,7 @@ def _measure(stage: str, node_label: str, system: str, user: str, requirement_da
     if snapshot_tokens:
         assert 0.0 < row["snapshot_share"] < 1.0, (node_label, stage, row["snapshot_share"])
     print(
-        f"[#188] {node_label} / {stage}: total={row['total']:.0f}tok "
+        f"[snapshot-share] {node_label} / {stage}: total={row['total']:.0f}tok "
         f"focus={row['focus']:.0f} ({row['focus_share'] * 100:.1f}%) "
         f"snapshot={row['snapshot']:.0f} ({row['snapshot_share'] * 100:.1f}%) "
         f"combined={row['combined']:.0f} ({row['combined_share'] * 100:.1f}%) "
@@ -259,40 +263,49 @@ def test_measure_requirement_snapshot_token_share(
     assert by_stage["DESIGN"]["combined"] > by_stage["TestDrivenDeveloper"]["combined"]
 
 
-def test_measure_dict_shaped_visual_reference_variant(
+def test_production_visual_reference_reaches_focus_digest(
     arc_runtime,
     pipeline: ContextPipeline,
     tmp_project_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The "intended digest shape" contrast: had dict-shaped visual references
-    reached the pipeline, the focus digest would carry the analysis too. The
-    production persist path stringifies them, so this variant is produced by
-    serving the dict row from the store directly."""
+    """The #214 round-trip pin: dict-shaped visual references attached
+    through the production path (``update_requirement_fields``) survive the
+    persist, so the focus digest's ``<visual_reference>`` block renders the
+    analysis and the snapshot embeds structured JSON - no Python repr.
+    Before #214 the persist coerced the dicts to repr strings, the focus
+    block stayed empty, and the snapshot carried ``[{'image_path': ...}]``.
+    """
 
     workspace = tmp_project_dir.resolve()
     tree = load_requirements(EASY_YAML)
-    requirement_data = _seed_node(arc_runtime, tree, "REQ-2", None)
-    dict_references = [{"image_path": "./reference/login.png", "analysis": SYNTHETIC_VISUAL_ANALYSIS}]
-    requirement_data = {**requirement_data, "visual_reference": dict_references}
+    requirement_data = _seed_node(arc_runtime, tree, "REQ-2", SYNTHETIC_VISUAL_ANALYSIS)
 
-    real_get_requirement = arc_runtime.traceability.get_requirement
+    # The store row read back keeps the dict structure.
+    assert requirement_data["visual_reference"] == [
+        {"image_path": "./reference/login.png", "analysis": SYNTHETIC_VISUAL_ANALYSIS}
+    ]
 
-    def dict_shaped_get_requirement(req_id: str) -> dict[str, Any] | None:
-        row = real_get_requirement(req_id)
-        if row is not None and str(row.get("req_id")) == "REQ-2":
-            return {**row, "visual_reference": dict_references}
-        return row
+    prompts = _render_prompts(pipeline, "REQ-2", requirement_data, workspace)
+    for stage, (system, user) in prompts.items():
+        focus_match = FOCUS_RE.search(user)
+        assert focus_match, f"{stage}: <requirement_focus> missing"
+        focus_block = focus_match.group(0)
+        assert "<visual_reference>" in focus_block, f"{stage}: visual digest block missing"
+        assert "image_path" in focus_block
+        assert SYNTHETIC_VISUAL_ANALYSIS[:80] in focus_block, (
+            f"{stage}: analysis text must reach the focus digest"
+        )
 
-    monkeypatch.setattr(arc_runtime.traceability, "get_requirement", dict_shaped_get_requirement)
-
-    label = "easy-ticketbooking/REQ-2+dict-visual"
-    for stage, (system, user) in _render_prompts(pipeline, "REQ-2", requirement_data, workspace).items():
-        row = _measure(stage, label, system, user, requirement_data)
-        if stage == "DESIGN":
-            # The digest now carries the analysis, so the focus block must
-            # grow past the stringified-shape baseline.
-            assert row["focus"] > row["snapshot"] * 0.2
+    # The snapshot must round-trip the row verbatim as compact JSON (#215
+    # shape) with structured visual entries - single-quoted repr keys are the
+    # pre-#214 failure signature and must stay absent.
+    for stage in ("DESIGN", "TestGenerator"):
+        user = prompts[stage][1]
+        snapshot_json = extract_snapshot_json(user)
+        assert json.loads(snapshot_json) == requirement_data
+        assert "'image_path'" not in snapshot_json and "{'" not in snapshot_json
+    # TDD never carries the snapshot.
+    assert SNAPSHOT_RE.search(prompts["TestDrivenDeveloper"][1]) is None
 
 
 def test_requirement_focus_digest_repeats_snapshot_scenario_text(
