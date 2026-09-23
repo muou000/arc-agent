@@ -58,6 +58,11 @@ def filter_output_noise(text: str) -> tuple[str, dict[str, int]]:
 def render_filter_footer(raw_chars: int, removed: dict[str, int]) -> str:
     """One observation line: sizes, per-rule removals, no-truncation fact.
 
+    The counts cover the two command output streams (stdout + stderr) before
+    and after filtering — not the assembled result text, which adds the exit
+    header and the ``STDOUT:``/``STDERR:`` scaffolding ("raw streams", not
+    "raw output").
+
     The footer is model-visible on purpose — it tells the agent the output
     is complete (only formatting was dropped), closing the trust gap that
     made arc-output-serial-4's agent hunt for content it believed was cut.
@@ -67,6 +72,6 @@ def render_filter_footer(raw_chars: int, removed: dict[str, int]) -> str:
     rule_parts = ", ".join(f"{name} -{chars}" for name, chars in removed.items())
     filtered_chars = raw_chars - sum(removed.values())
     return (
-        f"{FOOTER_TAG} raw {raw_chars} -> {filtered_chars} chars "
+        f"{FOOTER_TAG} raw streams {raw_chars} -> {filtered_chars} chars "
         f"({rule_parts}); untruncated, formatting noise only."
     )

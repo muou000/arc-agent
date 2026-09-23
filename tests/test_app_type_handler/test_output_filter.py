@@ -56,7 +56,7 @@ def test_render_filter_footer_lists_every_rule_including_silent_ones() -> None:
 
     # A silent rule must stay visible: it is the observation window's signal
     # that a noise shape exists which no rule currently matches.
-    assert footer.startswith(f"{FOOTER_TAG} raw 1000 -> 700 chars ")
+    assert footer.startswith(f"{FOOTER_TAG} raw streams 1000 -> 700 chars ")
     assert "(ansi -300, carriage-return -0)" in footer
     assert "untruncated, formatting noise only." in footer
 
@@ -90,10 +90,10 @@ def test_execute_web_test_command_untruncated_and_filtered(tmp_path: Path) -> No
     assert "OUTPUT TRUNCATED" not in text
     assert "\x1b[" not in text and "\r" not in text
     assert text.rstrip("\n").endswith("untruncated, formatting noise only.")
-    assert f"{FOOTER_TAG} raw " in text
+    assert f"{FOOTER_TAG} raw streams " in text
     # stdout carried ~180 lines of noise plus a colored stderr line: the raw
     # count proves the full stream reached the footer accounting.
-    raw_reported = int(text.split(f"{FOOTER_TAG} raw ")[1].split(" ")[0])
+    raw_reported = int(text.split(f"{FOOTER_TAG} raw streams ")[1].split(" ")[0])
     assert raw_reported == sum(len(line) for line in lines) + len("\x1b[31mstderr noise\x1b[0m\r\n")
 
 

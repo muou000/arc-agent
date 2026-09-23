@@ -16,6 +16,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from app_type_handler.test_output_filter import render_filter_footer
 from app_type_handler.test_results import TestRunResult, parse_test_run
 from core.test_executor import (
     TDD_RUN_TESTS_BUDGET,
@@ -171,6 +172,39 @@ def test_registered_subset_runs_and_consumes_budget(tmp_path: Path) -> None:
     assert result.exit_code == 1
     assert runner.calls == [("Unit", [UNIT_TEST_FILE])]
     assert executor.usage("Unit") == 1
+
+
+def test_persisted_run_log_keeps_filtered_runner_text_verbatim(tmp_path: Path) -> None:
+    """#216: ``.arc/tdd_runs`` holds exactly the runner's filtered text.
+
+    The app handler's command runner strips formatting noise and appends the
+    filter footer; the executor must persist that text as-is (no
+    re-truncation, no raw rewrite), or the ``ARC_RUN_OUTPUT_LOG`` pointer
+    promises a completeness the file does not have — the broken-promise
+    failure mode behind arc-output-serial-4's grep-archaeology loop.
+    """
+    middle_evidence = "Unable to find a label with the text of: 用户名"
+    filtered_output = (
+        "Exit Code: 1\n"
+        "STDOUT:\n"
+        "RUN  v4.0.17 backend\n"
+        f"× rejects duplicate username — {middle_evidence}\n"
+        + render_filter_footer(12000, {"ansi": 3000, "carriage-return": 400})
+        + "\n"
+    )
+    runner = ScriptedRunner([run_of(filtered_output, exit_code=1)])
+    executor = make_executor(tmp_path, runner, manifest(("Unit", UNIT_TEST_FILE)))
+    executor.pin_active_layer("Unit")
+
+    result = asyncio.run(executor.run_requested(requested_files=[UNIT_TEST_FILE]))
+
+    persisted = (tmp_path / result.run_log_path).read_text(encoding="utf-8")
+    assert middle_evidence in persisted
+    assert "[output-filter] raw streams 12000 -> 8600 chars " in persisted
+    assert "OUTPUT TRUNCATED" not in persisted
+    # The pointer rides only on the model-facing text, not the persisted file.
+    assert "ARC_RUN_OUTPUT_LOG" in result.output
+    assert "ARC_RUN_OUTPUT_LOG" not in persisted
 
 
 # ---------------------------------------------------------------------------
