@@ -152,6 +152,16 @@ async def _run_android_gradle_build(workspace_path: str) -> str:
         return f"Exit Code: 1\nSTDERR:\nExecution failed: {str(exc)}\n"
 
 
+def _response_text(response: object) -> str:
+    """Best-effort text extraction from a chat model response."""
+    content = getattr(response, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(part for part in content if isinstance(part, str))
+    return ""
+
+
 class AndroidAppType(AppTypeHandler):
     name = "android"
 
@@ -383,23 +393,30 @@ If no app package can be identified, set package_name to "UNKNOWN"."""
         )
 
         try:
-            client = self.interface_designer.client
-            model = self.interface_designer.model
-            response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.0,
-                ),
-                timeout=60.0,
+            # This extraction runs outside any stage session, so the model is
+            # built through the unified factory: retry, per-request timeouts,
+            # transport fallback and usage capture come from the same adapter
+            # the stage agents use. No outer asyncio.wait_for: the adapter
+            # owns timeout and retry pacing, and an outer cap would cancel a
+            # healthy retry mid-backoff.
+            from agents.model.factory import create_arc_chat_model
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            model = create_arc_chat_model(self.interface_designer.model)
+            response = await model.ainvoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ]
             )
-            result_text = response.choices[0].message.content.strip()
+            result_text = _response_text(response)
             json_match = re.search(r"\{[\s\S]*\}", result_text)
             if not json_match:
-                await self._log("System", "Package extraction: no JSON found in LLM response, using fallback")
+                await self._log(
+                    "System",
+                    "Package extraction: no JSON found in LLM response, using fallback",
+                    "warning",
+                )
                 return self._fallback_package_name_extraction(all_reqs)
 
             parsed = json.loads(json_match.group())
@@ -407,9 +424,19 @@ If no app package can be identified, set package_name to "UNKNOWN"."""
             resource_ids = parsed.get("resource_ids", {})
             package_name = package_name.strip().strip("`").strip('"').strip("'")
             if package_name == "UNKNOWN" or not package_name or "." not in package_name:
+                await self._log(
+                    "System",
+                    f"Package extraction returned no usable package name ({package_name or 'empty'}), using fallback",
+                    "warning",
+                )
                 return self._fallback_package_name_extraction(all_reqs)
             for segment in package_name.split("."):
                 if not segment or not (segment[0].isalpha() or segment[0] == "_"):
+                    await self._log(
+                        "System",
+                        f"Package extraction returned malformed package name ({package_name}), using fallback",
+                        "warning",
+                    )
                     return self._fallback_package_name_extraction(all_reqs)
 
             await self._log("System", f"LLM extracted package name: {package_name}")
@@ -417,7 +444,11 @@ If no app package can be identified, set package_name to "UNKNOWN"."""
                 await self._log("System", f"LLM extracted {len(resource_ids)} resource-id mappings")
             return package_name
         except Exception as exc:
-            await self._log("System", f"Package extraction via LLM failed: {str(exc)}")
+            await self._log(
+                "System",
+                f"Package extraction via LLM failed: {str(exc)}",
+                "warning",
+            )
             return self._fallback_package_name_extraction(all_reqs)
 
     def _write_android_package_metadata(self, package_name: str, resource_ids: dict):
