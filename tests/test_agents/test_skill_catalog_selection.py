@@ -32,6 +32,7 @@ from agents.runtime.stage_session import StageSession
 from agents.skills.selection import (
     SKILLS_SOURCE,
     available_skill_names,
+    has_auth_context,
     implementation_skills,
     interface_design_skills,
     test_generation_skills as select_test_generation_skills,
@@ -82,6 +83,48 @@ def test_selection_test_generation_auth_floor_is_leaf_agnostic():
     auth_req = {"name": "Login shell", "description": "register and log in users", "children_ids": ["c1", "c2"]}
     assert select_test_generation_skills(auth_req) == ["auth-session-consistency"]
     assert interface_design_skills(auth_req) == []
+
+
+def test_selection_chinese_auth_floor():
+    # Chinese-first requirement trees must hit the same deterministic floor
+    # (issue #178: _AUTH_TERMS used to be English-only, a static miss).
+    auth_req = {"name": "登录", "description": "用户可以登录并查看自己的会话"}
+    assert interface_design_skills(auth_req) == ["auth-session-consistency"]
+    assert select_test_generation_skills(auth_req) == ["auth-session-consistency"]
+    assert implementation_skills(
+        interface_contract="登录页接口：处理会话保持与当前用户状态",
+        previous_failure_summary="",
+    ) == ["auth-session-consistency"]
+
+
+@pytest.mark.parametrize(
+    "term",
+    [
+        "登录",
+        "登陆",
+        "注册",
+        "登出",
+        "注销",
+        "会话",
+        "认证",
+        "授权",
+        "当前用户",
+        "账户",
+        "账号",
+    ],
+)
+def test_auth_terms_cover_chinese_variants(term):
+    assert has_auth_context({"description": f"支持{term}功能"}) is True
+
+
+def test_selection_chinese_non_auth_no_trigger():
+    non_auth = {"name": "商品列表", "description": "展示商品列表，支持按价格排序并加入购物车"}
+    assert interface_design_skills(non_auth) == []
+    assert select_test_generation_skills(non_auth) == []
+    assert implementation_skills(
+        interface_contract="商品列表接口：返回分页数据与筛选结果",
+        previous_failure_summary="",
+    ) == []
 
 
 def test_selection_failure_repair_floor():
