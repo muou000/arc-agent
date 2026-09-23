@@ -119,6 +119,14 @@ def tool_results_text(model: FauxChatModel) -> str:
     )
 
 
+def tool_messages_in_call(model: FauxChatModel, index: int) -> str:
+    """Tool-result texts delivered to one specific model call (by call index)."""
+
+    return "\n".join(
+        str(m.content) for m in model.calls[index] if getattr(m, "type", "") == "tool"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Happy path: write -> run_tests (fail) -> fix -> run_tests (pass) -> IMPLEMENTED
 # ---------------------------------------------------------------------------
@@ -443,11 +451,27 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
     first_call_messages = "\n".join(str(m.content) for m in model.calls[0])
     assert "environmental reason" in first_call_messages
     assert "repair" in first_call_messages
+    # The baseline handoff is the first report the first session sees; it
+    # must name the install_dependencies path too, never negate it (#174).
+    assert "install_dependencies" in first_call_messages
+    assert "must be installed, end your turn" not in first_call_messages
     # The first failing run offers the repair-and-revalidate contract; the
     # second (still environmental) run closes the layer for good. The two
     # status headers must be unambiguous about which state the layer is in.
     assert "This is your one repair-and-revalidate attempt" in all_tool_results
     assert "This layer is closed" in all_tool_results
+    # Nail (#174): the FIRST failing run's status report must point at the
+    # install_dependencies repair path instead of negating it ("you cannot
+    # fix it mid-run"), and the exhausted final report keeps its end-turn
+    # semantics so a doomed workspace still closes the layer.
+    first_run_report = tool_messages_in_call(model, 1)
+    assert "install_dependencies" in first_run_report
+    assert "you cannot fix it" not in first_run_report
+    final_env_report = tool_messages_in_call(model, 3)
+    assert (
+        "Do not call run_tests again; return a short report naming the missing dependency"
+        in final_env_report
+    )
     node_session = sessions.load_node_session(node_id)
     assert "environment failure" in node_session["recent_failure_summary"]
     assert "missing dependency" in node_session["recent_failure_summary"]
@@ -493,6 +517,9 @@ def test_environment_failure_repair_revalidates_and_passes(tmp_project_dir: Path
     assert model.call_count == 4
     all_tool_results = tool_results_text(model)
     assert "This is your one repair-and-revalidate attempt" in all_tool_results
+    # This flow shows only the first env-failure report; it must not negate
+    # any repair path (#174).
+    assert "you cannot fix it" not in all_tool_results
     # The repair really landed in the workspace and the node recovered.
     assert (tmp_project_dir / "src" / "testing-library-dom.js").exists()
     assert arc_runtime.traceability.get_test("T1")["passed"] is True
@@ -2084,6 +2111,12 @@ def test_missing_package_failure_grants_install_cycle(
     assert "cookie-parser" in all_tool_results
     assert "backend/node_modules" in all_tool_results
     assert "Re-run run_tests" in all_tool_results
+    # The report delivered after the install grant (second env failure) is
+    # the same first-report contract: it must still offer the
+    # install_dependencies path, not end the turn (#174).
+    install_grant_report = tool_messages_in_call(model, 2)
+    assert "install_dependencies" in install_grant_report
+    assert "you cannot fix it" not in install_grant_report
 
 
 def test_missing_package_install_fails_closes_layer(
