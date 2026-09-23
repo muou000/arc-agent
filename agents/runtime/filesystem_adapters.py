@@ -29,6 +29,17 @@ success receipts gain an integrity trailer (``bytes_written`` plus the first 8
 hex chars of the content's sha256) built on the same upstream tool factory
 seams as the delete tool, plus a standing note that the context echo's
 ``...(argument truncated)`` marker is display truncation only.
+
+Two grep behaviors (issue #218): ``ArcCompositeBackend`` replaces the stock
+``CompositeBackend`` in the build path and expands a pattern containing `|`
+into literal alternatives, searching each branch with upstream's own engines
+and merging the structured matches — so every output mode, permission filter
+and max_count truncation keeps upstream behavior. ``GrepGuidanceMiddleware``
+appended next to ``PermissionDeniedHintMiddleware`` replaces upstream's
+no-match regex hint (whose "run a separate search per alternative" advice
+coached the per-keyword call loop the expansion removes) with text that
+matches the actual semantics, and injects a strategy-change prompt once one
+search scope accumulates consecutive no-match results.
 """
 
 from __future__ import annotations
@@ -36,11 +47,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from deepagents import __version__ as _deepagents_version
-from deepagents.backends import FilesystemBackend
+from deepagents.backends import CompositeBackend, FilesystemBackend
+from deepagents.backends.protocol import GrepMatch, GrepResult
 from deepagents.backends.utils import validate_path
 from deepagents.middleware.filesystem import (
     DeleteSchema,
@@ -58,13 +71,21 @@ from langchain_core.tools import StructuredTool
 # upstream rename must fail the build loudly instead of silently dropping it.
 from deepagents.backends.filesystem import _raise_if_symlink_loop as _symlink_loop_guard
 
+# Same posture: the guidance middleware below rewrites this upstream note at
+# runtime (computed from the function itself, not a copied string, so upstream
+# wording drift keeps being stripped) — a rename must fail the build loudly
+# instead of letting the loop-coaching advice resurface silently.
+from deepagents.backends.utils import (
+    regex_literal_hint as _upstream_regex_literal_hint,
+)
+
 from core.path_compat import (
     normalize_windows_extended_prefix_path,
     normalize_windows_extended_prefix_text,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Mapping
 
     from langchain.agents.middleware.types import ToolCallRequest
     from langchain_core.tools import BaseTool
@@ -280,6 +301,20 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
     # Matches the stock core-stack entry so ``create_deep_agent`` replaces it
     # in place instead of appending a second filesystem middleware.
     name = "FilesystemMiddleware"
+
+    def __init__(
+        self,
+        *,
+        custom_tool_descriptions: "Mapping[str, str] | None" = None,
+        **kwargs: Any,
+    ) -> None:
+        # `custom_tool_descriptions` is upstream's supported description seam
+        # (it also short-circuits the request-time execution-visibility
+        # rewrite, which would otherwise re-derive the stock text). ARC only
+        # overrides grep; every other tool keeps its stock description.
+        descriptions = dict(custom_tool_descriptions or {})
+        descriptions.setdefault("grep", ARC_GREP_TOOL_DESCRIPTION)
+        super().__init__(custom_tool_descriptions=descriptions, **kwargs)
 
     def _create_delete_tool(self) -> "BaseTool":
         upstream_delete = super()._create_delete_tool()
@@ -584,3 +619,364 @@ def workspace_filesystem_backend(root_dir: str) -> FilesystemBackend:
     if os.name == "nt":
         return WindowsCompatFilesystemBackend(root_dir=root_dir, virtual_mode=True)
     return FilesystemBackend(root_dir=root_dir, virtual_mode=True)
+
+
+# -- grep: literal-alternation expansion and no-match guidance (issue #218) -----
+
+
+#: ARC's replacement for upstream's grep tool description. The stock text ends
+#: with "To match any of several strings, run a separate grep for each" — the
+#: per-keyword call loop issue #218 removes — and denies the `|` expansion the
+#: backend now performs, so the injected description must state the actual
+#: semantics on every surface the model reads.
+ARC_GREP_TOOL_DESCRIPTION = """Search for a LITERAL text pattern across files (NOT regex).
+
+The pattern is matched verbatim: regex metacharacters are ordinary characters, not operators (`.*`, `\\.`, `^`, `$` are searched as plain text). A pattern containing `|` is expanded into literal alternatives: `grep(pattern="foo|bar")` matches files containing `foo` OR `bar` (at most 8 alternatives per call; write `\\|` to search for a literal `|` instead). Do not enumerate keyword guesses one grep at a time — when a search misses, read the candidate file (`read_file` with offset/limit) or search one distinctive literal copied from earlier tool output.
+
+Returns matching files or content per `output_mode`. Offloaded large tool results live under the artifacts root (`/large_tool_results/` by default); grep that directory to search them when you do not know the exact path."""
+
+
+#: Upper bound on literal alternatives expanded from one `|` pattern. The
+#: serial-4 run's misuse peaked around three alternatives; 8 leaves generous
+#: headroom while bounding the per-call fan-out (each branch is a full search).
+MAX_GREP_ALTERNATIVES = 8
+
+#: Upstream renders an empty grep result as exactly this sentinel line.
+_GREP_NO_MATCH_SENTINEL = "No matches found"
+
+#: Consecutive no-match greps on one scope before the budget hint fires, and
+#: the count at which its wording escalates. The hint is advisory only: the
+#: 2026-09-22 serial-4 REQ-1 run burned 88 greps (about half alternation
+#: misuse) without any signal to change strategy.
+_GREP_NO_MATCH_HINT_AFTER = 3
+_GREP_NO_MATCH_ESCALATE_AFTER = 2 * _GREP_NO_MATCH_HINT_AFTER
+
+
+@dataclass(frozen=True)
+class GrepAlternation:
+    """A pattern's literal-alternation expansion, shared by backend and guidance.
+
+    ``searched`` holds the deduplicated, trimmed branches the backend runs
+    (capped at ``MAX_GREP_ALTERNATIVES``); ``total`` is the pre-cap branch
+    count. ``expanded`` is false for a single-branch result (e.g. `a\\|b`
+    unescaping to the literal `a|b`): the search differs from the raw pattern,
+    but no alternation happened, so the guidance must not claim one.
+    """
+
+    searched: tuple[str, ...]
+    total: int
+
+    @property
+    def expanded(self) -> bool:
+        return self.total > 1
+
+    @property
+    def dropped(self) -> int:
+        return self.total - len(self.searched)
+
+
+def split_literal_alternation(pattern: str) -> list[str] | None:
+    """Split a grep pattern on `|` into literal alternatives.
+
+    deepagents' grep matches literal text, so a model-written `a|b|c` searches
+    for the literal characters and silently misses — upstream's result note
+    then advises "run a separate search per alternative", which coached the
+    per-keyword LLM-call archaeology loop this expansion removes. The split is
+    purely lexical: each branch is itself a literal pattern (no regex), a
+    backslash-escaped `\\|` unescapes to a literal `|` (the documented escape
+    hatch for searching a real pipe), branches are trimmed and deduplicated
+    keeping first-seen order, and empty branches (from `a||b` or a dangling
+    `|`) are dropped.
+
+    Returns ``None`` when the pattern contains no `|` at all — the caller then
+    searches the raw pattern with upstream behavior unchanged — or the
+    effective branch list (one or more literals) otherwise.
+    """
+
+    pattern = str(pattern)
+    if "|" not in pattern:
+        return None
+    branches: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in pattern:
+        if escaped:
+            # Only `\|` is special: any other backslash sequence stays literal.
+            if char == "|":
+                current.append("|")
+            else:
+                current.append("\\")
+                current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "|":
+            branches.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if escaped:
+        current.append("\\")
+    branches.append("".join(current))
+    cleaned: list[str] = []
+    for branch in branches:
+        branch = branch.strip()
+        if branch and branch not in cleaned:
+            cleaned.append(branch)
+    return cleaned or None
+
+
+def alternation_expansion(pattern: str) -> GrepAlternation | None:
+    """The pattern's expansion, or ``None`` when there is nothing to expand."""
+
+    branches = split_literal_alternation(pattern)
+    if branches is None:
+        return None
+    return GrepAlternation(
+        searched=tuple(branches[:MAX_GREP_ALTERNATIVES]),
+        total=len(branches),
+    )
+
+
+def _merge_alternation_results(
+    results: list[GrepResult],
+    *,
+    max_count: int | None,
+) -> GrepResult:
+    """Merge per-branch grep results into one, deduplicating by (path, line).
+
+    Structured merging keeps every downstream behavior upstream-owned: the
+    tool boundary formats all output modes from the merged match list, the
+    permission filter still redacts, and the truncation note still renders.
+    A merged result is flagged ``truncated`` when any branch was, or when the
+    cap was reached — reaching the cap across branches proves nothing about
+    the unsearched remainder, mirroring upstream's conservative composite
+    semantics. Branch errors are deduplicated and joined so an error that
+    affected every branch (a refused glob, a bad path) still renders as an
+    error result.
+    """
+
+    matches: list[GrepMatch] = []
+    seen: set[tuple[str, int]] = set()
+    errors: list[str] = []
+    truncated = False
+    for result in results:
+        truncated = truncated or result.truncated
+        if result.error and result.error not in errors:
+            errors.append(result.error)
+        for match in result.matches or []:
+            key = (str(match.get("path", "")), int(match.get("line", 0) or 0))
+            if key in seen:
+                continue
+            if max_count is not None and len(matches) >= max_count:
+                truncated = True
+                break
+            seen.add(key)
+            matches.append(match)
+    return GrepResult(error="\n".join(errors) or None, matches=matches, truncated=truncated)
+
+
+class ArcCompositeBackend(CompositeBackend):
+    """Composite backend that expands `|` patterns into literal branch searches.
+
+    Mounted at the composite seam (not per-route) so every routed backend and
+    the default one share the semantics: a pathless grep scans routes *and*
+    the default backend, and expanding inside one route only would make the
+    same pattern alternation-aware in one part of the result and literal-only
+    in another. Each branch runs upstream's own grep (ripgrep `-F` or the
+    Python fallback) with the caller's ``max_count`` passed through, so
+    per-branch cost stays bounded; the structured matches are then merged once.
+    """
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
+        expansion = alternation_expansion(pattern)
+        if expansion is None:
+            return super().grep(pattern, path=path, glob=glob, max_count=max_count)
+        results = [
+            super().grep(branch, path=path, glob=glob, max_count=max_count)
+            for branch in expansion.searched
+        ]
+        return _merge_alternation_results(results, max_count=max_count)
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
+        expansion = alternation_expansion(pattern)
+        if expansion is None:
+            return await super().agrep(pattern, path=path, glob=glob, max_count=max_count)
+        results = [
+            await super().agrep(branch, path=path, glob=glob, max_count=max_count)
+            for branch in expansion.searched
+        ]
+        return _merge_alternation_results(results, max_count=max_count)
+
+
+def _quote_branches(branches: tuple[str, ...], *, limit: int = 6) -> str:
+    shown = ", ".join(f"`{branch}`" for branch in branches[:limit])
+    if len(branches) > limit:
+        shown += f", … (+{len(branches) - limit} more)"
+    return shown
+
+
+def _expansion_note(expansion: GrepAlternation) -> str:
+    """The one-line note that states what an expanded pattern searched."""
+
+    if expansion.dropped:
+        head = (
+            f"Note: the pattern had {expansion.total} alternatives; searched the "
+            f"first {len(expansion.searched)} (cap {MAX_GREP_ALTERNATIVES}): "
+            f"{_quote_branches(expansion.searched)}."
+        )
+    else:
+        head = (
+            f"Note: the pattern was expanded as {expansion.total} literal "
+            f"alternatives: {_quote_branches(expansion.searched)}."
+        )
+    return (
+        f"{head} Results are the union across alternatives; write `\\|` to "
+        "search for a literal `|`."
+    )
+
+
+def _no_match_note(expansion: GrepAlternation | None) -> str:
+    """The no-match note that replaces upstream's loop-coaching regex hint."""
+
+    if expansion is not None and expansion.expanded:
+        if expansion.dropped:
+            head = (
+                f"Note: none of the first {len(expansion.searched)} of "
+                f"{expansion.total} alternatives "
+                f"({_quote_branches(expansion.searched)}) matched."
+            )
+        else:
+            head = (
+                f"Note: none of the {expansion.total} literal alternatives "
+                f"({_quote_branches(expansion.searched)}) matched."
+            )
+    else:
+        head = "Note: no file contains that pattern as literal text."
+    return (
+        f"{head} grep matches literal text, not regex: metacharacters like "
+        "`.*` and `\\.` are searched verbatim. Search a distinctive literal "
+        "copied from earlier file output, or read_file the likely file, "
+        "instead of retrying keyword variants."
+    )
+
+
+def _budget_note(streak: int, scope: str) -> str:
+    """The strategy-change prompt for a scope accumulating no-match greps."""
+
+    if streak >= _GREP_NO_MATCH_ESCALATE_AFTER:
+        return (
+            f"No-match budget: {streak} consecutive no-match greps on {scope}. "
+            "The text you keep guessing for is very likely absent from this "
+            "scope — stop searching it; read the file that should contain it "
+            "and verify, or change strategy."
+        )
+    return (
+        f"No-match budget: {streak} consecutive no-match greps on {scope}. "
+        "Stop enumerating keyword guesses — read the candidate file "
+        "(`read_file` with offset/limit) or confirm the file exists "
+        "(`ls`/`glob`) before another search."
+    )
+
+
+def _strip_upstream_regex_note(content: str, pattern: str) -> str:
+    """Cut upstream's regex hint from a grep result, if it was appended.
+
+    The note text is computed from upstream's own function rather than copied,
+    so wording drift on the upstream side keeps being stripped. If upstream
+    stops emitting the note entirely, this is a no-op — the ARC note below is
+    appended unconditionally on no-match, so the semantics never regress to
+    the loop-coaching advice.
+    """
+
+    note = _upstream_regex_literal_hint(pattern)
+    if note and content.endswith(note):
+        return content[: -len(note)].rstrip()
+    return content
+
+
+class GrepGuidanceMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Keep grep results honest about their semantics and bound no-match loops.
+
+    Two rewrites on the tool boundary, both keyed off the call's own args:
+
+    - The upstream no-match regex hint (emitted whenever a pattern carries
+      regex signals — including every `a|b` alternation) ends with "for `|`
+      alternation, run a separate search per alternative". With
+      ``ArcCompositeBackend`` expanding alternation that advice is wrong on
+      both counts, and it is the sentence that coached the serial-4 REQ-1
+      loop. It is stripped and replaced with the matching-semantics note
+      above; matching results from an expanded pattern gain the one-line
+      expansion note so the model learns the semantics from the result.
+    - A per-scope streak counter turns repeated no-match greps on the same
+      path into an escalating strategy-change prompt. The state lives on the
+      middleware instance (one per built stage agent — a session's
+      conversation scope) and resets when that scope returns a match; error
+      results neither count nor reset.
+
+    Best-effort like the usage capture: any failure leaves the tool result
+    untouched rather than breaking the call.
+    """
+
+    def __init__(self) -> None:
+        self._no_match_streaks: dict[str, int] = {}
+
+    def wrap_tool_call(self, request: "ToolCallRequest", handler: Any) -> Any:
+        return self._with_guidance(request, handler(request))
+
+    async def awrap_tool_call(self, request: "ToolCallRequest", handler: Any) -> Any:
+        return self._with_guidance(request, await handler(request))
+
+    def _with_guidance(self, request: "ToolCallRequest", result: Any) -> Any:
+        try:
+            call = getattr(request, "tool_call", None) or {}
+            if str(call.get("name") or "") != "grep":
+                return result
+            content = getattr(result, "content", None)
+            if not isinstance(content, str):
+                return result
+            if str(getattr(result, "status", "") or "") == "error":
+                # Errors (denied paths, refused globs) are not no-matches:
+                # they must neither advance nor reset the budget streak.
+                return result
+            args = call.get("args") or {}
+            pattern = str(args.get("pattern") or "")
+            scope = str(args.get("path") or "").strip().rstrip("/") or "(default root)"
+            expansion = alternation_expansion(pattern)
+            no_match = content.split("\n\n", 1)[0] == _GREP_NO_MATCH_SENTINEL
+            if no_match:
+                streak = self._no_match_streaks.get(scope, 0) + 1
+                self._no_match_streaks[scope] = streak
+            else:
+                streak = 0
+                self._no_match_streaks[scope] = 0
+
+            notes: list[str] = []
+            if no_match:
+                notes.append(_no_match_note(expansion))
+            elif expansion is not None and expansion.expanded:
+                notes.append(_expansion_note(expansion))
+            if streak >= _GREP_NO_MATCH_HINT_AFTER:
+                notes.append(_budget_note(streak, scope))
+            if not notes:
+                return result
+            updated = _strip_upstream_regex_note(content, pattern)
+            result.content = updated + "\n\n" + "\n\n".join(notes)
+            return result
+        except Exception:
+            logger.debug("grep guidance rewrite failed", exc_info=True)
+            return result
