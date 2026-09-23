@@ -93,6 +93,11 @@ def _filter_android_gradle_output(output: str, error: str, exit_code: int) -> st
         result += filtered
     return result
 
+_ANDROID_SUBPROCESS_ENV_OVERRIDES = {
+    "PYTHONIOENCODING": "utf-8",
+    "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8",
+}
+
 
 async def _run_android_gradle_test(workspace_path: str, file_path: str) -> str:
     test_class = _android_file_to_test_class(file_path)
@@ -110,9 +115,7 @@ async def _run_android_gradle_test(workspace_path: str, file_path: str) -> str:
             cwd=workspace_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=build_subprocess_env(
-                {"PYTHONIOENCODING": "utf-8", "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8"}
-            ),
+            env=build_subprocess_env(_ANDROID_SUBPROCESS_ENV_OVERRIDES),
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=180.0)
         output = stdout.decode("utf-8", errors="replace")
@@ -135,9 +138,7 @@ async def _run_android_gradle_build(workspace_path: str) -> str:
             cwd=workspace_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=build_subprocess_env(
-                {"PYTHONIOENCODING": "utf-8", "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8"}
-            ),
+            env=build_subprocess_env(_ANDROID_SUBPROCESS_ENV_OVERRIDES),
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=180.0)
         output = stdout.decode("utf-8", errors="replace")
