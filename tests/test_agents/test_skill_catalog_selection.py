@@ -160,9 +160,9 @@ def test_resolve_skill_instruction_paths_ignores_non_skill_sources():
 
 
 def test_resolve_skill_instruction_paths_accepts_single_skill_dir():
-    paths = _resolve_skill_instruction_paths(["/skills/frontend-design"], SKILLS_ROOT)
+    paths = _resolve_skill_instruction_paths(["/skills/auth-session-consistency"], SKILLS_ROOT)
 
-    assert paths == ["/skills/frontend-design/SKILL.md"]
+    assert paths == ["/skills/auth-session-consistency/SKILL.md"]
 
 
 # -- prompts: required floor + optional catalog reads --------------------------

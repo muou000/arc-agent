@@ -16,7 +16,6 @@
 ## 规则范围
 
 - 根目录规则适用于 Python 编译器、agent 适配器、运行时 SDK、app-type handler、模板和测试。
-- 修改 `skills/vercel-react-best-practices/` 或 `skills/vercel-composition-patterns/` 时，遵守对应目录下的 `AGENTS.md`。
 - 开发任务一律在独立的 git worktree 中进行（见「Git、依赖和敏感信息」）；开始前运行 `git status --short` 了解主工作区状态，只处理当前任务相关文件。
 
 ## 项目目标
