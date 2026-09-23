@@ -42,6 +42,7 @@ from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 
 from tests.helpers.faux import FauxChatModel, faux_text  # noqa: F401 - faux fixture availability
+from tests.helpers.jsonl import read_jsonl
 
 
 def _git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
@@ -780,6 +781,192 @@ def test_task_runner_gate_provider_builds_a_middleware(tmp_path: Path) -> None:
             os.environ.pop(REBASE_ON_MERGE_ENV, None)
         else:
             os.environ[REBASE_ON_MERGE_ENV] = previous
+
+
+# ---------------------------------------------------------------------------
+# audit event chain (issue #179)
+# ---------------------------------------------------------------------------
+
+
+def _gate_with_pending_sibling(manager: ARCWorkflowManager) -> Any:
+    """A workflow-built gate whose task has one applicable sibling merge.
+
+    The gate comes from ``_build_task_rebase_gate`` - the workflow's own
+    wiring of the audit hooks - not a hand-built middleware, so the tests
+    below exercise the exact hook -> emit -> events-sink chain that shipped
+    broken (every emit raised TypeError, swallowed fail-open, events lost).
+    """
+
+    wt = manager._worktree_manager
+    handle = wt.prepare("REQ-A")
+    sibling = wt.prepare("REQ-B")
+    Path(sibling.path, "backend", "shared.js").write_text(
+        "base;\nsibling;\n", encoding="utf-8"
+    )
+    wt.integrate(sibling, "REQ-B (implement): shared")
+    _record_pending(wt, handle, ["backend/shared.js"])
+    return manager._build_task_rebase_gate("REQ-A", handle)
+
+
+def test_workflow_gate_emits_started_and_resolved_audit_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean replay through the workflow-built gate lands the ``started``
+    and ``resolved`` (``replayed`` mapping retained) lifecycle events."""
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    manager, events = _make_manager(tmp_path, rebase_on_merge=True)
+    gate = _gate_with_pending_sibling(manager)
+    result = gate.wrap_tool_call(
+        _make_request("read_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
+    )
+    assert "were applied to this workspace" in result.content
+    assert [event["status"] for event in events.rebase_events] == ["started", "resolved"]
+    assert events.rebase_events[0] == {
+        "node_id": "REQ-A",
+        "status": "started",
+        "files": [],
+        "message": "pending merge touched",
+    }
+    resolved = events.rebase_events[1]
+    assert resolved["node_id"] == "REQ-A"
+    assert "backend/shared.js" in resolved["files"]
+    # A clean replay's outcome carries no detail: the event's message is None.
+    assert resolved["message"] is None
+
+
+def test_workflow_gate_writes_rebase_replay_events_to_runner_events_jsonl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The audit chain ends on disk: with the run's real ``EventClient`` all
+    four lifecycle statuses land in ``.arc/runner-events.jsonl`` (ADR 0003's
+    auditable chain), not just in a test sink. Three rounds drive the
+    statuses: a clean replay (started, resolved), a conflicting replay
+    (conflicts), and a mechanically aborted replay (aborted)."""
+
+    from arcbench_agent_runtime.context import RuntimePaths
+    from arcbench_agent_runtime.events import EventClient
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    manager, _events = _make_manager(tmp_path, rebase_on_merge=True)
+    manager.runtime.events = EventClient(
+        RuntimePaths.from_env(project_dir=manager.workspace_path)
+    )
+    wt = manager._worktree_manager
+
+    # Round 1: clean replay.
+    gate = _gate_with_pending_sibling(manager)
+    gate.wrap_tool_call(
+        _make_request("read_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
+    )
+
+    # Round 2: conflicting replay - the branch rewrites the same line the
+    # new sibling merge rewrites.
+    handle_c = wt.prepare("REQ-C")
+    Path(handle_c.path, "backend", "shared.js").write_text(
+        "base;\nrival;\n", encoding="utf-8"
+    )
+    sibling_d = wt.prepare("REQ-D")
+    Path(sibling_d.path, "backend", "shared.js").write_text(
+        "base;\nsibling2;\n", encoding="utf-8"
+    )
+    wt.integrate(sibling_d, "REQ-D (implement): shared")
+    _record_pending(wt, handle_c, ["backend/shared.js"])
+    gate_c = manager._build_task_rebase_gate("REQ-C", handle_c)
+    result = gate_c.wrap_tool_call(
+        _make_request("edit_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
+    )
+    assert "merge conflicts" in result.content
+
+    # Round 3: aborted replay (stubbed outcome; the abort mechanics are
+    # covered by test_aborted_replay_restores_the_dirty_tree).
+    handle_e = wt.prepare("REQ-E")
+    _record_pending(wt, handle_e, ["backend/shared.js"])
+    wt.replay_pending_merges = lambda _h: ReplayOutcome(
+        status=ReplayOutcome.ABORTED, detail="boom"
+    )
+    gate_e = manager._build_task_rebase_gate("REQ-E", handle_e)
+    assert gate_e.wrap_tool_call(
+        _make_request("read_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
+    ).content == "ok"
+
+    events_path = Path(manager.workspace_path) / ".arc" / "runner-events.jsonl"
+    rebase_events = [
+        event for event in read_jsonl(events_path) if event["type"] == "rebase_replay"
+    ]
+    assert [event["status"] for event in rebase_events] == [
+        "started",
+        "resolved",
+        "started",
+        "conflicts",
+        "started",
+        "aborted",
+    ]
+    assert [event["node_id"] for event in rebase_events] == [
+        "REQ-A",
+        "REQ-A",
+        "REQ-C",
+        "REQ-C",
+        "REQ-E",
+        "REQ-E",
+    ]
+
+
+def test_workflow_gate_emits_conflicts_audit_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A conflicting replay through the workflow-built gate lands the
+    ``conflicts`` lifecycle event with the conflicted paths."""
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    manager, events = _make_manager(tmp_path, rebase_on_merge=True)
+    wt = manager._worktree_manager
+    handle = wt.prepare("REQ-A")
+    shared = Path(handle.path, "backend", "shared.js")
+    shared.write_text("base;\nagent;\n", encoding="utf-8")
+    sibling = wt.prepare("REQ-B")
+    Path(sibling.path, "backend", "shared.js").write_text(
+        "base;\nsibling;\n", encoding="utf-8"
+    )
+    wt.integrate(sibling, "REQ-B (implement): shared")
+    _record_pending(wt, handle, ["backend/shared.js"])
+
+    gate = manager._build_task_rebase_gate("REQ-A", handle)
+    result = gate.wrap_tool_call(
+        _make_request("edit_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
+    )
+    assert "merge conflicts" in result.content
+    assert [event["status"] for event in events.rebase_events] == ["started", "conflicts"]
+    conflicts = events.rebase_events[1]
+    assert conflicts["files"] == ["backend/shared.js"]
+    assert conflicts["message"]
+
+
+def test_workflow_gate_emits_aborted_audit_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mechanically aborted replay lands the ``aborted`` event and the call
+    still proceeds fail-open. The abort *mechanics* are covered by
+    ``test_aborted_replay_restores_the_dirty_tree`` (which tolerates the
+    conflict outcome because the rollback is environment-sensitive); here the
+    audit chain is under test, so the replay is stubbed to return the ABORTED
+    outcome deterministically."""
+
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    manager, events = _make_manager(tmp_path, rebase_on_merge=True)
+    wt = manager._worktree_manager
+    handle = wt.prepare("REQ-A")
+    _record_pending(wt, handle, ["backend/shared.js"])
+    wt.replay_pending_merges = lambda _h: ReplayOutcome(
+        status=ReplayOutcome.ABORTED, detail="boom"
+    )
+    gate = manager._build_task_rebase_gate("REQ-A", handle)
+    result = gate.wrap_tool_call(
+        _make_request("read_file", {"file_path": "/workspace/backend/shared.js"}), _ok_tool
+    )
+    assert result.content == "ok"
+    assert [event["status"] for event in events.rebase_events] == ["started", "aborted"]
+    assert events.rebase_events[1]["message"] == "boom"
 
 
 def test_conflict_notice_includes_opposite_side_contract_cards() -> None:
