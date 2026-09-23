@@ -21,7 +21,7 @@ from agents.design.contract_skeleton import (
 )
 from agents.model.openai_api_adapter import json_schema_structured_output_supported
 from agents.runtime.factory import StageAgentBuild
-from agents.runtime.runners import salvage_json_objects
+from agents.runtime.runners import salvage_json_objects, text_from_raw_dump
 from agents.runtime.stage_discipline import MAX_DESIGN_WRITES, MAX_NON_LEAF_DESIGN_WRITES
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.runtime.rebase_gate import cached_rebase_gate
@@ -1037,7 +1037,7 @@ class InterfaceDesigner:
         # text into ``summary``; unwrapping the raw debug dump too keeps the
         # scan source aligned with the marker this method gates on, so an
         # adapter that only populates ``_raw_final_message`` still recovers.
-        final_text = summary_text if summary_text.strip() else InterfaceDesigner._text_from_raw_dump(raw_text)
+        final_text = summary_text if summary_text.strip() else text_from_raw_dump(raw_text)
         if not final_text.strip():
             return []
         return [
@@ -1045,38 +1045,6 @@ class InterfaceDesigner:
             for item in salvage_json_objects(final_text)
             if any(key in item for key in ("interface_id", "file_path", "specification", "responsibility"))
         ]
-
-    @staticmethod
-    def _text_from_raw_dump(raw_text: str) -> str:
-        """Unwrap the escaped message dump so the scanner can see its braces.
-
-        ``_stringify_final_message`` stores a JSON-encoded debug dump; the
-        fenced JSON inside it is escaped into a string value that the
-        quote-aware scanner would skip. Decode it first and return the
-        assistant content (string or text-block list) when possible.
-        """
-
-        try:
-            dumped = json.loads(raw_text)
-        except json.JSONDecodeError:
-            return raw_text
-        if not isinstance(dumped, dict):
-            return raw_text
-        content = dumped.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
-        if isinstance(content, list):
-            texts: list[str] = []
-            for block in content:
-                if isinstance(block, dict):
-                    text = block.get("text")
-                    if isinstance(text, str) and text.strip():
-                        texts.append(text)
-                elif isinstance(block, str) and block.strip():
-                    texts.append(block)
-            if texts:
-                return "\n".join(texts)
-        return raw_text
 
     @staticmethod
     def _load_merge_conflict_context(node_id: str) -> dict[str, Any] | None:

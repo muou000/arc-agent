@@ -145,11 +145,39 @@ def extract_payload(result: dict[str, Any]) -> dict[str, Any]:
     parsed = parse_json_payload(final_text)
     if parsed is not None:
         return parsed
-    return {"summary": final_text, "_raw_final_message": _stringify_final_message(result)}
+    fallback: dict[str, Any] = {
+        "summary": final_text,
+        "_raw_final_message": _stringify_final_message(result),
+    }
+    salvaged = _salvage_final_message_payload(final_text)
+    if salvaged is not None:
+        # Keep the raw-message evidence beside the recovered payload:
+        # consumer-side recoveries (interface_designer._recover_interfaces_from_raw)
+        # gate on the ``_raw_final_message`` marker, and the salvaged keys win
+        # so the payload's own structured summary survives the merge.
+        return {**fallback, **salvaged}
+    return fallback
+
+
+def _salvage_final_message_payload(text: str) -> dict[str, Any] | None:
+    """Last text-based recovery for prefixes no candidate rule can unwrap.
+
+    A reasoning prefix with an unrecognized marker leaves every
+    ``_json_candidates`` rule empty-handed even though the answer's payload
+    is a complete object. The quote-aware scanner only keeps objects that
+    still parse, and the intended payload is the last one: a root object
+    closes after its own nested fragments, and model answers put the payload
+    at the end, after any reasoning echoes.
+    """
+
+    objects = salvage_json_objects(text)
+    if not objects:
+        return None
+    return objects[-1]
 
 
 def parse_json_payload(text: str) -> dict[str, Any] | None:
-    current = (text or "").strip()
+    current = _strip_leading_reasoning_blocks((text or "").strip())
     for _ in range(3):
         if not current:
             return None
@@ -172,6 +200,68 @@ def parse_json_payload(text: str) -> dict[str, Any] | None:
             return None
         current = next_string
     return None
+
+
+# Reasoning-channel openers some gateways leak into the final message as raw
+# text (observed on the 2026-09-22 serial run: a think block rendered as
+# ``&&!...&&!`` around the answer). It is not natural prose, so a leading run
+# of marker-bounded blocks can be dropped wholesale before candidate
+# extraction.
+THINK_TEXT_MARKER = "&&!"
+
+
+def text_from_raw_dump(raw_text: str) -> str:
+    """Unwrap the escaped message dump so the scanners can see its braces.
+
+    ``_stringify_final_message`` stores a JSON-encoded debug dump; the
+    payload JSON inside it is escaped into a string value that the
+    quote-aware scanners would skip. Decode it first and return the
+    assistant content (string or text-block list) when possible, falling
+    back to the raw dump unchanged.
+    """
+
+    try:
+        dumped = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return raw_text
+    if not isinstance(dumped, dict):
+        return raw_text
+    content = dumped.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text)
+            elif isinstance(block, str) and block.strip():
+                texts.append(block)
+        if texts:
+            return "\n".join(texts)
+    return raw_text
+
+
+def _strip_leading_reasoning_blocks(text: str) -> str:
+    """Drop leading reasoning-channel blocks the gateway leaks as raw text.
+
+    The 2026-09-22 serial run's repair turn answered through a gateway that
+    renders its think block with ``&&!`` delimiters: the final message was a
+    reasoning region carrying an ``import { describe, ... }`` snippet, a
+    closing ``&&!``, then the complete manifest. The brace-span candidate
+    then starts at the snippet's ``{`` and never parses. An unmatched opener
+    leaves the text alone because the block boundary is unknown, and any
+    later marker inside the payload is never touched.
+    """
+
+    current = text.strip()
+    while current.startswith(THINK_TEXT_MARKER):
+        end = current.find(THINK_TEXT_MARKER, len(THINK_TEXT_MARKER))
+        if end == -1:
+            return current
+        current = current[end + len(THINK_TEXT_MARKER) :].strip()
+    return current
 
 
 def _loads_candidate(candidate: str) -> dict[str, Any] | str | None:
