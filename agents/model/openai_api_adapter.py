@@ -77,9 +77,9 @@ _PROBE_ROUNDS_PER_ATTEMPT = 3
 # Modes (ARC_MODEL_STREAM_TRANSPORT):
 #   stream (default) - first attempt already streams; a provider that rejects
 #                      the streamed request with a capability-proof 4xx
-#                      (400/404/405/415/422) permanently falls back to plain
-#                      non-streaming for the process (cached per endpoint),
-#                      without consuming the retry budget.
+#                      permanently falls back to plain non-streaming for the
+#                      process (cached per endpoint), without consuming the
+#                      retry budget.
 #   retry            - first attempt stays non-streaming; only retries after a
 #                      connection-class failure switch transport (the original
 #                      PR #44 behaviour, useful for providers whose streaming
@@ -301,7 +301,7 @@ def _has_stream_chunk_timeout_type(exc: BaseException | None) -> bool:
 
 # Recorded reasons for falling back from the streamed to the plain transport
 # (the "when to drop streaming" decisions, observable on ModelCallOutcome).
-FALLBACK_CLIENT_ERROR = "client_error"  # the provider answered the streamed request with 4xx
+FALLBACK_CLIENT_ERROR = "client_error"  # the provider answered the streamed request with a capability-proof 4xx
 FALLBACK_CHUNK_TIMEOUT = "chunk_timeout"  # the streamed attempt stalled between SSE chunks
 FALLBACK_CONNECTION_FAILURE = "connection_failure"  # a connection-class failure alternated transports
 
@@ -1157,12 +1157,12 @@ async def acall_model_with_retries(
     zero bytes while the model thinks, which gateways with an idle timeout
     (observed ~120s) drop mid generation, while SSE chunks keep the connection
     alive. A streamed attempt answered by a capability-proof client error
-    (400/404/405/415/422: the provider rejects the streamed request shape)
-    marks the endpoint streaming-unsupported for the whole process and
-    immediately re-attempts plain, without consuming the retry budget. Auth
-    (401/403) and transient (408/409/429) statuses are not streaming evidence:
-    they fall through to the generic classification — auth fails fast,
-    transients retry on the streamed transport with ``Retry-After`` honored.
+    (the ``_STREAMING_CAPABILITY_STATUS_CODES`` subset of 4xx) marks the
+    endpoint streaming-unsupported for the whole process and immediately
+    re-attempts plain, without consuming the retry budget. Auth and transient
+    statuses are not streaming evidence: they fall through to the generic
+    classification — auth fails fast, transients retry on the streamed
+    transport with ``Retry-After`` honored.
     Without ``stream_first`` (mode ``retry``) the first attempt stays
     plain and only a connection-class failure switches transport; transports
     alternate on further connection failures and any non-connection error
@@ -1218,16 +1218,14 @@ async def acall_model_with_retries(
         try:
             result = await _await_if_needed(attempt())
         except Exception as exc:
-            if stream_retry and _is_client_error(exc):
-                # The provider rejected the streamed request with a
-                # capability-proof status (see _is_client_error): not
-                # transient, and not the plain transport's fault. Switch the
-                # endpoint to plain for the rest of the process and re-attempt
-                # immediately without spending the retry budget. Auth and
-                # transient 4xx statuses are deliberately not caught here —
-                # they fall through to the generic classification below, so a
-                # throttled streamed call keeps its Retry-After/quota handling
-                # instead of bypassing it with an extra plain request.
+            if stream_retry and _is_streaming_capability_rejection(exc):
+                # The provider rejected the streamed request itself with a
+                # capability-proof status: not transient, and not the plain
+                # transport's fault. Switch the endpoint to plain for the rest
+                # of the process and re-attempt immediately without spending
+                # the retry budget. Auth/transient 4xx statuses are not caught
+                # here (see _STREAMING_CAPABILITY_STATUS_CODES): they fall
+                # through to the generic classification below.
                 _mark_streaming_unsupported(model, base_url)
                 fallbacks.append(
                     StreamFallback(reason=FALLBACK_CLIENT_ERROR, attempt=attempt_count)
@@ -1614,16 +1612,8 @@ def _is_connection_failure(exc: Exception) -> bool:
 _STREAMING_CAPABILITY_STATUS_CODES = frozenset({400, 404, 405, 415, 422})
 
 
-def _is_client_error(exc: Exception) -> bool:
-    """Whether the streamed failure proves streaming is unsupported (4xx).
-
-    Used on the streamed path only, and narrowed to the capability-proof
-    subset of 4xx (request-shape/route rejections). Auth (401/403) and
-    transient (408/409/429) statuses are NOT streaming evidence: they must
-    fall through to the generic classification — auth fails fast, transients
-    retry on the streamed transport with Retry-After honored — instead of
-    poisoning this capability mark for the TTL.
-    """
+def _is_streaming_capability_rejection(exc: Exception) -> bool:
+    """Whether the streamed failure proves streaming is unsupported (4xx subset)."""
 
     status_code = getattr(exc, "status_code", None)
     return isinstance(status_code, int) and status_code in _STREAMING_CAPABILITY_STATUS_CODES
