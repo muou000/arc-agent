@@ -30,6 +30,10 @@ def test_payload_declares_test_manifest_rejects_unparseable_payloads() -> None:
     # Declared but not a list: nothing parseable was answered.
     assert payload_declares_test_manifest({"tests": "I deleted the tests."}) is False
     assert payload_declares_test_manifest({"tests": None}) is False
+    # A declared list whose items all fail to parse as test entries is
+    # parse damage, not a decision to return zero tests (#172 boundary).
+    assert payload_declares_test_manifest({"tests": ["junk"]}) is False
+    assert payload_declares_test_manifest({"tests": [{"foo": 1}]}) is False
 
 
 def test_normalize_and_declare_agree_on_the_boundary() -> None:
@@ -40,9 +44,11 @@ def test_normalize_and_declare_agree_on_the_boundary() -> None:
     declared_empty = {"tests": []}
     undeclared = {"summary": "gibberish", "_raw_final_message": "..."}
     malformed = {"tests": "nope"}
+    junk_items = {"tests": ["junk", {"foo": 1}]}
 
-    for payload in (declared_empty, undeclared, malformed):
+    for payload in (declared_empty, undeclared, malformed, junk_items):
         assert normalize_test_manifest_payload(payload) == []
     assert payload_declares_test_manifest(declared_empty) is True
     assert payload_declares_test_manifest(undeclared) is False
     assert payload_declares_test_manifest(malformed) is False
+    assert payload_declares_test_manifest(junk_items) is False
