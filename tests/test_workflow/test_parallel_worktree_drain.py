@@ -936,6 +936,69 @@ def test_auto_tdd_retry_releases_blocked_dependents(
     assert state["node_states"]["RB"] == NODE_UNSEEN
 
 
+def test_auto_tdd_retry_reprompt_carries_previous_attempt_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry reprompt must quote the failed attempt's objective numbers
+    (issue #219): model calls (≈ steps), read-only calls, run_tests calls and
+    the zero-writes fact, aggregated from the per-call event streams that
+    survive even a GraphRecursionError crash (which skips the tdd_handoff
+    write). The recorded cursor must fence the attempt so a later auto retry
+    (resume after the retry failed again) measures only the newest one.
+    """
+    from core import sessions
+
+    manager = _make_parallel_manager(tmp_path)
+    state = _blocked_state()
+    events_path = Path(manager.workspace_path) / ".arc" / "runner-events.jsonl"
+    manager.runtime.paths = SimpleNamespace(runner_events_path=events_path)
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _row(record: dict[str, Any]) -> str:
+        return json.dumps({"timestamp": "2026-09-23 06:00:00", **record}) + "\n"
+
+    rows = [
+        {"type": "llm_usage", "node_id": "RA", "phase": "IMPLEMENT"},
+        {"type": "llm_usage", "node_id": "RA", "phase": "IMPLEMENT"},
+        {"type": "llm_usage", "node_id": "RA", "phase": "IMPLEMENT"},
+        {"type": "tool_usage", "node_id": "RA", "phase": "IMPLEMENT", "tool": "grep", "status": "ok"},
+        {"type": "tool_usage", "node_id": "RA", "phase": "IMPLEMENT", "tool": "grep", "status": "ok"},
+        {"type": "tool_usage", "node_id": "RA", "phase": "IMPLEMENT", "tool": "run_tests", "status": "ok"},
+        {"type": "tool_usage", "node_id": "RA", "phase": "IMPLEMENT", "tool": "write_file", "status": "blocked"},
+        {
+            "type": "requirement_state",
+            "node_id": "RA",
+            "phase": "test",
+            "status": "failed",
+            "message": "Unit: sessionService failed",
+        },
+    ]
+    events_path.write_text("".join(_row(row) for row in rows), encoding="utf-8")
+
+    assert asyncio.run(manager._prepare_auto_tdd_retry(state)) == ["RA"]
+
+    summary = sessions.load_node_session("RA")["recent_failure_summary"]
+    assert "3 model calls" in summary
+    assert "4 tool calls" in summary
+    assert "2 read-only" in summary
+    assert "1 run_tests call" in summary
+    assert "NO successful file edits" in summary
+    cursor = sessions.load_node_session("RA")["tdd_retry_events_cursor"]
+    assert cursor == len(rows)
+
+    # A later auto retry (resume after the retry failed again) measures only
+    # the newest attempt: the cursor fences attempt 1's events.
+    state["node_states"]["RA"] = NODE_FAILED
+    next(task for task in state["tasks"] if task["task_id"] == "RA:IMPLEMENT")["status"] = TASK_FAILED
+    with events_path.open("a", encoding="utf-8") as fh:
+        fh.write(_row({"type": "llm_usage", "node_id": "RA", "phase": "IMPLEMENT"}))
+    assert asyncio.run(manager._prepare_auto_tdd_retry(state)) == ["RA"]
+    second = sessions.load_node_session("RA")["recent_failure_summary"]
+    assert "1 model call," in second
+    assert "3 model calls" not in second
+    assert sessions.load_node_session("RA")["tdd_retry_events_cursor"] == len(rows) + 1
+
+
 def test_subtree_tasks_share_one_worktree_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
