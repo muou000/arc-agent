@@ -10,18 +10,8 @@ semantic content and is cache-amplified on every round of a node session.
 
 from __future__ import annotations
 
-import json
-
 from agents.context.prompts.common import task_context_block
-
-
-def _snapshot_json(block: str, *, blank_line_after_header: bool) -> str:
-    header = "### Requirement Snapshot\n"
-    if blank_line_after_header:
-        header += "\n"
-    start = block.index(header) + len(header) + len("```json\n")
-    end = block.index("\n```", start)
-    return block[start:end]
+from tests.helpers.snapshot_block import assert_compact_requirement_snapshot
 
 
 def test_requirement_snapshot_block_is_compact_json() -> None:
@@ -43,10 +33,4 @@ def test_requirement_snapshot_block_is_compact_json() -> None:
         requirement_data=requirement_data,
     )
 
-    json_text = _snapshot_json(block, blank_line_after_header=True)
-    # Semantics are unchanged: the block still round-trips to the full row.
-    assert json.loads(json_text) == requirement_data
-    # Format is compact: no pretty-print newlines, no separator padding.
-    assert "\n" not in json_text
-    assert ", " not in json_text
-    assert ": " not in json_text
+    assert_compact_requirement_snapshot(block, requirement_data)
