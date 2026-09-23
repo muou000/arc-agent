@@ -76,6 +76,13 @@ from core.merge_arbitration import (
     read_workspace_file,
 )
 from core.path_safety import validate_clean_target
+from core.scheduling_switches import (
+    ARC_AFFINITY_DEPTH,
+    ARC_AUTO_TDD_RETRY,
+    ARC_DESIGN_GATE_PIPELINE,
+    ARC_MAX_CONCURRENT_TASKS,
+    ARC_NODE_WORKTREES,
+)
 from core.tdd_retry import build_tdd_reprompt, scan_test_failures
 from core.visual_analysis import precompute_visual_references, visual_precompute_enabled
 from core.worktree import (
@@ -133,7 +140,7 @@ MAX_PARALLEL_TASKS = 8
 
 
 def _worktrees_enabled() -> bool:
-    raw = os.environ.get("ARC_NODE_WORKTREES", "").strip().lower()
+    raw = os.environ.get(ARC_NODE_WORKTREES, "").strip().lower()
     # Parallel mode is the default; only an explicit falsy value disables it.
     return raw not in {"0", "false", "no", "off"}
 
@@ -152,7 +159,7 @@ def _affinity_depth() -> int:
     a depth past the tree's height is the sanctioned every-subtree-its-own-
     group mode (no worktree sharing), monotonic and literal.
     """
-    raw = os.environ.get("ARC_AFFINITY_DEPTH", "").strip()
+    raw = os.environ.get(ARC_AFFINITY_DEPTH, "").strip()
     try:
         depth = int(raw)
     except ValueError:
@@ -160,7 +167,7 @@ def _affinity_depth() -> int:
     return max(depth, 1)
 
 
-DESIGN_GATE_PIPELINE_ENV = "ARC_DESIGN_GATE_PIPELINE"
+DESIGN_GATE_PIPELINE_ENV = ARC_DESIGN_GATE_PIPELINE
 
 
 def _design_pipelining_enabled() -> bool:
@@ -738,7 +745,7 @@ class ARCWorkflowManager:
     def _max_concurrent_tasks(self) -> int:
         if not self._parallel_mode:
             return DEFAULT_MAX_CONCURRENT_TASKS
-        raw = os.environ.get("ARC_MAX_CONCURRENT_TASKS", "").strip()
+        raw = os.environ.get(ARC_MAX_CONCURRENT_TASKS, "").strip()
         try:
             value = int(raw)
         except ValueError:
@@ -1941,7 +1948,7 @@ class ARCWorkflowManager:
 
     @staticmethod
     def _auto_tdd_retry_enabled() -> bool:
-        return os.environ.get("ARC_AUTO_TDD_RETRY", "1").strip().lower() not in {"0", "false", "no", "off"}
+        return os.environ.get(ARC_AUTO_TDD_RETRY, "1").strip().lower() not in {"0", "false", "no", "off"}
 
     def _load_or_create_processing_queue(
         self,
