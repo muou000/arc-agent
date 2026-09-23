@@ -10,7 +10,10 @@ def section(title: str, lines: list[str]) -> str:
 
 
 def json_block(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    # Compact on purpose (#211): the snapshot blocks are model-facing prompt
+    # payload, and pretty-printing was measured as ~199 tok of pure format
+    # cost on a dense requirement leaf (#188), cache-amplified every round.
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def compiler_background() -> str:
