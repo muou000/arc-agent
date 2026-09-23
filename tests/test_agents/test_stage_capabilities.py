@@ -240,6 +240,24 @@ def test_common_prompt_delete_statement_matches_table() -> None:
     assert capability_for("implementation", "delete", "/workspace/tests/x.test.ts").allowed
 
 
+def test_common_prompt_arc_tdd_runs_readonly_exception_matches_runtime() -> None:
+    """Issue #175: the blanket `.arc` file-tool ban must name the one runtime
+    carve-out. ``factory._build_filesystem_permissions`` already allows
+    read-only reads under ``.arc/tdd_runs`` (pinned in test_failure_digest),
+    and the ``run_tests`` result points the model at that persisted log via
+    ``ARC_RUN_OUTPUT_LOG`` — but if the policy text keeps the ban absolute,
+    the model treats the most direct failure evidence as forbidden and burns
+    budget re-running tests to see output it already has."""
+    policy = common_prompts.workspace_tool_policy()
+    # Wording anchors line up with the run_tests result text ("complete raw
+    # output", "instead of re-running the tests") so the pointer and the
+    # permission it relies on are recognizably the same contract.
+    assert "The only `.arc` exception is read-only: when a `run_tests` result points at `ARC_RUN_OUTPUT_LOG`" in policy
+    assert "`read_file` that exact `.arc/tdd_runs/`" in policy
+    assert "instead of re-running the tests" in policy
+    assert "every other `.arc` path and every write stays denied" in policy
+
+
 def test_test_generator_prompt_boundary_matches_table() -> None:
     prompt = test_generator_prompts.get_system_prompt()
     assert "Do not implement or edit product code, run tests/builds" in prompt
