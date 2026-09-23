@@ -25,7 +25,11 @@ from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 
 from agents.model.usage_capture import current_usage_context
-from agents.runtime.stage_discipline import BLOCKED_RESULT_PREFIX, _discipline_path
+from agents.runtime.stage_discipline import (
+    BLOCKED_RESULT_PREFIX,
+    _discipline_path,
+    _tool_result_failed,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -129,9 +133,15 @@ def _record(request: ToolCallRequest, result: ToolMessage | Any) -> None:
 
 
 def _result_status(result: ToolMessage | Any) -> str:
-    if isinstance(result, ToolMessage) and result.status == "error":
-        content = str(getattr(result, "content", "") or "")
-        return "blocked" if content.startswith(BLOCKED_RESULT_PREFIX) else "error"
+    content = str(getattr(result, "content", "") or "")
+    if content.startswith(BLOCKED_RESULT_PREFIX):
+        return "blocked"
+    # Results that self-report failure in their rendered text (an exit-code
+    # segment the tool wrote itself) share the discipline's failure predicate,
+    # so the observation cannot call a mixed-exit-code build "ok" while the
+    # write lock treats it as failed.
+    if _tool_result_failed(result):
+        return "error"
     return "ok"
 
 
