@@ -452,9 +452,12 @@ def test_environment_failure_stops_the_tdd_loop_immediately(tmp_project_dir: Pat
     assert "environmental reason" in first_call_messages
     assert "repair" in first_call_messages
     # The baseline handoff is the first report the first session sees; it
-    # must name the install_dependencies path too, never negate it (#174).
+    # must name the install_dependencies path too, never negate it (#174),
+    # and carry the same install-failure escalation clause as the executor
+    # report so both copies of the contract stay interchangeable.
     assert "install_dependencies" in first_call_messages
     assert "must be installed, end your turn" not in first_call_messages
+    assert "blocker only when the install itself fails" in first_call_messages
     # The first failing run offers the repair-and-revalidate contract; the
     # second (still environmental) run closes the layer for good. The two
     # status headers must be unambiguous about which state the layer is in.
