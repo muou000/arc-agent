@@ -1177,7 +1177,9 @@ class WorkflowPhaseRunner:
                     "applies: make one file edit that fixes the root cause (create a missing local "
                     "module, correct a wrong relative import, add a missing npm script) and call "
                     "run_tests once to re-validate. If the failure names a package that must be "
-                    "installed, end your turn with a short report naming the missing dependency.\n"
+                    "installed, repair it with one `install_dependencies(package=..., "
+                    "target=...'backend'|'frontend')` call and re-run run_tests to re-validate; "
+                    "report the package as a blocker only when the install itself fails.\n"
                 )
             elif baseline_env_failure is None and all(
                 state == "green" for state in executor.file_states(ordered_type).values()

@@ -717,9 +717,10 @@ class TddTestExecutor:
                 "- First decide the root cause. If it is fixable with a file edit (create a "
                 "missing local module, correct a wrong relative import, add a missing npm "
                 "script), make that edit and call run_tests once more to re-validate.\n"
-                "- If instead it names a package that must be installed, you cannot fix it "
-                "mid-run: end your turn with a short report naming the missing dependency "
-                "and do not call run_tests again.\n"
+                "- If instead it names a package that must be installed, repair it with one "
+                "`install_dependencies(package=..., target=...'backend'|'frontend')` call and "
+                "call run_tests once more to re-validate; report the package as a blocker only "
+                "when the install itself fails.\n"
             )
         return result
 
