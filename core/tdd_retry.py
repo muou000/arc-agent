@@ -25,13 +25,17 @@ from pathlib import Path
 #: write surface (``_FILE_WRITE_TOOLS`` / ``_ADDITIVE_FILE_WRITE_TOOLS`` plus
 #: the delete channel) — a missed write tool would make the "zero writes"
 #: fact lie to the retry. Pinned against the discipline in
-#: ``tests/test_agents/test_stage_discipline.py``.
+#: ``tests/test_agents/test_stage_discipline.py``. The read-only names are
+#: the pass-through filesystem tools: ``ls`` is deepagents' builtin listing
+#: tool, the rest are ARC's own mounts.
 READ_ONLY_TOOL_NAMES = frozenset({"read_file", "grep", "glob", "ls"})
 MUTATING_TOOL_NAMES = frozenset({"write_file", "edit_file", "append_file", "delete"})
 TEST_RUN_TOOL_NAMES = frozenset({"run_tests"})
 
 #: ``tool_usage``/``llm_usage`` events carry the phase of the session that
-#: made the call; the implement phase's sessions report this value.
+#: made the call; the implement phase's sessions report this value. Kept as a
+#: literal (not imported from ``core.queue_state``) so this module stays
+#: standard-library only.
 IMPLEMENT_PHASE = "IMPLEMENT"
 
 
