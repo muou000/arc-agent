@@ -21,9 +21,12 @@ Deliberate caveats kept honest in the measurements:
 - one node per test invocation (the requirement tables of two seeded trees
   share ids like ``REQ-2`` and ``store_requirement_tree`` replaces the whole
   table, so a shared store would mix requirements across blocks);
-- the workspace under test is empty, so the denominator lacks the scaffold
-  files, workspace map, and interface cards a real node sees; measured shares
-  are upper bounds;
+- the denominator is smaller than a real pass in three ways, so measured
+  shares are upper bounds: the workspace under test is empty (no scaffold
+  files, workspace map, or interface cards), the system prompts omit the
+  stage skill activation section the adapters append per run, and
+  TestGenerator/TDD receive an empty ``interface_contract`` where production
+  passes the current contract;
 - the visual reference is attached through the production path
   (``update_requirement_fields``), which stringifies dict payloads on
   persist, so the focus digest's ``<visual_reference>`` block stays empty and
