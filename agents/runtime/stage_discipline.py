@@ -48,6 +48,18 @@ MAX_NON_LEAF_DESIGN_WRITES = _MAX_NON_LEAF_DESIGN_WRITES
 # shape-only skeleton definition plus the mutation sniffing below.
 MAX_APPEND_LINES = 80
 MAX_APPENDS_PER_FILE = 3
+
+
+def append_line_limit_message(received_lines: int) -> str:
+    """One rejection message for oversized appends, shared by the middleware
+    and the ``append_file`` tool so the two cannot drift apart."""
+
+    return (
+        f"append_file accepts at most {MAX_APPEND_LINES} lines per call; received {received_lines}. "
+        "If the next section does not fit in one compact append, it is not skeleton "
+        "material - put the behavior in your stage response for TestDrivenDeveloper "
+        "instead of extending this file."
+    )
 _MAX_READ_LIMIT = 200
 # Fresh overlapping re-reads allowed per path before the block returns. The
 # hard block exists for the run7 loop (50 consecutive offset probes), but the
@@ -336,10 +348,10 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         """Validate the DESIGN-stage additive continuation tool.
 
         Stage availability is the capability table's verdict (enforced
-        pre-flight in ``_validate_tool_call``). The filesystem tool checks
-        the real file length; this middleware keeps ownership and per-pass
-        policy here so appending cannot bypass claims, write-count limits,
-        or the observability used by InterfaceDesigner.
+        pre-flight in ``_validate_tool_call``). The filesystem tool owns the
+        existence and permission checks; this middleware keeps ownership and
+        per-pass policy here so appending cannot bypass claims, write-count
+        limits, or the observability used by InterfaceDesigner.
         """
 
         path = _discipline_path(args)
@@ -358,12 +370,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return violation
         line_count = len(content.splitlines())
         if line_count > MAX_APPEND_LINES:
-            return (
-                f"append_file accepts at most {MAX_APPEND_LINES} lines per chunk; received {line_count}. "
-                "If the next section does not fit in one compact append, it is not skeleton "
-                "material - put the behavior in your stage response for TestDrivenDeveloper "
-                "instead of extending this file."
-            )
+            return append_line_limit_message(line_count)
         if import_block := self._validate_test_imports(path, content):
             return import_block
         if budget_block := self._reserve_design_write(path):

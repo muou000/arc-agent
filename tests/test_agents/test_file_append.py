@@ -8,6 +8,7 @@ from pathlib import Path
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
+from agents.runtime.stage_discipline import MAX_APPEND_LINES, MAX_APPENDS_PER_FILE
 from agents.tools.file_append import APPEND_FILE_TOOL_DESCRIPTION, build_append_file_tool
 from tests.helpers.faux import FauxChatModel, faux_text, faux_tool_call
 
@@ -25,7 +26,7 @@ def test_append_requires_an_initial_skeleton(tmp_path: Path) -> None:
     assert not (tmp_path / "src" / "missing.ts").exists()
 
 
-def test_append_adds_lines_without_a_per_file_ceiling(tmp_path: Path) -> None:
+def test_append_adds_lines_to_an_existing_file(tmp_path: Path) -> None:
     target = tmp_path / "src" / "page.tsx"
     target.parent.mkdir(parents=True)
     target.write_text("export function Page() {\n", encoding="utf-8")
@@ -84,8 +85,8 @@ def test_tool_description_matches_design_only_boundary() -> None:
     assert "cohesive" not in APPEND_FILE_TOOL_DESCRIPTION
     assert "not a skeleton" in APPEND_FILE_TOOL_DESCRIPTION
     assert "stage response" in APPEND_FILE_TOOL_DESCRIPTION
-    assert "80 lines per call" in APPEND_FILE_TOOL_DESCRIPTION
-    assert "3 appends per file" in APPEND_FILE_TOOL_DESCRIPTION
+    assert f"{MAX_APPEND_LINES} lines per call" in APPEND_FILE_TOOL_DESCRIPTION
+    assert f"{MAX_APPENDS_PER_FILE} appends per file" in APPEND_FILE_TOOL_DESCRIPTION
 
 
 def test_interface_design_agent_exposes_append_file(tmp_path: Path) -> None:

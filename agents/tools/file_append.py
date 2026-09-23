@@ -1,4 +1,4 @@
-"""Small additive continuation for files DESIGN has already touched.
+"""Small additive continuation tool for the DESIGN stage.
 
 DESIGN materializes one compact, shape-only skeleton per file in a single
 ``write_file`` (issue #158 / ADR 0005: a skeleton that does not fit one
@@ -13,15 +13,11 @@ exists for the two cases that remain after that rule:
   this stage already wrote, since a second ``write_file``/``edit_file`` on
   a written path is locked.
 
-Enforcement split (deliberately not duplicated):
-
-- ``StageDisciplineMiddleware`` owns *ownership* policy. It treats
-  ``append_file`` as a write for claims, bookkeeping and the ``materialized
-  paths`` ground truth, keeps the repeated-write lock on ``write_file``/
-  ``edit_file`` only, and enforces the per-pass append budget and the
-  content sniffing.
-- This tool owns the per-call line backstop (the only place that sees the
-  raw call) and reuses the agent's own write-permission rules.
+Enforcement split: ``StageDisciplineMiddleware`` owns the ownership policy
+(claims, write budget, per-pass append budget, content sniffing — it sees
+the same raw call), while this tool owns the filesystem reality: existence,
+the agent's write-permission rules, and the per-call line backstop it
+reports on.
 """
 
 from __future__ import annotations
@@ -32,12 +28,12 @@ from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
 
-from agents.runtime.stage_discipline import MAX_APPEND_LINES, MAX_APPENDS_PER_FILE
+from agents.runtime.stage_discipline import MAX_APPEND_LINES, MAX_APPENDS_PER_FILE, append_line_limit_message
 from core.file_claims import normalize_claim_path
 
 _LOGGER = logging.getLogger(__name__)
 
-APPEND_FILE_TOOL_DESCRIPTION = f"""Append a few lines to the end of a file you already touched, without re-emitting the file.
+APPEND_FILE_TOOL_DESCRIPTION = f"""Append a few lines to the end of an existing file, without re-emitting the file.
 
 Usage:
 - Use this tool only for small additive continuations: wiring your node-owned module into the template's shared runtime surfaces (whose whole-file `write_file` is rejected), or adding a small piece such as a route row or a table declaration to a file you already wrote this stage. A file you already wrote cannot be rewritten (`write_file`/`edit_file` on it are blocked), so appending is the sanctioned way to extend it.
@@ -97,12 +93,7 @@ def build_append_file_tool(
 
         appended_lines = len(body.splitlines())
         if appended_lines > MAX_APPEND_LINES:
-            return (
-                f"Error: append_file accepts at most {MAX_APPEND_LINES} lines per chunk; received {appended_lines}. "
-                "If the next section does not fit in one compact append, it is not skeleton "
-                "material - put the behavior in your stage response for TestDrivenDeveloper "
-                "instead of extending this file."
-            )
+            return f"Error: {append_line_limit_message(appended_lines)}"
 
         try:
             with path.open("a", encoding="utf-8") as handle:
