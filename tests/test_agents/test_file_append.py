@@ -8,7 +8,11 @@ from pathlib import Path
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.factory import build_stage_agent
 from agents.runtime.runners import ainvoke_stage_agent
-from agents.runtime.stage_discipline import MAX_APPEND_LINES, MAX_APPENDS_PER_FILE
+from agents.runtime.stage_discipline import (
+    MAX_APPEND_LINES,
+    MAX_APPENDS_PER_FILE,
+    append_line_limit_message,
+)
 from agents.tools.file_append import APPEND_FILE_TOOL_DESCRIPTION, build_append_file_tool
 from tests.helpers.faux import FauxChatModel, faux_text, faux_tool_call
 
@@ -68,10 +72,15 @@ def test_append_rejects_oversized_chunks_and_path_escape(tmp_path: Path) -> None
     escaped = _invoke(tool, file_path="/workspace/../outside.ts", content="x")
 
     assert "Appended" not in oversized
-    assert "at most 80" in oversized
-    # The rejection points at the #158 escape hatch, not at chunk-and-append.
-    assert "not skeleton material" in oversized
-    assert "Split the next cohesive" not in oversized
+    # The rejection must be exactly the single-sourced template plus the
+    # load-bearing "Error: " prefix (``_tool_result_failed`` classifies the
+    # tool's plain-string results by that prefix), so the tool and the
+    # middleware cannot drift apart.
+    assert oversized == f"Error: {append_line_limit_message(81)}"
+    # The shared template itself points at the #158 escape hatch, not at
+    # chunk-and-append.
+    assert "not skeleton material" in append_line_limit_message(1)
+    assert "Split the next cohesive" not in append_line_limit_message(1)
     assert "Appended 1 line(s)" in safe_name_result
     assert "traversal" in escaped or "outside the project root" in escaped
 

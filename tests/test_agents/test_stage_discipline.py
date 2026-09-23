@@ -23,7 +23,7 @@ from typing import Any
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 
-from agents.runtime.stage_discipline import StageDisciplineMiddleware
+from agents.runtime.stage_discipline import BLOCKED_RESULT_PREFIX, StageDisciplineMiddleware, append_line_limit_message
 
 
 def make_request(
@@ -972,10 +972,11 @@ def test_interface_design_allows_bounded_append_continuations() -> None:
         make("interface_design"),
         make_request("append_file", {"file_path": "/workspace/src/other.ts", "content": "x\n" * 81}),
     )
-    assert oversized.status == "error" and "at most 80 lines" in oversized.content
-    # Issue #158: the rejection points at the escape hatch instead of teaching
-    # "split into another append" (the chunk-and-rework loop generator).
-    assert "stage response for TestDrivenDeveloper" in oversized.content
+    # Issue #161: the middleware rejection is exactly the single-sourced
+    # template under the marker prefix the tool-usage "blocked" status and
+    # the failure classifier rely on, so it cannot drift from the tool's.
+    assert oversized.status == "error"
+    assert oversized.content == f"{BLOCKED_RESULT_PREFIX} {append_line_limit_message(81)}"
 
     blocked = run(
         make("implementation"),
