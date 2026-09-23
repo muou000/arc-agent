@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -505,6 +506,13 @@ def test_generator_repair_message_carries_requirement_snapshot(
     assert "### Requirement Snapshot" in message
     assert '"Login"' in message
     assert "user can log in and see their session" in message
+    # #211: the repair snapshot is the same compact block the first pass
+    # embeds (repair/first-pass parity), not a pretty-printed variant.
+    json_text = message.split("### Requirement Snapshot\n```json\n", 1)[1].split("\n```", 1)[0]
+    assert json.loads(json_text) == requirement_data
+    assert "\n" not in json_text
+    assert ", " not in json_text
+    assert ": " not in json_text
 
 
 # -- planner removal ------------------------------------------------------------
