@@ -21,6 +21,7 @@ from agents.runtime.tool_usage import (
     record_tool_usage,
     set_tool_usage_sink,
 )
+from tests.helpers.tool_result_texts import ALL_ZERO_BUILD_RESULT, MIXED_BUILD_RESULT
 
 
 def make_request(
@@ -127,6 +128,57 @@ def test_error_result_is_recorded_as_error() -> None:
 
     assert records[0].status == "error"
     assert records[0].result_chars == len("Error: file not found")
+
+
+def test_string_content_with_mixed_exit_code_is_recorded_as_error() -> None:
+    # run_build's ToolMessage carries the two concatenated build results with
+    # no error status; the observation must apply the same failure predicate
+    # as the write-lock discipline instead of reading "ok" off the absence
+    # of a message status.
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    middleware.wrap_tool_call(
+        make_request("run_build"),
+        lambda request: ToolMessage(content=MIXED_BUILD_RESULT, name="run_build", tool_call_id=request.tool_call["id"]),
+    )
+
+    assert records[0].tool == "run_build"
+    assert records[0].status == "error"
+    assert records[0].result_chars == len(MIXED_BUILD_RESULT)
+
+
+def test_string_content_with_all_zero_exit_codes_is_recorded_as_ok() -> None:
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    middleware.wrap_tool_call(
+        make_request("run_build"),
+        lambda request: ToolMessage(
+            content=ALL_ZERO_BUILD_RESULT, name="run_build", tool_call_id=request.tool_call["id"]
+        ),
+    )
+
+    assert records[0].status == "ok"
+
+
+def test_string_content_without_exit_code_is_recorded_as_ok() -> None:
+    # Fail-open: text with no parseable exit-code segment keeps the old
+    # ok-by-default reading (only Error-prefixed text reads as failed).
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    middleware.wrap_tool_call(
+        make_request("run_build"),
+        lambda request: ToolMessage(
+            content="Command timed out after 120.0 seconds.", name="run_build", tool_call_id=request.tool_call["id"]
+        ),
+    )
+
+    assert records[0].status == "ok"
 
 
 def test_missing_sink_is_a_noop() -> None:
