@@ -1,0 +1,61 @@
+Runner: Vitest
+Batch Test Type: Integration
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- backend/tests/authRoutes.test.js
+Backend Working Directory: D:\code\.arc-eval-214\candidate-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\candidate-rep001\frontend
+Backend Targets:
+- tests/authRoutes.test.js
+
+Exit Code: 1
+
+=== Backend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[46m RUN [49m[22m [36mv4.0.17 [39m[90mD:/code/.arc-eval-214/candidate-rep001/backend[39m
+
+ [31m❯[39m tests/authRoutes.test.js [2m([22m[2m12 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 936[2mms[22m[39m
+[31m     [31m×[31m returns 201 with a user payload and an httpOnly session cookie for a valid submission[39m[32m 119[2mms[22m[39m
+     [32m✓[39m restores the session through GET /api/auth/session with the cookie[32m 97[2mms[22m[39m
+     [32m✓[39m returns 400 with per-field error codes and no cookie for missing fields[32m 35[2mms[22m[39m
+     [32m✓[39m rejects an invalid username format with INVALID_USERNAME[32m 31[2mms[22m[39m
+     [32m✓[39m rejects a weak password with INVALID_PASSWORD[32m 34[2mms[22m[39m
+     [32m✓[39m rejects mismatched confirmation with PASSWORD_MISMATCH[32m 35[2mms[22m[39m
+     [32m✓[39m rejects a malformed email with INVALID_EMAIL[32m 31[2mms[22m[39m
+     [32m✓[39m rejects an unaccepted terms flag with TERMS_NOT_ACCEPTED[32m 33[2mms[22m[39m
+     [32m✓[39m returns 409 DUPLICATE_USERNAME for a repeat username and creates no session[32m 94[2mms[22m[39m
+     [32m✓[39m returns 409 DUPLICATE_EMAIL for a case-different repeat email[32m 93[2mms[22m[39m
+     [32m✓[39m reports no user without a cookie[32m 30[2mms[22m[39m
+     [32m✓[39m clears the session on logout so the session endpoint reports no user afterwards[32m 104[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m11 passed[39m[22m[90m (12)[39m
+[2m   Start at [22m 02:48:02
+[2m   Duration [22m 1.36s[2m (transform 32ms, setup 0ms, import 216ms, tests 936ms, environment 0ms)[22m
+
+
+STDERR:
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 1 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/authRoutes.test.js[2m > [22mPOST /api/auth/register (REQ-1-API-Auth)[2m > [22mreturns 201 with a user payload and an httpOnly session cookie for a valid submission
+[31m[1mAssertionError[22m: expected 'session_token=7120ca9d86486e7b5f32f64…' to contain 'httponly'[39m
+
+Expected: [32m"httponly"[39m
+Received: [31m"session_token=7120ca9d86486e7b5f32f64d3aa30b3d942f39b01ed9cd84bc95491af72eb158"[39m
+
+[36m [2m❯[22m tests/authRoutes.test.js:[2m59:34[22m[39m
+    [90m 57| [39m
+    [90m 58| [39m    [35mconst[39m cookie [33m=[39m [34mextractSessionCookie[39m(res)[33m;[39m
+    [90m 59| [39m    [34mexpect[39m(cookie[33m.[39m[34mtoLowerCase[39m())[33m.[39m[34mtoContain[39m([32m'httponly'[39m)[33m;[39m
+    [90m   | [39m                                 [31m^[39m
+    [90m 60| [39m  })[33m;[39m
+    [90m 61| [39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+
+

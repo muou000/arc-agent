@@ -1,0 +1,64 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/registerValidation.test.ts
+- frontend/tests/sessionContext.test.tsx
+- frontend/tests/registerApi.test.ts
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Frontend Targets:
+- tests/registerValidation.test.ts
+- tests/sessionContext.test.tsx
+- tests/registerApi.test.ts
+
+Exit Code: 1
+
+=== Frontend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/frontend[39m
+
+ [31m❯[39m tests/registerValidation.test.ts [2m([22m[2m13 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[32m 10[2mms[22m[39m
+     [32m✓[39m exposes the required ID types with the placeholder first[32m 1[2mms[22m[39m
+     [32m✓[39m exposes the required passenger types with the placeholder first[32m 0[2mms[22m[39m
+     [32m✓[39m includes +86 (default) and +84 in country codes[32m 1[2mms[22m[39m
+     [32m✓[39m scores empty/weak passwords 0[32m 0[2mms[22m[39m
+[31m     [31m×[31m scores 1-3 across increasing complexity within 0..3[39m[32m 3[2mms[22m[39m
+     [32m✓[39m accepts a fully valid form[32m 0[2mms[22m[39m
+     [32m✓[39m reports required-field errors in Chinese[32m 0[2mms[22m[39m
+     [32m✓[39m mirrors backend rules for invalid values[32m 0[2mms[22m[39m
+     [32m✓[39m rejects mismatched confirm password[32m 0[2mms[22m[39m
+     [32m✓[39m rejects weak passwords[32m 0[2mms[22m[39m
+     [32m✓[39m rejects placeholder dropdown selections[32m 0[2mms[22m[39m
+     [32m✓[39m requires the agreement checkbox[32m 0[2mms[22m[39m
+     [32m✓[39m validates the phone against the selected country code[32m 0[2mms[22m[39m
+ [32m✓[39m tests/registerApi.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m tests/sessionContext.test.tsx [2m([22m[2m5 tests[22m[2m)[22m[32m 238[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m2 passed[39m[22m[90m (3)[39m
+[2m      Tests [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m22 passed[39m[22m[90m (23)[39m
+[2m   Start at [22m 01:10:17
+[2m   Duration [22m 2.75s[2m (transform 155ms, setup 1.62s, import 304ms, tests 253ms, environment 4.21s)[22m
+
+
+STDERR:
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 1 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/registerValidation.test.ts[2m > [22mpasswordStrength (REQ-1-UI-ID-TYPES)[2m > [22mscores 1-3 across increasing complexity within 0..3
+[31m[1mAssertionError[22m: expected 2 to be less than 2[39m
+[36m [2m❯[22m tests/registerValidation.test.ts:[2m56:17[22m[39m
+    [90m 54|[39m     [35mconst[39m mid [33m=[39m [34mpasswordStrength[39m([32m'Abcdefgh1234'[39m)[33m;[39m
+    [90m 55|[39m     [35mconst[39m high [33m=[39m [34mpasswordStrength[39m([32m'Abcdefgh1234!'[39m)[33m;[39m
+    [90m 56|[39m     [34mexpect[39m(low)[33m.[39m[34mtoBeLessThan[39m(mid)[33m;[39m
+    [90m   |[39m                 [31m^[39m
+    [90m 57|[39m     [34mexpect[39m(mid)[33m.[39m[34mtoBeLessThan[39m(high)[33m;[39m
+    [90m 58|[39m     [34mexpect[39m([34mpasswordStrength[39m([32m'A'[39m[33m.[39m[34mrepeat[39m([34m30[39m)))[33m.[39m[34mtoBeLessThanOrEqual[39m([34m3[39m)[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+
+

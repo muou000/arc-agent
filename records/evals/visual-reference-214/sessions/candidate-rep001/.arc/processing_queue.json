@@ -1,0 +1,80 @@
+{
+  "root_id": "ROOT",
+  "tasks": [
+    {
+      "task_id": "ROOT:DESIGN",
+      "node_id": "ROOT",
+      "phase": "DESIGN",
+      "order": 0,
+      "status": "FAILED"
+    },
+    {
+      "task_id": "REQ-1:DESIGN",
+      "node_id": "REQ-1",
+      "phase": "DESIGN",
+      "order": 1,
+      "status": "COMPLETED"
+    },
+    {
+      "task_id": "REQ-1:IMPLEMENT",
+      "node_id": "REQ-1",
+      "phase": "IMPLEMENT",
+      "order": 2,
+      "status": "FAILED"
+    },
+    {
+      "task_id": "REQ-2:DESIGN",
+      "node_id": "REQ-2",
+      "phase": "DESIGN",
+      "order": 3,
+      "status": "BLOCKED"
+    },
+    {
+      "task_id": "REQ-2:IMPLEMENT",
+      "node_id": "REQ-2",
+      "phase": "IMPLEMENT",
+      "order": 4,
+      "status": "BLOCKED"
+    },
+    {
+      "task_id": "ROOT:IMPLEMENT",
+      "node_id": "ROOT",
+      "phase": "IMPLEMENT",
+      "order": 5,
+      "status": "FAILED"
+    }
+  ],
+  "node_states": {
+    "ROOT": "FAILED",
+    "REQ-1": "FAILED",
+    "REQ-2": "BLOCKED_BY_DEPENDENCY"
+  },
+  "node_design_done": {
+    "ROOT": false,
+    "REQ-1": true,
+    "REQ-2": false
+  },
+  "descendants": {
+    "ROOT": [
+      "REQ-1",
+      "REQ-2"
+    ]
+  },
+  "parents": {
+    "REQ-1": "ROOT",
+    "REQ-2": "ROOT"
+  },
+  "affinity": {
+    "ROOT": "ROOT",
+    "REQ-1": "REQ-1",
+    "REQ-2": "REQ-2"
+  },
+  "dependencies": {
+    "REQ-2": [
+      "REQ-1"
+    ]
+  },
+  "dropped_dependency_edges": [],
+  "last_task_id": "REQ-1:IMPLEMENT",
+  "recovered_interrupted_tasks": []
+}

@@ -1,0 +1,85 @@
+Runner: Vitest
+Batch Test Type: Integration
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- backend/tests/accountsRepository.test.js
+- backend/tests/authService.test.js
+- backend/tests/authRoutes.test.js
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Backend Targets:
+- tests/accountsRepository.test.js
+- tests/authService.test.js
+- tests/authRoutes.test.js
+
+Exit Code: 1
+
+=== Backend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/backend[39m
+
+ [31m❯[39m tests/accountsRepository.test.js [2m([22m[2m8 tests[22m[2m | [22m[31m7 failed[39m[2m)[22m[32m 188[2mms[22m[39m
+[31m     [31m×[31m creates an account with a session and returns no password hash[39m[32m 30[2mms[22m[39m
+[31m     [31m×[31m finds accounts by username case-insensitively[39m[32m 24[2mms[22m[39m
+[31m     [31m×[31m finds accounts by email ignoring case[39m[32m 21[2mms[22m[39m
+     [32m✓[39m returns null for unknown username or email[32m 21[2mms[22m[39m
+[31m     [31m×[31m rejects duplicate usernames case-insensitively[39m[32m 26[2mms[22m[39m
+[31m     [31m×[31m rejects duplicate emails case-insensitively[39m[32m 24[2mms[22m[39m
+[31m     [31m×[31m authenticates a session token and deletes the session[39m[32m 21[2mms[22m[39m
+[31m     [31m×[31m creates an additional session for an existing account[39m[32m 20[2mms[22m[39m
+ [31m❯[39m tests/authService.test.js [2m([22m[2m7 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 407[2mms[22m[39m
+     [32m✓[39m registers a valid account, creates a session and returns no secrets[32m 98[2mms[22m[39m
+     [32m✓[39m reports duplicate username without creating account or session[32m 92[2mms[22m[39m
+     [32m✓[39m reports duplicate email case-insensitively[32m 87[2mms[22m[39m
+     [32m✓[39m reports validation field codes for invalid payloads[32m 4[2mms[22m[39m
+[31m     [31m×[31m creates, authenticates and destroys sessions[39m[32m 97[2mms[22m[39m
+     [32m✓[39m returns null for unknown tokens[32m 24[2mms[22m[39m
+     [32m✓[39m exposes the shared session cookie contract[32m 4[2mms[22m[39m
+ [31m❯[39m tests/authRoutes.test.js [2m([22m[2m9 tests[22m[2m | [22m[31m9 failed[39m[2m)[22m[33m 329[2mms[22m[39m
+[31m     [31m×[31m registers a valid a
+...[OUTPUT TRUNCATED]...
+[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[15/17]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/authRoutes.test.js[2m > [22mPOST /api/auth/logout (REQ-1-API-AuthRoutes)[2m > [22mreturns 200 even without a session
+[31m[1mAssertionError[22m: expected 404 to be 200 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 200[39m
+[31m+ 404[39m
+
+[36m [2m❯[22m tests/authRoutes.test.js:[2m125:24[22m[39m
+    [90m123|[39m   [34mit[39m([32m'returns 200 even without a session'[39m[33m,[39m [35masync[39m () [33m=>[39m {
+    [90m124|[39m     [35mconst[39m res [33m=[39m [35mawait[39m [34mrequest[39m(app)[33m.[39m[34mpost[39m([32m'/api/auth/logout'[39m)[33m;[39m
+    [90m125|[39m     [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m200[39m)[33m;[39m
+    [90m   |[39m                        [31m^[39m
+    [90m126|[39m   })[33m;[39m
+    [90m127|[39m })[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[16/17]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/authService.test.js[2m > [22mauthService (REQ-1-FUNC-AuthService)[2m > [22mcreates, authenticates and destroys sessions
+[31m[1mAssertionError[22m: expected null to be truthy[39m
+
+[32m- Expected:[39m
+true
+
+[31m+ Received:[39m
+null
+
+[36m [2m❯[22m tests/authService.test.js:[2m82:51[22m[39m
+    [90m 80|[39m     [35mconst[39m registered [33m=[39m [35mawait[39m [34mregisterAccount[39m([34mvalidPayload[39m())[33m;[39m
+    [90m 81|[39m     [35mconst[39m token [33m=[39m [35mawait[39m [34mcreateSession[39m(registered[33m.[39maccount[33m.[39mid)[33m;[39m
+    [90m 82|[39m     [34mexpect[39m([35mawait[39m [34mauthenticateSessionToken[39m(token))[33m.[39m[34mtoBeTruthy[39m()[33m;[39m
+    [90m   |[39m                                                   [31m^[39m
+    [90m 83|[39m
+    [90m 84|[39m     [35mawait[39m [34mdestroySession[39m(token)[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[17/17]⎯[22m[39m
+
+
+

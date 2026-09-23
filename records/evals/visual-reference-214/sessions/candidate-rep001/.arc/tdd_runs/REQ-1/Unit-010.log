@@ -1,0 +1,74 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/RegisterPage.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\candidate-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\candidate-rep001\frontend
+Frontend Targets:
+- tests/RegisterPage.test.tsx
+
+Exit Code: 1
+
+=== Frontend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/candidate-rep001/frontend[39m
+
+ [31m❯[39m tests/RegisterPage.test.tsx [2m([22m[2m5 tests[22m[2m | [22m[31m4 failed[39m[2m)[22m[33m 2355[2mms[22m[39m
+[31m     [31m×[31m renders all requirement-declared accessible controls[39m[32m 53[2mms[22m[39m
+[31m     [31m×[31m shows a terms/privacy checkbox and submits a full valid form to register()[39m[33m 981[2mms[22m[39m
+[31m     [31m×[31m shows a three-segment password strength meter that changes with input[39m[32m 187[2mms[22m[39m
+     [32m✓[39m blocks submission with a visible Chinese error when required fields are missing[32m 104[2mms[22m[39m
+[31m     [31m×[31m shows a visible Chinese error and does not navigate when register() fails[39m[33m 1029[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m4 failed[39m[22m[2m | [22m[1m[32m1 passed[39m[22m[90m (5)[39m
+[2m   Start at [22m 02:20:19
+[2m   Duration [22m 4.29s[2m (transform 96ms, setup 355ms, import 374ms, tests 2.36s, environment 948ms)[22m
+
+
+STDERR:
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 4 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mrenders all requirement-declared accessible controls
+[31m[1mError[22m: [2mexpect([22m[31melement[31m[2m).toHaveAttribute([22m[32m[32m"type"[32m[31m[2m, [22m[32m[32m"password"[32m[31m[2m) // element.getAttribute("type") === "password"[22m
+
+Expected the element to have attribute:
+[32m  type="password"[31m
+Received:
+[31m  null[31m[39m
+[36m [2m❯[22m tests/RegisterPage.test.tsx:[2m31:60[22m[39m
+    [90m 29|[39m     [34mrenderRegisterPage[39m()[33m;[39m
+    [90m 30|[39m     expect(screen.getByLabelText('用户名', { exact: true })).toBeInTheDoc…
+    [90m 31|[39m     expect(screen.getBy
+...[OUTPUT TRUNCATED]...
+m❯[22m Object.getElementError node_modules/@testing-library/dom/dist/config.js:[2m37:19[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/user-event/dist/esm/utility/selectOptions.js:[2m37:35[22m[39m
+[90m [2m❯[22m Object.selectOptionsBase node_modules/@testing-library/user-event/dist/esm/utility/selectOptions.js:[2m29:38[22m[39m
+[90m [2m❯[22m Object.selectOptions node_modules/@testing-library/user-event/dist/esm/utility/selectOptions.js:[2m16:30[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/user-event/dist/esm/setup/setup.js:[2m83:35[22m[39m
+[90m [2m❯[22m Object.asyncWrapper node_modules/@testing-library/react/dist/pure.js:[2m88:28[22m[39m
+[90m [2m❯[22m wrapAsync node_modules/@testing-library/user-event/dist/esm/setup/wrapAsync.js:[2m6:24[22m[39m
+[90m [2m❯[22m Object.method [as selectOptions] node_modules/@testing-library/user-event/dist/esm/setup/setup.js:[2m83:16[22m[39m
+[90m [2m❯[22m Object.selectOptions node_modules/@testing-library/user-event/dist/esm/setup/directApi.js:[2m36:37[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mshows a three-segment password strength meter that changes with input
+[31m[1mAssertionError[22m: expected 1 to be less than 1[39m
+[36m [2m❯[22m tests/RegisterPage.test.tsx:[2m109:24[22m[39m
+    [90m107|[39m     [35mawait[39m userEvent[33m.[39m[34mtype[39m(password[33m,[39m [32m'A1!'[39m)[33m;[39m
+    [90m108|[39m     const strongActive = Array.from(meter()).filter((el) => el.dataset…
+    [90m109|[39m     [34mexpect[39m(weakActive)[33m.[39m[34mtoBeLessThan[39m(strongActive)[33m;[39m
+    [90m   |[39m                        [31m^[39m
+    [90m110|[39m     [34mexpect[39m(strongActive)[33m.[39m[34mtoBe[39m([34m3[39m)[33m;[39m
+    [90m111|[39m   })[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/4]⎯[22m[39m
+
+
+

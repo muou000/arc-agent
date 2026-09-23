@@ -1,0 +1,61 @@
+Runner: Vitest
+Batch Test Type: Integration
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- backend/tests/authRoutes.test.js
+- backend/tests/accountsRepository.test.js
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Backend Targets:
+- tests/authRoutes.test.js
+- tests/accountsRepository.test.js
+
+Exit Code: 1
+
+=== Backend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/backend[39m
+
+ [32m✓[39m tests/accountsRepository.test.js [2m([22m[2m8 tests[22m[2m)[22m[32m 255[2mms[22m[39m
+ [31m❯[39m tests/authRoutes.test.js [2m([22m[2m9 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 452[2mms[22m[39m
+[31m     [31m×[31m registers a valid account, sets the session cookie and returns the account without secrets[39m[32m 119[2mms[22m[39m
+     [32m✓[39m returns per-field validation codes and creates no session for invalid input[32m 5[2mms[22m[39m
+     [32m✓[39m rejects duplicate username case-insensitively with a DUPLICATE_ code[32m 8[2mms[22m[39m
+     [32m✓[39m rejects duplicate email ignoring case with a DUPLICATE_ code[32m 7[2mms[22m[39m
+     [32m✓[39m rejects missing required fields[32m 3[2mms[22m[39m
+     [32m✓[39m returns 401 without a session[32m 3[2mms[22m[39m
+     [32m✓[39m returns 401 for an unknown token[32m 4[2mms[22m[39m
+     [32m✓[39m destroys the session and clears the cookie[32m 82[2mms[22m[39m
+     [32m✓[39m returns 200 even without a session[32m 2[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m1 passed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m16 passed[39m[22m[90m (17)[39m
+[2m   Start at [22m 01:53:44
+[2m   Duration [22m 950ms[2m (transform 55ms, setup 0ms, import 311ms, tests 708ms, environment 0ms)[22m
+
+
+STDERR:
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 1 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/authRoutes.test.js[2m > [22mPOST /api/auth/register (REQ-1-API-AuthRoutes)[2m > [22mregisters a valid account, sets the session cookie and returns the account without secrets
+[31m[1mAssertionError[22m: expected 'tb_session=3fc7239fca91f3361d6122692c…' to contain 'HttpOnly'[39m
+
+Expected: [32m"HttpOnly"[39m
+Received: [31m"tb_session=3fc7239fca91f3361d6122692c4bc7a9eccf4242cdd1162ab261b33be5b799c4"[39m
+
+[36m [2m❯[22m tests/authRoutes.test.js:[2m55:20[22m[39m
+    [90m 53|[39m
+    [90m 54|[39m     [35mconst[39m cookie [33m=[39m [34mextractSessionCookie[39m(res)[33m;[39m
+    [90m 55|[39m     [34mexpect[39m(cookie)[33m.[39m[34mtoContain[39m([32m'HttpOnly'[39m)[33m;[39m
+    [90m   |[39m                    [31m^[39m
+    [90m 56|[39m
+    [90m 57|[39m     const me = await request(app).get('/api/auth/me').set('Cookie', co…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+
+

@@ -1,0 +1,28 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/registerValidation.test.ts
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Frontend Targets:
+- tests/registerValidation.test.ts
+
+Exit Code: 0
+
+=== Frontend Vitest Batch ===
+Exit Code: 0
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/frontend[39m
+
+ [32m✓[39m tests/registerValidation.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 12[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m13 passed[39m[22m[90m (13)[39m
+[2m   Start at [22m 01:10:45
+[2m   Duration [22m 2.95s[2m (transform 75ms, setup 679ms, import 41ms, tests 12ms, environment 1.79s)[22m
+
+
+

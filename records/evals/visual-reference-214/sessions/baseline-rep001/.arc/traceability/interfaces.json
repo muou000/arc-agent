@@ -1,0 +1,216 @@
+{
+  "REQ-1-API-AuthRoutes": {
+    "interface_id": "REQ-1-API-AuthRoutes",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "API",
+    "content": "{\"interface_id\": \"REQ-1-API-AuthRoutes\", \"req_id\": \"REQ-1\", \"type\": \"API\", \"name\": \"authRoutes\", \"file_path\": \"backend/src/routes/authRoutes.js\", \"first_line\": \"// REQ-1 API: POST /api/auth/register, GET /api/auth/me, POST /api/auth/logout.\", \"responsibility\": \"HTTP boundary for registration, current-user, logout.\", \"specification\": \"POST /api/auth/register: 200 { code:200, account:{id,username,email,name} } + sets tb_session httpOnly cookie; 400 { code:400, error:'VALIDATION_FAILED', fields:{field:code} }. GET /api/auth/me: 200 { code:200, account } or 401 { code:401 }. POST /api/auth/logout: always 200, destroys session + clears cookie. Route mounted at /api/auth in app.js.\", \"inputs\": \"JSON body / session cookie\", \"outputs\": \"JSON responses per contract\", \"callers\": [\"backend/src/app.js\", \"frontend registerApi\"], \"callees\": [\"authService.js\"], \"test_focus\": \"Supertest: success sets cookie + persists; each failure returns correct field codes; /me works after register; logout clears.\"}",
+    "file_path": "backend/src/routes/authRoutes.js",
+    "first_line": "// REQ-1 API: POST /api/auth/register, GET /api/auth/me, POST /api/auth/logout.",
+    "implemented": false,
+    "callers": [
+      "backend/src/app.js",
+      "frontend registerApi"
+    ],
+    "callees": [
+      "authService.js"
+    ]
+  },
+  "REQ-1-FUNC-AccountsRepository": {
+    "interface_id": "REQ-1-FUNC-AccountsRepository",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-1-FUNC-AccountsRepository\", \"req_id\": \"REQ-1\", \"type\": \"FUNC\", \"name\": \"accountsRepository\", \"file_path\": \"backend/src/repositories/accountsRepository.js\", \"first_line\": \"// REQ-1 persistence for passenger accounts and login sessions.\", \"responsibility\": \"SQLite persistence for accounts and sessions via shared db_runtime helpers; idempotent schema.\", \"specification\": \"ensureSchema creates accounts(id PK uuid, username UNIQUE COLLATE NOCASE, email COLLATE NOCASE UNIQUE, password_hash, id_type, name, id_number, passenger_type, country_code, phone, created_at) and sessions(token PK, account_id FK, created_at). API: findAccountByUsername (NOCASE), findAccountByEmail (lower() compare), createAccountWithSession, createSessionForAccount, findAccountBySessionToken, deleteSession — all transactional/safe writes; never return password_hash.\", \"inputs\": \"account payloads, tokens\", \"outputs\": \"account rows (no hash) or null\", \"callers\": [\"backend/src/services/authService.js\"], \"callees\": [\"backend/src/database/db_runtime.js\"], \"test_focus\": \"Integration tests on isolated DB: uniqueness case-insensitive, session join, no hash leakage.\"}",
+    "file_path": "backend/src/repositories/accountsRepository.js",
+    "first_line": "// REQ-1 persistence for passenger accounts and login sessions.",
+    "implemented": false,
+    "callers": [
+      "backend/src/services/authService.js"
+    ],
+    "callees": [
+      "backend/src/database/db_runtime.js"
+    ]
+  },
+  "REQ-1-FUNC-App": {
+    "interface_id": "REQ-1-FUNC-App",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-1-FUNC-App\", \"req_id\": \"REQ-1\", \"type\": \"FUNC\", \"name\": \"backend app wiring (reused shared surface)\", \"file_path\": \"backend/src/app.js\", \"first_line\": \"const express = require('express');\", \"responsibility\": \"Shared Express app; extended additively to mount authRoutes.\", \"specification\": \"Reused interface: two additive edits only — import authRoutes and app.use('/api/auth', authRoutes) before static/SPA fallback. No other changes.\", \"inputs\": \"HTTP requests\", \"outputs\": \"routed app\", \"callers\": [\"backend/src/index.js\", \"supertest\"], \"callees\": [\"authRoutes\"], \"test_focus\": \"Supertest against app; SPA fallback unaffected.\"}",
+    "file_path": "backend/src/app.js",
+    "first_line": "const express = require('express');",
+    "implemented": false,
+    "callers": [
+      "backend/src/index.js",
+      "supertest"
+    ],
+    "callees": [
+      "authRoutes"
+    ]
+  },
+  "REQ-1-FUNC-AuthService": {
+    "interface_id": "REQ-1-FUNC-AuthService",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-1-FUNC-AuthService\", \"req_id\": \"REQ-1\", \"type\": \"FUNC\", \"name\": \"authService\", \"file_path\": \"backend/src/services/authService.js\", \"first_line\": \"// REQ-1 auth service: account creation + session lifecycle.\", \"responsibility\": \"Orchestrates validation, uniqueness checks, secure account creation and session lifecycle.\", \"specification\": \"registerAccount(payload): validate -> check DUPLICATE_USERNAME/DUPLICATE_EMAIL via repo -> bcrypt hash (10 rounds) -> createAccountWithSession with crypto.randomUUID id and crypto.randomBytes(32).hex token -> { ok, account, token } or { ok:false, fields }. authenticateSessionToken(token), createSession, destroySession, sessionCookieOptions (httpOnly, sameSite lax, path /, 7-day maxAge), SESSION_COOKIE='tb_session'. No password/hash in any return.\", \"inputs\": \"registration payload / session token\", \"outputs\": \"result objects, account without secrets\", \"callers\": [\"backend/src/routes/authRoutes.js\"], \"callees\": [\"registerValidation.js\", \"accountsRepository.js\"], \"test_focus\": \"Unit/integration: duplicate detection merges field codes; session create/auth/destroy.\"}",
+    "file_path": "backend/src/services/authService.js",
+    "first_line": "// REQ-1 auth service: account creation + session lifecycle.",
+    "implemented": false,
+    "callers": [
+      "backend/src/routes/authRoutes.js"
+    ],
+    "callees": [
+      "registerValidation.js",
+      "accountsRepository.js"
+    ]
+  },
+  "REQ-1-FUNC-RegisterApi": {
+    "interface_id": "REQ-1-FUNC-RegisterApi",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-1-FUNC-RegisterApi\", \"req_id\": \"REQ-1\", \"type\": \"FUNC\", \"name\": \"registerApi (frontend)\", \"file_path\": \"frontend/src/features/register/registerApi.ts\", \"first_line\": \"// REQ-1 frontend API client for auth endpoints.\", \"responsibility\": \"Axios calls for register / me / logout through the shared apiClient.\", \"specification\": \"register(payload): POST /api/auth/register; 200 -> {ok:true}; 400 -> {ok:false, fields}. fetchCurrentUser(): GET /api/auth/me -> account | null on 401. signOut(): POST /api/auth/logout. Uses shared apiClient (interceptor contract stays intact).\", \"inputs\": \"RegisterPayload\", \"outputs\": \"result / user\", \"callers\": [\"RegisterPage.tsx\", \"SessionContext.tsx\"], \"callees\": [\"frontend/src/api/index.ts\"], \"test_focus\": \"Mocked axios unit tests for ok/field-error/401 paths.\"}",
+    "file_path": "frontend/src/features/register/registerApi.ts",
+    "first_line": "// REQ-1 frontend API client for auth endpoints.",
+    "implemented": false,
+    "callers": [
+      "RegisterPage.tsx",
+      "SessionContext.tsx"
+    ],
+    "callees": [
+      "frontend/src/api/index.ts"
+    ]
+  },
+  "REQ-1-FUNC-RegisterValidation": {
+    "interface_id": "REQ-1-FUNC-RegisterValidation",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "FUNC",
+    "content": "{\"interface_id\": \"REQ-1-FUNC-RegisterValidation\", \"req_id\": \"REQ-1\", \"type\": \"FUNC\", \"name\": \"registerValidation\", \"file_path\": \"backend/src/services/registerValidation.js\", \"first_line\": \"// REQ-1 backend service: registration validation.\", \"responsibility\": \"Server-side field validation for registration payloads; single source of truth for error codes.\", \"specification\": \"validateRegistrationInput(input) -> { valid, fields: {field: code} }. Codes: REQUIRED_/INVALID_/DUPLICATE_ per field (DUPLICATE_* checked by repo, merged here via authService). Rules: username /^[A-Za-z0-9_-]{3,32}$/; password 12-128 with upper+lower+digit+special; confirmPassword equals; idType in ID_TYPES; name trimmed 2-100 non-space chars; idNumber /^[A-Za-z0-9-]{6,30}$/; passengerType in PASSENGER_TYPES; email optional, valid, <=254; countryCode in COUNTRY_CODES; phone digits valid for code (+84: 9 digits; others 11 starting 1); agreement required.\", \"inputs\": \"registration payload object\", \"outputs\": \"{ valid, fields }\", \"callers\": [\"backend/src/services/authService.js\"], \"callees\": [], \"test_focus\": \"Unit tests per field rule and code; boundary lengths.\"}",
+    "file_path": "backend/src/services/registerValidation.js",
+    "first_line": "// REQ-1 backend service: registration validation.",
+    "implemented": false,
+    "callers": [
+      "backend/src/services/authService.js"
+    ],
+    "callees": []
+  },
+  "REQ-1-UI-App": {
+    "interface_id": "REQ-1-UI-App",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-1-UI-App\", \"req_id\": \"REQ-1\", \"type\": \"UI\", \"name\": \"App routes (reused shared surface)\", \"file_path\": \"frontend/src/App.tsx\", \"first_line\": \"import { Route, Routes } from 'react-router-dom';\", \"responsibility\": \"Shared route table; extended additively with /register.\", \"specification\": \"Reused interface: additive import + <Route path=\\\"/register\\\" element={<RegisterPage />} />. TDD should also wrap Routes in SessionProvider (or mount it in main.tsx) so all pages share session state.\", \"inputs\": \"location\", \"outputs\": \"routed pages\", \"callers\": [\"main.tsx\"], \"callees\": [\"RegisterPage.tsx\", \"HomePage.tsx\"], \"test_focus\": \"Route resolution for /register; session provider present.\"}",
+    "file_path": "frontend/src/App.tsx",
+    "first_line": "import { Route, Routes } from 'react-router-dom';",
+    "implemented": false,
+    "callers": [
+      "main.tsx"
+    ],
+    "callees": [
+      "RegisterPage.tsx",
+      "HomePage.tsx"
+    ]
+  },
+  "REQ-1-UI-HeaderAuthSlot": {
+    "interface_id": "REQ-1-UI-HeaderAuthSlot",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-1-UI-HeaderAuthSlot\", \"req_id\": \"REQ-1\", \"type\": \"UI\", \"name\": \"HeaderAuthSlot\", \"file_path\": \"frontend/src/components/layout/HeaderAuthSlot.tsx\", \"first_line\": \"// REQ-1 frontend: header auth slot rendering real session state.\", \"responsibility\": \"Renders session-dependent header auth area, mounted into ROOT-owned SiteHeader authSlot.\", \"specification\": \"Signed-in: username text + Sign out link (aria-label Sign out) that calls useSession().signOut. Guest: 注册 link to /register and 登录 link to /login.\", \"inputs\": \"useSession()\", \"outputs\": \"links/user display\", \"callers\": [\"HomePage.tsx\", \"RegisterPage.tsx\"], \"callees\": [\"SessionContext.tsx\"], \"test_focus\": \"jsdom: guest shows 注册/登录; signed-in shows username + Sign out; click Sign out calls signOut.\"}",
+    "file_path": "frontend/src/components/layout/HeaderAuthSlot.tsx",
+    "first_line": "// REQ-1 frontend: header auth slot rendering real session state.",
+    "implemented": false,
+    "callers": [
+      "HomePage.tsx",
+      "RegisterPage.tsx"
+    ],
+    "callees": [
+      "SessionContext.tsx"
+    ]
+  },
+  "REQ-1-UI-HomePage": {
+    "interface_id": "REQ-1-UI-HomePage",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-1-UI-HomePage\", \"req_id\": \"REQ-1\", \"type\": \"UI\", \"name\": \"HomePage (reused shared surface)\", \"file_path\": \"frontend/src/pages/HomePage.tsx\", \"first_line\": \"// HomePage: ROOT-owned home composition\", \"responsibility\": \"Shared home page; extended additively to mount HeaderAuthSlot and provide Register entry.\", \"specification\": \"Reused interface: additive edit mounting <SiteHeader authSlot={<HeaderAuthSlot />} />. TODO for TDD: header/nav composition must include a clickable Register link (to /register) in the auth area when guest. No other changes.\", \"inputs\": \"none\", \"outputs\": \"home page\", \"callers\": [\"App.tsx route /\"], \"callees\": [\"HeaderAuthSlot.tsx\", \"SiteHeader.tsx\", \"BookingPanel.tsx\"], \"test_focus\": \"jsdom: guest home shows Register link; after register flow shows username + Sign out.\"}",
+    "file_path": "frontend/src/pages/HomePage.tsx",
+    "first_line": "// HomePage: ROOT-owned home composition",
+    "implemented": false,
+    "callers": [
+      "App.tsx route /"
+    ],
+    "callees": [
+      "HeaderAuthSlot.tsx",
+      "SiteHeader.tsx",
+      "BookingPanel.tsx"
+    ]
+  },
+  "REQ-1-UI-ID-TYPES": {
+    "interface_id": "REQ-1-UI-ID-TYPES",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-1-UI-ID-TYPES\", \"req_id\": \"REQ-1\", \"type\": \"UI\", \"name\": \"registerValidation (frontend)\", \"file_path\": \"frontend/src/features/register/registerValidation.ts\", \"first_line\": \"// REQ-1 frontend: register form validation + password strength helpers.\", \"responsibility\": \"Client-side validation, dropdown option sets, password strength scoring.\", \"specification\": \"Exports ID_TYPES (with 请选择证件类型 default), PASSENGER_TYPES (请选择乘客类型 default), COUNTRY_CODES (+86 default, +84 included); passwordStrength(pw) 0..3; validateRegisterForm(values) -> field->Chinese message map mirroring backend rules; RegisterFormValues type.\", \"inputs\": \"form values\", \"outputs\": \"option sets, errors, strength score\", \"callers\": [\"RegisterPage.tsx\"], \"callees\": [], \"test_focus\": \"Vitest unit: rules mirror backend; strength segments 0-3.\"}",
+    "file_path": "frontend/src/features/register/registerValidation.ts",
+    "first_line": "// REQ-1 frontend: register form validation + password strength helpers.",
+    "implemented": false,
+    "callers": [
+      "RegisterPage.tsx"
+    ],
+    "callees": []
+  },
+  "REQ-1-UI-RegisterPage": {
+    "interface_id": "REQ-1-UI-RegisterPage",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-1-UI-RegisterPage\", \"req_id\": \"REQ-1\", \"type\": \"UI\", \"name\": \"RegisterPage\", \"file_path\": \"frontend/src/features/register/RegisterPage.tsx\", \"first_line\": \"// REQ-1: passenger registration page.\", \"responsibility\": \"Registration form UI at /register with accessible-name contract and error rendering.\", \"specification\": \"Native label-input association for: 用户名, 登录密码 (password, with 3-segment strength meter updated on input), 确认密码, 证件类型 select (options from ID_TYPES, initial 请选择证件类型), 姓名, 证件号码, 优惠（待）类型 select (initial 请选择乘客类型), 邮箱 optional email, 国家/地区代码 select default +86, 手机号, checkbox accessible name containing 服务条款/隐私政策 (required), button 下一步. Submit: client validation -> visible role=alert Chinese errors, no API call; else register(); on success refresh session and navigate('/'); on field errors render per-field messages. Styling per visual reference: blue card header, labeled rows with red asterisks, orange 下一步 button.\", \"inputs\": \"user input\", \"outputs\": \"navigation, error messages\", \"callers\": [\"App.tsx route /register\", \"首页 Register 链接\"], \"callees\": [\"registerValidation.ts\", \"registerApi.ts\", \"SessionContext.tsx\", \"SiteHeader.tsx\"], \"test_focus\": \"jsdom render tests: labels, selects, strength meter, client errors block submission, success path calls API + navigates.\"}",
+    "file_path": "frontend/src/features/register/RegisterPage.tsx",
+    "first_line": "// REQ-1: passenger registration page.",
+    "implemented": false,
+    "callers": [
+      "App.tsx route /register",
+      "首页 Register 链接"
+    ],
+    "callees": [
+      "registerValidation.ts",
+      "registerApi.ts",
+      "SessionContext.tsx",
+      "SiteHeader.tsx"
+    ]
+  },
+  "REQ-1-UI-SessionProvider": {
+    "interface_id": "REQ-1-UI-SessionProvider",
+    "req_ids": [
+      "REQ-1"
+    ],
+    "type": "UI",
+    "content": "{\"interface_id\": \"REQ-1-UI-SessionProvider\", \"req_id\": \"REQ-1\", \"type\": \"UI\", \"name\": \"SessionContext\", \"file_path\": \"frontend/src/features/auth/SessionContext.tsx\", \"first_line\": \"// REQ-1 frontend: shared session state.\", \"responsibility\": \"Global current-user state shared by all pages; loaded from GET /api/auth/me.\", \"specification\": \"SessionProvider fetches current user on mount (loading state while pending), exposes { user, loading, refresh, signOut } via context; signOut calls POST /api/auth/logout then refresh. useSession hook for consumers. Persistence across refresh is cookie-based (server session), so reload keeps user.\", \"inputs\": \"api responses\", \"outputs\": \"session state\", \"callers\": [\"main/App provider mount\", \"RegisterPage\", \"HeaderAuthSlot\"], \"callees\": [\"registerApi.ts\"], \"test_focus\": \"jsdom: refresh loads user from /me; signOut clears user.\"}",
+    "file_path": "frontend/src/features/auth/SessionContext.tsx",
+    "first_line": "// REQ-1 frontend: shared session state.",
+    "implemented": false,
+    "callers": [
+      "main/App provider mount",
+      "RegisterPage",
+      "HeaderAuthSlot"
+    ],
+    "callees": [
+      "registerApi.ts"
+    ]
+  }
+}

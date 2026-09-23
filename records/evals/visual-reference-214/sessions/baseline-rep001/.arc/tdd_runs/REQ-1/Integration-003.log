@@ -1,0 +1,154 @@
+Runner: Vitest
+Batch Test Type: Integration
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- backend/tests/accountsRepository.test.js
+- backend/tests/authRoutes.test.js
+- backend/tests/authService.test.js
+- frontend/tests/homePage.test.tsx
+- frontend/tests/RegisterPage.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Backend Targets:
+- tests/accountsRepository.test.js
+- tests/authRoutes.test.js
+- tests/authService.test.js
+Frontend Targets:
+- tests/homePage.test.tsx
+- tests/RegisterPage.test.tsx
+
+Exit Code: 1
+
+=== Backend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/backend[39m
+
+ [31m❯[39m tests/accountsRepository.test.js [2m([22m[2m8 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[32m 279[2mms[22m[39m
+[31m     [31m×[31m creates an account with a session and returns no password hash[39m[32m 47[2mms[22m[39m
+     [32m✓[39m finds accounts by username case-insensitively[32m 31[2mms[22m[39m
+     [32m✓[39m finds accounts by email ignoring case[32m 32[2mms[22m[39m
+     [32m✓[39m returns null for unknown username or email[32m 25[2mms[22m[39m
+     [32m✓[39m rejects duplicate usernames case-insensitively[32m 31[2mms[22m[39m
+     [32m✓[39m rejects duplicate emails case-insensitively[32m 29[2mms[22m[39m
+     [32m✓[39m authenticates a session token and deletes the session[32m 44[2mms[22m[39m
+     [32m✓[39m creates an additional session for an existing account[32m 39[2mms[22m[39m
+ [31m❯[39m tests/authService.test.js [2m([22m[2m7 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 429[2mms[22m[39m
+     [32m✓[39m registers a valid account, creates a session and returns no secrets[32m 103[2mms[22m[39m
+     [32m✓[39m reports duplicate username without creating account or session[32m 90[2mms[22m[39m
+     [32m✓[39m reports duplicate email case-insensitively[32m 93[2mms[22m[39m
+     [32m✓[39m reports validation field codes for invalid payloads[32m 4[2mms[22m[39m
+[31m     [31m×[31m creates, authenticates and destroys sessions[39m[32m 98[2mms[22m[39m
+     [32m✓[39m returns null for unknown tokens[32m 35[2mms[22m[39m
+     [32m✓[39m exposes the shared session cookie contract[32m 5[2mms[22m[39m
+ [31m❯[39m tests/authRoutes.test.js [2m([22m[2m9 tests[22m[2m | [22m[31m2 failed[39m[2m)[22m[33m 440[2mms[22m[39m
+[31m     [31m×[31m registers a valid account, sets the session cookie and returns the account wit
+...[OUTPUT TRUNCATED]...
+et('/api/auth/me').set('Cookie', co…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/authRoutes.test.js[2m > [22mPOST /api/auth/logout (REQ-1-API-AuthRoutes)[2m > [22mdestroys the session and clears the cookie
+[31m[1mTypeError[22m: Cannot read properties of undefined (reading 'find')[39m
+[36m [2m❯[22m extractSessionCookie tests/authRoutes.test.js:[2m27:46[22m[39m
+    [90m 25|[39m
+    [90m 26|[39m [35mfunction[39m [34mextractSessionCookie[39m(response) {
+    [90m 27|[39m   const raw = response.headers['set-cookie'].find((c) => c.includes('t…
+    [90m   |[39m                                              [31m^[39m
+    [90m 28|[39m   [34mexpect[39m(raw)[33m.[39m[34mtoBeTruthy[39m()[33m;[39m
+    [90m 29|[39m   [35mreturn[39m raw[33m.[39m[34msplit[39m([32m';'[39m)[[34m0[39m][33m;[39m
+[90m [2m❯[22m tests/authRoutes.test.js:[2m114:20[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/4]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/authService.test.js[2m > [22mauthService (REQ-1-FUNC-AuthService)[2m > [22mcreates, authenticates and destroys sessions
+[31m[1mAssertionError[22m: expected null to be truthy[39m
+
+[32m- Expected:[39m
+true
+
+[31m+ Received:[39m
+null
+
+[36m [2m❯[22m tests/authService.test.js:[2m82:51[22m[39m
+    [90m 80|[39m     [35mconst[39m registered [33m=[39m [35mawait[39m [34mregisterAccount[39m([34mvalidPayload[39m())[33m;[39m
+    [90m 81|[39m     [35mconst[39m token [33m=[39m [35mawait[39m [34mcreateSession[39m(registered[33m.[39maccount[33m.[39mid)[33m;[39m
+    [90m 82|[39m     [34mexpect[39m([35mawait[39m [34mauthenticateSessionToken[39m(token))[33m.[39m[34mtoBeTruthy[39m()[33m;[39m
+    [90m   |[39m                                                   [31m^[39m
+    [90m 83|[39m
+    [90m 84|[39m     [35mawait[39m [34mdestroySession[39m(token)[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/4]⎯[22m[39m
+
+
+
+
+=== Frontend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/frontend[39m
+
+ [31m❯[39m tests/homePage.test.tsx [2m([22m[2m2 tests[22m[2m | [22m[31m2 failed[39m[2m)[22m[32m 31[2mms[22m[39m
+[31m     [31m×[31m renders for guests with a clickable Register entry link[39m[32m 25[2mms[22m[39m
+[31m     [31m×[31m shows the signed-in username and Sign out link in the header auth slot[39m[32m 4[2mms[22m[39m
+ [31m❯[39m tests/RegisterPage.test.tsx [2m([22m[2m7 tests[22m[2m | [22m[31m7 failed[39m[2m)[22m[33m 1357[2mms[22m[39m
+[31m     [31m×[31m renders every required control with its stable Chinese accessible name[39m[32m 60[2mms[22m[39m
+[31m     [31m×[31m shows the three-segment password strength meter reacting to input[39m[32m 22[2mms[22m[39m
+[31m     [31m×[31m blocks submission and shows role=alert Chinese errors when required fields are missing[39m[33m 1169[2mms[22m[39m
+[31m     [31m×[31m blocks submission when passwords do not match[39m[32m 29[2mms[22m[39m
+[31m     [31m×[31m blocks submission when the agreement is unchecked even with valid data[39m[32m 26[2mms[22m[39m
+[31m     [31m×[31m calls register with the payload, refreshes the session and navigates to / on success[39m[32m 23[2mms[22m[39m
+[31m     [31m×[31m renders backend field errors without navigating on duplicate username[39m[32m 25[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m2 failed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[31m9 failed[39m[22m[90m (9)[39m
+[2m   Start at [22m 01:28:20
+[2m   Duration [22m 3.92s[2m (transform 271ms, setup 1.11s, import 553ms, tests 1.39s, environment 2.58s)[22m
+
+
+STDERR:
+[90mstderr[2m | tests/RegisterPage.test.tsx[2m > [22m[2mRegisterPage accessible-name contract (REQ-1-UI-RegisterPage)[2m > [22m[2mrenders every required control with its stable Chinese accessible name
+[22m[39mAn update to Sessio
+...[OUTPUT TRUNCATED]...
+an>[39m
+            [36m</li>[39m
+            [36m<li[39m
+              [33mclass[39m=[32m"flex flex-1 items-center justify-center gap-1 border-r border-blue-400/40 text-sm last:border-r-0"[39m
+            [36m>[39m
+              [36m<span>[39m
+                [0m时刻表[0m
+              [36m</span>[39m
+              [36m<span[39m
+                [33maria-hidden[39m=[32m"true"[39m
+                [33mclass[39m=[32m"text-xs opacity-80"[39m
+              [36m>[39m
+                [0m▾[0m
+              [36m</span>[39m
+            [36m</li>[39m
+            [36m<li[39m
+              [33mclass[39m=[32m"flex flex-1 items-center justify-center gap-1 border-r border-blue-400/40 text-sm last:border-r-0"[39m
+            [36m>[39m
+              [36m<span>[39m
+                [0m帮助[0m
+              [36m</span>[39m
+              ...
+[90m [2m❯[22m Object.getElementError node_modules/@testing-library/dom/dist/config.js:[2m37:19[22m[39m
+[90m [2m❯[22m getAllByLabelText node_modules/@testing-library/dom/dist/queries/label-text.js:[2m111:38[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/dom/dist/query-helpers.js:[2m52:17[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/dom/dist/query-helpers.js:[2m95:19[22m[39m
+[36m [2m❯[22m fillValidForm tests/RegisterPage.test.tsx:[2m51:26[22m[39m
+    [90m 49|[39m
+    [90m 50|[39m [35masync[39m [35mfunction[39m [34mfillValidForm[39m(user) {
+    [90m 51|[39m   [35mawait[39m user[33m.[39m[34mtype[39m(screen[33m.[39m[34mgetByLabelText[39m([32m'用户名'[39m)[33m,[39m [32m'tb-user-1'[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m 52|[39m   await user.type(screen.getByLabelText('登录密码'), 'Valid-password-123!'…
+    [90m 53|[39m   await user.type(screen.getByLabelText('确认密码'), 'Valid-password-123!'…
+[90m [2m❯[22m tests/RegisterPage.test.tsx:[2m179:11[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/9]⎯[22m[39m
+
+
+

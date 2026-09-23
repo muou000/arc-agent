@@ -1,0 +1,83 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- backend/tests/authService.test.js
+- frontend/tests/RegisterPage.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\candidate-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\candidate-rep001\frontend
+Backend Targets:
+- tests/authService.test.js
+Frontend Targets:
+- tests/RegisterPage.test.tsx
+
+Exit Code: 1
+
+=== Backend Vitest Batch ===
+Exit Code: 0
+STDOUT:
+
+[1m[46m RUN [49m[22m [36mv4.0.17 [39m[90mD:/code/.arc-eval-214/candidate-rep001/backend[39m
+
+ [32m✓[39m tests/authService.test.js [2m([22m[2m26 tests[22m[2m)[22m[33m 1443[2mms[22m[39m
+       [33m[2m✓[22m[39m accepts every certificate type offered by the page [33m 305[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m26 passed[39m[22m[90m (26)[39m
+[2m   Start at [22m 02:15:36
+[2m   Duration [22m 1.72s[2m (transform 36ms, setup 0ms, import 61ms, tests 1.44s, environment 0ms)[22m
+
+
+
+
+=== Frontend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/candidate-rep001/frontend[39m
+
+ [31m❯[39m tests/RegisterPage.test.tsx [2m([22m[2m5 tests[22m[2m | [22m[31m5 failed[39m[2m)[22m[32m 21[2mms[22m[39m
+[31m     [31m×[31m renders all requirement-declared accessible controls[39m[32m 13[2mms[22m[39m
+[31m     [31m×[31m shows a terms/privacy checkbox and submits a full valid form to register()[39m[32m 2[2mms[22m[39m
+[31m     [31m×[31m shows a three-segment password strength meter that changes with input[39m[32m 1[2mms[22m[39m
+[31m     [31m×[31m blocks submission with a visible Chinese error when required fields are missing[39m[32m 1[2mms[22m[39m
+[31m     [31m×[31m shows a visible Chinese error and does not navigate when register() fails[39m[32m 1[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m5 failed[39m[22m[90m (5)[39m
+[2m   Start at [22m 02:15:40
+[2m   Duration [22m 2.08s[2m (transform 80ms, setup 361ms, import 358ms, tests 21ms, environment 955ms)[22m
+
+
+STDERR:
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 5 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mrenders all requirement-declared accessible controls
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mshows a terms/privacy checkbox and submits a full valid form to register()
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mshows a three-segment password strength meter that changes with input
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mblocks submission with a visible Chinese error when required fields are missing
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mshows a visible Chinese error and does not navigate when register() fails
+[31m[1mError[22m: useAuth must be used inside AuthProvider[39m
+[36m [2m❯[22m useAuth src/features/auth/AuthContext.tsx:[2m41:11[22m[39m
+    [90m 39|[39m   [35mconst[39m ctx [33m=[39m [34museContext[39m([33mAuthContext[39m)[33m;[39m
+    [90m 40|[39m   [35mif[39m ([33m![39mctx) {
+    [90m 41|[39m     [35mthrow[39m [35mnew[39m [33mError[39m([32m'useAuth must be used inside AuthProvider'[39m)[33m;[39m
+    [90m   |[39m           [31m^[39m
+    [90m 42|[39m   }
+    [90m 43|[39m   [35mreturn[39m ctx[33m;[39m
+[90m [2m❯[22m RegisterPage src/features/auth/RegisterPage.tsx:[2m29:22[22m[39m
+[90m [2m❯[22m Object.react_stack_bottom_frame node_modules/react-dom/cjs/react-dom-client.development.js:[2m25904:20[22m[39m
+[90m [2m❯[22m renderWithHooks node_modules/react-dom/cjs/react-dom-client.development.js:[2m7662:22[22m[39m
+[90m [2m❯[22m updateFunctionComponent node_modules/react-dom/cjs/react-dom-client.development.js:[2m10166:19[22m[39m
+[90m [2m❯[22m beginWork node_modules/react-dom/cjs/react-dom-client.development.js:[2m11778:18[22m[39m
+[90m [2m❯[22m runWithFiberInDEV node_modules/react-dom/cjs/react-dom-client.development.js:[2m874:13[22m[39m
+[90m [2m❯[22m performUnitOfWork node_modules/react-dom/cjs/react-dom-client.development.js:[2m17641:22[22m[39m
+[90m [2m❯[22m workLoopSync node_modules/react-dom/cjs/react-dom-client.development.js:[2m17469:41[22m[39m
+[90m [2m❯[22m renderRootSync node_modules/react-dom/cjs/react-dom-client.development.js:[2m17450:11[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/5]⎯[22m[39m
+
+
+

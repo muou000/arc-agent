@@ -1,0 +1,164 @@
+{
+  "REQ-1": {
+    "req_id": "REQ-1",
+    "name": "注册旅客账号",
+    "description": "Validation 契约：应用必须支持直接访问 `/register`，首页必须提供可点击的 `Register` 链接进入该页面。注册页必须提供以下稳定且唯一的中文可访问名称，供 Playwright 使用 `getByLabel` 或 `getByRole` 定位，控件必须与对应 label 原生关联，不得依赖 CSS class、DOM 顺序或 placeholder：`用户名` 为必填文本输入框；`登录密码` 为必填密码输入框，并显示随输入动态变化的三段密码强度指示器；`确认密码` 为必填密码输入框；`证件类型` 为必填原生下拉选择框，选项包括“请选择证件类型”（初始值）、“居民身份证”、“护照”、“港澳居民来往内地通行证”、“台湾居民来往大陆通行证”和“外国人永久居留身份证”；`姓名` 为必填文本输入框；`证件号码` 为必填文本输入框；`优惠（待）类型` 为必填原生下拉选择框，初始提示为“请选择乘客类型”，选项包括“成人”、“儿童”、“学生”、“残疾军人”和“其他优惠类型”；`邮箱` 为可选 email 输入框；`国家/地区代码` 为手机号组合控件中的必填下拉选择框，默认值为 `+86`，并至少提供 `+84` 等国际区号；`手机号` 为必填文本输入框；必须有 accessible name 包含 `服务条款` 或 `隐私政策` 的必选复选框；必须有 accessible name 为 `下一步` 的提交按钮。有效数据提交后必须调用注册接口、创建登录会话并导航回 `/`，首页显示提交的用户名和 accessible name 为 `Sign out` 的退出链接，刷新后仍保持登录；缺失、格式错误、密码不一致、重复用户名或重复邮箱、未同意协议时，必须显示可见的中文错误消息，且不得创建账号或登录会话。\n实现旅客注册页面和注册接口，从首页点击 `Register` 进入。\n页面提供用户名、登录密码、确认密码、证件类型、姓名、证件号码、优惠（待）类型、邮箱、国家/地区代码、手机号、服务条款和隐私政策复选框以及“下一步”按钮。\n前端负责必填提示和基础交互，后端必须再次完成全部校验，不能依赖前端结果。\n用户名、登录密码、确认密码、证件类型、姓名、证件号码、优惠（待）类型、国家/地区代码和手机号均为必填，邮箱为可选，服务条款和隐私政策必须同意。\n姓名去除首尾空格后应包含 2–100 个非空白字符；\n证件号码只能包含 6–30 个 ASCII 字母、数字或连字符；\n证件类型必须从页面提供的有效选项中选择，优惠（待）类型必须从页面提供的有效选项中选择，手机号必须与国家/地区代码组合通过校验。\n用户名只能包含 3–32 个 ASCII 字母、数字、连字符或下划线。\n邮箱填写时必须是完整有效的地址且不超过 254 个字符。\n登录密码长度为 12–128 个字符，并至少包含大写字母、小写字母、数字和特殊字符；\n确认密码必须一致；\n用户必须接受服务条款和隐私政策。\n用户名和邮箱都必须唯一，邮箱重复判断忽略大小写。\n注册接口使用服务端生成的账号标识和会话令牌，禁止返回密码或密码摘要。\n有效提交将账号安全写入持久化文件、创建登录会话并返回首页；\n页面显示当前用户名和“退出登录”。\n任何缺失、格式错误或重复数据都显示明确错误，不得创建账号或会话。\n账号写入应采用安全的读改写流程，避免文件损坏和只写入一半的数据。\n演示数据使用唯一用户名 `tb-user-<时间戳>-<随机值>`、由该用户名生成的有效邮箱、密码 `Valid-password-123!`、姓名 `Ticket User <时间戳>-<随机值>`、证件类型 `护照`、证件号码 `P<时间戳数字>`、优惠（待）类型 `成人`、国家/地区代码 `+84` 和有效手机号 `912345678`。\n重复场景复用相同用户名或邮箱；\n无效示例包括用户名 `bad username!`、邮箱 `not-an-email`、密码 `short`、两次密码不一致、缺少证件号码或未勾选协议。\n可选视觉参考：![注册页面](./reference/register.png)",
+    "visual_reference": [
+      "{'image_path': './reference/register.png', 'analysis': '### 1. Frontend Style Direction\\n* **Colors:** Primary blue header bar (#1B7CC4 → #2196D3 gradient); white surfaces (#FFF); label text dark gray (#333); required-asterisk red (#E33); hint/validation text orange (#F60 / #FF8800); link text blue (#3B8FD4); primary button orange (#F5820B); password strength meter red/gray.\\n* **Typography:** System sans-serif; labels ~14px regular; input placeholder ~14px gray (#999); hints ~13–14px; header title ~16–18px white.\\n* **Spacing Rhythm:** Medium density; ~16–20px vertical gap between form rows; inputs ~36–40px tall; generous outer padding (~30–40px) inside card; label column right-aligned before inputs.\\n* **Overall Tone:** Traditional Chinese government/enterprise service form — a single-card, one-column registration wizard step (e.g., account signup flow), functional and authoritative.\\n\\n### 2. Page Skeleton (Top to Bottom)\\n* **Section: Page Card**\\n  * **Purpose:** Contain a multi-step registration form (current step: account info).\\n  * **Container:** Full-width card, thin blue border, small corner radius (~4px); blue gradient header bar with left-aligned white title; white body.\\n  * **Children:**\\n    1. **Header Bar:** Blue gradient strip, white title text (\"账户信息\" style — account info section title).\\n    2. **Required Fields Block:** Vertical stack of label + input rows, each label right-aligned with a red asterisk prefix. Rows: username (text input + orange inline hint), login password (password input + strength meter to the right), confirm password, ID-type dropdown, name (input + orange hint with link), ID number (input + orange parenthetical hint), passenger-discount-type dropdown.\\n    3. **Divider:** Full-width light dashed/dotted horizontal rule separating required and optional groups.\\n    4. **Optional/Contact Fields Block:** Email row (no asterisk); phone row = country-code dropdown (+86-style select) + phone number input side-by-side, with orange hint text to the right.\\n    5. **Agreement Row:** Checkbox + text with blue hyperlinks for terms/privacy policy.\\n    6. **Action Row:** Centered orange primary button (\"下一步\" — next-step label), pill-ish radius (~4px), width ~200px.\\n* **Style Notes:** Inputs have light gray borders, white bg, subtle rounding; selects styled identically with chevron; hints only appear to the right of certain inputs, vertically centered with the row.\\n\\n### 3. Data Presentation Style\\n* **Pattern Type:** Single-column vertical form; no tables/charts.\\n* **Visual Structure:** Each row = right-aligned label (fixed width) + input (~350px wide) + optional hint column to the right.\\n* **Field Types:** short text, password, confirm-password, dropdown (ID type, passenger type), phone with country-code select, email, boolean checkbox.\\n* **Styling Rules:** Required fields marked with red `*`; optional email lacks asterisk; validation/hints rendered inline in orange to the right of inputs; password strength shown as a 3-segment horizontal bar (colored segment(s) + gray remainder) aligned under/next to the password hint.\\n* **Do Not Copy Actual Values:** No user data is shown as content; only placeholder and hint copy structure.\\n\\n### 4. Interaction Surfaces\\n* **Text inputs:** 5–6 fields, standard bordered style, gray placeholder text describing format rules.\\n* **Dropdowns:** 3 selects (ID type, discount/passenger type, country/region code) — native-style bordered selects with chevron.\\n* **Password strength meter:** 3-segment bar that updates live (weak=red → medium → strong), rendered beside the password row.\\n* **Checkbox + links:** agreement consent checkbox; two blue inline hyperlinks (service terms, privacy policy) that should open dialogs or new pages.\\n* **Primary button:** centered orange \"next step\" CTA — the only primary control; no visible secondary/cancel button.\\n* **Inline hints:** orange text and one orange underlined link (name-fill rules) that likely triggers a popover/tooltip.\\n\\n### 5. Frontend Requirements Summary\\n* **Must Preserve:** Blue-gradient card header; single-column labeled form with right-aligned labels and red required asterisks; inline orange hint column; dashed divider between required and optional sections; 3-segment password strength indicator; centered orange primary CTA; blue link styling for legal docs.\\n* **Runtime-Driven Areas:** Dropdown options (ID types, passenger types, country codes), validation messages, password strength state, hint/tooltips, checkbox state, and any multi-step wizard progression must be data/state driven.\\n* **Avoid:** Seeding placeholders/hints as actual input values; hardcoding dropdown options or legal link targets from the screenshot; reproducing specific regulatory/site-specific copy as UI content.', 'resolved_image_path': 'D:\\\\code\\\\arc-visual-reference-dict-214\\\\arc-bench-test\\\\easy-ticketbooking\\\\requirements\\\\reference\\\\register.png'}"
+    ],
+    "scenarios": [
+      {
+        "name": "使用有效资料注册并保持登录",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "一名未登录访客准备了唯一且符合规则的账号和旅客资料。"
+          },
+          {
+            "keyword": "WHEN",
+            "content": "访客填写注册表单、接受服务条款并点击“下一步”。"
+          },
+          {
+            "keyword": "THEN",
+            "content": "系统保存账号并创建会话，首页显示用户名和“退出登录”，刷新页面后仍保持登录。"
+          }
+        ]
+      },
+      {
+        "name": "拒绝缺失或格式错误的资料",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "注册资料存在必填项缺失、格式错误、日期无效、弱密码、确认密码不一致或未接受协议。"
+          },
+          {
+            "keyword": "WHEN",
+            "content": "访客提交注册表单。"
+          },
+          {
+            "keyword": "THEN",
+            "content": "页面显示对应错误，系统不创建账号，也不创建登录会话。"
+          }
+        ]
+      },
+      {
+        "name": "拒绝重复用户名或邮箱",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "系统中已经存在相同用户名或大小写不同但内容相同的邮箱。"
+          },
+          {
+            "keyword": "WHEN",
+            "content": "访客再次提交注册。"
+          },
+          {
+            "keyword": "THEN",
+            "content": "系统返回重复账号错误，原账号保持不变且不产生新的账号或会话。"
+          }
+        ]
+      }
+    ],
+    "parent_id": "ROOT",
+    "children_ids": [],
+    "dependencies": []
+  },
+  "REQ-2": {
+    "req_id": "REQ-2",
+    "name": "登录和退出账号",
+    "description": "Validation 契约：应用必须支持直接访问 `/login`，首页必须提供可通过 Playwright `getByRole('link')` 定位的 `登录` 或 `Login` 入口。登录页只需实现账号密码登录核心功能，不需要实现二维码、扫码登录、宣传内容、忘记密码或其他扩展功能；必须提供与 label 原生关联且可通过 Playwright `getByLabel` 或 `getByRole` 定位的控件：中文可访问名称 `用户名或邮箱`（同时兼容 `Username or email`）的文本输入框，中文可访问名称 `密码`（同时兼容 `Password`）的密码输入框，以及中文可访问名称 `立即登录` 或 `登录`（同时兼容 `Login` 或 `Sign in`）的提交按钮。登录输入框必须支持用户名或邮箱，服务端应去除账号标识首尾空格，用户名按保存值匹配，邮箱匹配忽略大小写，密码必须完全匹配且区分大小写。有效用户名和密码登录、使用大小写不同的邮箱登录、错误密码或不完整凭据登录、未知账号登录是必须通过的四个核心场景；错误密码、不完整凭据和未知账号必须显示完全相同的通用错误消息，错误语义可使用中文“无效凭据”“登录失败”“账号或密码错误”或兼容英文 `invalid credentials`、`login failed`、`sign-in failed`、`incorrect credentials`、`incorrect password`、`wrong credentials`、`wrong password`，且不得泄露账号是否存在。成功登录后必须导航到 `/`，首页显示当前用户名和可访问名称为 `退出登录` 或 `Sign out` 的退出链接，刷新后仍保持登录；失败登录不得显示退出链接，也不得创建或改变登录会话。\n实现登录页面、登录接口、会话恢复和退出登录。\n从首页点击“登录”进入登录页面。\n登录页面提供“用户名或邮箱”“密码”和“登录”控件。\n提交时去除账号标识首尾空格；\n用户名按保存值匹配，邮箱匹配忽略大小写，密码必须完全一致。\n后端从持久化账号文件读取用户，验证成功后生成不可预测的会话令牌并保存会话，随后返回首页。\n首页在未登录状态显示“注册”和“登录”，登录后显示当前用户名和“退出登录”。\n浏览器通过安全的会话凭据恢复身份，刷新页面后仍应保持登录。\n点击“退出登录”后，服务端删除或失效当前会话，浏览器清除会话凭据并恢复未登录导航状态；\n再次刷新不能恢复已经退出的会话。\n用户名、邮箱或密码为空，账号不存在，或者密码错误时，统一显示不泄露账号是否存在的登录失败提示，并保持未登录状态。\n接口响应不能返回密码、密码摘要或其他用户的资料。\n演示时使用通过 REQ-1 创建的唯一账号，正确密码为 `Valid-password-123!`；\n有效示例可使用用户名或邮箱并允许首尾空格，无效示例使用 `incorrect-password` 或不存在的邮箱。\n可选视觉参考：![登录页面](./reference/login.png)",
+    "visual_reference": [
+      "{'image_path': './reference/login.png', 'analysis': '### 1. Frontend Style Direction\\n* **Colors:**\\n  * Primary brand: Railway orange/red `#E64A19` (logo, accents)\\n  * Hero background: gradient blue `#5B8FD9 → #7FB3E8` with photographic station imagery\\n  * Primary CTA: orange `#F60` / `#FF7A00` solid button\\n  * Links: blue `#1A6FD4`\\n  * Surfaces: white cards `#FFFFFF`, footer dark gray `#4A4A4A`\\n  * Input borders: light gray `#DDD`\\n* **Typography:** Chinese sans-serif (system / \"Microsoft YaHei\" style). Scale: logo title ~28px bold, page heading ~26px, body ~14–16px, footer/legal ~12–13px. Weights: bold for headings/CTA, regular elsewhere.\\n* **Spacing Rhythm:** Medium-spacious; generous hero height (~70vh), form card padding ~24–32px, footer link cards with ~16px gaps.\\n* **Overall Tone:** Official government/enterprise portal login page — clean, trustworthy, brand-forward hero with a focused single-action login card.\\n\\n### 2. Page Skeleton (Top to Bottom)\\n\\n**A. Header Bar**\\n* **Purpose:** Brand identity + page title.\\n* **Container:** White, full width, ~80px height, no border/shadow.\\n* **Children:** Left: circular red logo + two-line brand name (CN large / EN small gray caps). Right of logo: page title “欢迎登录…”. All left-aligned within a centered content container.\\n* **Style Notes:** Flat, minimal, no nav menu — login is the sole focus.\\n\\n**B. Hero / Login Section**\\n* **Purpose:** Marketing banner + login entry point.\\n* **Container:** Full-width blue gradient hero with background photo overlay; wavy/curved white bottom edge. Min-height ~65–75vh.\\n* **Children:**\\n  1. **Left promo column** (~55% width): large bold white/yellow two-line headline; 2×2 grid of feature items each with check icon + label (yellow/white text); QR code block with arrow annotation and app-install instruction text; centered phone mockup image overlapping.\\n  2. **Right login card** (~380–420px fixed width, right-aligned): white, small radius (~4px), subtle shadow.\\n* **Style Notes:** Hero content vertically centered; carousel dot indicator at hero bottom center (single active white dot).\\n\\n**C. Login Card (child detail)**\\n* Tab bar: two equal tabs “账号登录 / 扫码登录”， active tab emphasized, thin divider between tabs.\\n* Two input fields: icon (person / lock) + placeholder text, full-width, ~44px height, light gray 1px border, small radius.\\n* Full-width orange primary button “立即登录”， white bold text, radius ~4–6px.\\n* Secondary links row: registration link (blue) + separator + “忘记密码？” link, centered, small text.\\n* Footer note inside card: small gray multi-line service-hours disclaimer text, separated by whitespace.\\n\\n**D. Links & QR Footer Section**\\n* **Purpose:** Friend links and official channel QR codes.\\n* **Container:** White, full width, generous vertical padding.\\n* **Children:**\\n  1. Left: “友情链接” label + 2×2 grid of bordered white logo cards (~1px gray border, logo + name).\\n  2. Right: row of 4 QR code columns, each with caption title above QR image; plus a bordered notice text box on the far right.\\n* **Style Notes:** Flat cards, light borders, centered captions.\\n\\n**E. Legal Footer**\\n* **Container:** Dark gray full-width bar, centered white/light-gray text, two stacked lines.\\n* **Children:** Copyright line, then filing/ICP line with separator pipes; right side: accessibility (适老化/无障碍) badge with icon.\\n\\n### 3. Data Presentation Style\\n* **Friend-link cards:** Pattern = logo tiles grid. Field types: partner logo image + optional org name. Border `1px #E5E5E5`, white bg, fixed card size, hover lift optional.\\n* **QR code columns:** Pattern = media figure list — caption (14px) above square QR image (~110–130px), horizontally spaced.\\n* **Feature checklist (hero):** Pattern = icon + label grid (2 columns), symbolic not data-driven.\\n* **Disclaimer text:** Plain multi-line paragraph, small font, muted color.\\n* **Do Not Copy Actual Values:** Do not seed partner names, QR destinations, filing numbers, dates, or app screenshots from the image; use placeholder structures.\\n\\n### 4. Interaction Surfaces\\n* **Tabs (primary):** account login vs QR login — underline/active-color state.\\n* **Text inputs (primary):** with leading icons, focus border in brand blue/orange.\\n* **Primary button:** full-width orange, hover darker orange.\\n* **Secondary links:** blue text links (register, forgot password).\\n* **Carousel dots:** hero slide indicator.\\n* **Accessibility badge:** clickable footer control.\\n\\n### 5. Frontend Requirements Summary\\n* **Must Preserve:** split hero layout (promo left / login card right), orange CTA on blue hero, tabbed login card, curved hero bottom edge, QR/link footer grid, dark legal bar.\\n* **Runtime-Driven Areas:** login form values and validation, tab state, friend-link list, QR code targets, disclaimer text, carousel slides.\\n* **Avoid:** hardcoding real partner names, ICP/公安 filing numbers, phone mockup app data, or actual QR payloads as seeded content.', 'resolved_image_path': 'D:\\\\code\\\\arc-visual-reference-dict-214\\\\arc-bench-test\\\\easy-ticketbooking\\\\requirements\\\\reference\\\\login.png'}"
+    ],
+    "scenarios": [
+      {
+        "name": "使用用户名登录并恢复会话",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "系统中存在一个已注册账号，访客当前未登录。"
+          },
+          {
+            "keyword": "WHEN",
+            "content": "访客使用带有可选首尾空格的用户名和正确密码登录。"
+          },
+          {
+            "keyword": "THEN",
+            "content": "首页显示保存的用户名和“退出登录”，刷新页面后会话仍然有效。"
+          }
+        ]
+      },
+      {
+        "name": "使用邮箱登录",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "系统中存在一个带有有效邮箱的已注册账号。"
+          },
+          {
+            "keyword": "WHEN",
+            "content": "访客使用大小写不同的邮箱和正确密码登录。"
+          },
+          {
+            "keyword": "THEN",
+            "content": "系统识别同一账号并建立登录会话。"
+          }
+        ]
+      },
+      {
+        "name": "拒绝无效凭据",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "登录标识或密码为空、不存在或不正确。"
+          },
+          {
+            "keyword": "WHEN",
+            "content": "访客点击“登录”。"
+          },
+          {
+            "keyword": "THEN",
+            "content": "页面显示统一的登录失败提示，不透露账号是否存在，也不创建会话。"
+          }
+        ]
+      },
+      {
+        "name": "退出当前会话",
+        "steps": [
+          {
+            "keyword": "GIVEN",
+            "content": "用户已经登录并位于任意公开页面。"
+          },
+          {
+            "keyword": "WHEN",
+            "content": "用户点击“退出登录”。"
+          },
+          {
+            "keyword": "THEN",
+            "content": "当前会话失效，页面恢复“注册”和“登录”入口，刷新后仍保持退出状态。"
+          }
+        ]
+      }
+    ],
+    "parent_id": "ROOT",
+    "children_ids": [],
+    "dependencies": [
+      "REQ-1"
+    ]
+  },
+  "ROOT": {
+    "req_id": "ROOT",
+    "name": "火车票预订演示系统",
+    "description": "一个小型火车票预订网站，访客可以注册账号、登录系统、搜索已发布的车次，并在登录后提交乘客信息完成订票。\n账号、登录会话和已确认订单需要持久化，页面刷新或服务重启后仍可恢复。\n系统只实现教学演示所需的完整主流程，不包含在线支付、退票、改签、取消订单、座位库存扣减、历史订单列表和时刻表管理。\n首页视觉参考：![首页](./reference/homepage.png)",
+    "visual_reference": [
+      "{'image_path': './reference/homepage.png', 'analysis': '### 1. Frontend Style Direction\\n* **Colors:**\\n  * Primary blue: #3B96F2 / #2E8BE6 (nav bar, sidebar, icons, hero overlay)\\n  * Accent orange: #FF7A00 (primary CTA button, logo red-orange #E34A26)\\n  * Surfaces: white #FFFFFF, light blue gradient banners (#DCEBFA → #EAF4FD)\\n  * Text: dark gray #333, secondary gray #666/#999\\n  * Borders: light gray #E0E0E0 on inputs\\n* **Typography:** Sans-serif (system/PingFang/Microsoft YaHei). Scale: ~14px body, 16–18px form labels/nav, 26–32px banner headings. Regular weight body, medium/semibold for nav and headings.\\n* **Spacing Rhythm:** Medium density; generous horizontal gutters (~15% side margins), consistent ~16–24px vertical gaps between content bands, 2-column banner grid with ~24px gutter.\\n* **Overall Tone:** Government/enterprise service portal — clean, trustworthy, blue-led, consumer-friendly booking homepage.\\n\\n### 2. Page Skeleton (Top to Bottom)\\n\\n**A. Header Bar**\\n* **Purpose:** Brand identity, global search, account utilities.\\n* **Container:** White full-width bar, ~80px tall, content centered at ~max-width 1400px.\\n* **Children (left→right):** Logo (icon + wordmark + sub-caption) → large search input with attached blue search button (~40% width) → utility links row (accessibility link, senior version, language dropdown, \"My 12306\" dropdown, login/register links) separated by thin vertical dividers.\\n* **Style Notes:** Utility links in gray/blue small text; dropdowns indicated with chevrons.\\n\\n**B. Primary Navigation Bar**\\n* **Purpose:** Main site sections.\\n* **Container:** Full-width solid blue (#3B96F2) bar, ~50px, white text.\\n* **Children:** 7 equal-width menu items, each label + dropdown chevron; active item shown with slightly darker/saturated blue background block.\\n* **Style Notes:** Flat, no borders/shadows; hover implies darker state.\\n\\n**C. Hero Carousel + Booking Panel**\\n* **Purpose:** Primary ticket-booking form overlaid on promotional carousel.\\n* **Container:** Full-width, ~600px tall photo carousel; left third has a light blue gradient panel; dot indicators (6 dots) bottom center; right side shows promo text + QR code block.\\n* **Children:**\\n  * White booking card (floating, rounded corners, subtle shadow), structured as: left vertical blue sidebar (3 icon tabs: tickets / frequent queries / dining, active tab highlighted) + main form area.\\n  * Form area: top row of 4 mode tabs (one-way selected with icon + blue underline; round-trip, transfer, refund/change), then stacked labeled fields: origin input, swap button (circular orange icon between fields), destination input, date input with calendar icon, two checkboxes row, full-width orange “查询” submit button.\\n* **Style Notes:** Inputs are bordered white fields with placeholder text and trailing icons (location pin, calendar); labels left-aligned gray text.\\n\\n**D. Services Icon Strip**\\n* **Purpose:** Quick links to auxiliary services.\\n* **Container:** White background, single row of 7 evenly spaced icon+label items.\\n* **Children:** Circular blue icons with small badge accents, label text below each; thin diagonal slash separators between items.\\n* **Style Notes:** Light, flat, monochrome blue icons.\\n\\n**E. Promo Banner Grid (2×2)**\\n* **Purpose:** Marketing/feature highlight cards.\\n* **Container:** Centered content width; 2 columns × 2 rows, ~24px gutters, each card ~380px tall, rounded corners (~4–8px).\\n* **Children:** Each card: gradient background (blue/teal/orange variants), left-aligned heading + 2 lines of subcopy, right-side illustration.\\n* **Style Notes:** Soft gradients, playful illustrations, no borders/shadows.\\n\\n**F. Right-edge Floating Toolbar**\\n* **Purpose:** Persistent utility dock.\\n* **Container:** Fixed right edge, vertically stacked small square buttons with icons + 2-char labels (announcements, customer service, app download, close).\\n* **Style Notes:** White/light gray squares with subtle borders.\\n\\n### 3. Data Presentation Style\\n* **Booking Form Fields:** Text inputs (station names, searchable with location icon), date picker field, checkbox options — labels left, controls right-aligned within a two-column label/field layout.\\n* **Promo Cards:** Image-led cards with heading + 2-line description; future content should be title + subtitle + image slot.\\n* **Carousel:** Full-bleed slides with headline text overlay + QR/media block; dot pagination.\\n* **No dense data tables** on this page; any runtime lists (e.g., search results, announcements) should follow the white-card + light-border + 14px text pattern.\\n\\n### 4. Interaction Surfaces\\n* **Primary:** Orange full-width “查询” submit button (high emphasis, rounded ~4px).\\n* **Secondary:** Mode tabs with icon + underline active state; vertical sidebar tabs (blue active block); swap-origin/destination circular button.\\n* **Global:** Search bar with attached blue button; nav dropdown menus; utility dropdowns (language, account); login/register text links; right dock buttons; carousel dots.\\n* **Inputs:** White, 1px gray border, ~40px height, trailing icons, placeholder-driven.\\n\\n### 5. Frontend Requirements Summary\\n* **Must Preserve:** Blue/orange two-tone scheme; three-band header (header + blue nav + hero); floating booking card with left vertical tab rail; 7-item icon strip; 2×2 gradient promo grid; fixed right utility dock; dot-pagination carousel.\\n* **Runtime-Driven Areas:** Carousel slides (title/image), promo cards (title/subtitle/illustration), search suggestions, service links, station autocomplete data, date defaults — all must be data-driven.\\n* **Avoid:** Hardcoding screenshot-specific station names, dates, phone listings, QR destinations, or train schedules as seeded content.', 'resolved_image_path': 'D:\\\\code\\\\arc-visual-reference-dict-214\\\\arc-bench-test\\\\easy-ticketbooking\\\\requirements\\\\reference\\\\homepage.png'}"
+    ],
+    "scenarios": [],
+    "parent_id": null,
+    "children_ids": [
+      "REQ-1",
+      "REQ-2"
+    ],
+    "dependencies": []
+  }
+}

@@ -1,0 +1,53 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/registerApi.test.ts
+- backend/tests/registerValidation.test.js
+- frontend/tests/registerValidation.test.ts
+- frontend/tests/sessionContext.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Backend Targets:
+- tests/registerValidation.test.js
+Frontend Targets:
+- tests/registerApi.test.ts
+- tests/registerValidation.test.ts
+- tests/sessionContext.test.tsx
+
+Exit Code: 0
+
+=== Backend Vitest Batch ===
+Exit Code: 0
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/backend[39m
+
+ [32m✓[39m tests/registerValidation.test.js [2m([22m[2m32 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m32 passed[39m[22m[90m (32)[39m
+[2m   Start at [22m 01:27:57
+[2m   Duration [22m 341ms[2m (transform 31ms, setup 0ms, import 57ms, tests 8ms, environment 0ms)[22m
+
+
+
+
+=== Frontend Vitest Batch ===
+Exit Code: 0
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/frontend[39m
+
+ [32m✓[39m tests/registerValidation.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m tests/registerApi.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m tests/sessionContext.test.tsx [2m([22m[2m5 tests[22m[2m)[22m[32m 243[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m3 passed[39m[22m[90m (3)[39m
+[2m      Tests [22m [1m[32m23 passed[39m[22m[90m (23)[39m
+[2m   Start at [22m 01:28:00
+[2m   Duration [22m 2.85s[2m (transform 161ms, setup 1.59s, import 314ms, tests 255ms, environment 4.52s)[22m
+
+
+

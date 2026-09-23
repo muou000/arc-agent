@@ -1,0 +1,50 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/RegisterPage.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\candidate-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\candidate-rep001\frontend
+Frontend Targets:
+- tests/RegisterPage.test.tsx
+
+Exit Code: 1
+
+=== Frontend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/candidate-rep001/frontend[39m
+
+ [31m❯[39m tests/RegisterPage.test.tsx [2m([22m[2m5 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 4893[2mms[22m[39m
+     [32m✓[39m renders all requirement-declared accessible controls[32m 118[2mms[22m[39m
+     [33m[2m✓[22m[39m shows a terms/privacy checkbox and submits a full valid form to register() [33m 2369[2mms[22m[39m
+[31m     [31m×[31m shows a three-segment password strength meter that changes with input[39m[32m 203[2mms[22m[39m
+     [32m✓[39m blocks submission with a visible Chinese error when required fields are missing[32m 110[2mms[22m[39m
+     [33m[2m✓[22m[39m shows a visible Chinese error and does not navigate when register() fails [33m 2091[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m4 passed[39m[22m[90m (5)[39m
+[2m   Start at [22m 02:30:14
+[2m   Duration [22m 6.81s[2m (transform 95ms, setup 355ms, import 389ms, tests 4.89s, environment 940ms)[22m
+
+
+STDERR:
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 1 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mshows a three-segment password strength meter that changes with input
+[31m[1mAssertionError[22m: expected 1 to be less than 1[39m
+[36m [2m❯[22m tests/RegisterPage.test.tsx:[2m109:24[22m[39m
+    [90m107|[39m     [35mawait[39m userEvent[33m.[39m[34mtype[39m(password[33m,[39m [32m'A1!'[39m)[33m;[39m
+    [90m108|[39m     const strongActive = Array.from(meter()).filter((el) => el.dataset…
+    [90m109|[39m     [34mexpect[39m(weakActive)[33m.[39m[34mtoBeLessThan[39m(strongActive)[33m;[39m
+    [90m   |[39m                        [31m^[39m
+    [90m110|[39m     [34mexpect[39m(strongActive)[33m.[39m[34mtoBe[39m([34m3[39m)[33m;[39m
+    [90m111|[39m   })[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+
+

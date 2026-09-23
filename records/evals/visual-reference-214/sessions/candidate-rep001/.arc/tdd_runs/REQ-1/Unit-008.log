@@ -1,0 +1,91 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/RegisterPage.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\candidate-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\candidate-rep001\frontend
+Frontend Targets:
+- tests/RegisterPage.test.tsx
+
+Exit Code: 1
+
+=== Frontend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/candidate-rep001/frontend[39m
+
+ [31m❯[39m tests/RegisterPage.test.tsx [2m([22m[2m5 tests[22m[2m | [22m[31m4 failed[39m[2m)[22m[32m 245[2mms[22m[39m
+[31m     [31m×[31m renders all requirement-declared accessible controls[39m[32m 53[2mms[22m[39m
+[31m     [31m×[31m shows a terms/privacy checkbox and submits a full valid form to register()[39m[32m 14[2mms[22m[39m
+[31m     [31m×[31m shows a three-segment password strength meter that changes with input[39m[32m 17[2mms[22m[39m
+     [32m✓[39m blocks submission with a visible Chinese error when required fields are missing[32m 147[2mms[22m[39m
+[31m     [31m×[31m shows a visible Chinese error and does not navigate when register() fails[39m[32m 12[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m4 failed[39m[22m[2m | [22m[1m[32m1 passed[39m[22m[90m (5)[39m
+[2m   Start at [22m 02:19:37
+[2m   Duration [22m 2.16s[2m (transform 95ms, setup 367ms, import 374ms, tests 245ms, environment 942ms)[22m
+
+
+STDERR:
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 4 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mrenders all requirement-declared accessible controls
+[31m[1mTestingLibraryElementError[22m[39m: Unable to find a label with the text of: 用户名
+
+Ignored nodes: comments, script, style
+[36m<body>[39m
+  [36m<div>[39m
+    [36m<main[39m
+      [33mclass[39m=[32m"min-h-screen bg-[#f6f7f9] py-8"[39m
+    [36m>[39m
+      [36m<div[39m
+        [33mclass[39m=[32m"mx-auto w-full max-w-3xl overflow-hidden rounded border border-[#bcd8ee] bg-white"[39m
+      [36m>[39m
+        [36m<div[39m
+          [33mclass[39m=[32m"bg-gradient-to-r from-[#2E7DB2] to-[#3B8CD4] px-6 py-3 text-lg font-bold text-white"[39m
+     
+...[OUTPUT TRUNCATED]...
+x; align-items: center; gap: 12px;"[39m
+              [36m>[39m
+                [36m<input[39m
+                  [33maria-invalid[39m=[32m"false"[39m
+                  [33mclass[39m=[32m"w-full max-w-sm rounded border border-gray-300 px-3 py-2 text-sm focus:border-[#2E8AE6] focus:outline-none"[39m
+                  [33mid[39m=[32m"reg-confirm-password"[39m
+                  [33mtype[39m=[32m"password"[39m
+                  [33mvalue[39m=[32m""[39m
+                [36m/>[39m
+              [36m</div>[39m
+            [36m</div>[39m
+          [36m</div>[39m
+          [36m<div[39m
+            [33mstyle[39m=[32m"display: flex; align-items: flex-start; padding: 8px 0px;"[39m
+          [36m>[39m
+            [36m<label[39m
+              [33mfor[39m=[32m"reg-cert-type"[39m
+              [33mstyle[39m=[32m"width: 10rem; flex-shrink: 0; padding-top: 8px; text-align: right; font-size: 0.875rem;"[39m
+            [36m>[39m
+              [36m<span[39m
+                [33mstyle[39m=[32m"color: red; margin-right: 4px;"[39m
+              ...
+[90m [2m❯[22m Object.getElementError node_modules/@testing-library/dom/dist/config.js:[2m37:19[22m[39m
+[90m [2m❯[22m getAllByLabelText node_modules/@testing-library/dom/dist/queries/label-text.js:[2m111:38[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/dom/dist/query-helpers.js:[2m52:17[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/dom/dist/query-helpers.js:[2m95:19[22m[39m
+[36m [2m❯[22m fillField tests/RegisterPage.test.tsx:[2m20:32[22m[39m
+    [90m 18|[39m
+    [90m 19|[39m [35mfunction[39m [34mfillField[39m(label[33m,[39m value) {
+    [90m 20|[39m   return userEvent.type(screen.getByLabelText(label, { exact: true }),…
+    [90m   |[39m                                [31m^[39m
+    [90m 21|[39m }
+    [90m 22|[39m
+[90m [2m❯[22m tests/RegisterPage.test.tsx:[2m132:11[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/4]⎯[22m[39m
+
+
+
