@@ -5,7 +5,8 @@ the e2e harness idea (``pi/packages/coding-agent/test/suite/harness.ts``):
 
 - ``FauxChatModel`` is a LangChain ``BaseChatModel`` that pops scripted
   ``AIMessage``s from a queue (``faux_text`` / ``faux_tool_call`` builders mirror
-  pi's ``fauxText`` / ``fauxToolCall``). Because it is a real chat model object,
+  pi's ``fauxText`` / ``fauxToolCall``; an ``Exception`` queue entry raises
+  that call's error instead). Because it is a real chat model object,
   ``build_stage_agent``/``create_deep_agent`` drive the genuine agent loop:
   tool calls are executed by the real tool nodes, results flow back as
   ``ToolMessage``s, and middleware (``StageDisciplineMiddleware``,
@@ -66,9 +67,14 @@ def faux_tool_calls(*calls: Any, response_metadata: dict[str, Any] | None = None
 
 
 class FauxChatModel(BaseChatModel):
-    """Scripted chat model: each model call consumes the next queued response."""
+    """Scripted chat model: each model call consumes the next queued response.
 
-    responses: list[BaseMessage] = Field(default_factory=list)
+    Queue entries are normally scripted ``AIMessage``s; an ``Exception``
+    entry makes that one model call raise instead, scripting provider
+    failures (transient errors, malformed payloads) without a real LLM.
+    """
+
+    responses: list[BaseMessage | Exception] = Field(default_factory=list)
     _queue: deque = PrivateAttr(default_factory=deque)
     _calls: list = PrivateAttr(default_factory=list)
 
@@ -77,7 +83,7 @@ class FauxChatModel(BaseChatModel):
 
     # -- scripting API (mirrors pi's faux provider registration) ------------
 
-    def set_responses(self, responses: list[BaseMessage]) -> None:
+    def set_responses(self, responses: list[BaseMessage | Exception]) -> None:
         self.responses = list(responses)
         self._queue = deque(self.responses)
 
@@ -131,6 +137,8 @@ class FauxChatModel(BaseChatModel):
                 f"after {self.call_count} call(s). Extend the script or check the loop."
             )
         response = self._queue.popleft()
+        if isinstance(response, Exception):
+            raise response
         return ChatResult(generations=[ChatGeneration(message=response)])
 
 

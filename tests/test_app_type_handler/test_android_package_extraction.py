@@ -12,24 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from types import SimpleNamespace
+
+from tests.helpers.faux import FauxChatModel, faux_text
 
 from app_type_handler.android import AndroidAppType
-
-
-class _FauxModel:
-    """Stands in for an adapter-built chat model; records ``ainvoke`` calls."""
-
-    def __init__(self, *, content: str | None = None, error: Exception | None = None) -> None:
-        self.calls: list[list] = []
-        self._content = content
-        self._error = error
-
-    async def ainvoke(self, messages):
-        self.calls.append(messages)
-        if self._error is not None:
-            raise self._error
-        return SimpleNamespace(content=self._content)
 
 
 class _FauxDesigner:
@@ -67,35 +53,26 @@ def _write_requirements(tmp_path, *, with_resource_ids: bool = True) -> str:
     return str(path)
 
 
-def _extraction_logs(logs: _LogCollector) -> list[tuple]:
-    return [record for record in logs.records if "Package extraction" in str(record[1]) or "no JSON" in str(record[1])]
+def _package_response(package_name: str) -> str:
+    return json.dumps({"package_name": package_name, "resource_ids": {"newFile": "Button"}})
 
 
 def test_llm_extraction_reaches_injected_model_and_applies_package(tmp_path) -> None:
-    payload = json.dumps(
-        {"package_name": "org.billthefarmer.editor", "resource_ids": {"newFile": "Button"}}
-    )
-    model = _FauxModel(content=payload)
+    model = FauxChatModel(responses=[faux_text(_package_response("org.billthefarmer.editor"))])
     logs = _LogCollector()
     handler = AndroidAppType(str(tmp_path), _write_requirements(tmp_path), _FauxDesigner(model), logs)
 
     package = asyncio.run(handler._extract_android_package_name_via_llm())
 
     assert package == "org.billthefarmer.editor"
-    assert len(model.calls) == 1
-    prompt_text = "\n".join(
-        str(getattr(message, "content", message)) for message in model.calls[0]
-    )
+    assert model.call_count == 1
+    prompt_text = "\n".join(str(message.content) for message in model.calls[0])
     assert "org.billthefarmer.editor:id/newFile" in prompt_text
-    assert not _extraction_logs(logs) or all(
-        record[2] != "warning" for record in _extraction_logs(logs)
-    )
+    assert all(record[2] != "warning" for record in logs.records)
 
 
 def test_string_model_routes_through_unified_factory(monkeypatch, tmp_path) -> None:
-    built = _FauxModel(
-        content=json.dumps({"package_name": "com.example.reader", "resource_ids": {}})
-    )
+    built = FauxChatModel(responses=[faux_text(_package_response("com.example.reader"))])
     seen_names: list[str] = []
 
     def fake_build(model_name, **_kwargs):
@@ -112,11 +89,11 @@ def test_string_model_routes_through_unified_factory(monkeypatch, tmp_path) -> N
 
     assert package == "com.example.reader"
     assert seen_names == ["gpt-test"]
-    assert len(built.calls) == 1
+    assert built.call_count == 1
 
 
 def test_model_failure_falls_back_with_warning_log(tmp_path) -> None:
-    model = _FauxModel(error=RuntimeError("endpoint down"))
+    model = FauxChatModel(responses=[RuntimeError("endpoint down")])
     logs = _LogCollector()
     handler = AndroidAppType(
         str(tmp_path), _write_requirements(tmp_path, with_resource_ids=False), _FauxDesigner(model), logs
@@ -131,7 +108,7 @@ def test_model_failure_falls_back_with_warning_log(tmp_path) -> None:
 
 
 def test_unparseable_response_falls_back_with_warning_log(tmp_path) -> None:
-    model = _FauxModel(content="I could not identify any package here.")
+    model = FauxChatModel(responses=[faux_text("I could not identify any package here.")])
     logs = _LogCollector()
     handler = AndroidAppType(
         str(tmp_path), _write_requirements(tmp_path, with_resource_ids=False), _FauxDesigner(model), logs
@@ -145,7 +122,7 @@ def test_unparseable_response_falls_back_with_warning_log(tmp_path) -> None:
 
 
 def test_unusable_package_name_falls_back_with_warning_log(tmp_path) -> None:
-    model = _FauxModel(content=json.dumps({"package_name": "UNKNOWN", "resource_ids": {}}))
+    model = FauxChatModel(responses=[faux_text(_package_response("UNKNOWN"))])
     logs = _LogCollector()
     handler = AndroidAppType(
         str(tmp_path), _write_requirements(tmp_path, with_resource_ids=False), _FauxDesigner(model), logs
@@ -156,3 +133,17 @@ def test_unusable_package_name_falls_back_with_warning_log(tmp_path) -> None:
     assert package.startswith("com.")
     warnings = [record for record in logs.records if record[2] == "warning"]
     assert any("Package extraction" in str(record[1]) for record in warnings)
+
+
+def test_malformed_package_segments_fall_back_with_warning_log(tmp_path) -> None:
+    model = FauxChatModel(responses=[faux_text(_package_response("1editor.app"))])
+    logs = _LogCollector()
+    handler = AndroidAppType(
+        str(tmp_path), _write_requirements(tmp_path, with_resource_ids=False), _FauxDesigner(model), logs
+    )
+
+    package = asyncio.run(handler._extract_android_package_name_via_llm())
+
+    assert package.startswith("com.")
+    warnings = [record for record in logs.records if record[2] == "warning"]
+    assert any("malformed package name" in str(record[1]) for record in warnings)
