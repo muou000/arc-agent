@@ -105,6 +105,9 @@ _MAX_READ_LIMIT = 200
 # rebuilding one file, at a higher round-trip cost than the re-read itself.
 # A small per-path budget serves the legitimate case and still caps the loop.
 _MAX_REPEATED_READS_PER_PATH = 2
+# Issue #242: this budget is cumulative for the stage and binds across
+# unlock cycles (an unlock restores the right to read, it never resets the
+# count); each successful write on the path earns one more re-read on top.
 # Successful delete-then-rewrite cycles allowed per test-file path in one
 # test_generation or implementation pass. The delete release exists so a
 # legitimate fix does not wait for an accidental failure to unlock; the
@@ -221,6 +224,11 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         self._import_fail_open_count = 0
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._repeated_read_counts: dict[str, int] = {}
+        # Issue #242: successful write/edit/append calls per path. Each one
+        # earns a single additional overlapping re-read on top of the base
+        # budget — the controlled exit that keeps the fail -> fix -> verify
+        # loop open once the budget turned cumulative across unlock cycles.
+        self._read_budget_credits: dict[str, int] = {}
         self._written_paths: set[str] = set()
         # Call-ordered log of every successful write/edit/append/delete path,
         # repeats included (``_written_paths`` is a set: a re-edit of the same
@@ -538,19 +546,36 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             )
         offset = _as_nonnegative_int(args.get("offset"), default=0)
         limit = min(_as_nonnegative_int(args.get("limit"), default=100), _MAX_READ_LIMIT)
-        previous = self._read_ranges.get(path, [])
-        if not previous or self._path_unlocked(path):
-            return None
-        if any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous):
-            if self._repeated_read_counts.get(path, 0) >= _MAX_REPEATED_READS_PER_PATH:
+        # Issue #242 (serial-6): the budget is cumulative for the stage and
+        # binds in the unlocked state too. The old code skipped both this
+        # check and the counting in ``_record_result`` while the path was
+        # unlocked — and unlocks come exactly from the failures that start a
+        # repair loop — so every unlock cycle re-armed unlimited whole-file
+        # re-reads (85 redundant overlapping reads in that run). An unlock
+        # restores the right to read; it does not reset the observation.
+        if self._overlaps_previous_range(path, offset, limit):
+            budget = _MAX_REPEATED_READS_PER_PATH + self._read_budget_credits.get(path, 0)
+            if self._repeated_read_counts.get(path, 0) >= budget:
                 return (
-                    f"Repeated read blocked: {path} was re-read {_MAX_REPEATED_READS_PER_PATH} time(s) "
-                    "in this stage already. Use the earlier results and continue; if the file needs "
-                    "changes, follow the write options instead of probing offsets to bypass the cache. "
-                    "A narrower limit or shifted offset is the same blocked read."
+                    f"Repeated read blocked: {path} was re-read {self._repeated_read_counts.get(path, 0)} time(s) "
+                    f"in this stage already (budget: {_MAX_REPEATED_READS_PER_PATH} + one per successful write "
+                    "on this path, and unlocks do not reset it). Use the earlier results and continue; if the "
+                    "file needs changes, write the fix first — each successful write earns one more re-read for "
+                    "verification. A narrower limit or shifted offset is the same blocked read."
                 )
-            return None
         return None
+
+    def _overlaps_previous_range(self, path: str, offset: int, limit: int) -> bool:
+        """Shared overlap predicate for the read gate and the counting side.
+
+        The block check (``_validate_read``) and the budget consumption
+        (``_record_result``) must judge the same reads the same way — the
+        #242 bypass was two hand-kept conditions drifting apart — so both
+        call this one predicate.
+        """
+
+        previous = self._read_ranges.get(path, [])
+        return any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous)
 
     def _validate_write(self, args: dict[str, Any], *, tool: str = "write_file") -> str | None:
         """Runtime gates on the writes the capability table already allowed.
@@ -852,6 +877,11 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         path = _discipline_path(args)
         if name in _VALIDATION_TOOLS:
             if _tool_result_failed(result, tool=name):
+                # Deliberately never reset (pinned by test): once validation
+                # failed, written paths stay readable for the rest of the
+                # stage. Since #242 made the re-read budget cumulative, the
+                # flag no longer disables any budget — it only keeps the
+                # fail -> fix loop able to read what it wrote.
                 self._validation_failed = True
                 self._failed_paths.update(self._written_paths)
             return
@@ -879,6 +909,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             self._failed_paths.discard(path)
             self._read_ranges.pop(path, None)
             self._repeated_read_counts.pop(path, None)
+            self._read_budget_credits.pop(path, None)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
             if was_written:
@@ -888,21 +919,27 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             self._close_probe_window()
             return
         if name == "read_file" and path:
+            # Same clamp as the gate's own overlap judgment: the counting
+            # side must judge reads exactly as the block side did, or the
+            # budget moves without the gate ever gating (review finding on
+            # the #242 predicate).
             offset = _as_nonnegative_int(args.get("offset"), default=0)
-            limit = _as_nonnegative_int(args.get("limit"), default=100)
-            previous = self._read_ranges.get(path, [])
-            if (
-                previous
-                and not self._path_unlocked(path)
-                and any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous)
-            ):
+            limit = min(_as_nonnegative_int(args.get("limit"), default=100), _MAX_READ_LIMIT)
+            # Issue #242: the unlock term is gone from the condition — an
+            # unlocked overlapping re-read consumes the cumulative budget
+            # exactly like a locked one (same predicate as the block check).
+            if self._overlaps_previous_range(path, offset, limit):
                 # Only a read that actually returned content consumes the
-                # fresh re-read budget; failed reads must not.
+                # budget; failed reads exited above without recording.
                 self._repeated_read_counts[path] = self._repeated_read_counts.get(path, 0) + 1
             self._read_ranges.setdefault(path, []).append((offset, offset + limit))
             self._cache_read_summary(request, path, offset, limit, result)
         if (name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS) and path:
             self._written_paths.add(path)
+            # Issue #242: the controlled exit — each successful write earns
+            # one more overlapping re-read for the verify step of the
+            # fail -> fix -> verify loop.
+            self._read_budget_credits[path] = self._read_budget_credits.get(path, 0) + 1
             self._write_events.append(path)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
