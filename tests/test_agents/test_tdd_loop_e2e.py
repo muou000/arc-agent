@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agents.test_driven_developer import TestDrivenDeveloper
 from core import sessions
 from core.phases import TDD_RUN_TESTS_BUDGET, TDD_STALL_THRESHOLD, WorkflowPhaseRunner
@@ -112,6 +114,26 @@ def track_tdd_handoffs(tdd: TestDrivenDeveloper) -> list[str]:
 
     tdd.run = recording_run
     return handoffs
+
+
+def track_stage_thread_ids(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the checkpointer thread id of every stage-agent invocation.
+
+    Wraps ``ainvoke_stage_agent`` at its ``StageSession`` import site so the
+    recorded ids are exactly what ``build_agent_config`` receives (#226).
+    """
+
+    import agents.runtime.stage_session as stage_session_module
+
+    original = stage_session_module.ainvoke_stage_agent
+    recorded: list[str] = []
+
+    async def recording_ainvoke(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        recorded.append(str(kwargs.get("thread_id") or ""))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(stage_session_module, "ainvoke_stage_agent", recording_ainvoke)
+    return recorded
 
 
 def tool_results_text(model: FauxChatModel) -> str:
@@ -2038,6 +2060,84 @@ def test_retry_reprompt_attempt_facts_reach_first_session(
     assert "96 model calls" in first_call
     assert "88 read-only" in first_call
     assert "NO successful file edits" in first_call
+
+
+def _seed_retry_session(node_id: str, attempt: int) -> None:
+    """Write the session state ``_prepare_auto_tdd_retry`` leaves behind."""
+
+    sessions.merge_node_session(
+        node_id,
+        {
+            "recent_failure_summary": "retry me",
+            "tdd_retry_attempt": attempt,
+            "tdd_retry_events_cursor": 500,
+        },
+    )
+
+
+def test_tdd_retry_fresh_thread_default_off_keeps_regular_thread(
+    tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#226: with the switch off (default), a retry-round session uses the
+    regular per-layer thread, byte-identical to a non-retry TDD pass."""
+
+    node_id = "REQ-TDD-THREAD-OFF"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    write_test_file(tmp_project_dir)
+    _seed_retry_session(node_id, attempt=1)
+
+    model = FauxChatModel(responses=[faux_text("giving up")])
+    fake = FakeAppHandler([failing_test_output()])
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+    thread_ids = track_stage_thread_ids(monkeypatch)
+
+    asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert thread_ids, "the TDD pass must invoke the stage agent at least once"
+    for thread_id in thread_ids:
+        assert "@retry" not in thread_id
+        assert thread_id.endswith(f":{node_id}:IMPLEMENT:TestDrivenDeveloper:Unit")
+
+
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_tdd_retry_fresh_thread_env_forks_retry_round_thread(
+    tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch, attempt: int
+) -> None:
+    """#226: with ARC_TDD_RETRY_FRESH_THREAD on, every session of a retry
+    round runs on one forked thread ``...:{layer}@retry{N}`` (N from 1) —
+    within-round sessions still resume each other; only the round boundary
+    leaves the previous attempt's thread behind."""
+
+    node_id = f"REQ-TDD-THREAD-ON-{attempt}"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    write_test_file(tmp_project_dir)
+    _seed_retry_session(node_id, attempt=attempt)
+    monkeypatch.setenv("ARC_TDD_RETRY_FRESH_THREAD", "1")
+
+    # Session 1: one failing run_tests then ends its turn; session 2: ends
+    # without running anything. Two same-round sessions must share a thread.
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call("run_tests", {"test_type": "Unit"}, call_id="s1c1"),
+            faux_text("continuation needed"),
+            faux_text("no more attempts"),
+        ]
+    )
+    fake = FakeAppHandler([failing_test_output(), failing_test_output()])
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+    thread_ids = track_stage_thread_ids(monkeypatch)
+
+    asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    assert len(thread_ids) == 2, thread_ids
+    expected_suffix = f":Unit@retry{attempt}"
+    for thread_id in thread_ids:
+        assert thread_id.endswith(expected_suffix), thread_id
+    assert thread_ids[0] == thread_ids[1], "sessions of one retry round resume each other"
 
 
 # ---------------------------------------------------------------------------

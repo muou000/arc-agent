@@ -12,7 +12,11 @@ across every rebuilt agent turns those repeated invocations into a *resumed*
 conversation instead of a cold start. The TDD retry loop in
 ``core.phases.WorkflowPhaseRunner._run_tdd_for_node`` is the main beneficiary: it
 re-invokes ``TestDrivenDeveloper`` up to ``TDD_RUN_TESTS_BUDGET`` times per layer,
-and the post-run auto TDD retry re-invokes it again for every failing node.
+and the post-run auto TDD retry re-invokes it again for every failing node -
+within one retry round. With ``ARC_TDD_RETRY_FRESH_THREAD`` enabled the round
+forks a fresh thread (``@retry{N}`` suffix), so the store only carries
+within-round continuation; state across retry rounds travels through the node
+sessions, not the checkpointer.
 
 The store is in-memory on purpose: it is scoped to one compilation process, and
 the existing ``.arc/node_sessions/*.json`` + ``resume_context`` mechanism still
