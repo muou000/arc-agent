@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
-from agents.runtime.capabilities import capability_for, is_test_file_path, normalize_manifest_path
+from agents.runtime.capabilities import capability_for, is_test_asset, is_test_file_path, normalize_manifest_path
 from agents.runtime.import_checks import (
     ImportViolation,
     build_import_block_message,
@@ -105,22 +105,116 @@ _MAX_READ_LIMIT = 200
 # rebuilding one file, at a higher round-trip cost than the re-read itself.
 # A small per-path budget serves the legitimate case and still caps the loop.
 _MAX_REPEATED_READS_PER_PATH = 2
-# Successful repair attempts allowed per test-file path in one test_generation
-# or implementation pass. Two channels share this one budget: a targeted
-# same-path ``edit_file`` fix on an already-written test asset (issue #240)
-# and a full delete-then-rewrite cycle. The delete release exists so a
-# legitimate fix does not wait for an accidental failure to unlock; the
-# 2026-09-19 arc-output3 run showed its unbounded edge: a TestGenerator that
-# *believed* its writes had been truncated (they had not — no truncation error
-# ever occurred) re-ran the delete+write cycle 5-7 times per file, ~10M input
-# tokens, until the step budget crashed the whole DESIGN task. Counting the
-# cycle on the delete keeps the last written version on disk when the cap
-# trips. The arc-output-serial-6 run showed the other edge: with delete+write
-# as the only sanctioned channel, a one-apostrophe fix found by grep became a
-# 6.2KB whole-file rewrite (11+ delete→write pairs, ~$0.5-0.7 of the stage),
-# and the rewrite itself introduced new errors — hence the cheaper edit
-# channel drawing from the same budget instead of a separate one.
-_MAX_TEST_ASSET_REPAIRS_PER_PATH = 2
+# Issue #242: this budget is cumulative for the stage and binds across
+# unlock cycles (an unlock restores the right to read, it never resets the
+# count); each successful write on the path earns one more re-read on top.
+# Per-path write-lock budgets, one table (issue #241): every refinement
+# channel that spends units against a written path draws its limit from here
+# and counts through _PathBudgetLedger, so budget channels share one
+# accounting store per path instead of growing parallel counters.
+#
+#   edit           - successful edit_file calls per path per stage pass. The
+#                    hard turn-based lock it replaced blocked a path's second
+#                    edit outright; arc-output-serial-6 recorded 7 blocked
+#                    edits in one DESIGN pass, every one a seconds-later
+#                    same-path refinement, each turning into a blocked-edit
+#                    plus full-file re-read round trip once a real failure
+#                    unlocked the path. Issue #240 narrows the
+#                    test_generation channel to test assets: only a targeted
+#                    anchor fix on an already-written test asset may refine
+#                    it, and it draws from the same per-path repair ledger
+#                    as delete-rewrite (one budget, two channels), so
+#                    swapping the expensive whole-file rewrite for the cheap
+#                    targeted edit cannot inflate the total.
+#   delete_rewrite - delete-then-rewrite cycles per test-file path in one
+#                    test_generation or implementation pass. The delete
+#                    release exists so a legitimate fix does not wait for an
+#                    accidental failure to unlock; the 2026-09-19 arc-output3
+#                    run showed its unbounded edge: a TestGenerator that
+#                    *believed* its writes had been truncated (they had not -
+#                    no truncation error ever occurred) re-ran the delete+
+#                    write cycle 5-7 times per file, ~10M input tokens, until
+#                    the step budget crashed the whole DESIGN task. Counting
+#                    cycles on the delete keeps the last written version on
+#                    disk when the cap trips.
+_PATH_STAGE_BUDGETS = {
+    "edit": 2,
+    "delete_rewrite": 2,
+}
+_MAX_EDITS_PER_PATH = _PATH_STAGE_BUDGETS["edit"]
+MAX_EDITS_PER_PATH = _MAX_EDITS_PER_PATH
+_MAX_DELETE_REWRITES_PER_PATH = _PATH_STAGE_BUDGETS["delete_rewrite"]
+
+
+class _PathBudgetLedger:
+    """Per-path budget counters for the write-lock area (single source).
+
+    #241 (bounded edit refinements), the delete-rewrite cap, #240's shared
+    test-asset repair budget (the test_generation edit channel and the
+    delete-rewrite escape spend the same per-path units), and #242's
+    re-read allowance (``write_credit``) all count per-path units in
+    ``StageDisciplineMiddleware``; this store is the one place those counts
+    live, so another budget channel draws from the same accounting instead
+    of growing a second counter over the same path. Kinds stay separate
+    because they reset differently: ``edit`` and ``write_credit`` units drop
+    when the path is deleted - a delete-rewrite cycle hands the rewritten
+    file a fresh budget and dead content releases the re-read allowance it
+    earned, like the other per-path state the delete branch clears - while
+    ``delete_rewrite`` units survive it, because counting that cycle is
+    their whole job.
+
+    Units commit on the successful tool call, mirroring the delete-rewrite
+    budget's form: the budgets limit self-review churn, and a failed attempt
+    unlocks the path anyway. ``reserve``/``settle``/``release`` add one
+    refinement for the #240 channel: the agent emits file tools in parallel
+    batches, so counting only on success would let a whole batch (arc-output4
+    ROOT: 12 writes in one tool-call burst) observe the same stale count and
+    overshoot the cap. A validated edit reserves its unit at validation time
+    (keyed by tool_call id, so a sibling call's reservation on the same path
+    is untouched); ``settle`` converts it to a spent unit on success and
+    ``release`` frees it on failure, so an errored attempt does not burn
+    budget.
+
+    ``write_credit`` differs from the other kinds in role: not a cap but an
+    allowance. Each committed unit extends the path's overlapping-re-read
+    budget (``_MAX_REPEATED_READS_PER_PATH`` plus the spent count) by one,
+    so it never consults the limit table.
+    """
+
+    def __init__(self) -> None:
+        self._spent: dict[tuple[str, str], int] = {}
+        self._reserved: dict[tuple[str, str], int] = {}
+
+    def spent(self, kind: str, path: str) -> int:
+        return self._spent.get((kind, path), 0)
+
+    def reserved(self, kind: str, path: str) -> int:
+        return sum(1 for key in self._reserved if key[0] == kind and key[1].split("\x00", 1)[0] == path)
+
+    def commit(self, kind: str, path: str) -> None:
+        self._spent[(kind, path)] = self.spent(kind, path) + 1
+
+    def reserve(self, kind: str, path: str, key: str) -> None:
+        self._reserved[(kind, f"{path}\x00{key}")] = path
+
+    def settle(self, kind: str, path: str, key: str) -> bool:
+        """Convert a reservation into a spent unit; True when one existed."""
+
+        if self._reserved.pop((kind, f"{path}\x00{key}"), None) is not None:
+            self.commit(kind, path)
+            return True
+        return False
+
+    def release(self, kind: str, path: str, key: str) -> None:
+        self._reserved.pop((kind, f"{path}\x00{key}"), None)
+
+    def exhausted(self, kind: str, path: str, limit: int) -> bool:
+        return self.spent(kind, path) + self.reserved(kind, path) >= limit
+
+    def drop(self, kind: str, path: str) -> None:
+        self._spent.pop((kind, path), None)
+        for key in [k for k in self._reserved if k[0] == kind and k[1].split("\x00", 1)[0] == path]:
+            del self._reserved[key]
 _DESIGN_MUTATION_PATTERNS = (
     re.compile(r"\b(?:INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.IGNORECASE),
     re.compile(
@@ -245,18 +339,12 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # batch that respects it.
         self._design_write_reservations: set[str] = set()
         self._append_counts: dict[str, int] = {}
-        # Per-path repair budget (issue #240): successful delete-rewrite
-        # cycles and budgeted same-path repair edits both consume one unit
-        # per path — one ledger, so swapping the expensive channel for the
-        # cheap one cannot inflate the total.
-        self._repair_counts: dict[str, int] = {}
-        # Repair units reserved at validation time but not yet settled,
-        # keyed by tool_call_id -> path. Reserving at validation keeps the
-        # cap exact for parallel tool-call batches (same reasoning as the
-        # DESIGN write reservations below); the id key lets ``_record_result``
-        # release exactly the failed call's unit without touching a sibling
-        # call's reservation on the same path.
-        self._repair_reservations: dict[str, str] = {}
+        # Per-path budget counters (edit refinements, delete-rewrite cycles,
+        # the #242 re-read allowance): the single accounting store behind the
+        # write-lock area's budgets. The #240 test-asset repair channel
+        # reserves its units here at validation time (see the ledger's
+        # reserve/settle/release) so parallel batches respect the cap.
+        self._path_budgets = _PathBudgetLedger()
         self._write_block_counts: dict[str, int] | None = {} if stage == "interface_design" else None
         # Read-only probe ledger (issue #217): probes per normalized target
         # since the last successful write-family call, plus whether this
@@ -506,9 +594,30 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         path = _discipline_path(args)
         if not path or self._path_unlocked(path):
             return None
-        if self._repair_counts.get(path, 0) + self._outstanding_repair_reservations(path) < _MAX_TEST_ASSET_REPAIRS_PER_PATH:
+        # test_generation test assets spend the #240 shared budget (edits +
+        # cycles in one cap); every other delete channel keeps #241's
+        # per-kind cycle count.
+        if self._stage == "test_generation" and is_test_asset(path):
+            exhausted = self._repair_budget_exhausted(path)
+        else:
+            exhausted = self._path_budgets.exhausted("delete_rewrite", path, _MAX_DELETE_REWRITES_PER_PATH)
+        if not exhausted:
             return None
         return self._repair_budget_blocked(path, prefix="Rewrite budget")
+
+    def _repair_budget_exhausted(self, path: str) -> bool:
+        """Whether the #240 shared repair budget for ``path`` is spent.
+
+        One budget, two channels: targeted edits and delete-rewrite cycles
+        sum into the same per-path cap (issue #240, adjudicated on the
+        issue — the delete must not launder spent repairs into a fresh
+        budget). Counts include still-open reservations so a parallel batch
+        cannot overshoot.
+        """
+
+        spent = self._path_budgets.spent("edit", path) + self._path_budgets.spent("delete_rewrite", path)
+        reserved = self._path_budgets.reserved("edit", path)
+        return spent + reserved >= _MAX_EDITS_PER_PATH
 
     def _repair_budget_blocked(self, path: str, *, prefix: str) -> str:
         """The shared exhausted-budget block for both repair channels (#240).
@@ -521,7 +630,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         """
 
         attempts = (
-            f"{_MAX_TEST_ASSET_REPAIRS_PER_PATH} repair attempts (targeted edits and "
+            f"{_MAX_EDITS_PER_PATH} repair attempts (targeted edits and "
             "delete-rewrite cycles share one budget)"
         )
         fully_written = self._manifest_fully_written()
@@ -547,47 +656,52 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         is the cheap repair the delete-rewrite channel used to force into a
         whole-file rewrite (arc-output-serial-6: one apostrophe fix became a
         6.2KB rewrite that itself introduced new errors). The channel draws
-        from the same per-path repair ledger as delete-rewrite
-        (``_MAX_TEST_ASSET_REPAIRS_PER_PATH``), so the runaway cap survives
-        with a cheaper unit. A failed file operation on the path still
-        unlocks it through ``_path_unlocked`` — the budget limits
-        self-review churn, not repair after an error.
+        from the same per-path repair ledger as delete-rewrite — one budget,
+        two channels (issue #240) — so the runaway cap survives with a
+        cheaper unit. A failed file operation on the path still unlocks it
+        through ``_path_unlocked`` — the budget limits self-review churn,
+        not repair after an error.
 
         Called only for test_generation ``edit_file`` calls on written,
-        locked paths (the caller's ``repair_edit`` decision). Written paths
-        in test_generation are test assets by construction — the capability
-        table denies every other write — so no asset predicate is needed
-        here. The budget unit is reserved by the caller at the end of the
-        validation ladder, after the manifest and import checks.
+        locked test-asset paths (the caller's ``repair_edit`` decision);
+        non-test-asset paths in other stages go through
+        :meth:`_validate_edit_refinement_budget` (#241). The budget unit is
+        reserved by the caller at the end of the validation ladder, after
+        the manifest and import checks.
         """
 
-        if self._repair_counts.get(path, 0) + self._outstanding_repair_reservations(path) < _MAX_TEST_ASSET_REPAIRS_PER_PATH:
+        if not self._repair_budget_exhausted(path):
             return None
         return self._repair_budget_blocked(path, prefix="Repair budget")
 
-    def _outstanding_repair_reservations(self, path: str) -> int:
-        """Repair units reserved for ``path`` but not yet settled.
+    def _validate_edit_refinement_budget(self, path: str) -> str | None:
+        """Bounded same-path ``edit_file`` refinements on a written path (#241).
 
-        Parallel tool-call batches validate every call before any of them
-        reaches ``_record_result`` (arc-output4 ROOT: a whole batch observed
-        the same stale count), so the cap must be judged on settled units
-        plus the batch's still-open reservations — same reasoning as the
-        DESIGN write reservations.
+        The write lock's hard turn-based rule blocked a path's second edit
+        outright and only real failures unlocked it — serial-6 showed the
+        model paying a blocked edit plus a full-file re-read for every small
+        refinement. The budget lets a locked path take
+        :data:`_MAX_EDITS_PER_PATH` refinements per stage pass and only then
+        falls back to the lock's exit table. A blocked call never reaches the
+        result recorder, so retries cannot march the count forward. Unlock
+        conditions are untouched: a failed file operation or a failing
+        validation run still frees the path entirely, and ``write_file``
+        keeps the hard repeated-write block.
+
+        In test_generation this validator only sees non-test-asset paths
+        (helpers, runner configs): test assets route through the #240
+        repair channel, whose exhausted wording names the shared
+        edit/delete-rewrite budget instead of the generic one.
         """
 
-        return sum(1 for reserved in self._repair_reservations.values() if reserved == path)
-
-    def _reserve_test_asset_edit(self, path: str, call_id: str) -> None:
-        """Reserve one repair unit for a validated budgeted edit (#240).
-
-        Reserving at validation time keeps the cap exact for parallel
-        tool-call batches (same reasoning as the DESIGN write reservations);
-        keying by call id lets ``_record_result`` settle exactly this call's
-        unit — consumed on success, released on failure — without touching a
-        sibling call's reservation on the same path.
-        """
-
-        self._repair_reservations[call_id] = path
+        if not self._path_budgets.exhausted("edit", path, _MAX_EDITS_PER_PATH):
+            return None
+        exit_text = _WRITE_BLOCK_EXITS[self._stage]
+        return (
+            f"Edit budget blocked: {path} has already taken {_MAX_EDITS_PER_PATH} edit_file "
+            "refinements in this stage; the version on disk stands and the content you "
+            f"wrote is in your context. {exit_text}"
+        )
 
     def _manifest_fully_written(self) -> list[str] | None:
         """Declared manifest paths when every one of them is materialized.
@@ -623,19 +737,36 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             )
         offset = _as_nonnegative_int(args.get("offset"), default=0)
         limit = min(_as_nonnegative_int(args.get("limit"), default=100), _MAX_READ_LIMIT)
-        previous = self._read_ranges.get(path, [])
-        if not previous or self._path_unlocked(path):
-            return None
-        if any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous):
-            if self._repeated_read_counts.get(path, 0) >= _MAX_REPEATED_READS_PER_PATH:
+        # Issue #242 (serial-6): the budget is cumulative for the stage and
+        # binds in the unlocked state too. The old code skipped both this
+        # check and the counting in ``_record_result`` while the path was
+        # unlocked — and unlocks come exactly from the failures that start a
+        # repair loop — so every unlock cycle re-armed unlimited whole-file
+        # re-reads (85 redundant overlapping reads in that run). An unlock
+        # restores the right to read; it does not reset the observation.
+        if self._overlaps_previous_range(path, offset, limit):
+            budget = _MAX_REPEATED_READS_PER_PATH + self._path_budgets.spent("write_credit", path)
+            if self._repeated_read_counts.get(path, 0) >= budget:
                 return (
-                    f"Repeated read blocked: {path} was re-read {_MAX_REPEATED_READS_PER_PATH} time(s) "
-                    "in this stage already. Use the earlier results and continue; if the file needs "
-                    "changes, follow the write options instead of probing offsets to bypass the cache. "
-                    "A narrower limit or shifted offset is the same blocked read."
+                    f"Repeated read blocked: {path} was re-read {self._repeated_read_counts.get(path, 0)} time(s) "
+                    f"in this stage already (budget: {_MAX_REPEATED_READS_PER_PATH} + one per successful write "
+                    "on this path, and unlocks do not reset it). Use the earlier results and continue; if the "
+                    "file needs changes, write the fix first — each successful write earns one more re-read for "
+                    "verification. A narrower limit or shifted offset is the same blocked read."
                 )
-            return None
         return None
+
+    def _overlaps_previous_range(self, path: str, offset: int, limit: int) -> bool:
+        """Shared overlap predicate for the read gate and the counting side.
+
+        The block check (``_validate_read``) and the budget consumption
+        (``_record_result``) must judge the same reads the same way — the
+        #242 bypass was two hand-kept conditions drifting apart — so both
+        call this one predicate.
+        """
+
+        previous = self._read_ranges.get(path, [])
+        return any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous)
 
     def _validate_write(self, args: dict[str, Any], *, tool: str, call_id: str) -> str | None:
         """Runtime gates on the writes the capability table already allowed.
@@ -649,26 +780,37 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         writes and non-test-asset deletes were always denied), so an asset
         verdict firing before the repeated-write check never redirects a
         call the repeated-write check would have caught. The remaining order
-        here is the runtime-state ladder: repeated-write lock (with the
-        test_generation budgeted same-path edit repair channel opened inside
-        it, issue #240), manifest declaration, test-import validation,
-        DESIGN content/budget, file-claim gate — and the repair unit
-        reservation last of all, so a content-rejected repair edit never
-        burns budget.
+        here is the runtime-state ladder: repeated-write lock (``write_file``)
+        or the bounded edit refinement budget (``edit_file`` — the #240
+        test-asset repair channel in test_generation, the #241 generic
+        refinement budget elsewhere), manifest declaration, test-import
+        validation, DESIGN content/budget, file-claim gate — and the repair
+        unit reservation last of all, so a content-rejected repair edit
+        never burns budget.
         """
 
         path = _discipline_path(args)
         if not path:
             return None
         written_and_locked = path in self._written_paths and not self._path_unlocked(path)
-        # Whether this repeated write enters the budgeted same-path repair
-        # channel (issue #240): a targeted ``edit_file`` fix on a written
-        # test asset in test_generation. The decision is taken here but the
-        # budget unit is only reserved at the end of the ladder, after the
-        # manifest and import checks — a content-rejected repair edit must
-        # not burn budget (same invariant as the DESIGN write budget).
-        repair_edit = tool == "edit_file" and self._stage == "test_generation" and written_and_locked
-        if written_and_locked and not repair_edit:
+        # Which edit channel this repeated write enters (issues #240/#241):
+        # a targeted ``edit_file`` fix on a written test asset in
+        # test_generation takes the #240 repair channel (budget + ladder-end
+        # reservation); every other edit_file takes the #241 generic
+        # refinement budget. The decision is taken here but the #240 unit is
+        # only reserved at the end of the ladder, after the manifest and
+        # import checks — a content-rejected repair edit must not burn
+        # budget (same invariant as the DESIGN write budget).
+        repair_edit = tool == "edit_file" and self._stage == "test_generation" and written_and_locked and is_test_asset(path)
+        if written_and_locked and tool == "edit_file" and not repair_edit:
+            # Issue #241: a written path takes a bounded number of edit_file
+            # refinements before the lock bites (the hard turn-based rule
+            # blocked the second edit outright). The remaining ladder still
+            # applies to the refinement payload.
+            budget_block = self._validate_edit_refinement_budget(path)
+            if budget_block:
+                return budget_block
+        elif written_and_locked and not repair_edit:
             exit_text = _WRITE_BLOCK_EXITS[self._stage]
             if self._write_block_counts is not None:
                 block_count = self._write_block_counts.get(path, 0) + 1
@@ -723,7 +865,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             # Reserve the repair unit last: every content/manifest/claim
             # check above has passed, so the edit will run (a later tool
             # error releases the unit in ``_record_result``).
-            self._reserve_test_asset_edit(path, call_id)
+            self._path_budgets.reserve("edit", path, call_id)
         return None
 
     def _validate_design_content(self, content: str) -> str | None:
@@ -958,6 +1100,11 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         path = _discipline_path(args)
         if name in _VALIDATION_TOOLS:
             if _tool_result_failed(result, tool=name):
+                # Deliberately never reset (pinned by test): once validation
+                # failed, written paths stay readable for the rest of the
+                # stage. Since #242 made the re-read budget cumulative, the
+                # flag no longer disables any budget — it only keeps the
+                # fail -> fix loop able to read what it wrote.
                 self._validation_failed = True
                 self._failed_paths.update(self._written_paths)
             return
@@ -975,58 +1122,73 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 # failed repair edit (e.g. a stale anchor) must not burn a
                 # unit; the failure itself unlocks the path anyway.
                 if name == "edit_file":
-                    self._repair_reservations.pop(_tool_call_id(request), None)
+                    self._path_budgets.release("edit", path, _tool_call_id(request))
             return
         if name == "delete" and path:
             # The file is gone, so its write lock, read ranges, repeat-read
-            # budget and failure record describe content that no longer
-            # exists; dropping them is what makes delete-then-rewrite a real
-            # exit instead of one that depends on an accidental later failure
-            # to unlock. The repair count is the one exception: it exists
-            # precisely to observe how often that exit repeats, so it
-            # survives the delete.
+            # budget, refinement budget and failure record describe content
+            # that no longer exists; dropping them is what makes
+            # delete-then-rewrite a real exit instead of one that depends on
+            # an accidental later failure to unlock. Two exceptions: the
+            # rewrite-cycle count exists precisely to observe how often that
+            # exit repeats, so it survives the delete; and the #240 shared
+            # repair budget (test_generation test assets) keeps its edit
+            # units — edit and delete-rewrite spend one combined per-path
+            # budget there, so a delete must not launder spent repairs into
+            # a fresh one.
             was_written = path in self._written_paths
             self._written_paths.discard(path)
             self._failed_paths.discard(path)
             self._read_ranges.pop(path, None)
             self._repeated_read_counts.pop(path, None)
+            if not (self._stage == "test_generation" and is_test_asset(path)):
+                self._path_budgets.drop("edit", path)
+            self._path_budgets.drop("write_credit", path)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
             if was_written:
-                self._repair_counts[path] = self._repair_counts.get(path, 0) + 1
+                self._path_budgets.commit("delete_rewrite", path)
             self._write_events.append(path)
             self._discard_written_path(request, path)
             self._close_probe_window()
             return
         if name == "read_file" and path:
+            # Same clamp as the gate's own overlap judgment: the counting
+            # side must judge reads exactly as the block side did, or the
+            # budget moves without the gate ever gating (review finding on
+            # the #242 predicate).
             offset = _as_nonnegative_int(args.get("offset"), default=0)
-            limit = _as_nonnegative_int(args.get("limit"), default=100)
-            previous = self._read_ranges.get(path, [])
-            if (
-                previous
-                and not self._path_unlocked(path)
-                and any(_ranges_overlap(offset, offset + limit, start, end) for start, end in previous)
-            ):
+            limit = min(_as_nonnegative_int(args.get("limit"), default=100), _MAX_READ_LIMIT)
+            # Issue #242: the unlock term is gone from the condition — an
+            # unlocked overlapping re-read consumes the cumulative budget
+            # exactly like a locked one (same predicate as the block check).
+            if self._overlaps_previous_range(path, offset, limit):
                 # Only a read that actually returned content consumes the
-                # fresh re-read budget; failed reads must not.
+                # budget; failed reads exited above without recording.
                 self._repeated_read_counts[path] = self._repeated_read_counts.get(path, 0) + 1
             self._read_ranges.setdefault(path, []).append((offset, offset + limit))
             self._cache_read_summary(request, path, offset, limit, result)
         if (name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS) and path:
+            if name == "edit_file":
+                # The refinement budget counts every successful edit on the
+                # path, whether the edit materialized it or refined an
+                # earlier write (issue #241). A #240 repair edit settles its
+                # validation-time reservation instead — the reservation is
+                # always present for that channel, and settle() commits the
+                # unit, so the plain commit must be skipped to avoid double
+                # counting. Settling defensively (no-op when no reservation
+                # exists) keeps the ledger exact even if a future check-order
+                # change drops the invariant.
+                if not self._path_budgets.settle("edit", path, _tool_call_id(request)):
+                    self._path_budgets.commit("edit", path)
             self._written_paths.add(path)
+            # Issue #242: the controlled exit — each successful write earns
+            # one more overlapping re-read for the verify step of the
+            # fail -> fix -> verify loop.
+            self._path_budgets.commit("write_credit", path)
             self._write_events.append(path)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
-            if name == "edit_file":
-                # Settle the repair channel's reservation (issue #240): the
-                # successful budgeted edit converts its reserved unit into a
-                # consumed one. A reservation is always present here — the
-                # validator reserved before the handler ran — but settling
-                # defensively keeps the ledger exact even if a future check
-                # order change drops that invariant.
-                reserved_path = self._repair_reservations.pop(_tool_call_id(request), None)
-                if reserved_path is not None:
-                    self._repair_counts[reserved_path] = self._repair_counts.get(reserved_path, 0) + 1
             self._cache_written_path(request, path)
             self._close_probe_window()
 

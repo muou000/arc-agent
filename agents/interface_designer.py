@@ -5,9 +5,9 @@ import json
 import os
 import re
 from dataclasses import replace
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from langchain.agents.structured_output import ToolStrategy
 
@@ -32,9 +32,42 @@ from agents.tools.traceability import build_traceability_tools
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
 
+class InterfaceContractRecord(BaseModel):
+    """One interface contract of the current node's design.
+
+    Identity fields (`interface_id`, `type`) are required; every other field
+    is optional and unknown extra fields are preserved, so a record may carry
+    any additional shape (`inputs`/`outputs` as dicts, strings, or lists).
+    Reused parent/dependency contracts keep their original `interface_id` and
+    set `relation` to "reused".
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    interface_id: str = Field(
+        min_length=1,
+        description="Stable globally-unique contract id including the owning node id (e.g. REQ-2-UI-LoginPage); reused interfaces keep their original id.",
+    )
+    type: Literal["UI", "API", "FUNC", "DB"] = Field(
+        description="Contract kind: UI page/component, API endpoint/client, FUNC service/helper, DB table/seed. Required even when the interface_id already contains the type segment.",
+    )
+    req_id: str = Field(default="", description="Owning requirement node id; reused contracts keep their original owner.")
+    name: str = ""
+    file_path: str = Field(default="", description="Workspace-relative path of the file that embodies this contract.")
+    first_line: str = ""
+    responsibility: str = ""
+    specification: str = ""
+    relation: str = Field(default="", description="Free-form relation label: owned, reused, parent, dependency, update, or another descriptor.")
+    callers: list[str] = Field(default_factory=list, description="Interface ids this contract is called by.")
+    callees: list[str] = Field(default_factory=list, description="Interface ids this contract calls.")
+    inputs: Any = None
+    outputs: Any = None
+    test_focus: Any = None
+
+
 class InterfaceDesignResponse(BaseModel):
     summary: str = Field(default="", description="Short design-stage summary.")
-    interfaces: list[dict[str, Any]] = Field(default_factory=list, description="Interface contracts for the current node.")
+    interfaces: list[InterfaceContractRecord] = Field(default_factory=list, description="Interface contracts for the current node.")
     files_written: list[str] = Field(default_factory=list, description="Workspace-relative files written or edited.")
 
 
@@ -70,7 +103,7 @@ def _dynamic_repair_response_format(min_items: int) -> Any | None:
         __base__=BaseModel,
         summary=(str, Field(default="", description="Short design-stage summary.")),
         interfaces=(
-            list[dict[str, Any]],
+            list[InterfaceContractRecord],
             Field(
                 min_length=min_items,
                 description=f"Interface contracts for the current node; at least {min_items} records are required.",
@@ -679,7 +712,7 @@ class InterfaceDesigner:
                 "Your design pass recorded no files and an empty `interfaces` array, so no contract reached the traceability store.",
                 "Reusing a parent/dependency surface attaches this node to a contract only when the reused interface is returned as a structured record under its ORIGINAL `interface_id`; prose in `summary` attaches the node to nothing.",
                 "Return now a single `InterfaceDesignResponse` whose `interfaces` array contains:",
-                "1. one record for every interface below that this node's design reuses — only `interface_id` (exact, original) plus `relation: \"reused\"` are required, the registry already holds their identity and semantics; and",
+                "1. one record for every interface below that this node's design reuses — `interface_id` (exact, original), its `type`, and `relation: \"reused\"` are required, the registry already holds their identity and semantics; and",
                 "2. any contract this node newly owns that your design introduced (for example a route registration), with the full schema fields from your original instructions.",
                 "Do not invent contracts beyond this list and your own design. Keep each record compact: `responsibility` and `specification` at most ~200 characters each.",
                 "Return the structured fields themselves. Do NOT wrap the JSON in markdown code fences and do NOT nest the response JSON inside the `summary` string; keep `files_written` empty for pure reuse.",

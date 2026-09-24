@@ -270,6 +270,14 @@ class TestGenerator:
                 status="warning",
                 node_id=node_id,
             )
+        for path, fields in result.get("backfilled_fields", {}).items():
+            missing = ", ".join(f"`{field}`" for field in fields)
+            await self._log(
+                f"Manifest entry `{path}` returned without {missing}; "
+                "restored from the locked declaration (issue #233 audit backfill).",
+                status="warning",
+                node_id=node_id,
+            )
         for path in result["unwritten_paths"]:
             await self._log(
                 f"Manifest entry `{path}` was declared but never written; dropping it "

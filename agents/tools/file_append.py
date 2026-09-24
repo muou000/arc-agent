@@ -28,7 +28,12 @@ from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
 
-from agents.runtime.stage_discipline import MAX_APPEND_LINES, MAX_APPENDS_PER_FILE, append_line_limit_message
+from agents.runtime.stage_discipline import (
+    MAX_APPEND_LINES,
+    MAX_APPENDS_PER_FILE,
+    MAX_EDITS_PER_PATH,
+    append_line_limit_message,
+)
 from core.file_claims import normalize_claim_path
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,7 +41,7 @@ _LOGGER = logging.getLogger(__name__)
 APPEND_FILE_TOOL_DESCRIPTION = f"""Append a few lines to the end of an existing file, without re-emitting the file.
 
 Usage:
-- Use this tool only for small additive continuations: wiring your node-owned module into the template's shared runtime surfaces (whose whole-file `write_file` is rejected), or adding a small piece such as a route row or a table declaration to a file you already wrote this stage. A file you already wrote cannot be rewritten (`write_file`/`edit_file` on it are blocked), so appending is the sanctioned way to extend it.
+- Use this tool only for small additive continuations: wiring your node-owned module into the template's shared runtime surfaces (whose whole-file `write_file` is rejected), or adding a small piece such as a route row or a table declaration to a file you already wrote this stage. A file you have already written cannot be rewritten wholesale (`write_file` on it is blocked; `edit_file` takes at most {MAX_EDITS_PER_PATH} refinements before it blocks too), so appending is the sanctioned way to keep extending it.
 - Appends are strictly additive: existing lines are never modified, and the tool is capped at {MAX_APPEND_LINES} lines per call and {MAX_APPENDS_PER_FILE} appends per file.
 - A skeleton that does not fit in one compact `write_file` is not a skeleton: do not split it into chunks or use appends as continuations; put the complete behavior description in your stage response for TestDrivenDeveloper. DESIGN still only materializes skeletons.
 - `file_path` is a `/workspace/...` path or a workspace-relative path; the file must already exist.

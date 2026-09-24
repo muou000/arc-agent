@@ -17,12 +17,17 @@ traceability tables; and repair-fail -> registry judgment -> phase False.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from agents.interface_designer import InterfaceDesigner
 from core.phases import WorkflowPhaseRunner
-from tests.helpers.design_type_backfill import STORED_PARENT_CONTRACTS, seed_stored_parent_contracts
-from tests.helpers.faux import FauxChatModel, faux_tool_call
+from tests.helpers.design_type_backfill import (
+    STORED_PARENT_CONTRACTS,
+    seed_stored_parent_contracts,
+    typed_incident_rows,
+)
+from tests.helpers.faux import FauxChatModel, faux_text, faux_tool_call
 
 # Reuse the process-wide runtime fixture so WorkflowPhaseRunner.traceability,
 # core.sessions and context_pipeline all resolve inside tmp_project_dir.
@@ -171,31 +176,30 @@ def test_design_phase_backfills_missing_types_and_lands_contracts(
     assert node_id in stored_shell["req_ids"]
 
 
-def test_design_phase_full_serial5_chain_rescues_all_eleven_records(
+def test_design_phase_typeless_tool_call_is_fixed_in_session_and_lands_all_records(
     tmp_project_dir, arc_runtime
 ) -> None:
-    """The acceptance replay: 11 typeless records -> one repair ask for the
-    orphan -> ladder backfills the rest -> every contract lands with a type."""
+    """The full-chain replay under the tightened schema (#233): the typeless
+    structured tool call is rejected at decode, the in-session retry delivers
+    every record typed, and all eleven contracts land without spending a
+    repair ask."""
 
     node_id = "REQ-S5-D"
     _seed_shell_requirement(arc_runtime, node_id)
     seed_stored_parent_contracts(arc_runtime.traceability)
     orphan_id = f"{node_id}-SeedService"
+    typed_rows = typed_incident_rows(_full_incident_rows(node_id))
     model = FauxChatModel(
         responses=[
             faux_tool_call(
                 "InterfaceDesignResponse",
                 {"summary": "Shell wired.", "interfaces": _full_incident_rows(node_id), "files_written": []},
-                call_id="main",
+                call_id="typeless",
             ),
             faux_tool_call(
                 "InterfaceDesignResponse",
-                {
-                    "summary": "Typed the orphan.",
-                    "interfaces": [{"interface_id": orphan_id, "type": "FUNC"}],
-                    "files_written": [],
-                },
-                call_id="repair",
+                {"summary": "Shell wired.", "interfaces": typed_rows, "files_written": []},
+                call_id="typed-retry",
             ),
         ]
     )
@@ -206,37 +210,41 @@ def test_design_phase_full_serial5_chain_rescues_all_eleven_records(
     )
 
     assert ok is True
-    assert model.call_count == 2  # main pass + exactly one repair ask
+    assert model.call_count == 2  # typeless turn + the decode-retry turn
     store = arc_runtime.traceability
     # All 11 records carry the node and landed with resolved types.
     assert len(store.list_interfaces(req_id=node_id)) == 11
-    # Backfilled from the stored row / id segment...
     assert store.get_interface("ROOT-UI-AppShell")["type"] == "UI"
     assert store.get_interface(f"{node_id}-UI-LoginPage")["type"] == "UI"
     assert store.get_interface(f"{node_id}-API-AuthApi")["type"] == "API"
-    # ...and the orphan from the repair ask.
     assert store.get_interface(orphan_id)["type"] == "FUNC"
     errors = [entry[1] for entry in logs if entry[2] == "error"]
     assert not any("invalid `type`" in message for message in errors)
 
 
-def test_design_phase_full_chain_judges_failed_when_repair_cannot_help(
+def test_design_phase_recovery_channel_rows_still_reach_the_repair_ask_and_judgment(
     tmp_project_dir, arc_runtime
 ) -> None:
-    """The second direction of the repair bargain: the ask was spent, the
-    answer carries no usable type, and the registry's judgment fails DESIGN."""
+    """The second direction of the repair bargain, via the decode-bypassing
+    recovery channel: a bare-JSON final message hands typeless rows to the
+    ladder, the orphan gets its one repair ask, a typeless-decode answer
+    exhausts the queue, and the registry's judgment fails DESIGN."""
 
     node_id = "REQ-S5-E"
     _seed_shell_requirement(arc_runtime, node_id)
     seed_stored_parent_contracts(arc_runtime.traceability)
     orphan_id = f"{node_id}-SeedService"
+    raw_json_answer = json.dumps(
+        {
+            "summary": "Shell wired.",
+            "interfaces": _full_incident_rows(node_id),
+            "files_written": ["frontend/src/pages/LoginPage.tsx"],
+        },
+        ensure_ascii=False,
+    )
     model = FauxChatModel(
         responses=[
-            faux_tool_call(
-                "InterfaceDesignResponse",
-                {"summary": "Shell wired.", "interfaces": _full_incident_rows(node_id), "files_written": []},
-                call_id="main",
-            ),
+            faux_text(raw_json_answer),
             faux_tool_call(
                 "InterfaceDesignResponse",
                 {"summary": "Tried.", "interfaces": [{"interface_id": orphan_id, "type": "SCHEDULE"}], "files_written": []},
@@ -251,7 +259,9 @@ def test_design_phase_full_chain_judges_failed_when_repair_cannot_help(
     )
 
     assert ok is False
-    assert model.call_count == 2  # the one repair ask was spent before judgment
+    # main(1) + the repair ask's stream attempt: tool call(2), decode-retry(3)
+    # exhausting the queue, then the stream wrapper's ainvoke fallback(4).
+    assert model.call_count == 4
     errors = [entry[1] for entry in logs if entry[2] == "error"]
     assert any("invalid `type`" in message and orphan_id in message for message in errors)
 
@@ -339,3 +349,103 @@ def test_design_phase_dropped_warning_survives_a_type_judgment_failure(
     assert any("invalid `type`" in message and "IF-ORPHAN" in message for message in errors)
     warnings = [entry[1] for entry in logs if entry[2] == "warning"]
     assert any("without an `interface_id`" in message and "Ghost.tsx" in message for message in warnings)
+
+
+# ---------------------------------------------------------------------------
+# Issue #233: the remaining silent holes become observable warnings
+# ---------------------------------------------------------------------------
+
+
+def test_design_phase_warns_on_unresolved_edge_references(tmp_project_dir, arc_runtime) -> None:
+    """A caller/callee id that resolves to no stored contract used to skip
+    edge creation silently; the registration now reports it."""
+
+    node_id = "REQ-S5-G"
+    _seed_shell_requirement(arc_runtime, node_id)
+    runner, logs = _make_runner(
+        tmp_project_dir,
+        {
+            "summary": "Shell wired.",
+            "interfaces": [
+                {
+                    "interface_id": f"{node_id}-UI-Shell",
+                    "type": "UI",
+                    "file_path": "frontend/src/App.tsx",
+                    "callees": ["IF-GHOST-CALLED"],
+                },
+            ],
+            "files_written": [],
+        },
+    )
+
+    ok = asyncio.run(
+        runner.run_design_phase(node_id, {"name": "Auth Shell", "description": "Shell"})
+    )
+
+    assert ok is True
+    warnings = [entry[1] for entry in logs if entry[2] == "warning"]
+    assert any(
+        "no cross-requirement edge was created" in message and "IF-GHOST-CALLED" in message
+        for message in warnings
+    )
+
+
+def test_design_phase_warns_on_dropped_and_backfilled_test_rows(tmp_project_dir, arc_runtime) -> None:
+    """Manifest rows that cannot be registered are dropped with a warning;
+    rows with a derivable test_id or no coverage_scope are backfilled with a
+    warning (issue #233 audit wiring). The manifest then trips the
+    foreign-owned check, so the phase verdict is False — irrelevant to the
+    warnings under pin, which fire in prepare_tests before it."""
+
+    node_id = "REQ-S5-H"
+    arc_runtime.traceability.store_requirement_tree(
+        {
+            "id": node_id,
+            "name": "Login Leaf",
+            "description": "Leaf feature node",
+        }
+    )
+    runner, logs = _make_runner(
+        tmp_project_dir,
+        {
+            "summary": "Login designed.",
+            "interfaces": [
+                {
+                    "interface_id": f"{node_id}-UI-LoginPage",
+                    "type": "UI",
+                    "file_path": "frontend/src/pages/LoginPage.tsx",
+                },
+            ],
+            "files_written": [],
+        },
+    )
+
+    class _ManifestGenerator:
+        app_handler = None
+
+        async def run(self, node_id: str, requirement_data: dict) -> tuple:
+            return (
+                [
+                    # Unregistrable: no file path at all.
+                    {"test_id": "T-NOPATH", "type": "Unit"},
+                    # Derivable identity: no test_id, no coverage_scope.
+                    {"type": "Unit", "file_path": "frontend/tests/unit/login.test.ts"},
+                ],
+                "summary",
+            )
+
+    runner.test_generator = _ManifestGenerator()
+
+    ok = asyncio.run(
+        runner.run_design_phase(node_id, {"name": "Login Leaf", "description": "Leaf"})
+    )
+
+    warnings = [entry[1] for entry in logs if entry[2] == "warning"]
+    assert any(
+        "cannot be registered" in message and "T-NOPATH" in message for message in warnings
+    )
+    assert any(
+        "Backfilled manifest row field(s)" in message and "test_id" in message
+        and "coverage_scope" in message
+        for message in warnings
+    )
