@@ -120,10 +120,11 @@ class ToolUsageMiddleware(AgentMiddleware[Any, Any, Any]):
 def _record(request: ToolCallRequest, result: ToolMessage | Any) -> None:
     tool_call = request.tool_call
     args = tool_call.get("args", {}) or {}
-    status = _result_status(result)
-    is_read = str(tool_call.get("name", "")) == "read_file"
+    tool = str(tool_call.get("name", ""))
+    status = _result_status(result, tool=tool)
+    is_read = tool == "read_file"
     record_tool_usage(
-        tool=str(tool_call.get("name", "")),
+        tool=tool,
         status=status,
         path=_discipline_path(args) or None,
         offset=_optional_int(args.get("offset")) if is_read else None,
@@ -132,15 +133,16 @@ def _record(request: ToolCallRequest, result: ToolMessage | Any) -> None:
     )
 
 
-def _result_status(result: ToolMessage | Any) -> str:
+def _result_status(result: ToolMessage | Any, *, tool: str = "") -> str:
     content = str(getattr(result, "content", "") or "")
     if content.startswith(BLOCKED_RESULT_PREFIX):
         return "blocked"
     # Results that self-report failure in their rendered text (an exit-code
     # segment the tool wrote itself) share the discipline's failure predicate,
     # so the observation cannot call a mixed-exit-code build "ok" while the
-    # write lock treats it as failed.
-    if _tool_result_failed(result):
+    # write lock treats it as failed. The predicate itself narrows the scan
+    # by tool: a read whose *content* holds failure markers still read fine.
+    if _tool_result_failed(result, tool=tool):
         return "error"
     return "ok"
 

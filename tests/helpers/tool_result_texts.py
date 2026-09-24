@@ -4,7 +4,9 @@ The mixed/all-zero build transcriptions are the exact shapes the
 multi-segment exit-code fix (#176) judges: both the write-lock discipline
 (``_tool_result_failed``) and the tool-usage observation must classify them
 identically, so the texts are pinned in one place instead of drifting apart
-between the two consumers' test files.
+between the two consumers' test files. The read-class narrowing (#220) reuses
+the same transcriptions as the *content* a ``read_file`` fetched: identical
+text must flip from "failed build" to "successful read" with the tool alone.
 """
 
 MIXED_BUILD_RESULT = (

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from deepagents import GeneralPurposeSubagentProfile, FilesystemPermission, HarnessProfile, create_deep_agent, register_harness_profile
-from deepagents.backends import CompositeBackend, StateBackend
+from deepagents.backends import StateBackend
 from deepagents._models import get_model_provider
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import AIMessage, ToolMessage
@@ -18,6 +18,9 @@ from agents.runtime.checkpointer import get_checkpointer
 from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.filesystem_adapters import (
     ARCFilesystemMiddleware,
+    ArcCompositeBackend,
+    GrepGuidanceMiddleware,
+    MAX_GREP_ALTERNATIVES,
     PermissionDeniedHintMiddleware,
     workspace_filesystem_backend,
 )
@@ -115,7 +118,14 @@ class OpenAIGlobSchema(BaseModel):
 class OpenAIGrepSchema(BaseModel):
     """OpenAI-compatible schema for the grep tool."""
 
-    pattern: str = Field(description="Text pattern to search for (literal string, not regex).")
+    pattern: str = Field(
+        description=(
+            "Literal text to search for (not regex). A pattern containing `|` is "
+            "expanded as literal alternatives (`foo|bar` matches either text; at "
+            f"most {MAX_GREP_ALTERNATIVES} per call; `\\|` searches for a literal `|`). "
+            "Other regex metacharacters (`.*`, `\\.`) are searched verbatim."
+        )
+    )
     path: str = Field(default=None, description="Base directory to search from. Defaults to the backend's default root.")
     glob: str = Field(
         default=None,
@@ -448,7 +458,7 @@ def build_stage_agent(
     skills_root = _compiler_skills_root()
     if skills_root.exists():
         routes[f"{SKILLS_PREFIX}/"] = workspace_filesystem_backend(str(skills_root))
-    backend = CompositeBackend(default=StateBackend(), routes=routes)
+    backend = ArcCompositeBackend(default=StateBackend(), routes=routes)
 
     resolved_model = create_arc_chat_model(model)
     _register_arc_tool_exclusions(model=model, resolved_model=resolved_model)
@@ -522,6 +532,10 @@ def build_stage_agent(
             # middleware rewrites permission-denied results afterwards.
             ARCFilesystemMiddleware(backend=backend, _permissions=permissions),
             PermissionDeniedHintMiddleware(),
+            # Innermost result shaper: strips upstream's loop-coaching grep
+            # note, states the alternation semantics, and enforces the
+            # no-match budget (issue #218).
+            GrepGuidanceMiddleware(),
         ]
     )
     # Mount-time capability filter: the same table the middleware enforces
