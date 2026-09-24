@@ -1698,3 +1698,29 @@ def test_probe_stall_blocked_repeated_reads_still_count_toward_the_storm() -> No
         for index in range(10)
     ]
     assert any("Repeated read blocked" in str(r.content) for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Contract pin: core.tdd_retry's tool-name classification (issue #219)
+# ---------------------------------------------------------------------------
+
+
+def test_tdd_retry_tool_name_sets_match_stage_discipline_write_surface() -> None:
+    """``core.tdd_retry.collect_attempt_facts`` counts the previous attempt's
+    successful writes from ``tool_usage`` events by tool name, and its
+    "NO successful file edits" callout steers the auto TDD retry (issue #219).
+    If the discipline's write surface ever grows, a missed name would make the
+    zero-writes fact lie — the classification must move with the discipline.
+    """
+
+    from agents.runtime import stage_discipline
+    from core.tdd_retry import MUTATING_TOOL_NAMES, READ_ONLY_TOOL_NAMES, TEST_RUN_TOOL_NAMES
+
+    assert MUTATING_TOOL_NAMES == (
+        stage_discipline._FILE_WRITE_TOOLS
+        | stage_discipline._ADDITIVE_FILE_WRITE_TOOLS
+        | {"delete"}
+    )
+    assert TEST_RUN_TOOL_NAMES <= stage_discipline._VALIDATION_TOOLS
+    assert not (READ_ONLY_TOOL_NAMES & MUTATING_TOOL_NAMES)
+    assert not (READ_ONLY_TOOL_NAMES & stage_discipline._VALIDATION_TOOLS)

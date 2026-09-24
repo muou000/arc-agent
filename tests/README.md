@@ -127,7 +127,10 @@ make clean       # 清理 pytest 缓存与 __pycache__
 
 - `core/tdd_retry.py` 纯函数：`scan_test_failures` 读取 JSONL、去重、保持首次出现
   顺序、跳过空行/非 JSON/空 node_id；`build_tdd_reprompt` 在提示中包含 node_id、
-  失败详情并完整表述 TDD 序列（先写失败测试，禁止为通过而弱化测试）。
+  失败详情并完整表述 TDD 序列（先写失败测试，禁止为通过而弱化测试）；
+  `collect_attempt_facts` 从 `tool_usage`/`llm_usage` 逐次事件流聚合前次尝试的
+  客观数字（模型调用/只读调用/run_tests/成功写入，支持游标分段），工具名分类在
+  `test_agents/test_stage_discipline.py` 与阶段纪律的写面对账。
 - 队列与调度：并行调度规则与子树亲和分组、依赖门禁与 `BLOCKED_BY_DEPENDENCY`
   传播、任务崩溃标记节点失败、saved state 恢复、跨节点文件声明
   （`core/file_claims.py`）。

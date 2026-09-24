@@ -19,6 +19,7 @@ from typing import Any
 from agents.test_driven_developer import TestDrivenDeveloper
 from core import sessions
 from core.phases import TDD_RUN_TESTS_BUDGET, TDD_STALL_THRESHOLD, WorkflowPhaseRunner
+from core.tdd_retry import build_tdd_reprompt
 from agents.tools.build import build_install_dependencies_tool
 from app_type_handler.test_results import parse_test_run
 from tests.helpers.faux import (
@@ -1986,6 +1987,57 @@ def test_followup_session_receives_digest_and_diff_hint(tmp_project_dir: Path, a
     assert "Structured Failure Digest" in session2_handoff
     # And the persisted raw output pointer reached the next session.
     assert ".arc/tdd_runs/" in session2_handoff
+
+
+def test_retry_reprompt_attempt_facts_reach_first_session(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """Issue #219: the auto retry's injected summary - including the objective
+    previous-attempt facts - must reach TestDrivenDeveloper.
+
+    The workflow injects the reprompt as the node session's
+    ``recent_failure_summary``; the context pipeline renders it as the
+    ``<recent_failure_summary>`` block in EVERY TDD session. That channel
+    matters most for a layer's FIRST session, whose ``previous_failure_summary``
+    slot carries the baseline RED evidence instead - a retry that resumes the
+    previous thread must still see what the failed attempt objectively spent.
+    """
+
+    node_id = "REQ-TDD-FACTS"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    write_test_file(tmp_project_dir)
+    # What core.workflow._prepare_auto_tdd_retry writes before the retry drain.
+    sessions.merge_node_session(
+        node_id,
+        {
+            "recent_failure_summary": build_tdd_reprompt(
+                node_id,
+                "Unit: assertion failed",
+                attempt_facts={
+                    "model_calls": 96,
+                    "tool_calls": 214,
+                    "read_only_calls": 88,
+                    "run_tests_calls": 7,
+                    "successful_writes": 0,
+                    "end_line": 500,
+                },
+            )
+        },
+    )
+
+    model = FauxChatModel(responses=[faux_text("giving up")])
+    fake = FakeAppHandler([failing_test_output()])
+    tdd = make_tdd(tmp_project_dir, model, fake)
+    runner = make_runner(tmp_project_dir, tdd, fake)
+
+    asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
+
+    first_call = "\n".join(str(m.content) for m in model.calls[0])
+    assert "<recent_failure_summary>" in first_call
+    assert "96 model calls" in first_call
+    assert "88 read-only" in first_call
+    assert "NO successful file edits" in first_call
 
 
 # ---------------------------------------------------------------------------

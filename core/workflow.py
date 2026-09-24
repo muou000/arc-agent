@@ -77,7 +77,7 @@ from core.scheduling_switches import (
     ARC_MAX_CONCURRENT_TASKS,
     ARC_NODE_WORKTREES,
 )
-from core.tdd_retry import build_tdd_reprompt, scan_test_failures
+from core.tdd_retry import build_tdd_reprompt, collect_attempt_facts, scan_test_failures
 from core.visual_analysis import precompute_visual_references, visual_precompute_enabled
 from core.worktree import (
     ArbitrationHooks,
@@ -1807,7 +1807,12 @@ class ARCWorkflowManager:
         keeps only nodes whose current queue state is still ``FAILED``, resets them
         for an implement-only retry (design artefacts are preserved), and injects the
         TDD follow-up into each node session so ``TestDrivenDeveloper`` receives it as
-        ``previous_failure_summary``. Returns the node ids queued for retry.
+        ``previous_failure_summary``. The follow-up carries the failed attempt's
+        objective counters (:func:`core.tdd_retry.collect_attempt_facts`) because the
+        retry resumes the same checkpointer thread and its inherited context can
+        otherwise pass for progress. The events cursor stored alongside fences each
+        attempt so a later auto retry measures only the newest one. Returns the node
+        ids queued for retry.
         """
         failures = scan_test_failures(self.runtime.paths.runner_events_path)
         eligible = [
@@ -1845,17 +1850,40 @@ class ARCWorkflowManager:
         self._save_processing_queue(queue_state)
 
         # Inject the follow-up AFTER the reset so it survives into the implement
-        # phase, which reads recent_failure_summary as previous_failure_summary.
+        # phase, which reads recent_failure_summary as previous_failure_summary
+        # (and the context pipeline renders it as the <recent_failure_summary>
+        # block in every TDD session, including each layer's first one).
+        runner_events_path = self.runtime.paths.runner_events_path
         for node_id, message in eligible:
             if node_id not in retry_node_ids:
                 continue
-            handoff = sessions.load_node_session(node_id).get("tdd_handoff") or {}
-            reprompt = build_tdd_reprompt(node_id, message, handoff=handoff if isinstance(handoff, dict) else None)
+            session = sessions.load_node_session(node_id)
+            try:
+                events_cursor = int(session.get("tdd_retry_events_cursor") or 0)
+            except (TypeError, ValueError):
+                events_cursor = 0
+            # Objective record of what the failed attempt already spent, from
+            # the per-call event streams (they survive even a
+            # GraphRecursionError crash, which skips the tdd_handoff write).
+            # The stored cursor fences finished attempts so a later auto
+            # retry - a resume after this retry failed again - measures only
+            # the newest attempt instead of double-counting this one.
+            attempt_facts = collect_attempt_facts(
+                runner_events_path, node_id, start_line=events_cursor
+            )
+            handoff = session.get("tdd_handoff")
+            reprompt = build_tdd_reprompt(
+                node_id,
+                message,
+                handoff=handoff if isinstance(handoff, dict) else None,
+                attempt_facts=attempt_facts,
+            )
             sessions.merge_node_session(
                 node_id,
                 {
                     "recent_failure_summary": reprompt,
                     "resume_context": {"tdd_reprompt": reprompt, "instruction": reprompt},
+                    "tdd_retry_events_cursor": attempt_facts.get("end_line", 0),
                 },
             )
             await self._log(

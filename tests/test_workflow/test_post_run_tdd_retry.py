@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from core.tdd_retry import build_tdd_reprompt, scan_test_failures
+from core.tdd_retry import build_tdd_reprompt, collect_attempt_facts, scan_test_failures
 
 
 def _append_record(path: Path, record: dict) -> None:
@@ -221,6 +221,196 @@ def test_build_reprompt_dedupes_across_layers() -> None:
     assert "Unit: 1|b" in reprompt
     assert "E2E: 1|c" in reprompt
     assert "unchanged across runs" not in reprompt
+
+
+# ---------------------------------------------------------------------------
+# collect_attempt_facts: objective numbers from the raw per-call event streams
+# ---------------------------------------------------------------------------
+
+
+def _tool_usage(node_id: str, tool: str, status: str = "ok", phase: str = "IMPLEMENT") -> dict:
+    return _timestamped(type="tool_usage", node_id=node_id, phase=phase, tool=tool, status=status)
+
+
+def _llm_usage(node_id: str, phase: str = "IMPLEMENT") -> dict:
+    return _timestamped(type="llm_usage", node_id=node_id, phase=phase)
+
+
+def test_collect_counts_model_calls_reads_tests_and_writes(tmp_path: Path) -> None:
+    """The facts quote the raw per-call streams: model calls (≈ agent steps),
+    read-only reads/searches, run_tests calls, and successful file writes.
+
+    Only successful writes count — a write the discipline blocked or that
+    errored did not change the workspace, and the zero-writes fact must stay
+    truthful (issue #219: the retry must know the previous round produced
+    nothing).
+    """
+    path = tmp_path / "runner-events.jsonl"
+    for row in [
+        _llm_usage("REQ-1"),
+        _llm_usage("REQ-1"),
+        _llm_usage("REQ-1"),
+        _tool_usage("REQ-1", "read_file"),
+        _tool_usage("REQ-1", "grep"),
+        _tool_usage("REQ-1", "glob"),
+        _tool_usage("REQ-1", "run_tests"),
+        _tool_usage("REQ-1", "write_file"),
+        _tool_usage("REQ-1", "edit_file", status="error"),
+    ]:
+        _append_record(path, row)
+    facts = collect_attempt_facts(path, "REQ-1")
+    assert facts["model_calls"] == 3
+    assert facts["tool_calls"] == 6
+    assert facts["read_only_calls"] == 3
+    assert facts["run_tests_calls"] == 1
+    assert facts["successful_writes"] == 1
+    assert facts["end_line"] == 9
+
+
+def test_collect_ignores_other_nodes_and_other_phases(tmp_path: Path) -> None:
+    """Only the node's IMPLEMENT-phase calls are the failed attempt's work."""
+    path = tmp_path / "runner-events.jsonl"
+    for row in [
+        _llm_usage("REQ-OTHER"),
+        _llm_usage("REQ-1", phase="DESIGN"),
+        _tool_usage("REQ-1", "write_file", phase="DESIGN"),
+        _tool_usage("REQ-OTHER", "grep"),
+        _llm_usage("REQ-1"),
+    ]:
+        _append_record(path, row)
+    facts = collect_attempt_facts(path, "REQ-1")
+    assert facts["model_calls"] == 1
+    assert facts["tool_calls"] == 0
+    assert facts["successful_writes"] == 0
+
+
+def test_collect_counts_delete_as_write_but_not_blocked_attempts(tmp_path: Path) -> None:
+    path = tmp_path / "runner-events.jsonl"
+    for row in [
+        _tool_usage("REQ-1", "delete"),
+        _tool_usage("REQ-1", "write_file", status="blocked"),
+        _tool_usage("REQ-1", "append_file"),
+    ]:
+        _append_record(path, row)
+    facts = collect_attempt_facts(path, "REQ-1")
+    assert facts["successful_writes"] == 2
+    assert facts["read_only_calls"] == 0
+
+
+def test_collect_honors_start_line_cursor(tmp_path: Path) -> None:
+    """A recorded cursor fences finished attempts: with ``start_line`` at the
+    previous retry's position only the latest attempt's events count, so a
+    repeated auto retry does not double-count earlier ones."""
+    path = tmp_path / "runner-events.jsonl"
+    for row in [_llm_usage("REQ-1"), _llm_usage("REQ-1"), _tool_usage("REQ-1", "grep")]:
+        _append_record(path, row)
+    first = collect_attempt_facts(path, "REQ-1")
+    assert first["model_calls"] == 2
+    assert first["end_line"] == 3
+
+    # The retry attempt appends its own events; the next preparation reads
+    # only the new segment.
+    _append_record(path, _llm_usage("REQ-1"))
+    _append_record(path, _tool_usage("REQ-1", "read_file"))
+    second = collect_attempt_facts(path, "REQ-1", start_line=first["end_line"])
+    assert second["model_calls"] == 1
+    assert second["read_only_calls"] == 1
+    assert second["end_line"] == 5
+
+
+def test_collect_returns_zeros_when_cursor_sits_at_file_end(tmp_path: Path) -> None:
+    """A cursor exactly at EOF means nothing new happened; it must scan nothing
+    (not restart from zero and double-count the fenced attempt)."""
+    path = tmp_path / "runner-events.jsonl"
+    _append_record(path, _llm_usage("REQ-1"))
+    facts = collect_attempt_facts(path, "REQ-1", start_line=1)
+    assert facts["model_calls"] == 0
+    assert facts["end_line"] == 1
+
+
+def test_collect_clamps_stale_cursor_beyond_file(tmp_path: Path) -> None:
+    """A cursor past EOF (events file recreated smaller) must not hide the
+    attempt behind an impossible slice."""
+    path = tmp_path / "runner-events.jsonl"
+    _append_record(path, _llm_usage("REQ-1"))
+    facts = collect_attempt_facts(path, "REQ-1", start_line=99)
+    assert facts["model_calls"] == 1
+
+
+def test_collect_tolerates_missing_file_and_garbage_lines(tmp_path: Path) -> None:
+    missing = collect_attempt_facts(tmp_path / "nope.jsonl", "REQ-1")
+    assert missing["model_calls"] == 0
+    assert missing["end_line"] == 0
+
+    path = tmp_path / "runner-events.jsonl"
+    path.write_text("not-json\nnull\n[]\n", encoding="utf-8")
+    facts = collect_attempt_facts(path, "REQ-1")
+    assert facts["model_calls"] == 0
+    assert facts["end_line"] == 3
+
+
+# ---------------------------------------------------------------------------
+# build_tdd_reprompt: previous-attempt objective facts
+# ---------------------------------------------------------------------------
+
+
+def _attempt_facts(**overrides: int) -> dict:
+    facts = {
+        "model_calls": 96,
+        "tool_calls": 214,
+        "read_only_calls": 88,
+        "run_tests_calls": 7,
+        "successful_writes": 0,
+        "end_line": 500,
+    }
+    facts.update(overrides)
+    return facts
+
+
+def test_build_reprompt_quotes_previous_attempt_facts() -> None:
+    """Issue #219: the retry must know what the previous attempt objectively
+    spent — model calls, read-only calls, run_tests calls — and that it wrote
+    nothing, so the inherited thread's bulk cannot pass for progress."""
+    reprompt = build_tdd_reprompt("REQ-1", "Unit: assertion failed", attempt_facts=_attempt_facts())
+    assert "Previous attempt record" in reprompt
+    assert "96 model calls" in reprompt
+    assert "214 tool calls" in reprompt
+    assert "88 read-only" in reprompt
+    assert "7 run_tests" in reprompt
+    lowered = reprompt.lower()
+    assert "no successful file edits" in lowered
+    assert "change the approach" in lowered
+
+
+def test_build_reprompt_with_writes_skips_zero_write_callout() -> None:
+    reprompt = build_tdd_reprompt("REQ-1", "boom", attempt_facts=_attempt_facts(successful_writes=5))
+    assert "5 successful file writes" in reprompt
+    assert "NO successful file edits" not in reprompt
+
+
+def test_build_reprompt_omits_attempt_facts_block_without_signal() -> None:
+    """All-zero facts mean the node never reached IMPLEMENT; an empty record
+    would only be noise."""
+    reprompt = build_tdd_reprompt("REQ-1", "boom", attempt_facts=_attempt_facts(model_calls=0, tool_calls=0))
+    assert "Previous attempt record" not in reprompt
+
+
+def test_build_reprompt_tolerates_malformed_attempt_facts() -> None:
+    for bad in (None, "x", 42, {"model_calls": "nope"}):
+        reprompt = build_tdd_reprompt("REQ-1", "boom", attempt_facts=bad)  # type: ignore[arg-type]
+        assert "TDD follow-up for REQ-1" in reprompt
+        assert "boom" in reprompt
+
+
+def test_build_reprompt_orders_attempt_facts_before_handoff_evidence() -> None:
+    """Scale first (what was spent), then what was tried (fingerprints)."""
+    reprompt = build_tdd_reprompt(
+        "REQ-1",
+        "boom",
+        handoff={"layer_usage": {"Unit": 10}},
+        attempt_facts=_attempt_facts(),
+    )
+    assert reprompt.index("Previous attempt record") < reprompt.index("Unit: 10/10 run_tests calls")
 
 
 # ---------------------------------------------------------------------------
