@@ -90,6 +90,7 @@ from core.scheduling import (
     next_affinity_task,
     next_runnable_stage_task,
     next_runnable_task,
+    stage_backpressure_state,
 )
 from core.scheduling_switches import (
     ARC_AFFINITY_DEPTH,
@@ -548,19 +549,24 @@ class ARCWorkflowManager:
         else:
             await self._precompute_visual_references(requirement_tree)
 
-        if self._stage_pipeline and not self._parallel_mode:
-            # The current phase runner still owns the bundled DESIGN phase;
-            # use the stage scheduler in the safe shared-workspace mode and
-            # leave the stage/worktree combination behind its later gate.
-            await self._drain_stage_tasks(
-                queue_state,
-                lambda stage_task: self._execute_stage_task(stage_task, queue_state),
-            )
-        else:
-            await self._drain_runnable_tasks(queue_state)
+        try:
+            if self._stage_pipeline and not self._parallel_mode:
+                # The current phase runner still owns the bundled DESIGN
+                # phase; use the stage scheduler in the safe shared-workspace
+                # mode and leave the stage/worktree combination behind its
+                # later gate.
+                await self._drain_stage_tasks(
+                    queue_state,
+                    lambda stage_task: self._execute_stage_task(stage_task, queue_state),
+                )
+            else:
+                await self._drain_runnable_tasks(queue_state)
 
-        if self._stage_pipeline:
-            await self._finish_visual_ready_tasks(queue_state)
+            if self._stage_pipeline:
+                await self._finish_visual_ready_tasks(queue_state)
+        except asyncio.CancelledError:
+            await self._cancel_visual_stage_tasks()
+            raise
 
         # Post-run auto TDD re-prompt: after a full pass over the queue, scan the
         # runner events the agents emitted for `test/failed` requirement states and
@@ -901,6 +907,15 @@ class ARCWorkflowManager:
             await self._mark_unexpected_visual_failure(node_id, queue_state, result)
         self._visual_stage_tasks.clear()
 
+    async def _cancel_visual_stage_tasks(self) -> None:
+        tasks = list(self._visual_stage_tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._visual_stage_tasks.clear()
+
     async def _mark_unexpected_visual_failure(
         self,
         node_id: str,
@@ -1111,37 +1126,20 @@ class ARCWorkflowManager:
                                     return_when=asyncio.FIRST_COMPLETED,
                                 )
                                 continue
-                            ready_to_merge = sum(
-                                1
-                                for item in queue_state.get("stage_tasks", []) or []
-                                if str(item.get("status", "")).strip().upper()
-                                == STAGE_READY_TO_MERGE
-                            )
-                            pending = sum(
-                                1
-                                for item in queue_state.get("stage_tasks", []) or []
-                                if str(item.get("status", "")).strip().upper() == STAGE_PENDING
-                            )
                             ready_limit = queue_state.get(
                                 "stage_max_ready_to_merge", max_concurrency
                             )
-                            try:
-                                ready_limit = max(1, int(ready_limit))
-                            except (TypeError, ValueError):
-                                ready_limit = max_concurrency
-                            if pending and ready_to_merge >= ready_limit:
-                                queue_state["stage_backpressure"] = {
-                                    "ready_to_merge": ready_to_merge,
-                                    "limit": ready_limit,
-                                    "pending": pending,
-                                }
+                            backpressure = stage_backpressure_state(queue_state, ready_limit)
+                            if backpressure is not None:
+                                queue_state["stage_backpressure"] = backpressure
                                 self._save_processing_queue(queue_state)
                                 await self._log(
                                     "Compiler",
                                     (
                                         "Stage drain paused by backpressure: "
-                                        f"{ready_to_merge} publication(s) await merge, "
-                                        f"limit {ready_limit}, {pending} pending stage task(s)."
+                                        f"{backpressure['ready_to_merge']} publication(s) await merge, "
+                                        f"limit {backpressure['limit']}, "
+                                        f"{backpressure['pending']} pending stage task(s)."
                                     ),
                                     status="warning",
                                 )
@@ -1174,6 +1172,9 @@ class ARCWorkflowManager:
                         result = {
                             "status": STAGE_FAILED,
                             "error": f"{type(exc).__name__}: {detail}",
+                            "error_category": str(
+                                getattr(exc, "category", None) or type(exc).__name__
+                            ),
                         }
 
                     if result is False or (
@@ -1185,11 +1186,17 @@ class ARCWorkflowManager:
                             if isinstance(result, dict)
                             else "stage execution failed"
                         )
+                        error_category = (
+                            str(result.get("error_category", "stage_execution"))
+                            if isinstance(result, dict)
+                            else "stage_execution"
+                        )
                         fail_stage_task(
                             queue_state,
                             node_id,
                             stage,
                             error=error,
+                            error_category=error_category,
                             on_state_change=self._upsert_node_state,
                         )
                     else:
@@ -2579,6 +2586,7 @@ class ARCWorkflowManager:
             if not ready or status in {STAGE_FAILED, STAGE_BLOCKED}:
                 return {
                     "status": STAGE_FAILED,
+                    "error_category": "visual_analysis",
                     "error": str(
                         (stage_task_of(queue_state, node_id, STAGE_VISUAL_ANALYSIS) or {}).get(
                             "error", "visual analysis did not reach ready"
@@ -2596,6 +2604,7 @@ class ARCWorkflowManager:
                 return {"status": STAGE_PUBLISHED}
             return {
                 "status": STAGE_FAILED,
+                "error_category": "test_generation",
                 "error": "TEST_GENERATION is not independently runnable until the phase runner split",
             }
 
@@ -2604,7 +2613,11 @@ class ARCWorkflowManager:
         elif stage == STAGE_IMPLEMENTATION:
             phase = PHASE_IMPLEMENT
         else:
-            return {"status": STAGE_FAILED, "error": f"unsupported stage {stage or '(missing)'}"}
+            return {
+                "status": STAGE_FAILED,
+                "error_category": "stage_scheduler",
+                "error": f"unsupported stage {stage or '(missing)'}",
+            }
 
         aggregate_task = next(
             (
@@ -2616,7 +2629,11 @@ class ARCWorkflowManager:
             None,
         )
         if aggregate_task is None:
-            return {"status": STAGE_FAILED, "error": f"aggregate {phase} task is missing"}
+            return {
+                "status": STAGE_FAILED,
+                "error_category": "stage_scheduler",
+                "error": f"aggregate {phase} task is missing",
+            }
 
         self._begin_task(aggregate_task, queue_state)
         await self._execute_task(aggregate_task, queue_state)
@@ -2625,6 +2642,7 @@ class ARCWorkflowManager:
             return {"status": STAGE_PUBLISHED}
         return {
             "status": STAGE_FAILED,
+            "error_category": "aggregate_phase",
             "error": str(
                 (stage_task_of(queue_state, node_id, stage) or {}).get(
                     "error", f"{stage} did not publish"

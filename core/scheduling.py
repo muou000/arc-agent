@@ -409,23 +409,12 @@ def stage_overlap_allowed(left: Mapping[str, Any], right: Mapping[str, Any]) -> 
 
 
 def _stage_node_order(task: Mapping[str, Any]) -> int | None:
-    if "node_order" in task:
-        raw = task.get("node_order")
-        if raw is None:
-            return None
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return None
-    stage = _stage_name(task)
+    if "node_order" not in task or task.get("node_order") is None:
+        return None
     try:
-        stage_offset = STAGE_PIPELINE.index(stage)
-        order = int(task.get("order", ""))
+        return int(task["node_order"])
     except (TypeError, ValueError):
         return None
-    if order < stage_offset or (order - stage_offset) % len(STAGE_PIPELINE):
-        return None
-    return (order - stage_offset) // len(STAGE_PIPELINE)
 
 
 def _approved_stage_overlap_for_queue(
@@ -437,10 +426,6 @@ def _approved_stage_overlap_for_queue(
         return False
     candidate_order = _stage_node_order(candidate)
     blocker_order = _stage_node_order(blocker)
-    if candidate_order is None and blocker_order is None:
-        # Hand-built queue fixtures and legacy callers may omit the optional
-        # node-order metadata; preserve their stage-type/write-set decision.
-        return True
     if candidate_order is None or blocker_order is None:
         # An incomplete persisted queue must fail closed rather than guessing
         # its adjacency relationship.
@@ -512,6 +497,32 @@ def _stage_ready_to_merge_count(queue_state: dict[str, Any]) -> int:
         if isinstance(task, Mapping)
         and _stage_status(queue_state, task) == STAGE_READY_TO_MERGE
     )
+
+
+def stage_backpressure_state(
+    queue_state: dict[str, Any],
+    max_ready_to_merge: int,
+) -> dict[str, int] | None:
+    """Return an auditable backpressure snapshot when publication slots are full."""
+
+    try:
+        limit = max(1, int(max_ready_to_merge))
+    except (TypeError, ValueError):
+        limit = 1
+    ready_to_merge = _stage_ready_to_merge_count(queue_state)
+    pending = sum(
+        1
+        for task in queue_state.get("stage_tasks", []) or []
+        if isinstance(task, Mapping)
+        and _stage_status(queue_state, task) == STAGE_PENDING
+    )
+    if pending and ready_to_merge >= limit:
+        return {
+            "ready_to_merge": ready_to_merge,
+            "limit": limit,
+            "pending": pending,
+        }
+    return None
 
 
 def next_runnable_stage_task(

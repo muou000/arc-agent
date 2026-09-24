@@ -41,7 +41,6 @@ def _stage(
         "node_id": node_id,
         "stage": stage,
         "order": order,
-        "node_order": node_order,
         "status": status,
         "applicable": True,
         "attempt_count": 0,
@@ -51,6 +50,8 @@ def _stage(
     }
     if writes is not None:
         task["declared_write_set"] = writes
+    if node_order is not None:
+        task["node_order"] = node_order
     return task
 
 
@@ -173,20 +174,23 @@ def test_published_write_set_is_used_when_the_task_field_is_not_registered_yet()
 
 
 def test_stage_selector_skips_conflicting_earlier_work_and_keeps_later_work_fair() -> None:
-    active_design = _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_READY_TO_MERGE, writes=["src/shared.ts"])
+    active_design = _stage(
+        "A", STAGE_INTERFACE_DESIGN, 1, STAGE_READY_TO_MERGE,
+        writes=["src/shared.ts"], node_order=2,
+    )
     blocked_implementation = _stage(
-        "B", STAGE_IMPLEMENTATION, 2, writes=["src/shared.ts"]
+        "B", STAGE_IMPLEMENTATION, 2, writes=["src/shared.ts"], node_order=1
     )
     ready_test_generation = _stage(
-        "C", STAGE_TEST_GENERATION, 3, writes=["tests/c.test.ts"]
+        "C", STAGE_TEST_GENERATION, 3, writes=["tests/c.test.ts"], node_order=1
     )
     queue = _queue(
-        _stage("B", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED),
-        _stage("B", STAGE_INTERFACE_DESIGN, 4, STAGE_PUBLISHED),
-        _stage("B", STAGE_TEST_GENERATION, 5, STAGE_PUBLISHED),
+            _stage("B", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED, node_order=1),
+            _stage("B", STAGE_INTERFACE_DESIGN, 4, STAGE_PUBLISHED, node_order=1),
+            _stage("B", STAGE_TEST_GENERATION, 5, STAGE_PUBLISHED, node_order=1),
         blocked_implementation,
-        _stage("C", STAGE_VISUAL_ANALYSIS, 6, STAGE_PUBLISHED),
-        _stage("C", STAGE_INTERFACE_DESIGN, 7, STAGE_PUBLISHED),
+            _stage("C", STAGE_VISUAL_ANALYSIS, 6, STAGE_PUBLISHED, node_order=1),
+            _stage("C", STAGE_INTERFACE_DESIGN, 7, STAGE_PUBLISHED, node_order=1),
         ready_test_generation,
     )
 
@@ -218,12 +222,15 @@ def test_stage_selector_rejects_non_adjacent_overlap_even_when_writes_are_disjoi
 
 
 def test_stage_backpressure_stops_new_work_when_publications_are_queued() -> None:
-    ready_to_merge = _stage("A", STAGE_INTERFACE_DESIGN, 0, STAGE_READY_TO_MERGE, writes=["src/a.ts"])
-    candidate = _stage("B", STAGE_TEST_GENERATION, 1, writes=["tests/b.test.ts"])
+    ready_to_merge = _stage(
+        "A", STAGE_INTERFACE_DESIGN, 0, STAGE_READY_TO_MERGE,
+        writes=["src/a.ts"], node_order=1,
+    )
+    candidate = _stage("B", STAGE_TEST_GENERATION, 1, writes=["tests/b.test.ts"], node_order=0)
     queue = _queue(
         ready_to_merge,
-        _stage("B", STAGE_VISUAL_ANALYSIS, 2, STAGE_PUBLISHED),
-        _stage("B", STAGE_INTERFACE_DESIGN, 3, STAGE_PUBLISHED),
+        _stage("B", STAGE_VISUAL_ANALYSIS, 2, STAGE_PUBLISHED, node_order=0),
+        _stage("B", STAGE_INTERFACE_DESIGN, 3, STAGE_PUBLISHED, node_order=0),
         candidate,
     )
 
@@ -254,12 +261,12 @@ def test_stage_drain_uses_bounded_slots_and_the_approved_overlap_window(
     manager.runtime = runtime
     manager._save_processing_queue = lambda _queue: None
     queue = _queue(
-        _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED),
-        _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_PUBLISHED),
-        _stage("A", STAGE_TEST_GENERATION, 2, writes=["tests/a.test.ts"]),
-        _stage("B", STAGE_VISUAL_ANALYSIS, 3, STAGE_PUBLISHED),
-        _stage("B", STAGE_INTERFACE_DESIGN, 4, writes=["src/b.ts"]),
-        _stage("B", STAGE_TEST_GENERATION, 5),
+        _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_TEST_GENERATION, 2, writes=["tests/a.test.ts"], node_order=0),
+        _stage("B", STAGE_VISUAL_ANALYSIS, 3, STAGE_PUBLISHED, node_order=1),
+        _stage("B", STAGE_INTERFACE_DESIGN, 4, writes=["src/b.ts"], node_order=1),
+        _stage("B", STAGE_TEST_GENERATION, 5, node_order=1),
     )
     active: set[str] = set()
     peak = 0

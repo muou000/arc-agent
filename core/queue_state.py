@@ -297,6 +297,7 @@ def transition_stage_task(
     publication: dict[str, Any] | None = None,
     error: str | None = None,
     retry_at: str | None = None,
+    error_category: str | None = None,
 ) -> dict[str, Any]:
     """Apply one validated stage transition and return the task payload.
 
@@ -326,6 +327,10 @@ def transition_stage_task(
         task["error"] = error
     elif next_status not in {STAGE_FAILED, STAGE_RETRY_WAIT}:
         task["error"] = None
+    if error_category is not None:
+        task["error_category"] = error_category
+    elif next_status not in {STAGE_FAILED, STAGE_RETRY_WAIT}:
+        task["error_category"] = None
     return task
 
 
@@ -335,6 +340,7 @@ def fail_stage_task(
     stage: str,
     *,
     error: str,
+    error_category: str | None = None,
     on_state_change: StateChangeCallback | None = None,
 ) -> dict[str, Any]:
     """Fail one stage and project the node into the legacy FAILED state.
@@ -351,6 +357,7 @@ def fail_stage_task(
         stage,
         STAGE_FAILED,
         error=error,
+        error_category=error_category,
     )
     try:
         failed_index = STAGE_PIPELINE.index(stage)
@@ -365,6 +372,7 @@ def fail_stage_task(
             if later_status in {STAGE_PENDING, STAGE_RETRY_WAIT}:
                 later_task["status"] = STAGE_BLOCKED
                 later_task["error"] = f"blocked by failed {stage} stage"
+                later_task["error_category"] = "blocked_by_stage"
                 later_task["retry_at"] = None
             elif later_status in {STAGE_RUNNING, STAGE_READY, STAGE_READY_TO_MERGE}:
                 transition_stage_task(
@@ -373,6 +381,7 @@ def fail_stage_task(
                     later_stage,
                     STAGE_FAILED,
                     error=f"blocked by failed {stage} stage",
+                    error_category="blocked_by_stage",
                 )
     _set_node_state(queue_state, node_id, NODE_FAILED, on_state_change)
     return task
@@ -494,6 +503,7 @@ def _reset_stage_tasks_for_retry(
         task["retry_at"] = None
         task["publication"] = None
         task["error"] = None
+        task["error_category"] = None
 
 
 def _block_pending_stage_tasks(queue_state: dict[str, Any], node_id: str) -> None:
@@ -513,6 +523,7 @@ def _release_stage_task_blocks(queue_state: dict[str, Any], node_id: str) -> Non
             continue
         task["status"] = STAGE_SKIPPED if not bool(task.get("applicable", True)) else STAGE_PENDING
         task["error"] = None
+        task["error_category"] = None
         task["retry_at"] = None
 
 
@@ -1193,6 +1204,7 @@ def _migrate_stage_tasks(
         current.setdefault("declared_write_set", None)
         current.setdefault("publication", None)
         current.setdefault("error", None)
+        current.setdefault("error_category", None)
         migrated.append(current)
     return migrated
 
@@ -1301,6 +1313,7 @@ def _make_stage_task(
         "declared_write_set": None,
         "publication": None,
         "error": None,
+        "error_category": None,
     }
 
 
