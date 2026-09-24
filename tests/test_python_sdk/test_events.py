@@ -118,6 +118,51 @@ class TestRequirementStateWriter:
         events.mark_design_done("REQ-1")
 
 
+class TestVisualAnalysisEvents:
+    def test_record_visual_analysis_writes_stage_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_visual_analysis(
+            node_id=" REQ-1 ",
+            status="retry_wait",
+            attempt=2,
+            retry_at="2026-09-24T12:00:00+00:00",
+            message="provider unavailable",
+        )
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0] == {
+            "type": "visual_analysis",
+            "node_id": "REQ-1",
+            "status": "retry_wait",
+            "attempt": 2,
+            "retry_at": "2026-09-24T12:00:00+00:00",
+            "message": "provider unavailable",
+            "timestamp": lines[0]["timestamp"],
+        }
+
+    def test_record_visual_analysis_normalizes_optional_fields(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_visual_analysis(
+            node_id="REQ-1",
+            status="ready",
+            attempt=-1,
+            retry_at="  ",
+        )
+
+        event = read_jsonl(event_paths.runner_events_path)[0]
+        assert event["attempt"] == 0
+        assert event["retry_at"] is None
+        assert event["message"] is None
+
+    def test_record_visual_analysis_ignores_empty_node_id(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_visual_analysis(status="failed")
+        assert read_jsonl(event_paths.runner_events_path) == []
+
+
 class TestRunnerStateEvents:
     @pytest.mark.parametrize(
         "method_name,state",

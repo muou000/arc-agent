@@ -5,6 +5,7 @@ import os
 import shutil
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -30,6 +31,15 @@ from core.queue_state import (
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
     QUEUE_FILENAME,
+    STAGE_BLOCKED,
+    STAGE_FAILED,
+    STAGE_PENDING,
+    STAGE_PUBLISHED,
+    STAGE_READY,
+    STAGE_RETRY_WAIT,
+    STAGE_RUNNING,
+    STAGE_SKIPPED,
+    STAGE_VISUAL_ANALYSIS,
     TASK_BLOCKED,
     TASK_COMPLETED,
     TASK_FAILED,
@@ -40,6 +50,7 @@ from core.queue_state import (
     begin_task,
     complete_task,
     fail_task,
+    fail_stage_task,
     has_phase_tasks,
     design_status_of,
     load_or_create_queue,
@@ -49,7 +60,10 @@ from core.queue_state import (
     release_dependency_blocks,
     reset_node_for_retry,
     save_queue,
+    stage_status_of,
+    stage_task_of,
     task_status,
+    transition_stage_task,
 )
 from core.service import configure_runtime
 from core.commits import build_commit_message
@@ -77,9 +91,19 @@ from core.scheduling_switches import (
     ARC_AUTO_TDD_RETRY,
     ARC_MAX_CONCURRENT_TASKS,
     ARC_NODE_WORKTREES,
+    ARC_STAGE_PIPELINE,
 )
 from core.tdd_retry import build_tdd_reprompt, collect_attempt_facts, scan_test_failures
-from core.visual_analysis import precompute_visual_references, visual_precompute_enabled
+from core.visual_analysis import (
+    VISUAL_STAGE_MAX_ATTEMPTS,
+    VISUAL_STAGE_RETRY_BACKOFF_SECONDS,
+    VisualAnalysisError,
+    analyze_visual_ready_references,
+    has_visual_references,
+    precompute_visual_references,
+    visual_precompute_concurrency,
+    visual_precompute_enabled,
+)
 from core.worktree import (
     ArbitrationHooks,
     MergeArbitrationError,
@@ -140,6 +164,11 @@ def _worktrees_enabled() -> bool:
     raw = os.environ.get(ARC_NODE_WORKTREES, "").strip().lower()
     # Serial shared-workspace mode is the default; an explicit truthy value
     # opts into per-node worktree parallelism.
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _stage_pipeline_enabled() -> bool:
+    raw = os.environ.get(ARC_STAGE_PIPELINE, "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
@@ -219,6 +248,10 @@ class ARCWorkflowManager:
         # Per-node worktree parallelism (default off; ARC_NODE_WORKTREES=1
         # opts in) instead of the shared-workspace serial mode.
         self._parallel_mode = _worktrees_enabled()
+        # The stage pipeline is deliberately opt-in. Keeping the decision at
+        # manager construction makes one compile run internally consistent if
+        # the host environment changes while a run is in flight.
+        self._stage_pipeline = _stage_pipeline_enabled()
         # Captured once per process like ARC_NODE_WORKTREES: one CLI run, one
         # grouping; a mid-run flip would put queued tasks in two groups' files.
         self._affinity_depth = _affinity_depth()
@@ -236,6 +269,12 @@ class ARCWorkflowManager:
         # path consults this to attach pending merges for the eager
         # replay (issue #127); entries live for the task's duration only.
         self._inflight: dict[str, _TaskWorkspace] = {}
+        # Node-level visual gates run outside product worktrees. Their only
+        # shared writes are coordinator-owned cache, traceability, queue, and
+        # runner-event records.
+        self._visual_stage_tasks: dict[str, asyncio.Task[None]] = {}
+        self._visual_stage_semaphore: asyncio.Semaphore | None = None
+        self._visual_stage_semaphore_loop: asyncio.AbstractEventLoop | None = None
         # Eager mid-phase replay gate (issue #127, ARC_REBASE_ON_MERGE,
         # default off): off keeps the merge rails byte-for-byte identical.
         self._rebase_on_merge = _rebase_on_merge_enabled()
@@ -499,9 +538,15 @@ class ARCWorkflowManager:
             f"Loaded processing queue with {len(queue_state['tasks'])} task(s) for root node {root_id}.",
         )
 
-        await self._precompute_visual_references(requirement_tree)
+        if self._stage_pipeline:
+            await self._prepare_visual_ready_tasks(requirement_tree, queue_state)
+        else:
+            await self._precompute_visual_references(requirement_tree)
 
         await self._drain_runnable_tasks(queue_state)
+
+        if self._stage_pipeline:
+            await self._finish_visual_ready_tasks(queue_state)
 
         # Post-run auto TDD re-prompt: after a full pass over the queue, scan the
         # runner events the agents emitted for `test/failed` requirement states and
@@ -554,6 +599,360 @@ class ARCWorkflowManager:
             await self._log(
                 "Compiler",
                 f"Visual precompute finished; {count} node(s) analyzed before the node loop.",
+            )
+
+    def _visual_requirement_nodes(
+        self, requirement_tree: dict[str, Any]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        nodes: list[tuple[str, dict[str, Any]]] = []
+
+        def walk(node: dict[str, Any]) -> None:
+            node_id = str(node.get("id") or "").strip()
+            if node_id:
+                nodes.append((node_id, self.runtime.traceability.get_requirement(node_id) or node))
+            for child in node.get("children", []) or []:
+                if isinstance(child, dict):
+                    walk(child)
+
+        walk(requirement_tree)
+        return nodes
+
+    async def _prepare_visual_ready_tasks(
+        self,
+        requirement_tree: dict[str, Any],
+        queue_state: dict[str, Any],
+    ) -> None:
+        """Recover and optionally start every node's visual-ready task."""
+
+        if self.runtime is None:
+            return
+        changed = False
+        recovered_design_nodes = {
+            str(item.get("node_id") or "").strip()
+            for item in queue_state.get("recovered_interrupted_tasks", []) or []
+            if str(item.get("phase") or "").strip() == PHASE_DESIGN
+        }
+        for node_id, requirement_data in self._visual_requirement_nodes(requirement_tree):
+            status = stage_status_of(queue_state, node_id, STAGE_VISUAL_ANALYSIS)
+            if status is None:
+                # Queues created before #251 are migrated by load_or_create_queue;
+                # retaining this fallback keeps direct legacy test fixtures safe.
+                continue
+            if not has_visual_references(requirement_data):
+                if status == STAGE_PENDING:
+                    transition_stage_task(
+                        queue_state,
+                        node_id,
+                        STAGE_VISUAL_ANALYSIS,
+                        STAGE_SKIPPED,
+                        publication={"reference_count": 0, "image_paths": []},
+                    )
+                    self._record_visual_event(node_id, "skipped", attempt=0)
+                    changed = True
+                continue
+            if node_id in recovered_design_nodes and status in {STAGE_PENDING, STAGE_RETRY_WAIT}:
+                self._record_visual_event(
+                    node_id,
+                    "recovered",
+                    attempt=self._stage_attempt_count(queue_state, node_id),
+                    message="resuming an interrupted visual analysis",
+                )
+            if status == STAGE_RUNNING:
+                transition_stage_task(
+                    queue_state,
+                    node_id,
+                    STAGE_VISUAL_ANALYSIS,
+                    STAGE_RETRY_WAIT,
+                    error="visual analysis was interrupted before publication",
+                )
+                self._record_visual_event(
+                    node_id,
+                    "recovered",
+                    attempt=self._stage_attempt_count(queue_state, node_id),
+                    message="resuming an interrupted visual analysis",
+                )
+                changed = True
+                status = STAGE_RETRY_WAIT
+            if status in {STAGE_READY, STAGE_PUBLISHED, STAGE_SKIPPED, STAGE_FAILED, STAGE_BLOCKED}:
+                continue
+            if visual_precompute_enabled():
+                self._ensure_visual_stage_task(node_id, requirement_data, queue_state)
+        if changed:
+            self._save_processing_queue(queue_state)
+
+    def _ensure_visual_stage_task(
+        self,
+        node_id: str,
+        requirement_data: dict[str, Any],
+        queue_state: dict[str, Any],
+    ) -> asyncio.Task[None]:
+        existing = self._visual_stage_tasks.get(node_id)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(
+            self._run_visual_stage(node_id, requirement_data, queue_state),
+            name=f"visual-analysis:{node_id}",
+        )
+        self._visual_stage_tasks[node_id] = task
+        return task
+
+    async def _await_visual_ready(
+        self,
+        node_id: str,
+        requirement_data: dict[str, Any],
+        queue_state: dict[str, Any],
+    ) -> bool:
+        status = stage_status_of(queue_state, node_id, STAGE_VISUAL_ANALYSIS)
+        if status is None:
+            return True
+        if status in {STAGE_READY, STAGE_PUBLISHED, STAGE_SKIPPED}:
+            return True
+        if status in {STAGE_FAILED, STAGE_BLOCKED}:
+            return False
+        if not has_visual_references(requirement_data):
+            transition_stage_task(
+                queue_state,
+                node_id,
+                STAGE_VISUAL_ANALYSIS,
+                STAGE_SKIPPED,
+                publication={"reference_count": 0, "image_paths": []},
+            )
+            self._save_processing_queue(queue_state)
+            self._record_visual_event(node_id, "skipped", attempt=0)
+            return True
+        task = self._ensure_visual_stage_task(node_id, requirement_data, queue_state)
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive task boundary
+            await self._mark_unexpected_visual_failure(node_id, queue_state, exc)
+            return False
+        return stage_status_of(queue_state, node_id, STAGE_VISUAL_ANALYSIS) in {
+            STAGE_READY,
+            STAGE_PUBLISHED,
+            STAGE_SKIPPED,
+        }
+
+    async def _run_visual_stage(
+        self,
+        node_id: str,
+        requirement_data: dict[str, Any],
+        queue_state: dict[str, Any],
+    ) -> None:
+        stage = STAGE_VISUAL_ANALYSIS
+        status = stage_status_of(queue_state, node_id, stage)
+        if status in {STAGE_READY, STAGE_PUBLISHED, STAGE_SKIPPED, STAGE_FAILED, STAGE_BLOCKED}:
+            return
+
+        requirements_dir = self._visual_requirements_dir()
+        while self._stage_attempt_count(queue_state, node_id) < VISUAL_STAGE_MAX_ATTEMPTS:
+            task = stage_task_of(queue_state, node_id, stage)
+            if task is None:
+                return
+            status = stage_status_of(queue_state, node_id, stage)
+            if status in {STAGE_READY, STAGE_PUBLISHED, STAGE_SKIPPED, STAGE_FAILED, STAGE_BLOCKED}:
+                return
+            if status == STAGE_RETRY_WAIT:
+                await self._sleep_until_visual_retry(task.get("retry_at"))
+                if stage_status_of(queue_state, node_id, stage) == STAGE_BLOCKED:
+                    return
+            transition_stage_task(queue_state, node_id, stage, STAGE_RUNNING)
+            attempt = self._stage_attempt_count(queue_state, node_id)
+            task = stage_task_of(queue_state, node_id, stage) or task
+            task["retry_at"] = None
+            self._save_processing_queue(queue_state)
+            self._record_visual_event(node_id, "started", attempt=attempt)
+            try:
+                async with self._visual_stage_limit():
+                    analyzed = await analyze_visual_ready_references(
+                        workspace_path=self.workspace_path,
+                        requirements_dir=requirements_dir,
+                        requirement_data=requirement_data,
+                        log_cb=self._log,
+                    )
+                references = [
+                    item
+                    for item in analyzed.get("visual_reference", []) or []
+                    if isinstance(item, dict)
+                ]
+                transition_stage_task(
+                    queue_state,
+                    node_id,
+                    stage,
+                    STAGE_READY,
+                    publication={
+                        "reference_count": len(references),
+                        "image_paths": [str(item.get("image_path") or "") for item in references],
+                    },
+                )
+                self._save_processing_queue(queue_state)
+                self._record_visual_event(
+                    node_id,
+                    "ready",
+                    attempt=attempt,
+                    message=f"published {len(references)} visual reference(s)",
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except VisualAnalysisError as exc:
+                error = exc
+            except Exception as exc:
+                error = VisualAnalysisError(str(exc) or type(exc).__name__, transient=False)
+
+            if error.transient and attempt < VISUAL_STAGE_MAX_ATTEMPTS:
+                delay = VISUAL_STAGE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+                transition_stage_task(
+                    queue_state,
+                    node_id,
+                    stage,
+                    STAGE_RETRY_WAIT,
+                    error=str(error),
+                    retry_at=retry_at.isoformat(),
+                )
+                self._save_processing_queue(queue_state)
+                self._record_visual_event(
+                    node_id,
+                    "retry_wait",
+                    attempt=attempt,
+                    retry_at=retry_at.isoformat(),
+                    message=str(error),
+                )
+                continue
+
+            fail_stage_task(
+                queue_state,
+                node_id,
+                stage,
+                error=str(error),
+                on_state_change=self._upsert_node_state,
+            )
+            self._save_processing_queue(queue_state)
+            self._record_visual_event(
+                node_id,
+                "failed",
+                attempt=attempt,
+                message=str(error),
+            )
+            await self._log(
+                "Compiler",
+                f"Visual analysis failed for node {node_id}: {error}",
+                "error",
+                node_id,
+            )
+            return
+
+        task = stage_task_of(queue_state, node_id, stage)
+        if task is not None and stage_status_of(queue_state, node_id, stage) not in {
+            STAGE_FAILED,
+            STAGE_BLOCKED,
+            STAGE_READY,
+            STAGE_PUBLISHED,
+            STAGE_SKIPPED,
+        }:
+            fail_stage_task(
+                queue_state,
+                node_id,
+                stage,
+                error="visual analysis attempt budget exhausted",
+                on_state_change=self._upsert_node_state,
+            )
+            self._save_processing_queue(queue_state)
+            self._record_visual_event(
+                node_id,
+                "failed",
+                attempt=self._stage_attempt_count(queue_state, node_id),
+                message="visual analysis attempt budget exhausted",
+            )
+
+    async def _finish_visual_ready_tasks(self, queue_state: dict[str, Any]) -> None:
+        tasks = list(self._visual_stage_tasks.items())
+        if not tasks:
+            return
+        results = await asyncio.gather(
+            *(task for _node_id, task in tasks),
+            return_exceptions=True,
+        )
+        for (node_id, task), result in zip(tasks, results, strict=True):
+            if not isinstance(result, BaseException) or isinstance(result, asyncio.CancelledError):
+                continue
+            await self._mark_unexpected_visual_failure(node_id, queue_state, result)
+        self._visual_stage_tasks.clear()
+
+    async def _mark_unexpected_visual_failure(
+        self,
+        node_id: str,
+        queue_state: dict[str, Any],
+        error: BaseException,
+    ) -> None:
+        status = stage_status_of(queue_state, node_id, STAGE_VISUAL_ANALYSIS)
+        if status not in {STAGE_FAILED, STAGE_BLOCKED, STAGE_PUBLISHED, STAGE_SKIPPED}:
+            fail_stage_task(
+                queue_state,
+                node_id,
+                STAGE_VISUAL_ANALYSIS,
+                error=str(error) or type(error).__name__,
+                on_state_change=self._upsert_node_state,
+            )
+            self._save_processing_queue(queue_state)
+            self._record_visual_event(
+                node_id,
+                "failed",
+                attempt=self._stage_attempt_count(queue_state, node_id),
+                message=str(error) or type(error).__name__,
+            )
+
+    def _visual_requirements_dir(self) -> str:
+        if self.requirement_path:
+            return str(Path(self.requirement_path).expanduser().resolve().parent)
+        return str(Path(self.workspace_path) / "requirements")
+
+    def _visual_stage_limit(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        if self._visual_stage_semaphore is None or self._visual_stage_semaphore_loop is not loop:
+            self._visual_stage_semaphore = asyncio.Semaphore(visual_precompute_concurrency())
+            self._visual_stage_semaphore_loop = loop
+        return self._visual_stage_semaphore
+
+    @staticmethod
+    def _stage_attempt_count(queue_state: dict[str, Any], node_id: str) -> int:
+        task = stage_task_of(queue_state, node_id, STAGE_VISUAL_ANALYSIS)
+        return int((task or {}).get("attempt_count", 0) or 0)
+
+    @staticmethod
+    async def _sleep_until_visual_retry(retry_at: Any) -> None:
+        raw = str(retry_at or "").strip()
+        if not raw:
+            return
+        try:
+            target = datetime.fromisoformat(raw)
+        except ValueError:
+            return
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        delay = (target - datetime.now(timezone.utc)).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def _record_visual_event(
+        self,
+        node_id: str,
+        status: str,
+        *,
+        attempt: int,
+        retry_at: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        recorder = getattr(self.runtime.events, "record_visual_analysis", None)
+        if callable(recorder):
+            recorder(
+                node_id=node_id,
+                status=status,
+                attempt=attempt,
+                retry_at=retry_at,
+                message=message,
             )
 
     async def _drain_runnable_tasks(self, queue_state: dict[str, Any]) -> None:
@@ -743,33 +1142,29 @@ class ARCWorkflowManager:
         await self._log("Compiler", f"Running {phase} for node {node_id}...", node_id=node_id)
 
         ctx: _TaskWorkspace | None = None
-        if self._parallel_mode:
-            try:
-                ctx = await self._open_task_workspace(task, queue_state)
-                # In-flight registration for the eager replay (issue
-                # #127): sibling merges attach their changed files here.
-                self._inflight[node_id] = ctx
-            except Exception as exc:
-                await self._log(
-                    "Compiler",
-                    f"Failed to prepare the isolated workspace for {node_id}: "
-                    f"{type(exc).__name__}: {exc}",
-                    "error",
-                    node_id,
-                )
-
         task_ok = False
-        if ctx is not None or not self._parallel_mode:
-            try:
+        visual_ready = True
+        try:
+            if self._stage_pipeline and phase == PHASE_DESIGN:
+                # Keep vision outside any product worktree. In parallel mode
+                # this also prevents allocating a slot while the node waits
+                # for its own visual gate.
+                visual_ready = await self._await_visual_ready(node_id, requirement_data, queue_state)
+            if visual_ready and self._parallel_mode:
+                ctx = await self._open_task_workspace(task, queue_state)
+                # In-flight registration for the eager replay (issue #127):
+                # sibling merges attach changed files here.
+                self._inflight[node_id] = ctx
+            if visual_ready and (ctx is not None or not self._parallel_mode):
                 task_ok = await self._run_task(task, ctx)
-            except Exception as exc:
-                await self._log(
-                    "Compiler",
-                    f"{phase} task for node {node_id} crashed: {type(exc).__name__}: {exc}",
-                    "error",
-                    node_id,
-                )
-                task_ok = False
+        except Exception as exc:
+            await self._log(
+                "Compiler",
+                f"{phase} task for node {node_id} crashed: {type(exc).__name__}: {exc}",
+                "error",
+                node_id,
+            )
+            task_ok = False
 
         merged = True
         merge_conflict: list[str] = []

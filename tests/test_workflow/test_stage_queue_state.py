@@ -11,6 +11,7 @@ import core.config as core_config
 from core.queue_state import (
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
+    STAGE_BLOCKED,
     STAGE_FAILED,
     STAGE_INTERFACE_DESIGN,
     STAGE_IMPLEMENTATION,
@@ -29,6 +30,7 @@ from core.queue_state import (
     build_processing_tasks,
     build_stage_tasks,
     complete_task,
+    fail_stage_task,
     fail_task,
     load_or_create_queue,
     recover_interrupted,
@@ -136,6 +138,26 @@ def test_repeating_running_transition_does_not_consume_an_attempt(tmp_path: Path
         item for item in queue["stage_tasks"] if item["stage_task_id"] == "L:INTERFACE_DESIGN"
     )
     assert task["attempt_count"] == 1
+
+
+def test_failing_visual_stage_blocks_only_that_nodes_downstream_stages(tmp_path: Path) -> None:
+    queue = _queue(tmp_path)
+    changes: list[tuple[str, str]] = []
+
+    fail_stage_task(
+        queue,
+        "L",
+        STAGE_VISUAL_ANALYSIS,
+        error="invalid image",
+        on_state_change=lambda node_id, state: changes.append((node_id, state)),
+    )
+
+    assert stage_status_of(queue, "L", STAGE_VISUAL_ANALYSIS) == STAGE_FAILED
+    assert stage_status_of(queue, "L", STAGE_INTERFACE_DESIGN) == STAGE_BLOCKED
+    assert stage_status_of(queue, "L", STAGE_TEST_GENERATION) == STAGE_BLOCKED
+    assert stage_status_of(queue, "L", STAGE_IMPLEMENTATION) == STAGE_BLOCKED
+    assert queue["node_states"]["L"] == "FAILED"
+    assert changes == [("L", "FAILED")]
 
 
 def test_legacy_design_transitions_keep_stage_and_aggregate_views_coherent(tmp_path: Path) -> None:

@@ -267,3 +267,62 @@ def test_visual_client_sets_explicit_timeout_and_no_sdk_retries(
     timeout = captured["timeout"]
     assert timeout.read == 120
     assert timeout.connect == 5
+
+
+def test_strict_visual_analysis_reports_deterministic_missing_images(
+    visual_workspace: dict[str, Any],
+) -> None:
+    with pytest.raises(visual_analysis.VisualAnalysisError) as exc_info:
+        asyncio.run(
+            visual_analysis.analyze_visual_ready_references(
+                workspace_path=str(visual_workspace["workspace"]),
+                requirements_dir=str(visual_workspace["requirements_dir"]),
+                requirement_data=_requirement_data([{"image_path": "missing.png"}]),
+            )
+        )
+
+    assert exc_info.value.transient is False
+    assert "Image not found" in str(exc_info.value)
+
+
+def test_strict_visual_analysis_deduplicates_equivalent_inflight_requests(
+    visual_workspace: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_image(visual_workspace["requirements_dir"], "shared.png")
+    get_runtime().traceability.upsert_requirement(req_id="req-2", name="Req 2", description="desc")
+    recorder = _ConcurrencyRecorder()
+    monkeypatch.setattr(visual_analysis, "_request_visual_analysis", recorder)
+
+    async def run() -> list[dict[str, Any]]:
+        return await asyncio.gather(
+            visual_analysis.analyze_visual_ready_references(
+                workspace_path=str(visual_workspace["workspace"]),
+                requirements_dir=str(visual_workspace["requirements_dir"]),
+                requirement_data=_requirement_data([{"image_path": "shared.png"}]),
+            ),
+            visual_analysis.analyze_visual_ready_references(
+                workspace_path=str(visual_workspace["workspace"]),
+                requirements_dir=str(visual_workspace["requirements_dir"]),
+                requirement_data={
+                    "id": "req-2",
+                    "description": "",
+                    "visual_reference": [{"image_path": "shared.png"}],
+                },
+            ),
+        )
+
+    results = asyncio.run(run())
+
+    assert recorder.requested == ["shared.png"]
+    assert all(result["visual_reference"][0]["analysis"] == "analysis:shared.png" for result in results)
+
+
+def test_visual_cache_key_is_content_addressed(
+    visual_workspace: dict[str, Any],
+) -> None:
+    _write_image(visual_workspace["requirements_dir"], "a.png")
+    _write_image(visual_workspace["requirements_dir"], "b.png")
+
+    assert visual_analysis._build_visual_cache_key(
+        visual_workspace["requirements_dir"] / "a.png"
+    ) == visual_analysis._build_visual_cache_key(visual_workspace["requirements_dir"] / "b.png")
