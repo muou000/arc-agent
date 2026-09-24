@@ -119,7 +119,17 @@ class TestDrivenDeveloper:
         run_tests_usage: dict[str, int] | None = None,
         stop_on_test_budget_exhausted: bool = True,
         run_tests_executor: Callable[[str | None, list[str] | None], Awaitable["TestRunResult"]] | None = None,
+        retry_attempt: int = 0,
     ) -> str:
+        """Run one TDD layer session.
+
+        ``retry_attempt`` (1-based, from the node session's ``tdd_retry_attempt``
+        stamp) forks the checkpointer thread for a retry round when the caller
+        decides to: the session's thread suffix becomes
+        ``{test_type}@retry{N}``, and every session of that round resumes the
+        same forked thread. 0 (default) keeps the regular ``{test_type}``
+        thread, byte-identical to a non-retry pass.
+        """
         self._last_run_tests_result = None
         self._last_run_tests_exit_code = None
         self._last_verifier_report_text = ""
@@ -132,6 +142,9 @@ class TestDrivenDeveloper:
         self._current_test_type = test_type
         current_node_tests = [item for item in (node_tests or []) if isinstance(item, dict)]
         manifest_lock = self._build_import_manifest_lock(current_node_tests)
+        thread_suffix = self._current_test_type or "batch"
+        if retry_attempt:
+            thread_suffix = f"{thread_suffix}@retry{int(retry_attempt)}"
         session = StageSession(
             agent_name=self.agent_name,
             node_id=node_id,
@@ -142,7 +155,7 @@ class TestDrivenDeveloper:
             requirement_path=self.requirement_path,
             app_type=self.app_type,
             context_workspace_root=self.context_workspace_root,
-            thread_suffix=self._current_test_type or "batch",
+            thread_suffix=thread_suffix,
             test_type=self._current_test_type,
         )
 

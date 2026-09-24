@@ -999,6 +999,45 @@ def test_auto_tdd_retry_reprompt_carries_previous_attempt_facts(
     assert sessions.load_node_session("RA")["tdd_retry_events_cursor"] == len(rows) + 1
 
 
+def test_auto_tdd_retry_writes_attempt_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#226: each queued auto retry bumps the node session's
+    ``tdd_retry_attempt`` (from 1) alongside the events cursor, so the TDD
+    runner can fork a fresh thread per retry round when
+    ARC_TDD_RETRY_FRESH_THREAD is on (round N uses ``@retry{N}``)."""
+    from core import sessions
+
+    manager = _make_parallel_manager(tmp_path)
+    state = _blocked_state()
+    events_path = Path(manager.workspace_path) / ".arc" / "runner-events.jsonl"
+    manager.runtime.paths = SimpleNamespace(runner_events_path=events_path)
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    events_path.write_text(
+        json.dumps(
+            {
+                "type": "requirement_state",
+                "node_id": "RA",
+                "phase": "test",
+                "status": "failed",
+                "message": "Unit: sessionService failed",
+                "timestamp": "2026-09-24 06:00:00",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(manager._prepare_auto_tdd_retry(state)) == ["RA"]
+    assert sessions.load_node_session("RA")["tdd_retry_attempt"] == 1
+
+    # A later auto retry (resume after the retry failed again) is round 2.
+    state["node_states"]["RA"] = NODE_FAILED
+    next(task for task in state["tasks"] if task["task_id"] == "RA:IMPLEMENT")["status"] = TASK_FAILED
+    assert asyncio.run(manager._prepare_auto_tdd_retry(state)) == ["RA"]
+    assert sessions.load_node_session("RA")["tdd_retry_attempt"] == 2
+
+
 def test_subtree_tasks_share_one_worktree_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

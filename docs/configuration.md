@@ -35,6 +35,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 | `ARC_VISUAL_PRECOMPUTE_CONCURRENCY` | `4` | 参考图预分析并发调用数 |
 | `ARC_VISUAL_ANALYSIS_CONCURRENCY` | `4` | 需求截图并发分析上限（1-8） |
 | `ARC_AUTO_TDD_RETRY` | 开 | 运行结束后自动构造 TDD 修复提示 |
+| `ARC_TDD_RETRY_FRESH_THREAD` | 关 | auto TDD retry 轮边界分叉新线程（线程 id 追加 `@retry{N}` 后缀，轮内会话仍互相续写） |
 
 ## 模型连接
 

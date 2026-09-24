@@ -1811,8 +1811,10 @@ class ARCWorkflowManager:
         objective counters (:func:`core.tdd_retry.collect_attempt_facts`) because the
         retry resumes the same checkpointer thread and its inherited context can
         otherwise pass for progress. The events cursor stored alongside fences each
-        attempt so a later auto retry measures only the newest one. Returns the node
-        ids queued for retry.
+        attempt so a later auto retry measures only the newest one, and the 1-based
+        ``tdd_retry_attempt`` counter names the retry round (the thread fork under
+        ``ARC_TDD_RETRY_FRESH_THREAD`` keys off it). Returns the node ids queued
+        for retry.
         """
         failures = scan_test_failures(self.runtime.paths.runner_events_path)
         eligible = [
@@ -1862,6 +1864,13 @@ class ARCWorkflowManager:
                 events_cursor = int(session.get("tdd_retry_events_cursor") or 0)
             except (TypeError, ValueError):
                 events_cursor = 0
+            # The 1-based retry-round counter: each queued retry forks a new
+            # round, so a round-N thread suffix (@retry{N} under
+            # ARC_TDD_RETRY_FRESH_THREAD) names the attempt it belongs to.
+            try:
+                retry_attempt = int(session.get("tdd_retry_attempt") or 0)
+            except (TypeError, ValueError):
+                retry_attempt = 0
             # Objective record of what the failed attempt already spent, from
             # the per-call event streams (they survive even a
             # GraphRecursionError crash, which skips the tdd_handoff write).
@@ -1884,6 +1893,7 @@ class ARCWorkflowManager:
                     "recent_failure_summary": reprompt,
                     "resume_context": {"tdd_reprompt": reprompt, "instruction": reprompt},
                     "tdd_retry_events_cursor": attempt_facts.get("end_line", 0),
+                    "tdd_retry_attempt": retry_attempt + 1,
                 },
             )
             await self._log(

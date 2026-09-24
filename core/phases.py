@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from core.design_artifacts import (  # noqa: F401
     summarize_test_artifacts,
 )
 from core.path_compat import normalize_workspace_relative_path
+from core.scheduling_switches import ARC_TDD_RETRY_FRESH_THREAD
 from core.test_executor import (
     TDD_BATCH_ORDER,
     TDD_RUN_TESTS_BUDGET,
@@ -49,6 +51,24 @@ LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | Non
 DESIGN_BASELINE_MAX_REJECTIONS = 2
 #: Cap on run-output log files retained per node under ``.arc/tdd_runs``.
 TDD_RUN_LOG_RETENTION = 20
+
+
+def _tdd_retry_fresh_thread_attempt(node_session: dict[str, Any]) -> int:
+    """Retry-round number a TDD pass should fork a fresh thread for, else 0.
+
+    ``_prepare_auto_tdd_retry`` stamps the 1-based round counter into the node
+    session (``tdd_retry_attempt``). Forking is opt-in via
+    ``ARC_TDD_RETRY_FRESH_THREAD`` (default off: 0, the pass resumes the
+    regular per-layer thread exactly as before #226).
+    """
+
+    if os.environ.get(ARC_TDD_RETRY_FRESH_THREAD, "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return 0
+    try:
+        return int(node_session.get("tdd_retry_attempt") or 0)
+    except (TypeError, ValueError):
+        return 0
+
 
 class WorkflowPhaseRunner:
     """Run ARC DESIGN and IMPLEMENT phases using the agent adapters."""
@@ -1107,8 +1127,12 @@ class WorkflowPhaseRunner:
         # here so IMPLEMENT does not pay the same runs again. Files the DESIGN
         # baseline never saw (manifests from before that gate, or new files
         # from a repair pass) keep ``None`` and are baseline-run below.
-        design_baseline = sessions.load_node_session(node_id).get("design_baseline") or {}
+        node_session = sessions.load_node_session(node_id)
+        design_baseline = node_session.get("design_baseline") or {}
         executor.seed_file_states(design_baseline if isinstance(design_baseline, dict) else {})
+        # One thread fork per retry round, decided once for the whole pass:
+        # every layer and session of the round resumes the same forked thread.
+        retry_attempt = _tdd_retry_fresh_thread_attempt(node_session)
         await self._log(
             "TestDrivenDeveloper",
             "Running leaf TDD sessions in ordered layers with independent budgets: " + " -> ".join(ordered_types) + ".",
@@ -1339,6 +1363,7 @@ class WorkflowPhaseRunner:
                     run_tests_budget=None,
                     run_tests_usage=None,
                     run_tests_executor=executor.run_requested,
+                    retry_attempt=retry_attempt,
                 )
                 # Union across sessions: the adapter's per-session list resets
                 # on every run(), so accumulate here for the round-level
