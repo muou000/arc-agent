@@ -795,6 +795,200 @@ def test_run_tests_exit_code_zero_does_not_unlock() -> None:
 
 
 # ---------------------------------------------------------------------------
+# per-path edit refinement budget (issue #241)
+# ---------------------------------------------------------------------------
+
+
+def test_edit_file_refinements_pass_within_the_per_path_budget() -> None:
+    """The serial-6 loop (issue #241): every blocked edit_file was a same-path
+    refinement seconds after the write, and each block forced the model into
+    blocked-edit -> full-file re-read -> edit round trips. A written path now
+    takes a bounded number of edit_file refinements before the lock bites;
+    the third refinement is refused."""
+    for stage in ("interface_design", "test_generation", "implementation"):
+        middleware = make(stage)
+        path = "/workspace/tests/unit/test_calc.py" if stage == "test_generation" else "/workspace/src/calc.py"
+        write = run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
+        assert write.content == "ok", f"{stage} initial write must pass"
+        for index in range(2):
+            edit = run(
+                middleware,
+                make_request(
+                    "edit_file",
+                    {"file_path": path, "old_string": f"v{index + 1}", "new_string": f"v{index + 2}"},
+                    call_id=f"e{index}",
+                ),
+            )
+            assert edit.content == "ok", f"{stage} refinement {index + 1} must pass within the budget"
+        third = run(
+            middleware,
+            make_request("edit_file", {"file_path": path, "old_string": "v3", "new_string": "v4"}, call_id="e2"),
+        )
+        assert third.status == "error", f"{stage} third refinement must be blocked"
+        assert "Edit budget blocked" in third.content
+
+
+def test_edit_budget_block_lists_actionable_exits() -> None:
+    """The exhausted edit budget keeps the write-lock's exit table: every
+    stage must be told a way out it can actually take."""
+    for stage, expected in (
+        ("test_generation", ("delete", "manifest")),
+        ("implementation", ("run the tests", "new path")),
+        ("interface_design", ("response", "skeleton")),
+    ):
+        middleware = make(stage)
+        path = "/workspace/tests/unit/test_calc.py" if stage == "test_generation" else "/workspace/src/calc.py"
+        assert run(middleware, make_request("write_file", {"file_path": path, "content": "a\n"}, call_id="c1")).content == "ok"
+        for index in range(2):
+            edit = run(
+                middleware,
+                make_request(
+                    "edit_file",
+                    {"file_path": path, "old_string": f"old-{index}", "new_string": f"new-{index}"},
+                    call_id=f"e{index}",
+                ),
+            )
+            assert edit.content == "ok"
+        blocked = run(
+            middleware,
+            make_request("edit_file", {"file_path": path, "old_string": "o", "new_string": "n"}, call_id="e-blocked"),
+        )
+        assert blocked.status == "error"
+        assert blocked.content.startswith(BLOCKED_RESULT_PREFIX)
+        assert "Edit budget blocked" in blocked.content
+        for keyword in expected:
+            assert keyword in blocked.content, f"{stage} edit budget block should mention {keyword!r}"
+
+
+def test_blocked_edit_neither_consumes_budget_nor_moves_the_lock() -> None:
+    """Premise of the budget semantics (triage note on #241): a blocked call
+    returns at validation and never reaches the result recorder, so it must
+    not consume a refinement unit, not unlock the path, and not lift the
+    repeated-write or post-write read locks."""
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    args = {"file_path": path}
+    assert run(middleware, make_request("write_file", {**args, "content": "v1\n"}, call_id="c1")).content == "ok"
+    for index in range(2):
+        edit = run(
+            middleware,
+            make_request("edit_file", {**args, "old_string": f"v{index + 1}", "new_string": f"v{index + 2}"}, call_id=f"e{index}"),
+        )
+        assert edit.content == "ok"
+
+    first_block = run(middleware, make_request("edit_file", {**args, "old_string": "v3", "new_string": "v4"}, call_id="eb1"))
+    assert first_block.status == "error" and "Edit budget blocked" in first_block.content
+    # Retrying the blocked edit consumes nothing: the count stays at the
+    # budget and every retry meets the same block.
+    assert middleware._path_budgets.spent("edit", path) == 2
+    retry_block = run(middleware, make_request("edit_file", {**args, "old_string": "v3", "new_string": "v4"}, call_id="eb2"))
+    assert retry_block.status == "error" and "Edit budget blocked" in retry_block.content
+    # The whole-file rewrite lock is untouched by the blocked edits.
+    rewrite_block = run(middleware, make_request("write_file", {**args, "content": "v9\n"}, call_id="w2"))
+    assert rewrite_block.status == "error" and "Repeated write blocked" in rewrite_block.content
+    # The post-write read lock is untouched too.
+    read_block = run(middleware, make_request("read_file", {"file_path": path, "offset": 0, "limit": 100}, call_id="r1"))
+    assert read_block.status == "error" and "Read blocked" in read_block.content
+    # Nothing about the path unlocked: the materialized set stands.
+    assert middleware.materialized_paths() == [path]
+
+
+def test_failed_edit_still_unlocks_the_path_beyond_the_edit_budget() -> None:
+    """The unlock conditions keep today's semantics: a real failed file
+    operation on the path unlocks it, and edits are then free again without
+    the refinement budget gating them."""
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    args = {"file_path": path}
+    assert run(middleware, make_request("write_file", {**args, "content": "v1\n"}, call_id="c1")).content == "ok"
+    first = run(middleware, make_request("edit_file", {**args, "old_string": "v1", "new_string": "v2"}, call_id="e1"))
+    assert first.content == "ok"
+
+    def failing_edit(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="Error: anchor not found",
+            name="edit_file",
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+    failed = run(middleware, make_request("edit_file", {**args, "old_string": "v2", "new_string": "v3"}, call_id="e2"), failing_edit)
+    assert failed.status == "error"
+    # The failed operation unlocked the path: further edits pass regardless
+    # of how many refinements were already spent.
+    for index in range(3):
+        edit = run(
+            middleware,
+            make_request("edit_file", {**args, "old_string": f"a{index}", "new_string": f"b{index}"}, call_id=f"f{index}"),
+        )
+        assert edit.content == "ok", f"unlocked-path edit {index + 1} must pass"
+
+
+def test_validation_failure_unlocks_edits_beyond_the_budget() -> None:
+    """A failing validation run unlocks every written path for fixes (the TDD
+    fail->fix loop), including paths whose edit budget is already spent."""
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1")).content == "ok"
+    for index in range(2):
+        assert run(
+            middleware,
+            make_request("edit_file", {"file_path": path, "old_string": f"v{index + 1}", "new_string": f"v{index + 2}"}, call_id=f"e{index}"),
+        ).content == "ok"
+    blocked = run(middleware, make_request("edit_file", {"file_path": path, "old_string": "v3", "new_string": "v4"}, call_id="eb"))
+    assert blocked.status == "error"
+
+    middleware._record_result(
+        make_request("run_tests"),
+        ToolMessage(content="Exit Code: 1\nfailed", name="run_tests", tool_call_id="t1"),
+    )
+    assert run(middleware, make_request("edit_file", {"file_path": path, "old_string": "v3", "new_string": "v5"}, call_id="e-after")).content == "ok"
+
+
+def test_delete_rewrite_cycle_grants_a_fresh_edit_budget_and_keeps_the_cycle_cap() -> None:
+    """A delete erases the path's per-path state (read ranges, block counts —
+    and now the refinement count), so the rewritten file starts with a fresh
+    edit budget, while the delete-rewrite cycle cap still bounds the loop."""
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1")).content == "ok"
+    for index in range(2):
+        assert run(
+            middleware,
+            make_request("edit_file", {"file_path": path, "old_string": f"a{index}", "new_string": f"b{index}"}, call_id=f"e{index}"),
+        ).content == "ok"
+    blocked = run(middleware, make_request("edit_file", {"file_path": path, "old_string": "x", "new_string": "y"}, call_id="eb"))
+    assert blocked.status == "error" and "Edit budget blocked" in blocked.content
+
+    # The sanctioned escape still works, and the rewrite starts fresh.
+    assert run(middleware, make_request("delete", {"file_path": path}, call_id="d1")).content == "ok"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c2")).content == "ok"
+    fresh = run(middleware, make_request("edit_file", {"file_path": path, "old_string": "v2", "new_string": "v3"}, call_id="e2"))
+    assert fresh.content == "ok", "the rewritten path must get a fresh refinement budget"
+
+    # The runaway envelope is unchanged: the third delete-rewrite cycle is
+    # still refused (the run7-style loop cannot ride fresh edit budgets).
+    assert run(middleware, make_request("delete", {"file_path": path}, call_id="d2")).content == "ok"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v3\n"}, call_id="c3")).content == "ok"
+    third_delete = run(middleware, make_request("delete", {"file_path": path}, call_id="d3"))
+    assert third_delete.status == "error" and "Rewrite budget blocked" in third_delete.content
+
+
+def test_edit_materialized_path_gets_the_same_refinement_budget() -> None:
+    """The budget counts successful edit_file calls per path whether the edit
+    materialized the path (a file the session never wrote) or refined an
+    earlier write: two edits pass, the third blocks."""
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    first = run(middleware, make_request("edit_file", {"file_path": path, "old_string": "a", "new_string": "b"}, call_id="e1"))
+    assert first.content == "ok", "the first edit materializes the path"
+    second = run(middleware, make_request("edit_file", {"file_path": path, "old_string": "b", "new_string": "c"}, call_id="e2"))
+    assert second.content == "ok"
+    third = run(middleware, make_request("edit_file", {"file_path": path, "old_string": "c", "new_string": "d"}, call_id="e3"))
+    assert third.status == "error" and "Edit budget blocked" in third.content
+
+
+# ---------------------------------------------------------------------------
 # multi-segment exit-code results (run_build renders two builds back to back)
 # ---------------------------------------------------------------------------
 

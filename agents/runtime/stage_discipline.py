@@ -108,16 +108,82 @@ _MAX_REPEATED_READS_PER_PATH = 2
 # Issue #242: this budget is cumulative for the stage and binds across
 # unlock cycles (an unlock restores the right to read, it never resets the
 # count); each successful write on the path earns one more re-read on top.
-# Successful delete-then-rewrite cycles allowed per test-file path in one
-# test_generation or implementation pass. The delete release exists so a
-# legitimate fix does not wait for an accidental failure to unlock; the
-# 2026-09-19 arc-output3 run showed its unbounded edge: a TestGenerator that
-# *believed* its writes had been truncated (they had not — no truncation error
-# ever occurred) re-ran the delete+write cycle 5-7 times per file, ~10M input
-# tokens, until the step budget crashed the whole DESIGN task. Counting
-# cycles on the delete keeps the last written version on disk when the cap
-# trips.
-_MAX_DELETE_REWRITES_PER_PATH = 2
+# Per-path write-lock budgets, one table (issue #241): every refinement
+# channel that spends units against a written path draws its limit from here
+# and counts through _PathBudgetLedger, so budget channels share one
+# accounting store per path instead of growing parallel counters.
+#
+#   edit           - successful edit_file calls per path per stage pass. The
+#                    hard turn-based lock it replaces blocked a path's second
+#                    edit outright; arc-output-serial-6 recorded 7 blocked
+#                    edits in one DESIGN pass, every one a seconds-later
+#                    same-path refinement, each turning into a blocked-edit
+#                    plus full-file re-read round trip once a real failure
+#                    unlocked the path.
+#   delete_rewrite - delete-then-rewrite cycles per test-file path in one
+#                    test_generation or implementation pass. The delete
+#                    release exists so a legitimate fix does not wait for an
+#                    accidental failure to unlock; the 2026-09-19 arc-output3
+#                    run showed its unbounded edge: a TestGenerator that
+#                    *believed* its writes had been truncated (they had not -
+#                    no truncation error ever occurred) re-ran the delete+
+#                    write cycle 5-7 times per file, ~10M input tokens, until
+#                    the step budget crashed the whole DESIGN task. Counting
+#                    cycles on the delete keeps the last written version on
+#                    disk when the cap trips.
+_PATH_STAGE_BUDGETS = {
+    "edit": 2,
+    "delete_rewrite": 2,
+}
+_MAX_EDITS_PER_PATH = _PATH_STAGE_BUDGETS["edit"]
+MAX_EDITS_PER_PATH = _MAX_EDITS_PER_PATH
+_MAX_DELETE_REWRITES_PER_PATH = _PATH_STAGE_BUDGETS["delete_rewrite"]
+
+
+class _PathBudgetLedger:
+    """Per-path budget counters for the write-lock area (single source).
+
+    #241 (bounded edit refinements), the delete-rewrite cap, and #242's
+    re-read allowance (``write_credit``) all count per-path units in
+    ``StageDisciplineMiddleware``; this store is the one place those counts
+    live, so another budget channel (issue #240's shared test-asset repair
+    budget) draws from the same accounting instead of growing a second
+    counter over the same path. Kinds stay separate because they reset
+    differently: ``edit`` and ``write_credit`` units drop when the path is
+    deleted - a delete-rewrite cycle hands the rewritten file a fresh budget
+    and dead content releases the re-read allowance it earned, like the
+    other per-path state the delete branch clears - while ``delete_rewrite``
+    units survive it, because counting that cycle is their whole job.
+
+    Units commit on the successful tool call, mirroring the delete-rewrite
+    budget's form: the budgets limit self-review churn, and a failed attempt
+    unlocks the path anyway. The known looseness - a parallel tool-call batch
+    could land more units than the cap on one path - is the same trade the
+    delete-rewrite budget makes.
+
+    ``write_credit`` differs from the other kinds in role: not a cap but an
+    allowance. Each committed unit extends the path's overlapping-re-read
+    budget (``_MAX_REPEATED_READS_PER_PATH`` plus the spent count) by one,
+    so it never consults the limit table.
+    """
+
+    def __init__(self) -> None:
+        self._spent: dict[tuple[str, str], int] = {}
+
+    def spent(self, kind: str, path: str) -> int:
+        return self._spent.get((kind, path), 0)
+
+    def commit(self, kind: str, path: str) -> None:
+        self._spent[(kind, path)] = self.spent(kind, path) + 1
+
+    def exhausted(self, kind: str, path: str, limit: int) -> bool:
+        return self.spent(kind, path) >= limit
+
+    def drop(self, kind: str, path: str) -> None:
+        self._spent.pop((kind, path), None)
+
+
+
 _DESIGN_MUTATION_PATTERNS = (
     re.compile(r"\b(?:INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.IGNORECASE),
     re.compile(
@@ -224,11 +290,6 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         self._import_fail_open_count = 0
         self._read_ranges: dict[str, list[tuple[int, int]]] = {}
         self._repeated_read_counts: dict[str, int] = {}
-        # Issue #242: successful write/edit/append calls per path. Each one
-        # earns a single additional overlapping re-read on top of the base
-        # budget — the controlled exit that keeps the fail -> fix -> verify
-        # loop open once the budget turned cumulative across unlock cycles.
-        self._read_budget_credits: dict[str, int] = {}
         self._written_paths: set[str] = set()
         # Call-ordered log of every successful write/edit/append/delete path,
         # repeats included (``_written_paths`` is a set: a re-edit of the same
@@ -246,7 +307,10 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # batch that respects it.
         self._design_write_reservations: set[str] = set()
         self._append_counts: dict[str, int] = {}
-        self._rewrite_counts: dict[str, int] = {}
+        # Per-path budget counters (edit refinements, delete-rewrite cycles,
+        # the #242 re-read allowance): the single accounting store behind the
+        # write-lock area's budgets.
+        self._path_budgets = _PathBudgetLedger()
         self._write_block_counts: dict[str, int] | None = {} if stage == "interface_design" else None
         # Read-only probe ledger (issue #217): probes per normalized target
         # since the last successful write-family call, plus whether this
@@ -494,7 +558,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         path = _discipline_path(args)
         if not path or self._path_unlocked(path):
             return None
-        if self._rewrite_counts.get(path, 0) < _MAX_DELETE_REWRITES_PER_PATH:
+        if not self._path_budgets.exhausted("delete_rewrite", path, _MAX_DELETE_REWRITES_PER_PATH):
             return None
         fully_written = self._manifest_fully_written()
         if fully_written is not None:
@@ -510,6 +574,30 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             f"{_MAX_DELETE_REWRITES_PER_PATH} delete-rewrite cycles in this pass; the version on "
             "disk stands and the content you wrote is in your context. Continue with your "
             "remaining declared files and return the manifest instead of polishing this one."
+        )
+
+    def _validate_edit_refinement_budget(self, path: str) -> str | None:
+        """Bounded same-path ``edit_file`` refinements on a written path (#241).
+
+        The write lock's hard turn-based rule blocked a path's second edit
+        outright and only real failures unlocked it — serial-6 showed the
+        model paying a blocked edit plus a full-file re-read for every small
+        refinement. The budget lets a locked path take
+        :data:`_MAX_EDITS_PER_PATH` refinements per stage pass and only then
+        falls back to the lock's exit table. A blocked call never reaches the
+        result recorder, so retries cannot march the count forward. Unlock
+        conditions are untouched: a failed file operation or a failing
+        validation run still frees the path entirely, and ``write_file``
+        keeps the hard repeated-write block.
+        """
+
+        if not self._path_budgets.exhausted("edit", path, _MAX_EDITS_PER_PATH):
+            return None
+        exit_text = _WRITE_BLOCK_EXITS[self._stage]
+        return (
+            f"Edit budget blocked: {path} has already taken {_MAX_EDITS_PER_PATH} edit_file "
+            "refinements in this stage; the version on disk stands and the content you "
+            f"wrote is in your context. {exit_text}"
         )
 
     def _manifest_fully_written(self) -> list[str] | None:
@@ -554,7 +642,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # re-reads (85 redundant overlapping reads in that run). An unlock
         # restores the right to read; it does not reset the observation.
         if self._overlaps_previous_range(path, offset, limit):
-            budget = _MAX_REPEATED_READS_PER_PATH + self._read_budget_credits.get(path, 0)
+            budget = _MAX_REPEATED_READS_PER_PATH + self._path_budgets.spent("write_credit", path)
             if self._repeated_read_counts.get(path, 0) >= budget:
                 return (
                     f"Repeated read blocked: {path} was re-read {self._repeated_read_counts.get(path, 0)} time(s) "
@@ -589,8 +677,9 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         writes and non-test-asset deletes were always denied), so an asset
         verdict firing before the repeated-write check never redirects a
         call the repeated-write check would have caught. The remaining order
-        here is the runtime-state ladder: repeated-write lock, manifest
-        declaration, test-import validation, DESIGN content/budget,
+        here is the runtime-state ladder: repeated-write lock (``write_file``)
+        or the bounded edit refinement budget (``edit_file``, issue #241),
+        manifest declaration, test-import validation, DESIGN content/budget,
         file-claim gate.
         """
 
@@ -598,16 +687,25 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if not path:
             return None
         if path in self._written_paths and not self._path_unlocked(path):
-            exit_text = _WRITE_BLOCK_EXITS[self._stage]
-            if self._write_block_counts is not None:
-                block_count = self._write_block_counts.get(path, 0) + 1
-                self._write_block_counts[path] = block_count
-                if block_count == 1:
-                    exit_text = _INTERFACE_DESIGN_FIRST_WRITE_BLOCK_EXIT
-            return (
-                f"Repeated write blocked: {path} was already changed in this stage. "
-                f"{exit_text}"
-            )
+            if tool == "edit_file":
+                # Issue #241: a written path takes a bounded number of
+                # edit_file refinements before the lock bites (the hard
+                # turn-based rule blocked the second edit outright). The
+                # remaining ladder still applies to the refinement payload.
+                budget_block = self._validate_edit_refinement_budget(path)
+                if budget_block:
+                    return budget_block
+            else:
+                exit_text = _WRITE_BLOCK_EXITS[self._stage]
+                if self._write_block_counts is not None:
+                    block_count = self._write_block_counts.get(path, 0) + 1
+                    self._write_block_counts[path] = block_count
+                    if block_count == 1:
+                        exit_text = _INTERFACE_DESIGN_FIRST_WRITE_BLOCK_EXIT
+                return (
+                    f"Repeated write blocked: {path} was already changed in this stage. "
+                    f"{exit_text}"
+                )
         if self._stage == "test_generation":
             # Whether the path is a test asset at all was already answered by
             # the capability table (pre-flight); the manifest gate below adds
@@ -898,22 +996,23 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return
         if name == "delete" and path:
             # The file is gone, so its write lock, read ranges, repeat-read
-            # budget and failure record describe content that no longer
-            # exists; dropping them is what makes delete-then-rewrite a real
-            # exit instead of one that depends on an accidental later failure
-            # to unlock. The rewrite-cycle count is the one exception: it
-            # exists precisely to observe how often that exit repeats, so it
-            # survives the delete.
+            # budget, refinement budget and failure record describe content
+            # that no longer exists; dropping them is what makes
+            # delete-then-rewrite a real exit instead of one that depends on
+            # an accidental later failure to unlock. The rewrite-cycle count
+            # is the one exception: it exists precisely to observe how often
+            # that exit repeats, so it survives the delete.
             was_written = path in self._written_paths
             self._written_paths.discard(path)
             self._failed_paths.discard(path)
             self._read_ranges.pop(path, None)
             self._repeated_read_counts.pop(path, None)
-            self._read_budget_credits.pop(path, None)
+            self._path_budgets.drop("edit", path)
+            self._path_budgets.drop("write_credit", path)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
             if was_written:
-                self._rewrite_counts[path] = self._rewrite_counts.get(path, 0) + 1
+                self._path_budgets.commit("delete_rewrite", path)
             self._write_events.append(path)
             self._discard_written_path(request, path)
             self._close_probe_window()
@@ -935,11 +1034,16 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             self._read_ranges.setdefault(path, []).append((offset, offset + limit))
             self._cache_read_summary(request, path, offset, limit, result)
         if (name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS) and path:
+            if name == "edit_file":
+                # The refinement budget counts every successful edit on the
+                # path, whether the edit materialized it or refined an
+                # earlier write (issue #241).
+                self._path_budgets.commit("edit", path)
             self._written_paths.add(path)
             # Issue #242: the controlled exit — each successful write earns
             # one more overlapping re-read for the verify step of the
             # fail -> fix -> verify loop.
-            self._read_budget_credits[path] = self._read_budget_credits.get(path, 0) + 1
+            self._path_budgets.commit("write_credit", path)
             self._write_events.append(path)
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)

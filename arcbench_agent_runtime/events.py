@@ -347,6 +347,35 @@ class EventClient:
             },
         )
 
+    def record_edge_reconcile(
+        self,
+        *,
+        backfilled: list[dict[str, Any]] | None = None,
+        unresolved: list[dict[str, Any]] | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Append one ``edge_reconcile`` event for the compile-wrap-up sweep.
+
+        Emitted at the completion point after the queue drains (issue #238):
+        the sweep re-derives every stored interface's callers/callees against
+        the final store state, so ``backfilled`` carries the cross_req edges
+        forward references left missing (both endpoints registered, edge
+        absent) and ``unresolved`` the references that still resolved to no
+        stored contract at compile end. The event is what makes the
+        backfill — which registration-time warnings cannot show — auditable
+        alongside the traceability tables it repaired.
+        """
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "edge_reconcile",
+                "backfilled": list(backfilled or []),
+                "unresolved": list(unresolved or []),
+                "message": message,
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def record_traceability_row_event(self, payload: dict[str, Any]) -> None:
         """Append one pre-shaped traceability row event (``interface_upsert`` /
         ``interface_status`` / ``test_upsert``).

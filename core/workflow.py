@@ -14,6 +14,7 @@ from agents.test_generator import TestGenerator
 from app_type_handler import create_app_type_handler, normalize_app_type
 from agents.context.pipeline import context_pipeline
 from core import sessions
+from core.design_artifacts import DesignArtifactRegistry
 from core.file_claims import get_file_claim_registry
 from core.phases import WorkflowPhaseRunner
 from core.queue_state import (
@@ -512,6 +513,8 @@ class ARCWorkflowManager:
             retry_node_ids = await self._prepare_auto_tdd_retry(queue_state)
             if retry_node_ids:
                 await self._drain_runnable_tasks(queue_state)
+
+        await self._reconcile_call_edges()
 
         return self._build_compile_result(queue_state)
 
@@ -2015,6 +2018,76 @@ class ARCWorkflowManager:
             "visit_order": completed_tasks,
             "states": dict(queue_state["node_states"]),
         }
+
+    async def _reconcile_call_edges(self) -> None:
+        """Compile-wrap-up dangling-reference reconciliation (issue #238).
+
+        DESIGN registration derives a ``cross_req`` edge only when both
+        endpoint contracts are already registered, so a forward reference
+        (A declares a callee designed later) leaves the edge permanently
+        missing unless the later side declares the reverse. Every completion
+        point — a fresh compile and ``--resume`` alike funnel through
+        ``compile_requirement_tree`` — sweeps the final store state: missing
+        edges are backfilled through the same edge rule registration uses,
+        references still resolving to no contract get a final warning, and
+        the sweep itself is auditable via an ``edge_reconcile`` runner event.
+        Fail-open: a reconcile error must not fail an otherwise-complete
+        compile; the tables are left exactly as the phases wrote them.
+        """
+
+        try:
+            registry = DesignArtifactRegistry(
+                traceability=self.runtime.traceability,
+                app_handler=None,
+                workspace_path=self.workspace_path,
+            )
+            report = registry.reconcile_call_edges()
+        except Exception as exc:  # noqa: BLE001 - wrap-up repair must not fail the run
+            await self._log(
+                "Compiler",
+                f"Call-edge reconcile failed ({type(exc).__name__}: {exc}); the "
+                "traceability call_edges table is left as the phases wrote it.",
+                status="warning",
+            )
+            return
+        backfilled = report.get("backfilled") or []
+        unresolved = report.get("unresolved") or []
+        if not backfilled and not unresolved:
+            return
+        try:
+            self.runtime.events.record_edge_reconcile(
+                backfilled=backfilled,
+                unresolved=unresolved,
+            )
+        except Exception as exc:  # noqa: BLE001 - audit must never break the run
+            append_debug_log(
+                "EdgeReconcile",
+                f"edge reconcile audit emit failed: {type(exc).__name__}: {exc}",
+                workspace_root=self.workspace_path,
+            )
+        if backfilled:
+            details = "; ".join(
+                f"`{item['interface_id']}` {item['kind']} -> `{item['ref_id']}` "
+                f"({len(item['edges'])} edge(s))"
+                for item in backfilled
+            )
+            await self._log(
+                "Compiler",
+                "Call-edge reconcile backfilled missing cross_req edge(s) for references that "
+                "registered after their declaring interface: " + details + ".",
+                status="warning",
+            )
+        if unresolved:
+            details = "; ".join(
+                f"`{item['interface_id']}` {item['kind']} -> `{item['ref_id']}`"
+                for item in unresolved
+            )
+            await self._log(
+                "Compiler",
+                "Call-edge reconcile: caller/callee reference(s) still resolved to no stored "
+                "contract at compile end, so no cross_req edge exists: " + details + ".",
+                status="warning",
+            )
 
     def _save_processing_queue(self, queue_state: dict[str, Any]) -> None:
         save_queue(queue_state, self.queue_path)
