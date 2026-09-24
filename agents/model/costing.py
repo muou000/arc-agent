@@ -40,9 +40,14 @@ class ModelCost:
 # - All other entries carry the catalog's explicit cache-read discount.
 _BUILTIN_MODEL_COSTS: dict[str, ModelCost] = {
     "deepseek-v4-flash": ModelCost(input=3.0, output=9.0, cache_read=0.1),
+    "deepseek-v4-flash-vision-exp": ModelCost(input=1.0, output=4.0, cache_read=0.02),
     "deepseek-v4-pro": ModelCost(input=9.0, output=27.0, cache_read=0.3),
     "glm-5.2": ModelCost(input=8.0, output=28.0, cache_read=2.0),
     "glm-5.3": ModelCost(input=8.0, output=28.0, cache_read=2.0),
+    "glm-5.3-flash": ModelCost(input=0.8, output=2.8, cache_read=0.23),
+    "kimi-k2.6": ModelCost(input=6.5, output=27.0, cache_read=1.1),
+    "kimi-k2.7-code": ModelCost(input=6.5, output=27.0, cache_read=1.3),
+    "kimi-k2.7-code-highspeed": ModelCost(input=13.0, output=54.0, cache_read=2.6),
     "kimi-k3": ModelCost(input=20.0, output=100.0, cache_read=2.0),
     "minimax-m3": ModelCost(input=2.1, output=8.4, cache_read=0.42),
     "qwen3.6-flash": ModelCost(input=1.2, output=7.2, cache_read=1.2),

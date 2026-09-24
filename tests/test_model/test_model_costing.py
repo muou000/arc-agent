@@ -37,9 +37,14 @@ class TestCatalogRates:
     def test_all_catalog_entries(self) -> None:
         expected = {
             "deepseek-v4-flash": (3.0, 9.0, 0.1),
+            "deepseek-v4-flash-vision-exp": (1.0, 4.0, 0.02),
             "deepseek-v4-pro": (9.0, 27.0, 0.3),
             "glm-5.2": (8.0, 28.0, 2.0),
             "glm-5.3": (8.0, 28.0, 2.0),
+            "glm-5.3-flash": (0.8, 2.8, 0.23),
+            "kimi-k2.6": (6.5, 27.0, 1.1),
+            "kimi-k2.7-code": (6.5, 27.0, 1.3),
+            "kimi-k2.7-code-highspeed": (13.0, 54.0, 2.6),
             "kimi-k3": (20.0, 100.0, 2.0),
             "minimax-m3": (2.1, 8.4, 0.42),
             "qwen3.6-flash": (1.2, 7.2, 1.2),
