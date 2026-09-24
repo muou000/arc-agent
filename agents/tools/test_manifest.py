@@ -464,6 +464,10 @@ def reconcile_declared_manifest(
       the model returned tests it was forbidden to write (or forgot to declare
       them), so the run must fail loudly instead of registering phantom
       coverage;
+    - a declared-and-written path whose returned row dropped an identity
+      field (empty `type` or `coverage_scope`) has that field restored from
+      the declaration, and the restoration is reported in
+      ``backfilled_fields`` for the caller to log (issue #233 audit);
     - a declared-and-written path with no manifest entry means the model wrote
       the file but dropped its row; the row is re-attached from the declaration
       (path + type + interfaces survive), with ``req_id`` and ``test_id``
@@ -487,12 +491,14 @@ def reconcile_declared_manifest(
             "undeclared_paths": [],
             "unwritten_paths": [],
             "reattached_paths": [],
+            "backfilled_fields": {},
         }
 
     written = {normalize_manifest_path(path) for path in written_paths if str(path or "").strip()}
     reconciled: list[dict[str, Any]] = []
     undeclared: list[str] = []
     unwritten: list[str] = []
+    backfilled_fields: dict[str, list[str]] = {}
     seen_paths: set[str] = set()
     for item in manifest_items:
         if not isinstance(item, dict):
@@ -509,6 +515,27 @@ def reconcile_declared_manifest(
         if file_path not in written:
             unwritten.append(file_path)
             continue
+        # The declaration is the model's earlier validated word for this
+        # path; identity fields the response row dropped or mangled are
+        # restored from it instead of reaching the registration layer
+        # incomplete (issue #233 audit backfill).
+        row = manifest_lock.declared_files.get(file_path)
+        patched: list[str] = []
+        if row is not None:
+            if not str(item.get("type") or "").strip() and row.test_type:
+                item = {**item, "type": row.test_type}
+                patched.append("type")
+            returned_scope = str(item.get("coverage_scope") or "").strip()
+            if (not returned_scope or not normalize_coverage_scope(returned_scope)) and row.coverage_scope:
+                # An absent or mangled scope is drift from the declaration,
+                # not a new decision: the declared scope outranks the
+                # absent-scope default (`normalize_coverage_scope` already
+                # maps absent -> owned) and rescues a mangled value from the
+                # registration-layer rejection.
+                item = {**item, "coverage_scope": row.coverage_scope}
+                patched.append("coverage_scope")
+        if patched:
+            backfilled_fields[file_path] = patched
         reconciled.append(item)
 
     reattached: list[str] = []
@@ -519,7 +546,7 @@ def reconcile_declared_manifest(
         row = manifest_lock.declared_files[path]
         reconciled.append(
             {
-                "test_id": _mechanical_test_id(node_hint=node_id, file_path=path),
+                "test_id": mechanical_test_id(node_hint=node_id, file_path=path),
                 "req_id": str(node_id or "").strip(),
                 "interface_ids": list(row.interface_ids),
                 "coverage_scope": row.coverage_scope,
@@ -536,16 +563,22 @@ def reconcile_declared_manifest(
         "undeclared_paths": sorted(set(undeclared)),
         "unwritten_paths": sorted(set(unwritten)),
         "reattached_paths": sorted(reattached),
+        "backfilled_fields": backfilled_fields,
     }
 
 
-def _mechanical_test_id(node_hint: str, *, file_path: str) -> str:
-    """Deterministic test id for a mechanically re-attached manifest row.
+def mechanical_test_id(node_hint: str, *, file_path: str) -> str:
+    """Deterministic test id for a mechanically identified manifest row.
 
     Shape: ``<NODE>-T-<FILE-STEM>`` (``T-<STEM>`` without a node hint). The
     node prefix keeps ids from different nodes apart in the tests table even
     when two nodes each re-attach a same-named file, and satisfies the
     manifest contract that every ``test_id`` names its owning node.
+
+    Single source for both mechanical id sites: the reconciliation's
+    re-attached rows (declared-and-written file the response dropped) and
+    ``prepare_tests``' backfilled rows (returned row without a ``test_id``,
+    issue #233).
     """
 
     stem = Path(file_path).stem

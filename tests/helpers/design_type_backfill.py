@@ -36,3 +36,24 @@ def seed_stored_parent_contracts(traceability: Any, req_id: str = "ROOT") -> Non
             content="{}",
             file_path=path,
         )
+
+
+def typed_incident_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The same incident rows with `type` restored — the decode-retry turn's
+    answer once the tightened schema rejected the typeless tool call (issue
+    #233). Stored parent ids resolve from the incident table; the shell's own
+    new ids resolve from their type segment; the segment-less seed service —
+    the one record with no backfill source — is typed FUNC, matching the one
+    targeted repair ask #230 pins."""
+
+    from core.design_artifacts import infer_interface_type_from_id
+
+    stored = {interface_id: interface_type for interface_id, _path, interface_type in STORED_PARENT_CONTRACTS}
+    typed: list[dict[str, Any]] = []
+    for row in rows:
+        interface_id = row["interface_id"]
+        row_type = stored.get(interface_id) or infer_interface_type_from_id(interface_id)
+        if not row_type and str(interface_id).endswith("SeedService"):
+            row_type = "FUNC"
+        typed.append({**row, "type": row_type})
+    return typed
