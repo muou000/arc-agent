@@ -12,6 +12,7 @@ the node session updates all run for real — no tokens, no npm.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -515,6 +516,53 @@ def test_tdd_run_rejects_implemented_without_passing_run_tests(tmp_project_dir: 
 
     assert executor_calls == []
     assert final_text.startswith("Error: latest run_tests result did not pass")
+
+
+def test_test_contract_preflight_blocks_before_model_or_tdd_budget(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    node_id = "REQ-TDD-CONTRACT-PREFLIGHT"
+    test_path = "backend/tests/login.test.js"
+    seed_node(arc_runtime, node_id, [{"test_id": "T1", "type": "Unit", "file_path": test_path}])
+
+    backend = tmp_project_dir / "backend"
+    test_file = tmp_project_dir / test_path
+    backend.mkdir(parents=True)
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    (backend / "package.json").write_text(
+        json.dumps({"name": "backend", "devDependencies": {"vitest": "^4.0.0"}}),
+        encoding="utf-8",
+    )
+    (backend / "vitest.config.js").write_text(
+        """const { defineConfig } = require('vitest/config');
+module.exports = defineConfig({
+  test: { include: ['tests/**/*.test.js'], globals: false },
+});
+""",
+        encoding="utf-8",
+    )
+    test_file.write_text(
+        "describe('login', () => { beforeAll(() => {}); it('works', () => expect(true).toBe(true)); });\n",
+        encoding="utf-8",
+    )
+
+    model = FauxChatModel(responses=[])
+    fake = FakeAppHandler()
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=[{"test_id": "T1", "type": "Unit", "file_path": test_path}]))
+
+    assert final_ok is False
+    assert model.call_count == 0
+    assert fake.calls == []
+    session = sessions.load_node_session(node_id)
+    assert session["test_contract_preflight"]["status"] == "blocked"
+    assert session["test_contract_preflight"]["can_start_tdd"] is False
+    assert "no testdrivendeveloper session" in session["recent_failure_summary"].lower()
+    events = [event for event in read_jsonl(arc_runtime.paths.runner_events_path) if event["type"] == "test_contract_preflight"]
+    assert len(events) == 1
+    assert events[0]["node_id"] == node_id
+    assert events[0]["classification"] == "deterministic"
 
 
 # ---------------------------------------------------------------------------

@@ -327,6 +327,36 @@ class EventClient:
             },
         )
 
+    def record_test_contract_preflight(
+        self,
+        *,
+        node_id: str = "",
+        status: str = "",
+        classification: str = "",
+        files: list[str] | None = None,
+        issues: list[dict[str, Any]] | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Append the static test-contract gate result for one node."""
+
+        normalized_node_id = str(node_id or "").strip()
+        if not normalized_node_id:
+            return
+        normalized_files = [str(path or "").strip() for path in (files or [])]
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "test_contract_preflight",
+                "node_id": normalized_node_id,
+                "status": str(status or "").strip(),
+                "classification": str(classification or "").strip(),
+                "files": [path for path in normalized_files if path],
+                "issues": [issue for issue in (issues or []) if isinstance(issue, dict)],
+                "message": message,
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def record_rebase_replay(
         self,
         *,
