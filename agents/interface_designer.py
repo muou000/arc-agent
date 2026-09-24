@@ -488,14 +488,6 @@ class InterfaceDesigner:
         except Exception:
             return None
 
-    def _unresolvable_interface_types(self, interfaces: list[dict[str, Any]]) -> list[str]:
-        from core.design_artifacts import unresolvable_interface_types
-
-        lookup = self._stored_interface_lookup()
-        return unresolvable_interface_types(
-            interfaces, get_stored_interface=lookup or (lambda _interface_id: None)
-        )
-
     async def _repair_missing_interface_types(
         self,
         session: StageSession,
@@ -517,9 +509,12 @@ class InterfaceDesigner:
         remains is final (no second ask).
         """
 
-        from core.design_artifacts import ALLOWED_INTERFACE_TYPES
+        from core.design_artifacts import ALLOWED_INTERFACE_TYPES, unresolvable_interface_types
 
-        missing_ids = self._unresolvable_interface_types(interfaces)
+        lookup = self._stored_interface_lookup()
+        missing_ids = unresolvable_interface_types(
+            interfaces, get_stored_interface=lookup or (lambda _interface_id: None)
+        )
         if not missing_ids:
             return
         await self._log(

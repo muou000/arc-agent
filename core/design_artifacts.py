@@ -26,6 +26,10 @@ from core.path_compat import normalize_workspace_relative_path
 
 #: Valid interface contract types (UI/API/FUNC/DB).
 ALLOWED_INTERFACE_TYPES = {"UI", "API", "FUNC", "DB"}
+#: Same vocabulary in ladder order: the id-segment backfill scans for the
+#: first segment match, so resolution stays deterministic when an id carries
+#: several type-shaped segments.
+INTERFACE_TYPE_SEGMENTS = ("UI", "API", "FUNC", "DB")
 
 
 def infer_interface_type_from_id(interface_id: str) -> str:
@@ -38,7 +42,7 @@ def infer_interface_type_from_id(interface_id: str) -> str:
     """
 
     segments = {segment.strip().upper() for segment in str(interface_id).split("-")}
-    for candidate in ("UI", "API", "FUNC", "DB"):
+    for candidate in INTERFACE_TYPE_SEGMENTS:
         if candidate in segments:
             return candidate
     return ""

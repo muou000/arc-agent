@@ -15,19 +15,9 @@ from __future__ import annotations
 import asyncio
 
 from agents.interface_designer import InterfaceDesigner
+from tests.helpers.design_type_backfill import STORED_PARENT_CONTRACTS, seed_stored_parent_contracts
 from tests.helpers.faux import FauxChatModel, faux_tool_call
 from tests.test_agents.conftest import arc_runtime  # noqa: F401
-
-STORED_PARENT_CONTRACTS = [
-    ("ROOT-UI-AppShell", "frontend/src/App.tsx", "UI"),
-    ("ROOT-API-ExpressApp", "backend/src/app.js", "API"),
-    ("ROOT-UI-AppHeader", "frontend/src/components/layout/AppHeader.tsx", "UI"),
-    ("ROOT-UI-NavBar", "frontend/src/components/layout/NavBar.tsx", "UI"),
-    ("ROOT-FUNC-SeedDb", "backend/src/database/seed_db.js", "FUNC"),
-    ("ROOT-API-AuthRoutes", "backend/src/routes/auth_routes.js", "API"),
-    ("ROOT-FUNC-AuthService", "backend/src/services/auth_service.js", "FUNC"),
-    ("ROOT-DB-UsersTable", "backend/src/database/init_db.js", "DB"),
-]
 
 NEW_OWNED_ROWS = [
     {"interface_id": "REQ-2-UI-LoginPage", "file_path": "frontend/src/pages/LoginPage.tsx"},
@@ -47,19 +37,8 @@ def _typeless_rows() -> list[dict]:
     return rows
 
 
-def _seed_stored_contracts(runtime) -> None:
-    for interface_id, path, interface_type in STORED_PARENT_CONTRACTS:
-        runtime.traceability.upsert_interface(
-            interface_id=interface_id,
-            req_ids=["ROOT"],
-            type=interface_type,
-            content="{}",
-            file_path=path,
-        )
-
-
 def test_serial5_typeless_response_backfills_and_repairs(tmp_project_dir, arc_runtime) -> None:
-    _seed_stored_contracts(arc_runtime)
+    seed_stored_parent_contracts(arc_runtime.traceability)
     logs: list[tuple] = []
 
     def log_cb(agent, message, status=None, node_id=None):
@@ -124,7 +103,7 @@ def test_type_repair_answer_without_type_is_not_invented(tmp_project_dir, arc_ru
     """The repair patch must not mint a type the model did not supply: a
     garbage answer leaves the record untouched for the registry to judge."""
 
-    _seed_stored_contracts(arc_runtime)
+    seed_stored_parent_contracts(arc_runtime.traceability)
     logs: list[tuple] = []
 
     def log_cb(agent, message, status=None, node_id=None):

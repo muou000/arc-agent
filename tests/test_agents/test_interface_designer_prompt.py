@@ -181,7 +181,12 @@ def test_interface_designer_user_prompt_leads_serialization_rules_with_type_mand
 
     assert "Every interface record must carry a `type` field" in prompt
     assert "even when the `interface_id` already contains the type segment" in prompt
-    # Prominence: the rule precedes the field inventory it used to be buried under.
+    # Prominence: the rule is the first serialization rule of the response
+    # contract, ahead of the response-shape and field-inventory statements
+    # it used to be buried under.
+    assert prompt.index("Every interface record must carry a `type` field") < prompt.index(
+        "Return `summary`, `interfaces`, and `files_written`"
+    )
     assert prompt.index("Every interface record must carry a `type` field") < prompt.index(
         "Each interface should include"
     )

@@ -146,6 +146,29 @@ def test_prepare_interfaces_type_ladder_prefers_own_field_over_stored(
     assert prepared[0]["type"] == "API"
 
 
+def test_prepare_interfaces_type_ladder_prefers_stored_row_over_id_prefix(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """A reused id whose segment disagrees with its stored type resolves from
+    the stored row: the registry's record outranks the id's self-description.
+    The row is seeded with type only in its column (empty content JSON) so the
+    merge cannot hand the value to the own-field source."""
+
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    arc_runtime.traceability.upsert_interface(
+        interface_id="REQ-1-UI-Shell",
+        req_ids=["REQ-1"],
+        type="FUNC",
+        content="{}",
+        file_path="frontend/src/App.tsx",
+    )
+
+    prepared = registry.prepare_interfaces(
+        "REQ-2", [{"interface_id": "REQ-1-UI-Shell", "responsibility": "Updated"}]
+    )
+    assert prepared[0]["type"] == "FUNC"
+
+
 def test_prepare_interfaces_invalid_type_falls_back_before_raising(
     tmp_project_dir, arc_runtime
 ) -> None:
