@@ -30,16 +30,15 @@ from tests.helpers.faux import drive_scripted_tool_call
 def test_permission_denied_read_gains_the_workspace_root_hint(
     tmp_project_dir: Path,
 ) -> None:
-    """A host-style path like /frontend/src/x.tsx is denied by the catch-all
-    rule; the result must name /workspace (and /skills) as the valid roots."""
+    """An unknown virtual root is denied and names the valid roots."""
 
     (content,) = drive_scripted_tool_call(
         tmp_project_dir,
         "read_file",
-        {"file_path": "/frontend/src/App.tsx"},
+        {"file_path": "/unknown-root/src/App.tsx"},
     )
 
-    assert content.startswith("Error: permission denied for read on /frontend/src/App.tsx")
+    assert content.startswith("Error: permission denied for read on /unknown-root/src/App.tsx")
     assert "/workspace/<path>" in content
     assert "/skills/<name>/SKILL.md" in content
 
@@ -47,16 +46,15 @@ def test_permission_denied_read_gains_the_workspace_root_hint(
 def test_permission_denied_hint_applies_to_relative_paths_too(
     tmp_project_dir: Path,
 ) -> None:
-    """Relative paths are normalized to /-anchored virtual paths and denied
-    the same way; they get the same remediation."""
+    """An unqualified relative root remains denied and gets the remediation."""
 
     (content,) = drive_scripted_tool_call(
         tmp_project_dir,
         "read_file",
-        {"file_path": "backend/src/database/seed_db.js"},
+        {"file_path": "docs/readme.md"},
     )
 
-    assert "permission denied for read on /backend/src/database/seed_db.js" in content
+    assert "permission denied for read on /docs/readme.md" in content
     assert "/workspace/<path>" in content
 
 

@@ -228,6 +228,9 @@ class EventClient:
         offset: int | None = None,
         limit: int | None = None,
         result_chars: int = 0,
+        requested_path: str | None = None,
+        path_classification: str = "",
+        execution_path: str | None = None,
     ) -> None:
         """Append one ``tool_usage`` event for a single agent tool round-trip.
 
@@ -240,6 +243,28 @@ class EventClient:
         visible. An empty ``node_id`` attributes the call to the run as a whole.
         """
         normalized_chars = _nonneg_int(result_chars)
+        detail = {
+            "path": str(path or "").strip() or None,
+            "offset": _nullable_nonneg_int(offset),
+            "limit": _nullable_nonneg_int(limit),
+            "result_chars": normalized_chars,
+            "result_empty": normalized_chars == 0,
+        }
+        normalized_requested = str(requested_path or "").strip() or None
+        normalized_classification = str(path_classification or "").strip()
+        normalized_execution = str(execution_path or "").strip() or None
+        if normalized_requested is not None or normalized_classification or normalized_execution is not None:
+            # These optional fields are emitted only by the tool-boundary
+            # normalizer. Direct SDK callers keep the historical event shape,
+            # while production calls retain the raw/resolved pair and the
+            # security classification needed for audit.
+            detail.update(
+                {
+                    "requested_path": normalized_requested,
+                    "path_classification": normalized_classification,
+                    "execution_path": normalized_execution,
+                }
+            )
         append_jsonl(
             self.paths.runner_events_path,
             {
@@ -248,13 +273,7 @@ class EventClient:
                 "phase": str(phase or "").strip(),
                 "tool": str(tool or "").strip(),
                 "status": str(status or "").strip() or "ok",
-                "detail": {
-                    "path": str(path or "").strip() or None,
-                    "offset": _nullable_nonneg_int(offset),
-                    "limit": _nullable_nonneg_int(limit),
-                    "result_chars": normalized_chars,
-                    "result_empty": normalized_chars == 0,
-                },
+                "detail": detail,
                 "timestamp": utc_timestamp(),
             },
         )

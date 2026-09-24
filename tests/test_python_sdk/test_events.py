@@ -415,6 +415,23 @@ class TestToolUsageEvents:
             "result_empty": True,
         }
 
+    def test_path_audit_fields_preserve_requested_and_execution_paths(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_tool_usage(
+            tool="read_file",
+            path="/frontend/src/App.tsx",
+            requested_path="/frontend/src/App.tsx",
+            path_classification="missing_workspace_prefix",
+            execution_path="/workspace/frontend/src/App.tsx",
+        )
+
+        detail = read_jsonl(event_paths.runner_events_path)[0]["detail"]
+        assert detail["path"] == "/frontend/src/App.tsx"
+        assert detail["requested_path"] == "/frontend/src/App.tsx"
+        assert detail["path_classification"] == "missing_workspace_prefix"
+        assert detail["execution_path"] == "/workspace/frontend/src/App.tsx"
+
     def test_blocked_and_error_statuses_are_preserved(
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
