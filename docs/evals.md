@@ -39,6 +39,10 @@ IMPLEMENT 阶段成功收尾时，系统会清理"游离重复文件"：路径�
 
 叶节点声明了 owned 接口契约、但 TestGenerator 返回空 manifest 时，IMPLEMENT 会静默跳过 TDD 直接把接口标记为 implemented——空 manifest 是合法 DESIGN 结果（无本地行为的节点），但这与"漏检了 manifest"当前不可区分。为积累数据决定是否升级为门禁，该形态写入一条 `zero_test_leaf` 事件（字段含 `node_id`、`interface_count`（owned 接口数）与 `summary`（TestGenerator 响应自带的理由文本，未提供时为 `null`））。纯观测：不加门禁、不重试、不改变空 manifest 的合法性；无接口的叶节点与非叶节点不产生该事件。`usage` 命令不聚合该事件；它会出现在评测报告 `events` 诊断的按类型事件计数中，用于把零测试叶节点的分布与这些节点的评测通过率对照。
 
+### `edge_reconcile` 事件与跨节点前向引用对账
+
+DESIGN 注册只在「两端契约都已注册」时建 `cross_req` 边，前向引用（节点 A 声明 callee 指向晚于 A 注册的接口 B，且 B 不反向列出 A）会让这条边永久缺失。编译收尾（正常完成与 `--resume` 完成点共用，均经过 `compile_requirement_tree`）对全部已注册接口的 callers/callees 做一次对账：两端已注册而 `call_edges` 表缺边的按注册期同一套规则补算；到收尾仍解析不到任何已注册契约的发终判 warning（与注册期一次性 warning 并存，不做去重）。补算动作本身写入一条 `edge_reconcile` 事件（字段含 `backfilled`（补算的边清单，每项含声明接口、引用方向、引用接口与 source/target req_id 对）与 `unresolved`（仍悬挂的引用清单））。纯修复/观测：不改变调度语义，对账失败 fail-open（记 warning，不阻塞编译结果）。`usage` 命令不聚合该事件；它会出现在评测报告 `events` 诊断的按类型事件计数中，用于解释 `call_edges` 表在收尾时的增量来源。
+
 ### 成本单价目录
 
 内置单价取自基准评测模型目录（DeepSeek / Z.AI / Moonshot / MiniMax / Qwen，CNY 每百万 token，2026-09，见 `agents/model/costing.py`）。目录是封闭集合：模型名匹配不区分大小写（`MiniMax-M3` 与 `minimax-m3` 同价），表外模型一律不计成本（报表中显示为 unpriced），目录调整时直接更新 `costing.py` 中的 `_BUILTIN_MODEL_COSTS` 表。

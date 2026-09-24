@@ -569,3 +569,184 @@ def test_mark_interfaces_implemented_flips_stored_rows(tmp_project_dir, arc_runt
 
     for interface_id in ("IF-A", "IF-B"):
         assert runtime.traceability.get_interface(interface_id)["implemented"] is True
+
+
+# ---------------------------------------------------------------------------
+# reconcile_call_edges: compile-wrap-up dangling-reference sweep (issue #238)
+# ---------------------------------------------------------------------------
+
+
+def _edge_quads(traceability) -> set[tuple[str, str, str, str]]:
+    return {
+        (
+            edge["source_req_id"],
+            edge["target_req_id"],
+            edge["from_interface_id"],
+            edge["to_interface_id"],
+        )
+        for edge in traceability.list_call_edges()
+    }
+
+
+def test_reconcile_backfills_forward_callee_reference(tmp_project_dir, arc_runtime) -> None:
+    """The ticket's core shape: REQ-1 declares a callee whose contract is
+    designed later; the later side never declares the reverse, so registration
+    leaves the cross_req edge permanently missing and the wrap-up sweep
+    backfills it through the same edge rule."""
+    runtime = arc_runtime
+    registry = _make_registry(tmp_project_dir, runtime)
+    registry.register_design(
+        "REQ-1",
+        registry.prepare_interfaces("REQ-1", [_iface("IF-A", callees=["IF-B"], file_path="src/a.py")]),
+        [],
+    )
+    assert runtime.traceability.list_call_edges() == []
+    registry.register_design(
+        "REQ-2",
+        registry.prepare_interfaces("REQ-2", [_iface("IF-B", file_path="src/b.py")]),
+        [],
+    )
+    # The later registration only sweeps its own callers/callees: still no edge.
+    assert runtime.traceability.list_call_edges() == []
+
+    report = registry.reconcile_call_edges()
+
+    assert _edge_quads(runtime.traceability) == {("REQ-1", "REQ-2", "IF-A", "IF-B")}
+    stored = runtime.traceability.list_call_edges()[0]
+    assert stored["edge_type"] == "cross_req"
+    assert report["unresolved"] == []
+    assert report["backfilled"] == [
+        {
+            "interface_id": "IF-A",
+            "kind": "callees",
+            "ref_id": "IF-B",
+            "edges": [{"source_req_id": "REQ-1", "target_req_id": "REQ-2"}],
+        }
+    ]
+
+
+def test_reconcile_backfills_forward_caller_reference(tmp_project_dir, arc_runtime) -> None:
+    """The mirrored declaration side: the early interface lists its caller in
+    `callers` before the caller's contract exists."""
+    runtime = arc_runtime
+    registry = _make_registry(tmp_project_dir, runtime)
+    registry.register_design(
+        "REQ-1",
+        registry.prepare_interfaces("REQ-1", [_iface("IF-A", callers=["IF-B"], file_path="src/a.py")]),
+        [],
+    )
+    registry.register_design(
+        "REQ-2",
+        registry.prepare_interfaces("REQ-2", [_iface("IF-B", file_path="src/b.py")]),
+        [],
+    )
+
+    report = registry.reconcile_call_edges()
+
+    # The caller's requirement depends on the declared interface's requirement.
+    assert _edge_quads(runtime.traceability) == {("REQ-2", "REQ-1", "IF-B", "IF-A")}
+    assert report["unresolved"] == []
+
+
+def test_reconcile_backfills_every_reusing_requirement_of_a_late_contract(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """Req-id pairs come from each side's req_ids: an interface reused by two
+    requirements contributes one edge per reuser once the referenced contract
+    finally registers (registration never created either edge here)."""
+    runtime = arc_runtime
+    registry = _make_registry(tmp_project_dir, runtime)
+    registry.register_design(
+        "REQ-1",
+        registry.prepare_interfaces("REQ-1", [_iface("IF-A", callees=["IF-B"], file_path="src/a.py")]),
+        [],
+    )
+    registry.register_design(
+        "REQ-3",
+        registry.prepare_interfaces("REQ-3", [_iface("IF-A", file_path="src/a.py")]),
+        [],
+    )
+    registry.register_design(
+        "REQ-2",
+        registry.prepare_interfaces("REQ-2", [_iface("IF-B", file_path="src/b.py")]),
+        [],
+    )
+    assert runtime.traceability.list_call_edges() == []
+
+    registry.reconcile_call_edges()
+
+    assert _edge_quads(runtime.traceability) == {
+        ("REQ-1", "REQ-2", "IF-A", "IF-B"),
+        ("REQ-3", "REQ-2", "IF-A", "IF-B"),
+    }
+
+
+def test_reconcile_reports_still_unresolved_references(tmp_project_dir, arc_runtime) -> None:
+    """References that resolve to no stored contract at compile end come back
+    for the caller's final warning; no edge is fabricated for them."""
+    runtime = arc_runtime
+    registry = _make_registry(tmp_project_dir, runtime)
+    registry.register_design(
+        "REQ-1",
+        registry.prepare_interfaces(
+            "REQ-1", [_iface("IF-A", callers=["IF-GHOST"], file_path="src/a.py")]
+        ),
+        [],
+    )
+
+    report = registry.reconcile_call_edges()
+
+    assert report["unresolved"] == [
+        {"interface_id": "IF-A", "kind": "callers", "ref_id": "IF-GHOST"}
+    ]
+    assert report["backfilled"] == []
+    assert runtime.traceability.list_call_edges() == []
+
+
+def test_reconcile_skips_edges_the_registration_already_created(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """Both endpoints registered and the edge present: nothing is re-inserted
+    (the stored row, `created_at` included, stays byte-identical)."""
+    runtime = arc_runtime
+    registry = _make_registry(tmp_project_dir, runtime)
+    registry.register_design(
+        "REQ-1",
+        registry.prepare_interfaces("REQ-1", [_iface("IF-A", file_path="src/a.py")]),
+        [],
+    )
+    registry.register_design(
+        "REQ-2",
+        registry.prepare_interfaces("REQ-2", [_iface("IF-B", callers=["IF-A"], file_path="src/b.py")]),
+        [],
+    )
+    edges_before = runtime.traceability.list_call_edges()
+    assert len(edges_before) == 1
+
+    report = registry.reconcile_call_edges()
+
+    assert report["backfilled"] == []
+    assert report["unresolved"] == []
+    assert runtime.traceability.list_call_edges() == edges_before
+
+
+def test_reconcile_is_idempotent(tmp_project_dir, arc_runtime) -> None:
+    runtime = arc_runtime
+    registry = _make_registry(tmp_project_dir, runtime)
+    registry.register_design(
+        "REQ-1",
+        registry.prepare_interfaces("REQ-1", [_iface("IF-A", callees=["IF-B"], file_path="src/a.py")]),
+        [],
+    )
+    registry.register_design(
+        "REQ-2",
+        registry.prepare_interfaces("REQ-2", [_iface("IF-B", file_path="src/b.py")]),
+        [],
+    )
+
+    first = registry.reconcile_call_edges()
+    second = registry.reconcile_call_edges()
+
+    assert first["backfilled"]
+    assert second == {"backfilled": [], "unresolved": []}
+    assert len(runtime.traceability.list_call_edges()) == 1
