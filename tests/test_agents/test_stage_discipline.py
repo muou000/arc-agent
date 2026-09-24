@@ -7,10 +7,14 @@ The middleware guards every tool call of the three stage agents:
   default; the middleware accepts a higher tiered ceiling for non-leaf shell
   passes), counted per path across write_file/edit_file/append_file and
   reserved at validation time so parallel batches respect the cap.
-- every stage blocks repeated writes/re-reads until a file-operation or
-  validation failure unlocks the path again; in ``test_generation`` a
-  successful delete also releases the path, so delete-then-rewrite works
-  without waiting for an accidental failure to unlock it.
+- every stage blocks repeated writes until a file-operation or validation
+  failure unlocks the path again; in ``test_generation`` a successful delete
+  also releases the path, so delete-then-rewrite works without waiting for
+  an accidental failure to unlock it.
+- overlapping re-reads are capped by a cumulative per-path budget that
+  unlock cycles do not reset (issue #242): an unlock restores the right to
+  read, not the budget, and each successful write on the path earns one
+  more re-read as the controlled exit.
 
 These tests call the middleware directly with synthetic ``ToolCallRequest``
 objects, so no agent runtime is needed.
@@ -237,7 +241,12 @@ def test_repeated_read_blocked_only_after_the_fresh_reread_budget() -> None:
     assert "A narrower limit or shifted offset is the same blocked read." in blocked.content
 
 
-def test_failed_read_unlocks_the_path_beyond_the_read_budget() -> None:
+def test_failed_read_unlocks_reading_but_not_the_reread_budget() -> None:
+    # Issue #242 (serial-6): a failed file operation is the generic unlock,
+    # but the old code skipped the overlap check *and* its counter while
+    # unlocked, so every unlock cycle re-armed unlimited whole-file
+    # re-reads. The unlock restores the right to read; the cumulative
+    # budget still binds, and the controlled exit is a successful write.
     middleware = make("implementation")
     path = "/workspace/src/calc.py"
     read = {"file_path": path, "offset": 0, "limit": 100}
@@ -247,13 +256,22 @@ def test_failed_read_unlocks_the_path_beyond_the_read_budget() -> None:
     blocked = run(middleware, make_request("read_file", read, call_id="r4"))
     assert blocked.status == "error"
 
-    # A failed file operation is the generic unlock: the very next re-read
-    # must pass regardless of the budget (only successful reads consume it).
+    # A failed read never consumed budget (failed results exit recording
+    # early), and its unlock no longer zeroes the count either: the next
+    # re-read is still blocked.
     middleware._record_result(
         make_request("read_file", read),
         ToolMessage(content="Error: transient read failure", name="read_file", tool_call_id="t0", status="error"),
     )
-    assert run(middleware, make_request("read_file", read, call_id="r5")).content == "ok"
+    still_blocked = run(middleware, make_request("read_file", read, call_id="r5"))
+    assert still_blocked.status == "error" and "Repeated read blocked" in still_blocked.content
+
+    # The controlled exit: a successful write on the path earns one more
+    # re-read (the fail -> fix -> verify loop), then the budget binds again.
+    written = run(middleware, make_request("write_file", {"file_path": path, "content": "v2\n"}, call_id="c1"))
+    assert written.content == "ok"
+    assert run(middleware, make_request("read_file", read, call_id="r6")).content == "ok"
+    assert run(middleware, make_request("read_file", read, call_id="r7")).status == "error"
 
 
 def test_read_with_failure_markers_in_content_does_not_unlock_the_path() -> None:
@@ -279,24 +297,108 @@ def test_read_with_failure_markers_in_content_does_not_unlock_the_path() -> None
     assert run(middleware, make_request("read_file", read, call_id="r5")).status == "error"
 
 
-def test_validation_failure_unlocks_re_reads_beyond_the_budget() -> None:
+def test_validation_failure_unlocks_written_reads_but_not_the_budget() -> None:
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    read = {"file_path": path, "offset": 0, "limit": 100}
+    run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
+    blocked = run(middleware, make_request("read_file", read, call_id="r1"))
+    assert blocked.status == "error" and "Read blocked" in blocked.content
+
+    middleware._record_result(
+        make_request("run_tests"),
+        ToolMessage(content="Exit Code: 1\nfailed", name="run_tests", tool_call_id="t1"),
+    )
+    # A failing validation unlocks the written path so the TDD fail->fix
+    # loop can re-read its own edits — but under the cumulative budget
+    # (issue #242) it no longer disables the re-read cap. The first read
+    # after the unlock is fresh (no previous range), so it consumes nothing.
+    assert run(middleware, make_request("read_file", read, call_id="r2")).content == "ok"
+
+    # Lifecycle pin: the validation-failed flag never resets, so a passing
+    # validation does not re-lock the written path either.
+    middleware._record_result(
+        make_request("run_tests"),
+        ToolMessage(content="Exit Code: 0\nok", name="run_tests", tool_call_id="t2"),
+    )
+    assert run(middleware, make_request("read_file", read, call_id="r3")).content == "ok"
+
+    # The budget is cumulative across all of it: the c1 write earned one
+    # credit (budget 3), and the fresh read plus three overlapping re-reads
+    # consume it — the sixth read is blocked even though every read sat
+    # inside an unlocked window.
+    assert run(middleware, make_request("read_file", read, call_id="r4")).content == "ok"
+    assert run(middleware, make_request("read_file", read, call_id="r5")).content == "ok"
+    assert run(middleware, make_request("read_file", read, call_id="r6")).status == "error"
+
+
+def test_reread_budget_is_cumulative_across_unlock_cycles() -> None:
+    """Issue #242 nail (serial-6): unlock cycles must not re-arm the budget.
+
+    The brief's literal sequence — failed unlock -> overlap re-read ->
+    write -> failed unlock again -> overlap re-read — carried until the
+    cumulative reads outgrow base budget plus the one write-earned credit.
+    serial-6 evidence: 85 redundant overlapping re-reads in one run; the
+    old code skipped both the overlap check and its counter while the path
+    was unlocked, so every unlock cycle re-armed unlimited whole-file
+    re-reads.
+    """
+
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    read = {"file_path": path, "offset": 0, "limit": 100}
+    assert run(middleware, make_request("read_file", read, call_id="r1")).content == "ok"
+
+    # Unlock cycle 1: a failed file operation on the path.
+    middleware._record_result(
+        make_request("edit_file", {"file_path": path, "old_string": "x", "new_string": "y"}),
+        ToolMessage(content="Error: old_string not found", name="edit_file", tool_call_id="e1", status="error"),
+    )
+    assert run(middleware, make_request("read_file", read, call_id="r2")).content == "ok"
+
+    # The write between the cycles is the controlled exit: it earns one
+    # more re-read, it does not re-arm the budget.
+    assert run(
+        middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1")
+    ).content == "ok"
+
+    # Unlock cycle 2: a distinct validation failure. The count carries.
+    middleware._record_result(
+        make_request("run_build"),
+        ToolMessage(content="Exit Code: 1\nbuild failed", name="run_build", tool_call_id="b1"),
+    )
+    assert run(middleware, make_request("read_file", read, call_id="r3")).content == "ok"
+    assert run(middleware, make_request("read_file", read, call_id="r4")).content == "ok"
+    capped = run(middleware, make_request("read_file", read, call_id="r5"))
+    assert capped.status == "error" and "Repeated read blocked" in capped.content
+
+
+def test_successful_write_on_the_path_earns_one_more_reread() -> None:
+    """The controlled exit (issue #242): a successful write earns one more
+    overlapping re-read, so the fail -> fix -> verify loop never blocks,
+    while re-reads without an intervening write stay capped (the previous
+    test pins that side). The earned read lives inside the unlocked window
+    a written-and-locked path only opens through a failure."""
+
     middleware = make("implementation")
     path = "/workspace/src/calc.py"
     read = {"file_path": path, "offset": 0, "limit": 100}
     run(middleware, make_request("read_file", read, call_id="r1"))
     run(middleware, make_request("read_file", read, call_id="r2"))
     run(middleware, make_request("read_file", read, call_id="r3"))
-    blocked = run(middleware, make_request("read_file", read, call_id="r4"))
-    assert blocked.status == "error"
+    capped = run(middleware, make_request("read_file", read, call_id="r4"))
+    assert capped.status == "error" and "Repeated read blocked" in capped.content
 
+    run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1"))
     middleware._record_result(
         make_request("run_tests"),
         ToolMessage(content="Exit Code: 1\nfailed", name="run_tests", tool_call_id="t1"),
     )
-    # A failing validation unlocks the paths: the TDD fail->fix loop must be
-    # able to re-read its own edits without any budget limit.
-    assert run(middleware, make_request("read_file", read, call_id="r5")).content == "ok"
-    assert run(middleware, make_request("read_file", read, call_id="r6")).content == "ok"
+    # The write earned one re-read: without the credit the count (2) would
+    # already equal the base budget and this read would be blocked.
+    earned = run(middleware, make_request("read_file", read, call_id="r5"))
+    assert earned.content == "ok"
+    assert run(middleware, make_request("read_file", read, call_id="r6")).status == "error"
 
 
 def test_read_of_written_file_block_points_to_next_action() -> None:
