@@ -303,6 +303,93 @@ def test_register_design_ignores_unknown_and_same_node_edges(tmp_project_dir, ar
     assert runtime.traceability.list_call_edges() == []
 
 
+def test_register_design_resolves_same_pass_callee_reference(tmp_project_dir, arc_runtime) -> None:
+    """Every row is upserted before edge derivation: a callee pointing at a
+    sibling contract declared later in the same pass resolves instead of
+    silently missing the edge (issue #233)."""
+
+    runtime = arc_runtime
+    registry = _make_registry(tmp_project_dir, runtime)
+    registry.register_design(
+        "REQ-1",
+        registry.prepare_interfaces(
+            "REQ-1",
+            [
+                _iface("REQ-1-FUNC-First", callees=["REQ-1-FUNC-Second"]),
+                _iface("REQ-1-FUNC-Second"),
+            ],
+        ),
+        [],
+    )
+
+    # Same-node edges are never recorded (cross_req only), so register the
+    # callee from a second node to observe the edge the forward reference
+    # now creates.
+    registry.register_design(
+        "REQ-2",
+        registry.prepare_interfaces("REQ-2", [_iface("REQ-2-FUNC-User", callees=["REQ-1-FUNC-Second"])]),
+        [],
+    )
+    edges = runtime.traceability.list_call_edges()
+    assert [(edge["source_req_id"], edge["target_req_id"]) for edge in edges] == [("REQ-2", "REQ-1")]
+
+
+def test_register_design_resolves_same_pass_cross_node_reference(tmp_project_dir, arc_runtime) -> None:
+    """The real forward-reference fix: within one registration the callee's
+    row exists by the time the caller's edges are derived, so the reciprocal
+    listing is no longer required for the edge to exist."""
+
+    runtime = arc_runtime
+    registry = _make_registry(tmp_project_dir, runtime)
+    registry.register_design(
+        "REQ-1",
+        registry.prepare_interfaces(
+            "REQ-1",
+            [
+                _iface("REQ-1-FUNC-First", callees=["REQ-1-FUNC-Second"]),
+                _iface("REQ-1-FUNC-Second", file_path="src/second.py"),
+            ],
+        ),
+        [],
+    )
+    # REQ-2 reuses REQ-1-FUNC-Second and calls the FIRST interface — a
+    # reference that, pre-#233, resolved only through the callee's own
+    # caller listing.
+    registry.register_design(
+        "REQ-2",
+        registry.prepare_interfaces("REQ-2", [_iface("REQ-2-FUNC-User", callees=["REQ-1-FUNC-First"])]),
+        [],
+    )
+    edges = runtime.traceability.list_call_edges()
+    assert [(edge["source_req_id"], edge["target_req_id"], edge["to_interface_id"]) for edge in edges] == [
+        ("REQ-2", "REQ-1", "REQ-1-FUNC-First")
+    ]
+
+
+def test_register_design_reports_unresolved_edge_references(tmp_project_dir, arc_runtime) -> None:
+    """A caller/callee id that resolves to no stored contract used to be a
+    silent no-edge; it is now reported to the caller (issue #233)."""
+
+    runtime = arc_runtime
+    registry = _make_registry(tmp_project_dir, runtime)
+    unresolved: list[tuple[str, str, list[str]]] = []
+    registry.register_design(
+        "REQ-1",
+        registry.prepare_interfaces(
+            "REQ-1",
+            [_iface("IF-A", callers=["IF-GHOST-IN"], callees=["IF-GHOST-OUT", "IF-GHOST-OUT"])],
+        ),
+        [],
+        on_unresolved_edge_reference=lambda interface_id, kind, ids: unresolved.append((interface_id, kind, ids)),
+    )
+
+    assert runtime.traceability.list_call_edges() == []
+    assert sorted(unresolved) == [
+        ("IF-A", "callees", ["IF-GHOST-OUT"]),
+        ("IF-A", "callers", ["IF-GHOST-IN"]),
+    ]
+
+
 def test_register_design_stores_tests(tmp_project_dir, arc_runtime) -> None:
     runtime = arc_runtime
     registry = _make_registry(tmp_project_dir, runtime)
@@ -354,24 +441,92 @@ def test_prepare_tests_normalizes_and_attaches_req(tmp_project_dir, arc_runtime)
     assert stored[0]["coverage_scope"] == "owned"
 
 
-def test_prepare_tests_drops_invalid_rows(tmp_project_dir, arc_runtime) -> None:
+def test_prepare_tests_drops_unregistrable_rows_observably(tmp_project_dir, arc_runtime) -> None:
+    """Rows that cannot be registered at all — non-objects, rows without a
+    file path — are dropped, but no longer silently: the caller receives each
+    with a reason (issue #233 audit)."""
+
     registry = _make_registry(tmp_project_dir, arc_runtime)
+    dropped: list[tuple[object, str]] = []
     stored = registry.prepare_tests(
         node_id="REQ-1",
-        tests=[{"file_path": "x.py"}, "not-a-dict", _test_row("T-1"), _test_row("")],
+        tests=[{"test_id": "T-NOPATH", "type": "Unit"}, "not-a-dict", _test_row("T-1")],
+        on_dropped_entry=lambda item, reason: dropped.append((item, reason)),
     )
     assert [row["test_id"] for row in stored] == ["T-1"]
+    assert sorted(reason for _item, reason in dropped) == ["missing file_path", "not an object"]
+    assert dropped[0][0] == {"test_id": "T-NOPATH", "type": "Unit"}
+
+
+def test_prepare_tests_backfills_missing_test_id_mechanically(tmp_project_dir, arc_runtime) -> None:
+    """A row without a ``test_id`` but with a usable file path takes the
+    mechanical node-prefixed id — the same generator the reconciliation's
+    re-attach uses — instead of vanishing (issue #233 audit: backfill)."""
+
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    backfilled: list[tuple[str, str]] = []
+    stored = registry.prepare_tests(
+        node_id="REQ-1",
+        tests=[{"type": "Unit", "file_path": "tests/unit/login.test.ts"}],
+        on_backfilled_row=lambda test_id, field: backfilled.append((test_id, field)),
+    )
+    assert stored[0]["test_id"] == "REQ-1-T-LOGIN-TEST"
+    assert sorted(backfilled) == [
+        ("REQ-1-T-LOGIN-TEST", "coverage_scope"),
+        ("REQ-1-T-LOGIN-TEST", "test_id"),
+    ]
+    assert stored[0]["req_id"] == "REQ-1"
+
+
+def test_prepare_tests_defaults_missing_coverage_scope_to_owned(tmp_project_dir, arc_runtime) -> None:
+    """An absent ``coverage_scope`` backfills to ``owned`` — the default the
+    decode (TestManifestItem) and declaration (normalize_coverage_scope)
+    layers already establish. owned is the conservative choice: a
+    misclassified test stays subject to the baseline RED gate and the
+    foreign-owned check, both of which fail loudly; defaulting to
+    dependency/shared would silently exempt it (issue #233 semantic
+    decision)."""
+
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    backfilled: list[tuple[str, str]] = []
+    stored = registry.prepare_tests(
+        node_id="REQ-1",
+        tests=[_test_row("T-1", coverage_scope="")],
+        on_backfilled_row=lambda test_id, field: backfilled.append((test_id, field)),
+    )
+    assert stored[0]["coverage_scope"] == "owned"
+    assert backfilled == [("T-1", "coverage_scope")]
+
+
+def test_prepare_tests_backfilled_ids_participate_in_duplicate_check(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """A backfilled mechanical id colliding with a model-minted id is judged
+    by the same duplicate rule — loud, not silent overwrite."""
+
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    with pytest.raises(ValueError, match="duplicate test id"):
+        registry.prepare_tests(
+            node_id="REQ-1",
+            tests=[
+                _test_row("REQ-1-T-LOGIN-TEST"),
+                {"type": "Unit", "file_path": "tests/unit/login.test.ts"},
+            ],
+        )
 
 
 @pytest.mark.parametrize(
     "row,match",
     [
         (_test_row("T-1", type=""), "missing `type`"),
-        (_test_row("T-1", file_path=""), "missing `file_path`"),
         (_test_row("T-1", coverage_scope="bogus"), "invalid `coverage_scope`"),
     ],
 )
 def test_prepare_tests_raises_agent_facing_errors(tmp_project_dir, arc_runtime, row, match) -> None:
+    """The keep-failing branches of the #233 audit ladder: no backfill source
+    exists for an empty `type` or a non-empty invalid `coverage_scope`, and
+    the declaration loop already gave the model validated chances at both."""
+
     registry = _make_registry(tmp_project_dir, arc_runtime)
     with pytest.raises(ValueError, match=match):
         registry.prepare_tests(node_id="REQ-1", tests=[row])

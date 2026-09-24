@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from agents.tools.test_manifest import normalize_coverage_scope
+from agents.tools.test_manifest import mechanical_test_id, normalize_coverage_scope
 from core.path_compat import normalize_workspace_relative_path
 
 #: Valid interface contract types (UI/API/FUNC/DB).
@@ -219,7 +219,12 @@ class DesignArtifactRegistry:
         return prepared
 
     def register_design(
-        self, node_id: str, interfaces: list[dict[str, Any]], tests: list[dict[str, Any]]
+        self,
+        node_id: str,
+        interfaces: list[dict[str, Any]],
+        tests: list[dict[str, Any]],
+        *,
+        on_unresolved_edge_reference: Callable[[str, str, list[str]], None] | None = None,
     ) -> None:
         """Persist prepared contracts and tests, then derive call edges.
 
@@ -227,6 +232,14 @@ class DesignArtifactRegistry:
         ``tests`` must come from :meth:`prepare_tests`. Both are stored in
         that order so ``register_design`` stays atomic per DESIGN store point
         for every path that reaches it (main pass, conflict re-queue, retry).
+
+        Every interface row is upserted before any edge is derived, so
+        callers/callees pointing at a sibling contract of the same pass
+        resolve instead of silently missing the edge. References that resolve
+        to no stored interface at all (never registered anywhere) are reported
+        through ``on_unresolved_edge_reference(interface_id, kind, ids)`` —
+        ``kind`` is ``"callers"`` or ``"callees"`` — so a dangling cross-node
+        reference is observable instead of a silent no-edge (issue #233).
         """
 
         for interface in interfaces:
@@ -247,7 +260,16 @@ class DesignArtifactRegistry:
                 callers=normalize_string_list(interface.get("callers")),
                 callees=normalize_string_list(interface.get("callees")),
             )
-            self._register_interface_edges(node_id, interface_id, interface)
+        for interface in interfaces:
+            interface_id = str(interface.get("interface_id", "")).strip()
+            if not interface_id:
+                continue
+            self._register_interface_edges(
+                node_id,
+                interface_id,
+                interface,
+                on_unresolved_edge_reference=on_unresolved_edge_reference,
+            )
         for test in tests:
             self.traceability.upsert_test(
                 test_id=str(test.get("test_id", "") or "").strip(),
@@ -260,34 +282,45 @@ class DesignArtifactRegistry:
             )
 
     def _register_interface_edges(
-        self, node_id: str, interface_id: str, interface: dict[str, Any]
+        self,
+        node_id: str,
+        interface_id: str,
+        interface: dict[str, Any],
+        *,
+        on_unresolved_edge_reference: Callable[[str, str, list[str]], None] | None = None,
     ) -> None:
-        for caller_id in normalize_string_list(interface.get("callers")):
-            caller = self.traceability.get_interface(caller_id)
-            if not caller:
-                continue
-            for source_req_id in caller.get("req_ids", []):
-                if source_req_id and source_req_id != node_id:
-                    self.traceability.insert_call_edge(
-                        source_req_id=source_req_id,
-                        target_req_id=node_id,
-                        from_interface_id=caller_id,
-                        to_interface_id=interface_id,
-                        edge_type="cross_req",
-                    )
-        for callee_id in normalize_string_list(interface.get("callees")):
-            callee = self.traceability.get_interface(callee_id)
-            if not callee:
-                continue
-            for target_req_id in callee.get("req_ids", []):
-                if target_req_id and target_req_id != node_id:
-                    self.traceability.insert_call_edge(
-                        source_req_id=node_id,
-                        target_req_id=target_req_id,
-                        from_interface_id=interface_id,
-                        to_interface_id=callee_id,
-                        edge_type="cross_req",
-                    )
+        unresolved: dict[str, list[str]] = {}
+        for kind in ("callers", "callees"):
+            for ref_id in normalize_string_list(interface.get(kind)):
+                ref = self.traceability.get_interface(ref_id)
+                if not ref:
+                    ids = unresolved.setdefault(kind, [])
+                    if ref_id not in ids:
+                        ids.append(ref_id)
+                    continue
+                if kind == "callers":
+                    for source_req_id in ref.get("req_ids", []):
+                        if source_req_id and source_req_id != node_id:
+                            self.traceability.insert_call_edge(
+                                source_req_id=source_req_id,
+                                target_req_id=node_id,
+                                from_interface_id=ref_id,
+                                to_interface_id=interface_id,
+                                edge_type="cross_req",
+                            )
+                else:
+                    for target_req_id in ref.get("req_ids", []):
+                        if target_req_id and target_req_id != node_id:
+                            self.traceability.insert_call_edge(
+                                source_req_id=node_id,
+                                target_req_id=target_req_id,
+                                from_interface_id=interface_id,
+                                to_interface_id=ref_id,
+                                edge_type="cross_req",
+                            )
+        if on_unresolved_edge_reference is not None:
+            for kind, ids in unresolved.items():
+                on_unresolved_edge_reference(interface_id, kind, ids)
 
     # -- tests --------------------------------------------------------------
 
@@ -296,41 +329,75 @@ class DesignArtifactRegistry:
         *,
         node_id: str,
         tests: list[dict[str, Any]],
+        on_dropped_entry: Callable[[Any, str], None] | None = None,
+        on_backfilled_row: Callable[[str, str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Validate and normalize a generated test manifest for one node.
 
-        Drops non-dict rows and empty ids; raises ``ValueError`` with an
-        agent-facing message on missing type/path, app-type-invalid paths,
-        invalid coverage scope, or duplicate ids.
+        The per-field dispositions follow the #233 audit ladder — backfill
+        what a deterministic source can resolve, drop what is unregistrable,
+        judge (raise) only what has no source and would otherwise hide a real
+        contract break:
+
+        - non-dict rows and rows without a usable ``file_path`` are dropped
+          and reported through ``on_dropped_entry(item, reason)`` (neither can
+          be registered; the workflow's owned-witness gates still judge what
+          remains);
+        - a row without a ``test_id`` is backfilled mechanically from
+          ``node_id`` + the file path (same generator the reconciliation's
+          re-attach uses) and reported through ``on_backfilled_row``;
+        - an absent ``coverage_scope`` backfills to ``owned`` — the default
+          the decode and declaration layers already establish — and is
+          reported through ``on_backfilled_row``;
+        - an empty ``type``, an app-type-invalid path, a non-empty invalid
+          ``coverage_scope``, and a duplicate ``test_id`` raise ``ValueError``
+          with an agent-facing message: no backfill source exists for any of
+          them, and the declaration loop already gave the model validated
+          chances at each.
         """
 
         stored: list[dict[str, Any]] = []
         generated_ids: set[str] = set()
         for test in tests:
             if not isinstance(test, dict):
+                if on_dropped_entry is not None:
+                    on_dropped_entry(test, "not an object")
                 continue
             raw_test_id = str(test.get("test_id", "")).strip()
-            if not raw_test_id:
-                continue
             file_path = normalize_workspace_relative_path(
                 test.get("file_path"), self.workspace_path
             )
+            if not file_path:
+                if on_dropped_entry is not None:
+                    on_dropped_entry(test, "missing file_path")
+                continue
+            if not raw_test_id:
+                raw_test_id = mechanical_test_id(node_hint=node_id, file_path=file_path)
+                if on_backfilled_row is not None:
+                    on_backfilled_row(raw_test_id, "test_id")
             test_type = str(test.get("type", "") or "").strip()
             if not test_type:
                 raise ValueError(f"Generated test `{raw_test_id}` is missing `type`.")
-            if not file_path:
-                raise ValueError(f"Generated test `{raw_test_id}` is missing `file_path`.")
             validation_error = self.app_handler.validate_test_path(test_type, file_path)
             if validation_error:
                 raise ValueError(
                     f"Generated test `{raw_test_id}` has an invalid path. {validation_error}"
                 )
-            coverage_scope = normalize_coverage_scope(test.get("coverage_scope"))
+            raw_scope_text = str(test.get("coverage_scope") or "").strip()
+            coverage_scope = normalize_coverage_scope(raw_scope_text)
             if not coverage_scope:
                 raise ValueError(
                     f"Generated test `{raw_test_id}` has invalid `coverage_scope`; "
                     "expected owned, dependency, or shared."
                 )
+            if not raw_scope_text:
+                # Absent, not invalid: the vocabulary default is the
+                # conservative owned scope. A misdefaulted owned test fails
+                # loudly (RED-gate witness or the foreign-owned check); a
+                # defaulted dependency/shared scope would silently exempt it
+                # from both.
+                if on_backfilled_row is not None:
+                    on_backfilled_row(raw_test_id, "coverage_scope")
             if raw_test_id in generated_ids:
                 raise ValueError(f"Generated duplicate test id `{raw_test_id}`.")
             generated_ids.add(raw_test_id)

@@ -302,7 +302,7 @@ class WorkflowPhaseRunner:
         stored_tests: list[dict[str, Any]] = []
         if is_non_leaf:
             self.traceability.clear_node_design_artifacts(node_id)
-            self.registry.register_design(node_id, prepared_interfaces, [])
+            await self._register_design_observably(node_id, prepared_interfaces, [])
             context_pipeline.cache.invalidate_file_layers(node_id)
             context_pipeline.cache.invalidate_db_layers(node_id)
             self._update_node_session(
@@ -360,10 +360,48 @@ class WorkflowPhaseRunner:
         testgen_summary_text = testgen_summary(testgen_output)
 
         try:
-            stored_tests = self.registry.prepare_tests(node_id=node_id, tests=tests)
+            dropped_test_rows: list[tuple[Any, str]] = []
+            backfilled_test_rows: list[tuple[str, str]] = []
+            stored_tests = self.registry.prepare_tests(
+                node_id=node_id,
+                tests=tests,
+                on_dropped_entry=lambda item, reason: dropped_test_rows.append((item, reason)),
+                on_backfilled_row=lambda test_id, field: backfilled_test_rows.append((test_id, field)),
+            )
         except ValueError as exc:
             await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
             return False
+        if dropped_test_rows:
+            hints = ", ".join(
+                hint
+                for hint in (
+                    str(item.get("test_id") or item.get("file_path") or "").strip()
+                    if isinstance(item, dict)
+                    else str(item)[:60]
+                    for item, _reason in dropped_test_rows
+                )
+                if hint
+            ) or "no identifiable fields"
+            reasons = ", ".join(sorted({reason for _item, reason in dropped_test_rows}))
+            await self._log(
+                "TestGenerator",
+                f"Dropped {len(dropped_test_rows)} manifest row(s) ({reasons}) that cannot be "
+                f"registered: {hints}. Every test row needs a test file path on disk; these "
+                "rows never reach the tests table, and the remaining manifest is judged as-is.",
+                status="warning",
+                node_id=node_id,
+            )
+        if backfilled_test_rows:
+            details = ", ".join(f"`{test_id}` ({field})" for test_id, field in backfilled_test_rows)
+            await self._log(
+                "TestGenerator",
+                f"Backfilled manifest row field(s) with deterministic defaults: {details}. "
+                "A row without `test_id` takes the mechanical node-prefixed id; a row without "
+                "`coverage_scope` is treated as `owned` (subject to the baseline RED gate and "
+                "the owned-coverage check).",
+                status="warning",
+                node_id=node_id,
+            )
 
         owned_interface_ids = {
             str(item.get("interface_id") or "").strip()
@@ -439,7 +477,7 @@ class WorkflowPhaseRunner:
             stored_tests = baseline["revised_tests"]
 
         self.traceability.clear_node_design_artifacts(node_id)
-        self.registry.register_design(node_id, prepared_interfaces, stored_tests)
+        await self._register_design_observably(node_id, prepared_interfaces, stored_tests)
         context_pipeline.cache.invalidate_file_layers(node_id)
         context_pipeline.cache.invalidate_db_layers(node_id)
         self._update_node_session(
@@ -986,11 +1024,36 @@ class WorkflowPhaseRunner:
                 )
                 continue
             try:
-                current_tests = self.registry.prepare_tests(node_id=node_id, tests=revised_tests)
+                repair_dropped: list[tuple[Any, str]] = []
+                repair_backfilled: list[tuple[str, str]] = []
+                current_tests = self.registry.prepare_tests(
+                    node_id=node_id,
+                    tests=revised_tests,
+                    on_dropped_entry=lambda item, reason: repair_dropped.append((item, reason)),
+                    on_backfilled_row=lambda test_id, field: repair_backfilled.append((test_id, field)),
+                )
                 manifest_revised = True
             except ValueError as exc:
                 await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
                 return None
+            if repair_dropped:
+                await self._log(
+                    "TestGenerator",
+                    f"Green baseline rework manifest dropped {len(repair_dropped)} row(s) "
+                    f"({', '.join(sorted({reason for _item, reason in repair_dropped}))}): "
+                    "unregistrable rows never reach the tests table.",
+                    status="warning",
+                    node_id=node_id,
+                )
+            if repair_backfilled:
+                await self._log(
+                    "TestGenerator",
+                    "Green baseline rework manifest backfilled deterministic default(s) for: "
+                    + ", ".join(f"`{test_id}` ({field})" for test_id, field in repair_backfilled)
+                    + ".",
+                    status="warning",
+                    node_id=node_id,
+                )
             if not revised_tests and not current_tests:
                 # The repair explicitly returned an empty manifest (a real
                 # `tests: []` answer - unparseable payloads never reach
@@ -1687,6 +1750,53 @@ class WorkflowPhaseRunner:
     def _update_node_session(self, node_id: str, patch: dict[str, Any]) -> None:
         sessions.merge_node_session(node_id, patch)
         context_pipeline.cache.invalidate_db_layers(node_id)
+
+    async def _register_design_observably(
+        self,
+        node_id: str,
+        interfaces: list[dict[str, Any]],
+        tests: list[dict[str, Any]],
+    ) -> None:
+        """Register through the registry and surface unresolved edge references.
+
+        The one wiring every DESIGN store point shares: ``register_design``
+        reports caller/callee ids that resolved to no stored contract, and
+        this turns the report into the operator-visible warning.
+        """
+
+        notes: list[str] = []
+        self.registry.register_design(
+            node_id,
+            interfaces,
+            tests,
+            on_unresolved_edge_reference=lambda interface_id, kind, ids: notes.append(
+                f"`{interface_id}` {kind} -> {', '.join(ids)}"
+            ),
+        )
+        await self._warn_unresolved_edge_references(notes, node_id=node_id)
+
+    async def _warn_unresolved_edge_references(self, notes: list[str], *, node_id: str) -> None:
+        """Surface caller/callee references that resolved to no stored contract.
+
+        ``register_design`` only derives a cross-requirement edge when both
+        endpoints are registered interfaces; until #233 the unresolved case
+        was a silent no-edge. The registration still proceeds (fail-open —
+        a reference to a contract designed later in the compile, or a plain
+        id mistake, must not fail an otherwise-complete DESIGN), but the hole
+        is now visible in the log stream.
+        """
+
+        if not notes:
+            return
+        await self._log(
+            "InterfaceDesigner",
+            "Interface caller/callee reference(s) resolved to no stored contract, so no "
+            "cross-requirement edge was created: " + "; ".join(notes)
+            + ". An edge attaches only when both endpoints are registered interface "
+            "contracts — check the id, or the referenced node's DESIGN output.",
+            status="warning",
+            node_id=node_id,
+        )
 
     async def _log(
         self,

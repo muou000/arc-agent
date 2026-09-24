@@ -399,6 +399,56 @@ def test_reconcile_reattached_ids_do_not_collide_across_nodes() -> None:
     assert reattach("REQ-1") != reattach("REQ-2")
 
 
+def test_reconcile_backfills_dropped_identity_fields_from_the_declaration() -> None:
+    """A returned row that dropped `type` or mangled `coverage_scope` is
+    restored from its declaration instead of reaching the registration layer
+    incomplete; the restoration is reported for the caller's log (issue #233
+    audit backfill)."""
+
+    lock = TestManifestLock(
+        declared_files={
+            "tests/unit/a.test.ts": DeclaredTestFile(
+                file_path="tests/unit/a.test.ts", test_type="Unit", coverage_scope="owned"
+            ),
+        }
+    )
+    result = reconcile_declared_manifest(
+        manifest_items=[
+            # `type` dropped entirely; scope mangled beyond the vocabulary.
+            {"test_id": "T-A", "file_path": "tests/unit/a.test.ts", "coverage_scope": "Ownned"},
+        ],
+        manifest_lock=lock,
+        written_paths=["/workspace/tests/unit/a.test.ts"],
+    )
+    assert result["backfilled_fields"] == {"tests/unit/a.test.ts": ["type", "coverage_scope"]}
+    row = result["tests"][0]
+    assert row["type"] == "Unit"
+    assert row["coverage_scope"] == "owned"
+
+
+def test_reconcile_leaves_returned_identity_fields_untouched() -> None:
+    """A row that carries its own valid values is not overwritten by the
+    declaration — the response is the model's latest word for what it kept."""
+
+    lock = TestManifestLock(
+        declared_files={
+            "tests/unit/a.test.ts": DeclaredTestFile(
+                file_path="tests/unit/a.test.ts", test_type="Unit", coverage_scope="owned"
+            ),
+        }
+    )
+    result = reconcile_declared_manifest(
+        manifest_items=[
+            {"test_id": "T-A", "file_path": "tests/unit/a.test.ts", "type": "Integration", "coverage_scope": "shared"},
+        ],
+        manifest_lock=lock,
+        written_paths=["/workspace/tests/unit/a.test.ts"],
+    )
+    assert result["backfilled_fields"] == {}
+    assert result["tests"][0]["type"] == "Integration"
+    assert result["tests"][0]["coverage_scope"] == "shared"
+
+
 def test_reconcile_empty_lock_is_a_passthrough() -> None:
     # No declaration happened (e.g. node owns no tests): the returned manifest
     # is passed through untouched so an empty manifest stays empty.
