@@ -607,6 +607,55 @@ class TestZeroTestLeafEvents:
         assert lines[0]["summary"] is None
 
 
+class TestEdgeReconcileEvents:
+    """Pin the ``edge_reconcile`` schema: the compile-wrap-up dangling-edge
+    sweep over every stored interface's callers/callees (issue #238). The
+    event carries the backfilled cross_req edges and the references that
+    still resolved to no stored contract at compile end."""
+
+    def test_record_edge_reconcile_writes_canonical_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_edge_reconcile(
+            backfilled=[
+                {
+                    "interface_id": "IF-A",
+                    "kind": "callees",
+                    "ref_id": "IF-B",
+                    "edges": [{"source_req_id": "REQ-1", "target_req_id": "REQ-2"}],
+                }
+            ],
+            unresolved=[{"interface_id": "IF-C", "kind": "callers", "ref_id": "IF-GHOST"}],
+            message="backfilled 1 edge(s); 1 reference(s) still unresolved",
+        )
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "edge_reconcile",
+            "backfilled": [
+                {
+                    "interface_id": "IF-A",
+                    "kind": "callees",
+                    "ref_id": "IF-B",
+                    "edges": [{"source_req_id": "REQ-1", "target_req_id": "REQ-2"}],
+                }
+            ],
+            "unresolved": [{"interface_id": "IF-C", "kind": "callers", "ref_id": "IF-GHOST"}],
+            "message": "backfilled 1 edge(s); 1 reference(s) still unresolved",
+            "timestamp": lines[0]["timestamp"],
+        }
+
+    def test_defaults_and_invalid_values_are_normalized(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_edge_reconcile()
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["backfilled"] == []
+        assert lines[0]["unresolved"] == []
+        assert lines[0]["message"] is None
+
+
 class TestTraceabilityRowEvents:
     """Pin the row-event schemas ``TraceabilityStore`` emits through the
     public channel (issue #163): the payload mirrors the persisted row and

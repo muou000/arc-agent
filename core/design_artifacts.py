@@ -4,7 +4,9 @@ Single owner of the registration invariants a DESIGN pass produces:
 interface contracts (merge with existing rows, type validation, path
 normalization, ownership attachment), test manifests (id dedup, path and
 scope validation, normalization), the cross-requirement call edges derived
-from callers/callees, and the ``implemented`` flag flip. ``WorkflowPhaseRunner``
+from callers/callees (registration-time derivation plus the compile-wrap-up
+reconcile that backfills edges forward references left missing), and the
+``implemented`` flag flip. ``WorkflowPhaseRunner``
 calls this module's narrow interface; ``TraceabilityStore`` stays the
 persistence implementation for the seven tables (runtime SDK contract,
 unchanged by design).
@@ -102,6 +104,36 @@ def normalize_string_list(value: Any) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def cross_req_pairs(
+    owner_req_ids: Any, ref_req_ids: Any, kind: str
+) -> list[tuple[str, str]]:
+    """Req-id pairs one caller/callee reference contributes.
+
+    The single edge rule registration and the wrap-up reconcile share: the
+    owner side is the declaring interface's ``req_ids`` (at registration time
+    that is the declaring node alone), the ref side the referenced
+    interface's ``req_ids``; ``callers`` flow ref -> owner, ``callees`` flow
+    owner -> ref. Pairs naming the same requirement on both ends are
+    intra-node and never cross_req.
+    """
+
+    owner_ids = normalize_string_list(owner_req_ids)
+    ref_ids = normalize_string_list(ref_req_ids)
+    if kind == "callers":
+        return [
+            (ref_id, owner_id)
+            for owner_id in owner_ids
+            for ref_id in ref_ids
+            if ref_id != owner_id
+        ]
+    return [
+        (owner_id, ref_id)
+        for owner_id in owner_ids
+        for ref_id in ref_ids
+        if ref_id != owner_id
+    ]
 
 
 def summarize_interface_artifacts(interfaces: list[dict[str, Any]]) -> dict[str, Any]:
@@ -298,29 +330,93 @@ class DesignArtifactRegistry:
                     if ref_id not in ids:
                         ids.append(ref_id)
                     continue
-                if kind == "callers":
-                    for source_req_id in ref.get("req_ids", []):
-                        if source_req_id and source_req_id != node_id:
-                            self.traceability.insert_call_edge(
-                                source_req_id=source_req_id,
-                                target_req_id=node_id,
-                                from_interface_id=ref_id,
-                                to_interface_id=interface_id,
-                                edge_type="cross_req",
-                            )
-                else:
-                    for target_req_id in ref.get("req_ids", []):
-                        if target_req_id and target_req_id != node_id:
-                            self.traceability.insert_call_edge(
-                                source_req_id=node_id,
-                                target_req_id=target_req_id,
-                                from_interface_id=interface_id,
-                                to_interface_id=ref_id,
-                                edge_type="cross_req",
-                            )
+                for source_req_id, target_req_id in cross_req_pairs(
+                    [node_id], ref.get("req_ids", []), kind
+                ):
+                    self.traceability.insert_call_edge(
+                        source_req_id=source_req_id,
+                        target_req_id=target_req_id,
+                        from_interface_id=ref_id if kind == "callers" else interface_id,
+                        to_interface_id=interface_id if kind == "callers" else ref_id,
+                        edge_type="cross_req",
+                    )
         if on_unresolved_edge_reference is not None:
             for kind, ids in unresolved.items():
                 on_unresolved_edge_reference(interface_id, kind, ids)
+
+    def reconcile_call_edges(self) -> dict[str, Any]:
+        """Compile-wrap-up sweep over every stored interface's callers/callees.
+
+        Registration derives a ``cross_req`` edge only when both endpoints are
+        already registered, so a forward reference — A declares a callee whose
+        contract is designed later — leaves the edge permanently missing
+        unless the later side happens to declare the reverse (issue #238).
+        This re-derives every stored reference against the final store state
+        through the same edge rule registration uses
+        (:func:`cross_req_pairs`): edges already in ``call_edges`` stay
+        untouched, missing ones are backfilled through the public SDK API,
+        and references that still resolve to no stored contract are returned
+        for the caller's final warning.
+        """
+
+        existing = {
+            (
+                str(edge.get("source_req_id") or "").strip(),
+                str(edge.get("target_req_id") or "").strip(),
+                str(edge.get("from_interface_id") or "").strip(),
+                str(edge.get("to_interface_id") or "").strip(),
+            )
+            for edge in self.traceability.list_call_edges()
+        }
+        backfilled: list[dict[str, Any]] = []
+        unresolved: list[dict[str, Any]] = []
+        for owner in self.traceability.list_interfaces():
+            owner_id = str(owner.get("interface_id") or "").strip()
+            if not owner_id:
+                continue
+            for kind in ("callers", "callees"):
+                for ref_id in normalize_string_list(owner.get(kind)):
+                    ref = self.traceability.get_interface(ref_id)
+                    if not ref:
+                        unresolved.append(
+                            {"interface_id": owner_id, "kind": kind, "ref_id": ref_id}
+                        )
+                        continue
+                    from_id, to_id = (
+                        (ref_id, owner_id) if kind == "callers" else (owner_id, ref_id)
+                    )
+                    missing = [
+                        (source_req_id, target_req_id)
+                        for source_req_id, target_req_id in cross_req_pairs(
+                            owner.get("req_ids", []), ref.get("req_ids", []), kind
+                        )
+                        if (source_req_id, target_req_id, from_id, to_id) not in existing
+                    ]
+                    for source_req_id, target_req_id in missing:
+                        self.traceability.insert_call_edge(
+                            source_req_id=source_req_id,
+                            target_req_id=target_req_id,
+                            from_interface_id=from_id,
+                            to_interface_id=to_id,
+                            edge_type="cross_req",
+                        )
+                        existing.add((source_req_id, target_req_id, from_id, to_id))
+                    if missing:
+                        backfilled.append(
+                            {
+                                "interface_id": owner_id,
+                                "kind": kind,
+                                "ref_id": ref_id,
+                                "edges": [
+                                    {
+                                        "source_req_id": source_req_id,
+                                        "target_req_id": target_req_id,
+                                    }
+                                    for source_req_id, target_req_id in missing
+                                ],
+                            }
+                        )
+        return {"backfilled": backfilled, "unresolved": unresolved}
 
     # -- tests --------------------------------------------------------------
 
