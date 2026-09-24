@@ -1180,6 +1180,7 @@ def _migrate_stage_tasks(
                 current["status"] = STAGE_PENDING
         current.setdefault("attempt_count", 0)
         current.setdefault("retry_at", None)
+        current.setdefault("declared_write_set", None)
         current.setdefault("publication", None)
         current.setdefault("error", None)
         migrated.append(current)
@@ -1279,6 +1280,7 @@ def _make_stage_task(
         "applicable": applicable,
         "attempt_count": 0,
         "retry_at": None,
+        "declared_write_set": None,
         "publication": None,
         "error": None,
     }

@@ -36,6 +36,7 @@ from core.queue_state import (
     STAGE_PENDING,
     STAGE_PUBLISHED,
     STAGE_READY,
+    STAGE_READY_TO_MERGE,
     STAGE_RETRY_WAIT,
     STAGE_RUNNING,
     STAGE_SKIPPED,
@@ -84,6 +85,7 @@ from core.merge_arbitration import (
 from core.path_safety import validate_clean_target
 from core.scheduling import (
     next_affinity_task,
+    next_runnable_stage_task,
     next_runnable_task,
 )
 from core.scheduling_switches import (
@@ -1036,6 +1038,101 @@ class ARCWorkflowManager:
         # Normal completion only (cancellation re-raises through the finally):
         # the reusable subtree worktrees are no longer needed this run.
         await self._cleanup_reusable_worktrees()
+
+    async def _drain_stage_tasks(
+        self,
+        queue_state: dict[str, Any],
+        execute_stage_task: Callable[[dict[str, Any]], Awaitable[Any]],
+    ) -> None:
+        """Drain stage tasks through the bounded scheduling seam.
+
+        Stage worktree creation and publication merging are intentionally
+        supplied by the later stage-runner/merge-queue slices. This method
+        owns only the coordinator-side scheduling contract: it marks a task
+        RUNNING before execution, applies the same slot/backpressure limits to
+        every pick, and leaves successful work at READY_TO_MERGE unless the
+        executor explicitly returns a terminal publication status.
+        """
+
+        self._inflight.clear()
+        max_concurrency = self._max_concurrent_tasks()
+        in_flight: dict[asyncio.Task[Any], dict[str, Any]] = {}
+        try:
+            while True:
+                while len(in_flight) < max_concurrency:
+                    stage_task = next_runnable_stage_task(
+                        queue_state,
+                        in_flight.values(),
+                        max_in_flight=max_concurrency,
+                        stage_capacities=queue_state.get("stage_capacities"),
+                        max_ready_to_merge=queue_state.get(
+                            "stage_max_ready_to_merge", max_concurrency
+                        ),
+                    )
+                    if stage_task is None:
+                        break
+                    transition_stage_task(
+                        queue_state,
+                        stage_task["node_id"],
+                        stage_task["stage"],
+                        STAGE_RUNNING,
+                    )
+                    self._save_processing_queue(queue_state)
+                    in_flight[asyncio.create_task(execute_stage_task(stage_task))] = stage_task
+
+                if not in_flight:
+                    break
+                done, _pending = await asyncio.wait(
+                    set(in_flight), return_when=asyncio.FIRST_COMPLETED
+                )
+                for finished in done:
+                    stage_task = in_flight.pop(finished)
+                    node_id = stage_task["node_id"]
+                    stage = stage_task["stage"]
+                    try:
+                        result = finished.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        result = {"status": STAGE_FAILED, "error": str(exc) or type(exc).__name__}
+
+                    if result is False or (
+                        isinstance(result, dict)
+                        and str(result.get("status", "")).strip().upper() == STAGE_FAILED
+                    ):
+                        error = (
+                            str(result.get("error", "stage execution failed"))
+                            if isinstance(result, dict)
+                            else "stage execution failed"
+                        )
+                        fail_stage_task(
+                            queue_state,
+                            node_id,
+                            stage,
+                            error=error,
+                            on_state_change=self._upsert_node_state,
+                        )
+                    else:
+                        publication = result.get("publication") if isinstance(result, dict) else None
+                        status = (
+                            str(result.get("status", STAGE_READY_TO_MERGE)).strip().upper()
+                            if isinstance(result, dict)
+                            else STAGE_READY_TO_MERGE
+                        )
+                        transition_stage_task(
+                            queue_state,
+                            node_id,
+                            stage,
+                            status,
+                            publication=publication if isinstance(publication, dict) else None,
+                        )
+                    self._save_processing_queue(queue_state)
+        finally:
+            for pending in in_flight:
+                if not pending.done():
+                    pending.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
 
     async def _cleanup_reusable_worktrees(self) -> None:
         if self._worktree_manager is None:
