@@ -1,0 +1,301 @@
+{
+  "node_id": "REQ-1",
+  "phase_status": {
+    "design": "completed",
+    "test": "completed",
+    "implement": "in_progress"
+  },
+  "requirement_snapshot": {
+    "name": "注册旅客账号",
+    "description": "Validation 契约：应用必须支持直接访问 `/register`，首页必须提供可点击的 `Register` 链接进入该页面。注册页必须提供以下稳定且唯一的中文可访问名称，供 Playwright 使用 `getByLabel` 或 `getByRole` 定位，控件必须与对应 label 原生关联，不得依赖 CSS class、DOM 顺序或 placeholder：`用户名` 为必填文本输入框；`登录密码` 为必填密码输入框，并显示随输入动态变化的三段密码强度指示器；`确认密码` 为必填密码输入框；`证件类型` 为必填原生下拉选择框，选项包括“请选择证件类型”（初始值）、“居民身份证”、“护照”、“港澳居民来往内地通行证”、“台湾居民来往大陆通行证”和“外国人永久居留身份证”；`姓名` 为必填文本输入框；`证件号码` 为必填文本输入框；`优惠（待）类型` 为必填原生下拉选择框，初始提示为“请选择乘客类型”，选项包括“成人”、“儿童”、“学生”、“残疾军人”和“其他优惠类型”；`邮箱` 为可选 email 输入框；`国家/地区代码` 为手机号组合控件中的必填下拉选择框，默认值为 `+86`，并至少提供 `+84` 等国际区号；`手机号` 为必填文本输入框；必须有 accessible name 包含 `服务条款` 或 `隐私政策` 的必选复选框；必须有 accessible name 为 `下一步` 的提交按钮。有效数据提交后必须调用注册接口、创建登录会话并导航回 `/`，首页显示提交的用户名和 accessible name 为 `Sign out` 的退出链接，刷新后仍保持登录；缺失、格式错误、密码不一致、重复用户名或重复邮箱、未同意协议时，必须显示可见的中文错误消息，且不得创建账号或登录会话。\n实现旅客注册页面和注册接口，从首页点击 `Register` 进入。\n页面提供用户名、登录密码、确认密码、证件类型、姓名、证件号码、优惠（待）类型、邮箱、国家/地区代码、手机号、服务条款和隐私政策复选框以及“下一步”按钮。\n前端负责必填提示和基础交互，后端必须再次完成全部校验，不能依赖前端结果。\n用户名、登录密码、确认密码、证件类型、姓名、证件号码、优惠（待）类型、国家/地区代码和手机号均为必填，邮箱为可选，服务条款和隐私政策必须同意。\n姓名去除首尾空格后应包含 2–100 个非空白字符；\n证件号码只能包含 6–30 个 ASCII 字母、数字或连字符；\n证件类型必须从页面提供的有效选项中选择，优惠（待）类型必须从页面提供的有效选项中选择，手机号必须与国家/地区代码组合通过校验。\n用户名只能包含 3–32 个 ASCII 字母、数字、连字符或下划线。\n邮箱填写时必须是完整有效的地址且不超过 254 个字符。\n登录密码长度为 12–128 个字符，并至少包含大写字母、小写字母、数字和特殊字符；\n确认密码必须一致；\n用户必须接受服务条款和隐私政策。\n用户名和邮箱都必须唯一，邮箱重复判断忽略大小写。\n注册接口使用服务端生成的账号标识和会话令牌，禁止返回密码或密码摘要。\n有效提交将账号安全写入持久化文件、创建登录会话并返回首页；\n页面显示当前用户名和“退出登录”。\n任何缺失、格式错误或重复数据都显示明确错误，不得创建账号或会话。\n账号写入应采用安全的读改写流程，避免文件损坏和只写入一半的数据。\n演示数据使用唯一用户名 `tb-user-<时间戳>-<随机值>`、由该用户名生成的有效邮箱、密码 `Valid-password-123!`、姓名 `Ticket User <时间戳>-<随机值>`、证件类型 `护照`、证件号码 `P<时间戳数字>`、优惠（待）类型 `成人`、国家/地区代码 `+84` 和有效手机号 `912345678`。\n重复场景复用相同用户名或邮箱；\n无效示例包括用户名 `bad username!`、邮箱 `not-an-email`、密码 `short`、两次密码不一致、缺少证件号码或未勾选协议。\n可选视觉参考：![注册页面](./reference/register.png)",
+    "visual_reference": [
+      {
+        "image_path": "./reference/register.png",
+        "analysis": "### 1. Frontend Style Direction\n* **Colors:** Primary blue header bar (~#2E7DB2 gradient); white surface (#FFFFFF); orange accent (~#E8820C) for helper text, links, and primary button; red (~#E02020) for required-field asterisks and password-strength bar; gray placeholder text (~#999); blue links (~#3B8CD4).\n* **Typography:** System sans-serif (Chinese UI). Labels ~14–15px regular; placeholders ~14px gray; helper text ~13–14px orange; header title ~16–18px white bold.\n* **Spacing Rhythm:** Medium; form rows ~55–60px vertical rhythm; generous left/right padding inside a full-width container; fields right-aligned label column, left-aligned inputs.\n* **Overall Tone:** Classic Chinese government/enterprise service portal registration form — clean, utilitarian, high-clarity.\n\n### 2. Page Skeleton (Top to Bottom)\n* **Section: Page Card (\"Account Info\")**\n  * **Purpose:** Single-step account registration form.\n  * **Container:** Full-width card on white background, thin light-blue outer border, no shadow; top header bar with blue gradient, white title, small rounded top corners.\n  * **Children (ordered):**\n    1. **Header bar** – title text, white on blue gradient.\n    2. **Required fields group** – 8 form rows: username, login password (with strength meter), confirm password, certificate type (select), name, certificate number, passenger discount type (select).\n    3. **Dashed divider** – light gray horizontal dashed line separating required from optional group.\n    4. **Optional/contact group** – email row; phone row (country-code select + number input + orange helper text).\n    5. **Agreement row** – checkbox + agreement text with blue hyperlinks.\n    6. **Submit area** – centered orange button.\n  * **Style Notes:** Left-aligned label column with right-aligned labels; red asterisks prefix required labels; inline right-side helper text per row.\n\n### 3. Data Presentation Style\n* **Pattern Type:** Vertical label-input form (single column, centered block ~ middle of card).\n* **Visual Structure:**\n  * Each row: [required asterisk + label] → [input/select ~350–360px wide, 1px gray border, ~4px radius] → [optional orange helper text to the right].\n  * Password row includes a 3-segment horizontal strength meter (red/yellow/green segments, gray when inactive).\n  * Phone row: composite control — country-code dropdown (+86 style select) attached to a shorter number input.\n* **Field Types:** text, password, dropdown selects, email, phone number, checkbox consent.\n* **Styling Rules:** Inputs ~36–40px tall; placeholders gray; helper text inline, not stacked; label/asterisk color contrast is the main emphasis mechanism.\n* **Do Not Copy Actual Values:** Render placeholders generically; do not seed with the screenshot's specific placeholder sentences.\n\n### 4. Interaction Surfaces\n* **Primary:** Orange \"Next Step\" button — solid orange, white text, ~4–6px radius, ~150–200px wide, centered, subtle gradient.\n* **Secondary:** Text inputs and dropdowns (gray borders, white bg); password strength meter (visual feedback); agreement checkbox; blue inline hyperlinks (terms/privacy) opening dialogs or new pages.\n* **Helper text** acts as validation/format guidance adjacent to relevant inputs.\n\n### 5. Frontend Requirements Summary\n* **Must Preserve:** Blue-gradient card header; label-right / input-left alignment with inline right-side orange hints; red asterisk convention; dashed divider between required and optional sections; composite phone input (country select + number); 3-segment password strength meter; centered orange CTA.\n* **Runtime-Driven Areas:** Dropdown options (certificate types, discount types, country codes); password strength calculation; helper text driven by validation rules; link targets.\n* **Avoid:** Hardcoding the screenshot's specific placeholder strings, agreement titles, or country/option values as fixed business data.",
+        "resolved_image_path": "D:\\code\\arc-visual-reference-dict-214\\arc-bench-test\\easy-ticketbooking\\requirements\\reference\\register.png"
+      }
+    ],
+    "children_ids": [],
+    "dependencies": []
+  },
+  "recent_failure_summary": "TDD follow-up for REQ-1:\nYour previous implementation reported a test failure: (no detail provided)\n\nFollow this exact TDD sequence before declaring the fix done:\n1. Add or update a failing test (or e2e scenario) that reproduces the reported failure.\n2. Run it with `run_tests` and confirm it fails for the right reason.\n3. Modify the implementation until that test passes. Do not weaken the test to make it pass.\n4. Re-run the full test surface for this requirement (Unit -> Integration -> E2E) and confirm green.\n5. Return `IMPLEMENTED` only once every scheduled layer passes. If you cannot make it pass, keep\n   the failure recorded with an explicit reason instead of declaring success.\n\nDo not skip step 1. Do not modify tests just to silence them. Do not repeat an approach\nalready listed in the previous-round evidence above.",
+  "interfaces": [
+    {
+      "interface_id": "REQ-1-UI-RegisterPage",
+      "req_id": "REQ-1",
+      "type": "UI",
+      "name": "RegisterPage",
+      "file_path": "frontend/src/features/auth/RegisterPage.tsx",
+      "first_line": "// Skeleton only: register page shell. TODO(TDD): implement full form behavior per REQ-1.",
+      "responsibility": "注册表单页 /register：全部中文可访问名控件、三段密码强度、错误提示、提交后经 authApi 注册并跳转首页。",
+      "specification": "getByLabel/getByRole 名：用户名、登录密码、确认密码、证件类型、姓名、证件号码、优惠（待）类型、邮箱、国家/地区代码、手机号、服务条款/隐私政策复选框、下一步按钮；控件用 <label htmlFor> 原生关联；失败显示可见中文错误且不跳转。",
+      "inputs": "用户输入表单值",
+      "outputs": "调用 register()，成功 signIn + navigate('/'); 失败渲染字段错误",
+      "callers": [
+        "frontend/src/App.tsx route /register"
+      ],
+      "callees": [
+        "REQ-1-FUNC-AuthApi",
+        "REQ-1-UI-AuthProvider"
+      ],
+      "test_focus": "可访问名存在且唯一、密码强度段数随输入变化、错误消息可见、成功跳转首页",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-1-UI-AuthProvider",
+      "req_id": "REQ-1",
+      "type": "UI",
+      "name": "AuthContext/AuthProvider/useAuth",
+      "file_path": "frontend/src/features/auth/AuthContext.tsx",
+      "first_line": "// Skeleton only: AuthContext owns global authenticated session state.",
+      "responsibility": "全局登录会话状态：加载 session、signIn、signOut，供页头与注册页共享。",
+      "specification": "AuthProvider 包裹整个路由树；mount 时 fetchSession(); signIn(user) 立即更新; signOut() 调用 logoutRequest 后清空并刷新，首页显示用户名和 'Sign out' 退出链接。",
+      "inputs": "ReactNode children",
+      "outputs": "useAuth(): { user, loading, refresh, signIn, signOut }",
+      "callers": [
+        "frontend/src/App.tsx",
+        "frontend/src/features/auth/RegisterPage.tsx",
+        "frontend/src/components/layout/SiteHeader.tsx"
+      ],
+      "callees": [
+        "REQ-1-FUNC-AuthApi"
+      ],
+      "test_focus": "刷新后 session 保持；signOut 后回未登录态",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-1-FUNC-AuthApi",
+      "req_id": "REQ-1",
+      "type": "FUNC",
+      "name": "authApi client",
+      "file_path": "frontend/src/features/auth/authApi.ts",
+      "first_line": "// Skeleton only: auth API boundary. TODO(TDD): implement behavior per REQ-1.",
+      "responsibility": "注册/会话/登出的 HTTP 边界，统一字段错误结构。",
+      "specification": "register(payload)->RegisterResult {ok:true,user}|{ok:false,status,errors:FieldErrors}; fetchSession()->user|null (withCredentials); logoutRequest()->void. Field keys 与后端错误码一致。",
+      "inputs": "RegisterPayload",
+      "outputs": "RegisterResult / user|null",
+      "callers": [
+        "REQ-1-UI-RegisterPage",
+        "REQ-1-UI-AuthProvider"
+      ],
+      "callees": [
+        "REQ-1-API-Auth"
+      ],
+      "test_focus": "400/409 映射为 per-field errors；网络/axios 拦截器全局错误处理",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-1-UI-App",
+      "req_id": "REQ-1",
+      "type": "UI",
+      "name": "App routes + AuthProvider wiring",
+      "file_path": "frontend/src/App.tsx",
+      "first_line": "import { Route, Routes } from 'react-router-dom';",
+      "responsibility": "挂载 AuthProvider 与 /register 路由（共享入口的增量接线）。",
+      "specification": "<AuthProvider><Routes><Route path=\"/\" .../><Route path=\"/register\" element={<RegisterPage/>}/></Routes></AuthProvider>",
+      "inputs": "-",
+      "outputs": "路由树",
+      "callers": [
+        "frontend/src/main.tsx"
+      ],
+      "callees": [
+        "REQ-1-UI-AuthProvider",
+        "REQ-1-UI-RegisterPage"
+      ],
+      "test_focus": "/register 可直接访问且在 AuthProvider 内",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-1-UI-SiteHeader",
+      "req_id": "REQ-1",
+      "type": "UI",
+      "name": "SiteHeader auth slot",
+      "file_path": "frontend/src/components/layout/SiteHeader.tsx",
+      "first_line": "import { Link } from 'react-router-dom';",
+      "responsibility": "页头认证态：未登录显示 登录/注册（Register 链接），登录后显示用户名与 accessible name 'Sign out' 的退出链接。",
+      "specification": "使用 useAuth()；Sign out 点击调用 signOut()。保留现有导航结构，仅替换 TODO 认证槽位。",
+      "inputs": "useAuth()",
+      "outputs": "页头认证区域",
+      "callers": [
+        "frontend/src/pages/HomePage.tsx"
+      ],
+      "callees": [
+        "REQ-1-UI-AuthProvider"
+      ],
+      "test_focus": "注册后首页显示用户名 + Sign out；刷新后仍保持",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-1-API-Auth",
+      "req_id": "REQ-1",
+      "type": "API",
+      "name": "auth routes",
+      "file_path": "backend/src/routes/auth.js",
+      "first_line": "// Skeleton only: auth routes. TODO(TDD): implement behavior per REQ-1.",
+      "responsibility": "注册/会话/登出 HTTP 端点，校验错误映射与会话 cookie。",
+      "specification": "POST /api/auth/register: 201 {user:{accountId,username}} + httpOnly session cookie; 400/409 {errors:{field:CODE}}；绝不返回密码/摘要。GET /api/auth/session -> {user|null}; POST /api/auth/logout -> 204。",
+      "inputs": "JSON body（username、loginPassword、confirmPassword、certificateType、fullName、certificateNumber、passengerType、email?、countryCode、phoneNumber、acceptedTerms）",
+      "outputs": "如上 JSON 与 Set-Cookie",
+      "callers": [
+        "REQ-1-FUNC-AuthApi"
+      ],
+      "callees": [
+        "REQ-1-FUNC-AuthService"
+      ],
+      "test_focus": "supertest：有效 201+cookie；缺失/格式/重复各自错误码且无会话",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-1-FUNC-AuthService",
+      "req_id": "REQ-1",
+      "type": "FUNC",
+      "name": "authService",
+      "file_path": "backend/src/services/authService.js",
+      "first_line": "// Skeleton only: auth service. TODO(TDD): implement behavior per REQ-1.",
+      "responsibility": "服务端完整校验、唯一性检查、bcrypt 加密、事务写入 users/sessions。",
+      "specification": "registerUser 校验规则：用户名 /^[A-Za-z0-9_-]{3,32}$/ 唯一；密码 12-128 且含大小写数字特殊；确认一致；fullName trim 后 2-100 非空白；证件号 /^[A-Za-z0-9-]{6,30}$/；类型在选项内；邮箱有效≤254 且忽略大小写唯一；手机号与区号组合校验（+86: 1[3-9]\\d{9}，+84: 9-10 位）；acceptedTerms 必须。错误码：REQUIRED, INVALID_USERNAME, INVALID_PASSWORD, PASSWORD_MISMATCH, INVALID_CERTIFICATE_TYPE, INVALID_FULL_NAME, INVALID_CERTIFICATE_NUMBER, INVALID_PASSENGER_TYPE, INVALID_EMAIL, INVALID_PHONE, DUPLICATE_USERNAME, DUPLICATE_EMAIL, TERMS_NOT_ACCEPTED。",
+      "inputs": "注册 payload",
+      "outputs": "{user, errors, token}；findSessionUser(token)；deleteSession(token)",
+      "callers": [
+        "REQ-1-API-Auth"
+      ],
+      "callees": [
+        "REQ-1-DB-UsersTable",
+        "REQ-1-DB-SessionsTable"
+      ],
+      "test_focus": "每个校验规则的错误码；bcrypt 哈希不落明文；事务原子性",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-1-DB-UsersTable",
+      "req_id": "REQ-1",
+      "type": "DB",
+      "name": "users table",
+      "file_path": "backend/src/database/init_db.js",
+      "first_line": "const fs = require('fs');",
+      "responsibility": "users 持久化表与忽略大小写唯一邮箱索引（init_db 内幂等建表）。",
+      "specification": "users(id TEXT PK, username UNIQUE, email, password_hash, certificate_type, full_name, certificate_number, passenger_type, country_code, phone_number, created_at)；idx_users_email_lower ON lower(email)。",
+      "inputs": "authService 写入",
+      "outputs": "行记录",
+      "callers": [
+        "REQ-1-FUNC-AuthService"
+      ],
+      "callees": [],
+      "test_focus": "重复用户名/大小写不同邮箱触发约束；测试经 createTestDatabaseHarness 隔离",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    },
+    {
+      "interface_id": "REQ-1-DB-SessionsTable",
+      "req_id": "REQ-1",
+      "type": "DB",
+      "name": "sessions table",
+      "file_path": "backend/src/database/init_db.js",
+      "first_line": "const fs = require('fs');",
+      "responsibility": "会话令牌持久化（幂等建表）。",
+      "specification": "sessions(token TEXT PK, user_id -> users.id ON DELETE CASCADE, created_at)。令牌由服务端 crypto 生成。",
+      "inputs": "authService 写入",
+      "outputs": "会话行",
+      "callers": [
+        "REQ-1-FUNC-AuthService"
+      ],
+      "callees": [],
+      "test_focus": "session 有效期与删除；cookie 会话恢复刷新后仍登录",
+      "_existing_req_ids": [],
+      "_existing_implemented": false
+    }
+  ],
+  "materialized_files": [
+    "frontend/src/features/auth/AuthContext.tsx",
+    "frontend/src/features/auth/authApi.ts",
+    "frontend/src/features/auth/RegisterPage.tsx",
+    "frontend/src/App.tsx",
+    "frontend/src/components/layout/SiteHeader.tsx",
+    "backend/src/services/authService.js",
+    "backend/src/routes/auth.js",
+    "backend/src/app.js",
+    "backend/src/database/init_db.js"
+  ],
+  "test_contract_hooks": [
+    {
+      "kind": "role",
+      "value": "^sign out$",
+      "file_path": "backend/test-e2e/register.e2e.spec.js",
+      "source": "test_contract"
+    }
+  ],
+  "test_artifacts": [
+    {
+      "test_id": "REQ-1-UNIT-authService",
+      "req_id": "REQ-1",
+      "interface_ids": [
+        "REQ-1-FUNC-AuthService",
+        "REQ-1-DB-UsersTable",
+        "REQ-1-DB-SessionsTable"
+      ],
+      "coverage_scope": "owned",
+      "type": "Unit",
+      "file_path": "backend/tests/authService.test.js",
+      "first_line": "import { describe, it, expect, beforeEach, afterEach } from 'vitest';"
+    },
+    {
+      "test_id": "REQ-1-INT-authRoutes",
+      "req_id": "REQ-1",
+      "interface_ids": [
+        "REQ-1-API-Auth"
+      ],
+      "coverage_scope": "owned",
+      "type": "Integration",
+      "file_path": "backend/tests/authRoutes.test.js",
+      "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';"
+    },
+    {
+      "test_id": "REQ-1-UNIT-registerPage",
+      "req_id": "REQ-1",
+      "interface_ids": [
+        "REQ-1-UI-RegisterPage",
+        "REQ-1-FUNC-AuthApi",
+        "REQ-1-UI-AuthProvider"
+      ],
+      "coverage_scope": "owned",
+      "type": "Unit",
+      "file_path": "frontend/tests/RegisterPage.test.tsx",
+      "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';"
+    },
+    {
+      "test_id": "REQ-1-E2E-register",
+      "req_id": "REQ-1",
+      "interface_ids": [
+        "REQ-1-UI-RegisterPage",
+        "REQ-1-UI-SiteHeader",
+        "REQ-1-UI-App",
+        "REQ-1-API-Auth"
+      ],
+      "coverage_scope": "owned",
+      "type": "E2E",
+      "file_path": "backend/test-e2e/register.e2e.spec.js",
+      "first_line": "const { test, expect } = require('@playwright/test');"
+    }
+  ],
+  "test_summary": "REQ-1 注册旅客账号 tests by layer. Unit (backend/tests/authService.test.js): every authService validation rule against an isolated test DB harness (createTestDatabaseHarness, dynamic service import after setup), including all certificate-type options, +86/+84 phone rules, case-insensitive DUPLICATE_EMAIL, bcrypt-hash persistence, and session find/delete. Integration (backend/tests/authRoutes.test.js): supertest against dynamically imported app.js — 201 + httpOnly session cookie, session restore via cookie, 400 per-field error codes with no cookie, 409 duplicates, logout clears session. Frontend unit (frontend/tests/RegisterPage.test.tsx): accessible-name contract for all requirement-declared controls, select options, +86 default / +84 availability, 3-segment password strength meter, alert-region errors, register() payload shape, navigation on success/failure (register() spied via the app's own authApi module). E2E (backend/test-e2e/register.e2e.spec.js): one test per scenario plus per-invalid-input sub-tests (never sharing leftover form state), each with unique generated identifiers, asserting visible Chinese errors via role=alert, no session created on failure (checked through /api/auth/session), duplicate username/case-different email rejection, home Register link, and refresh-persistent login with username display and exact `Sign out` link. Protected path: UI form → authApi → /api/auth/register → authService → users/sessions tables with cookie session.",
+  "design_baseline": {
+    "backend/tests/authService.test.js": "red",
+    "frontend/tests/RegisterPage.test.tsx": "red",
+    "backend/tests/authRoutes.test.js": "red",
+    "backend/test-e2e/register.e2e.spec.js": "red"
+  },
+  "resume_context": {
+    "tdd_reprompt": "TDD follow-up for REQ-1:\nYour previous implementation reported a test failure: (no detail provided)\n\nFollow this exact TDD sequence before declaring the fix done:\n1. Add or update a failing test (or e2e scenario) that reproduces the reported failure.\n2. Run it with `run_tests` and confirm it fails for the right reason.\n3. Modify the implementation until that test passes. Do not weaken the test to make it pass.\n4. Re-run the full test surface for this requirement (Unit -> Integration -> E2E) and confirm green.\n5. Return `IMPLEMENTED` only once every scheduled layer passes. If you cannot make it pass, keep\n   the failure recorded with an explicit reason instead of declaring success.\n\nDo not skip step 1. Do not modify tests just to silence them. Do not repeat an approach\nalready listed in the previous-round evidence above.",
+    "instruction": "TDD follow-up for REQ-1:\nYour previous implementation reported a test failure: (no detail provided)\n\nFollow this exact TDD sequence before declaring the fix done:\n1. Add or update a failing test (or e2e scenario) that reproduces the reported failure.\n2. Run it with `run_tests` and confirm it fails for the right reason.\n3. Modify the implementation until that test passes. Do not weaken the test to make it pass.\n4. Re-run the full test surface for this requirement (Unit -> Integration -> E2E) and confirm green.\n5. Return `IMPLEMENTED` only once every scheduled layer passes. If you cannot make it pass, keep\n   the failure recorded with an explicit reason instead of declaring success.\n\nDo not skip step 1. Do not modify tests just to silence them. Do not repeat an approach\nalready listed in the previous-round evidence above."
+  },
+  "result_state": "",
+  "merge_conflict_context": null,
+  "merge_conflict_retry_used": false
+}

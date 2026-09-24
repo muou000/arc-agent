@@ -1,0 +1,63 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/RegisterPage.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\candidate-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\candidate-rep001\frontend
+Frontend Targets:
+- tests/RegisterPage.test.tsx
+
+Exit Code: 1
+
+=== Frontend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/candidate-rep001/frontend[39m
+
+ [31m❯[39m tests/RegisterPage.test.tsx [2m([22m[2m5 tests[22m[2m | [22m[31m5 failed[39m[2m)[22m[32m 30[2mms[22m[39m
+[31m     [31m×[31m renders all requirement-declared accessible controls[39m[32m 17[2mms[22m[39m
+[31m     [31m×[31m shows a terms/privacy checkbox and submits a full valid form to register()[39m[32m 3[2mms[22m[39m
+[31m     [31m×[31m shows a three-segment password strength meter that changes with input[39m[32m 2[2mms[22m[39m
+[31m     [31m×[31m blocks submission with a visible Chinese error when required fields are missing[39m[32m 2[2mms[22m[39m
+[31m     [31m×[31m shows a visible Chinese error and does not navigate when register() fails[39m[32m 3[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m5 failed[39m[22m[90m (5)[39m
+[2m   Start at [22m 02:17:03
+[2m   Duration [22m 2.11s[2m (transform 97ms, setup 353ms, import 373ms, tests 30ms, environment 940ms)[22m
+
+
+STDERR:
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 5 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mrenders all requirement-declared accessible controls
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mshows a terms/privacy checkbox and submits a full valid form to register()
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mshows a three-segment password strength meter that changes with input
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mblocks submission with a visible Chinese error when required fields are missing
+[41m[1m FAIL [22m[49m tests/RegisterPage.test.tsx[2m > [22mRegisterPage (REQ-1-UI-RegisterPage)[2m > [22mshows a visible Chinese error and does not navigate when register() fails
+[31m[1mReferenceError[22m: strengthMeter is not defined[39m
+[36m [2m❯[22m Row src/features/auth/RegisterPage.tsx:[2m81:12[22m[39m
+    [90m 79|[39m         [33m<[39m[33mdiv[39m [33mclassName[39m[33m=[39m[32m"flex items-center gap-3"[39m[33m>[39m
+    [90m 80|[39m           [33m{[39mchildren[33m}[39m
+    [90m 81|[39m           [33m{[39mstrengthMeter[33m}[39m
+    [90m   |[39m            [31m^[39m
+    [90m 82|[39m         [33m<[39m[33m/[39m[33mdiv[39m[33m>[39m
+    [90m 83|[39m         {hint ? <p className="mt-1 text-sm text-[#E8820C]">{hint}</p> …
+[90m [2m❯[22m Object.react_stack_bottom_frame node_modules/react-dom/cjs/react-dom-client.development.js:[2m25904:20[22m[39m
+[90m [2m❯[22m renderWithHooks node_modules/react-dom/cjs/react-dom-client.development.js:[2m7662:22[22m[39m
+[90m [2m❯[22m updateFunctionComponent node_modules/react-dom/cjs/react-dom-client.development.js:[2m10166:19[22m[39m
+[90m [2m❯[22m beginWork node_modules/react-dom/cjs/react-dom-client.development.js:[2m11778:18[22m[39m
+[90m [2m❯[22m runWithFiberInDEV node_modules/react-dom/cjs/react-dom-client.development.js:[2m874:13[22m[39m
+[90m [2m❯[22m performUnitOfWork node_modules/react-dom/cjs/react-dom-client.development.js:[2m17641:22[22m[39m
+[90m [2m❯[22m workLoopSync node_modules/react-dom/cjs/react-dom-client.development.js:[2m17469:41[22m[39m
+[90m [2m❯[22m renderRootSync node_modules/react-dom/cjs/react-dom-client.development.js:[2m17450:11[22m[39m
+[90m [2m❯[22m performWorkOnRoot node_modules/react-dom/cjs/react-dom-client.development.js:[2m16583:35[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/5]⎯[22m[39m
+
+
+

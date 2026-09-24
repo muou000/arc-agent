@@ -1,0 +1,50 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- backend/tests/authService.test.js
+- frontend/tests/RegisterPage.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\candidate-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\candidate-rep001\frontend
+Backend Targets:
+- tests/authService.test.js
+Frontend Targets:
+- tests/RegisterPage.test.tsx
+
+Exit Code: 0
+
+=== Backend Vitest Batch ===
+Exit Code: 0
+STDOUT:
+
+[1m[46m RUN [49m[22m [36mv4.0.17 [39m[90mD:/code/.arc-eval-214/candidate-rep001/backend[39m
+
+ [32m✓[39m tests/authService.test.js [2m([22m[2m26 tests[22m[2m)[22m[33m 1411[2mms[22m[39m
+       [33m[2m✓[22m[39m accepts every certificate type offered by the page [33m 306[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m26 passed[39m[22m[90m (26)[39m
+[2m   Start at [22m 02:31:33
+[2m   Duration [22m 1.68s[2m (transform 36ms, setup 0ms, import 60ms, tests 1.41s, environment 0ms)[22m
+
+
+
+
+=== Frontend Vitest Batch ===
+Exit Code: 0
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/candidate-rep001/frontend[39m
+
+ [32m✓[39m tests/RegisterPage.test.tsx [2m([22m[2m5 tests[22m[2m)[22m[33m 4855[2mms[22m[39m
+     [33m[2m✓[22m[39m shows a terms/privacy checkbox and submits a full valid form to register() [33m 2363[2mms[22m[39m
+     [33m[2m✓[22m[39m shows a visible Chinese error and does not navigate when register() fails [33m 2064[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m5 passed[39m[22m[90m (5)[39m
+[2m   Start at [22m 02:31:36
+[2m   Duration [22m 6.77s[2m (transform 95ms, setup 352ms, import 376ms, tests 4.85s, environment 946ms)[22m
+
+
+

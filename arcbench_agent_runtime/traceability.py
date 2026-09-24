@@ -33,6 +33,29 @@ def _as_str_list(value: Any) -> list[str]:
     return [str(item).strip() for item in _as_list(value) if str(item).strip()]
 
 
+def _as_visual_reference_list(value: Any) -> list[str | dict[str, Any]]:
+    """Normalize ``visual_reference`` while keeping dict entries intact (#214).
+
+    The visual analysis path attaches structured payloads
+    (``image_path``/``analysis``); coercing them through ``str()`` turned the
+    dicts into Python repr strings on persist, which starved the context
+    pipeline's visual digest (it filters for dict entries) and leaked repr
+    text into the requirement snapshot. Dict entries are stored verbatim so
+    they round-trip; plain string entries (bare image paths from the
+    requirements tree) keep the string-list semantics.
+    """
+
+    items: list[str | dict[str, Any]] = []
+    for item in _as_list(value):
+        if isinstance(item, dict):
+            items.append(dict(item))
+            continue
+        text = str(item).strip()
+        if text:
+            items.append(text)
+    return items
+
+
 def _as_optional_str(value: Any) -> str | None:
     normalized = str(value or "").strip()
     return normalized or None
@@ -67,7 +90,7 @@ class RequirementRecord:
     req_id: str
     name: str = ""
     description: str = ""
-    visual_reference: list[str] | None = None
+    visual_reference: list[str | dict[str, Any]] | None = None
     scenarios: list[dict[str, Any]] | None = None
     parent_id: str | None = None
     children_ids: list[str] | None = None
@@ -185,7 +208,7 @@ class TraceabilityStore:
                 "id": req_id,
                 "name": str(node.get("name") or "").strip(),
                 "description": str(node.get("description") or "").strip(),
-                "visual_reference": _as_str_list(node.get("visual_reference")),
+                "visual_reference": _as_visual_reference_list(node.get("visual_reference")),
                 "scenarios": node_scenarios,
                 "parent_id": _as_optional_str(parent_id),
                 "children_ids": children_ids,
@@ -239,7 +262,7 @@ class TraceabilityStore:
         req_id: str,
         name: str = "",
         description: str = "",
-        visual_reference: list[str] | None = None,
+        visual_reference: list[str | dict[str, Any]] | None = None,
         scenarios: list[dict[str, Any]] | None = None,
         parent_id: str | None = None,
         children_ids: list[str] | None = None,
@@ -256,7 +279,7 @@ class TraceabilityStore:
                 "req_id": normalized_req_id,
                 "name": str(name or "").strip(),
                 "description": str(description or "").strip(),
-                "visual_reference": _as_str_list(visual_reference),
+                "visual_reference": _as_visual_reference_list(visual_reference),
                 "scenarios": normalized_scenarios,
                 "parent_id": _as_optional_str(parent_id),
                 "children_ids": _as_str_list(children_ids),
@@ -289,7 +312,7 @@ class TraceabilityStore:
             req_id=req_id,
             name=str(merged.get("name") or "").strip(),
             description=str(merged.get("description") or "").strip(),
-            visual_reference=_as_str_list(merged.get("visual_reference")),
+            visual_reference=_as_visual_reference_list(merged.get("visual_reference")),
             scenarios=_as_list(merged.get("scenarios")),
             parent_id=merged.get("parent_id"),
             children_ids=_as_str_list(merged.get("children_ids")),

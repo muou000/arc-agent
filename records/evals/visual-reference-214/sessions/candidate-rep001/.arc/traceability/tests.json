@@ -1,0 +1,57 @@
+{
+  "REQ-1-E2E-register": {
+    "test_id": "REQ-1-E2E-register",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-UI-RegisterPage",
+      "REQ-1-UI-SiteHeader",
+      "REQ-1-UI-App",
+      "REQ-1-API-Auth"
+    ],
+    "type": "E2E",
+    "file_path": "backend/test-e2e/register.e2e.spec.js",
+    "passed": null,
+    "first_line": "const { test, expect } = require('@playwright/test');",
+    "scenario_id": null
+  },
+  "REQ-1-INT-authRoutes": {
+    "test_id": "REQ-1-INT-authRoutes",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-API-Auth"
+    ],
+    "type": "Integration",
+    "file_path": "backend/tests/authRoutes.test.js",
+    "passed": null,
+    "first_line": "import { describe, it, expect, beforeAll, afterAll } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-1-UNIT-authService": {
+    "test_id": "REQ-1-UNIT-authService",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-FUNC-AuthService",
+      "REQ-1-DB-UsersTable",
+      "REQ-1-DB-SessionsTable"
+    ],
+    "type": "Unit",
+    "file_path": "backend/tests/authService.test.js",
+    "passed": null,
+    "first_line": "import { describe, it, expect, beforeEach, afterEach } from 'vitest';",
+    "scenario_id": null
+  },
+  "REQ-1-UNIT-registerPage": {
+    "test_id": "REQ-1-UNIT-registerPage",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-UI-RegisterPage",
+      "REQ-1-FUNC-AuthApi",
+      "REQ-1-UI-AuthProvider"
+    ],
+    "type": "Unit",
+    "file_path": "frontend/tests/RegisterPage.test.tsx",
+    "passed": null,
+    "first_line": "import { describe, it, expect, vi, beforeEach } from 'vitest';",
+    "scenario_id": null
+  }
+}

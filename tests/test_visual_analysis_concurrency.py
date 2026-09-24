@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from core import visual_analysis
-from core.service import configure_runtime, reset_runtime_for_tests
+from core.service import configure_runtime, get_runtime, reset_runtime_for_tests
 
 
 @pytest.fixture
@@ -106,6 +106,14 @@ def test_visual_analyses_fan_out_by_default(
     references = result["visual_reference"]
     assert [payload["image_path"] for payload in references] == names
     assert [payload["analysis"] for payload in references] == [f"analysis:{name}" for name in names]
+    # The persist path (#214) must keep the dict payloads: the requirement row
+    # read back from the store still carries image_path/analysis entries, not
+    # their str() reprs.
+    stored = get_runtime().traceability.get_requirement("req-1") or {}
+    assert stored["visual_reference"] == [
+        {"image_path": name, "analysis": f"analysis:{name}", "resolved_image_path": str(visual_workspace["requirements_dir"] / name)}
+        for name in names
+    ]
     cache = visual_analysis._load_visual_cache(str(visual_workspace["workspace"]))
     assert len(cache) == len(names)
     assert not [status for _, status in logs if status == "error"]

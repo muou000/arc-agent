@@ -1,0 +1,80 @@
+Runner: Vitest
+Batch Test Type: Integration
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- backend/tests/authRoutes.test.js
+- backend/tests/authService.test.js
+- backend/tests/accountsRepository.test.js
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Backend Targets:
+- tests/authRoutes.test.js
+- tests/authService.test.js
+- tests/accountsRepository.test.js
+
+Exit Code: 1
+
+=== Backend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/backend[39m
+
+ [31m❯[39m tests/accountsRepository.test.js [2m([22m[2m8 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[32m 292[2mms[22m[39m
+[31m     [31m×[31m creates an account with a session and returns no password hash[39m[32m 53[2mms[22m[39m
+     [32m✓[39m finds accounts by username case-insensitively[32m 32[2mms[22m[39m
+     [32m✓[39m finds accounts by email ignoring case[32m 32[2mms[22m[39m
+     [32m✓[39m returns null for unknown username or email[32m 26[2mms[22m[39m
+     [32m✓[39m rejects duplicate usernames case-insensitively[32m 32[2mms[22m[39m
+     [32m✓[39m rejects duplicate emails case-insensitively[32m 31[2mms[22m[39m
+     [32m✓[39m authenticates a session token and deletes the session[32m 46[2mms[22m[39m
+     [32m✓[39m creates an additional session for an existing account[32m 38[2mms[22m[39m
+ [32m✓[39m tests/authService.test.js [2m([22m[2m7 tests[22m[2m)[22m[33m 418[2mms[22m[39m
+ [31m❯[39m tests/authRoutes.test.js [2m([22m[2m9 tests[22m[2m | [22m[31m2 failed[39m[2m)[22m[33m 394[2mms[22m[39m
+[31m     [31m×[31m registers a valid account, sets the session cookie and returns the account without secrets[39m[32m 115[2mms[22m[39m
+     [32m✓[39m returns per-field validation codes and creates no session for invalid input[32m 6[2mms[22m[39m
+     [32m✓[39m rejects duplicate username case-insensitively with a DUPLICATE_ code[32m 9[2mms[22m[39m
+     [32m✓[39m rejects duplicate email ignoring case with a DUPLICATE_ code[32m 8[2mms[22m[39m
+     [32m✓[39m rejects missing required fields[32m 3[2mms[22m[39m
+     [32m✓[39m returns 401 without a session[32m 4[2mms[22m[39m
+     [32m✓[39m returns 401 for an unknown token[32m 4[2mms[22m[39m
+[31m     [31m×[31m destroys the session and clears the cookie[39m[32m 4[2mms[22m
+...[OUTPUT TRUNCATED]...
+                    [31m^[39m
+    [90m 52|[39m   })[33m;[39m
+    [90m 53|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/authRoutes.test.js[2m > [22mPOST /api/auth/register (REQ-1-API-AuthRoutes)[2m > [22mregisters a valid account, sets the session cookie and returns the account without secrets
+[31m[1mAssertionError[22m: expected 'tb_session=03c295c6af72e5c18c5d6b5839…' to contain 'HttpOnly'[39m
+
+Expected: [32m"HttpOnly"[39m
+Received: [31m"tb_session=03c295c6af72e5c18c5d6b5839c68d9402fe730cf1a036250076dc94a543c67c"[39m
+
+[36m [2m❯[22m tests/authRoutes.test.js:[2m54:20[22m[39m
+    [90m 52|[39m
+    [90m 53|[39m     [35mconst[39m cookie [33m=[39m [34mextractSessionCookie[39m(res)[33m;[39m
+    [90m 54|[39m     [34mexpect[39m(cookie)[33m.[39m[34mtoContain[39m([32m'HttpOnly'[39m)[33m;[39m
+    [90m   |[39m                    [31m^[39m
+    [90m 55|[39m
+    [90m 56|[39m     const me = await request(app).get('/api/auth/me').set('Cookie', co…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/authRoutes.test.js[2m > [22mPOST /api/auth/logout (REQ-1-API-AuthRoutes)[2m > [22mdestroys the session and clears the cookie
+[31m[1mTypeError[22m: Cannot read properties of undefined (reading 'find')[39m
+[36m [2m❯[22m extractSessionCookie tests/authRoutes.test.js:[2m27:46[22m[39m
+    [90m 25|[39m
+    [90m 26|[39m [35mfunction[39m [34mextractSessionCookie[39m(response) {
+    [90m 27|[39m   const raw = response.headers['set-cookie'].find((c) => c.includes('t…
+    [90m   |[39m                                              [31m^[39m
+    [90m 28|[39m   [34mexpect[39m(raw)[33m.[39m[34mtoBeTruthy[39m()[33m;[39m
+    [90m 29|[39m   [35mreturn[39m raw[33m.[39m[34msplit[39m([32m';'[39m)[[34m0[39m][33m;[39m
+[90m [2m❯[22m tests/authRoutes.test.js:[2m114:20[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯[22m[39m
+
+
+

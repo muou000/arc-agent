@@ -1,0 +1,84 @@
+Runner: Vitest
+Batch Test Type: Unit
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/registerApi.test.ts
+- backend/tests/registerValidation.test.js
+- frontend/tests/registerValidation.test.ts
+- frontend/tests/sessionContext.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Backend Targets:
+- tests/registerValidation.test.js
+Frontend Targets:
+- tests/registerApi.test.ts
+- tests/registerValidation.test.ts
+- tests/sessionContext.test.tsx
+
+Exit Code: 1
+
+=== Backend Vitest Batch ===
+Exit Code: 0
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/backend[39m
+
+ [32m✓[39m tests/registerValidation.test.js [2m([22m[2m32 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m32 passed[39m[22m[90m (32)[39m
+[2m   Start at [22m 01:08:47
+[2m   Duration [22m 368ms[2m (transform 30ms, setup 0ms, import 56ms, tests 7ms, environment 0ms)[22m
+
+
+
+
+=== Frontend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/frontend[39m
+
+ [32m✓[39m tests/registerApi.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [31m❯[39m tests/registerValidation.test.ts [2m([22m[2m13 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[32m 9[2mms[22m[39m
+     [32m✓[39m exposes the required ID types with the placeholder first[32m 1[2mms[22m[39m
+     [32m✓[39m exposes the required passenger types with the placeholder first[32m 0[2mms[22m[39m
+     [32m✓[39m includes +86 (default) and +84 in country codes[32m 1[2mms[22m[39m
+     [32m✓[39m scores empty/weak passwords 0[32m 0[2mms[22m[39m
+[31m     [31m×[31m scores 1-3 across increasing complexity within 0..3[39m[32m 2[2mms[22m[39m
+     [32m✓[39m accepts a fully valid form[32m 0[2mms[22m[39m
+     [32m✓[39m reports required-field errors in Chinese[32m 0[2mms[22m[39m
+     [32m✓[39m mirrors backend rules for invalid values[32m 0[2mms[22m[39m
+     [32m✓[39m rejects mismatched confirm password[32m 0[2mms[22m[39m
+     [32m✓[39m rejects weak passwords[32m 0[2mms[22m[39m
+     [32m✓[39m rejects placeholder dropdown selections[32m 0[2mms[22m[39m
+     [32m✓[39m requires the agreement checkbox[32m 0[2mms[22m[39m
+     [32m✓[39m validates the phone against the selected country code[32m 0[2mms[22m[39m
+ [31m❯[39m tests/sessionContext.test.tsx [2m([22m[2m5 tests[22m[2m | [22m[31m5 failed[39m[2m)[22m[32m 25[2mms[22m[39m
+[31m     [31m×[31m starts in a loading state, then resolves to a signed-out session[39m[32m 16[2mms[22m[39m
+[31m     [31m×[31m loads the current user from GET /api/auth/me (cookie-based persistence)[39m[32m 2[2mms[22m[39m
+[31m     [31m×[31m signOut clears the shared session state[39m[32m 2[2mms[22m[39m
+[31m     [31m×[31m shows 注册 and 登录 links for guests[39m[32m 1[2mms[22m[39m
+[31m     
+...[OUTPUT TRUNCATED]...
+IL [22m[49m tests/sessionContext.test.tsx[2m > [22mSessionProvider (REQ-1-UI-SessionProvider)[2m > [22mloads the current user from GET /api/auth/me (cookie-based persistence)
+[41m[1m FAIL [22m[49m tests/sessionContext.test.tsx[2m > [22mSessionProvider (REQ-1-UI-SessionProvider)[2m > [22msignOut clears the shared session state
+[41m[1m FAIL [22m[49m tests/sessionContext.test.tsx[2m > [22mHeaderAuthSlot (REQ-1-UI-HeaderAuthSlot)[2m > [22mshows 注册 and 登录 links for guests
+[41m[1m FAIL [22m[49m tests/sessionContext.test.tsx[2m > [22mHeaderAuthSlot (REQ-1-UI-HeaderAuthSlot)[2m > [22mshows the username text and a Sign out link for signed-in users
+[31m[1mTypeError[22m: Cannot destructure property 'basename' of 'React10.useContext(...)' as it is null.[39m
+[90m [2m❯[22m LinkWithRef node_modules/react-router/dist/development/chunk-EPOLDU6W.mjs:[2m9941:11[22m[39m
+[90m [2m❯[22m Object.react_stack_bottom_frame node_modules/react-dom/cjs/react-dom-client.development.js:[2m25904:20[22m[39m
+[90m [2m❯[22m renderWithHooks node_modules/react-dom/cjs/react-dom-client.development.js:[2m7662:22[22m[39m
+[90m [2m❯[22m updateForwardRef node_modules/react-dom/cjs/react-dom-client.development.js:[2m9724:19[22m[39m
+[90m [2m❯[22m beginWork node_modules/react-dom/cjs/react-dom-client.development.js:[2m12117:18[22m[39m
+[90m [2m❯[22m runWithFiberInDEV node_modules/react-dom/cjs/react-dom-client.development.js:[2m874:13[22m[39m
+[90m [2m❯[22m performUnitOfWork node_modules/react-dom/cjs/react-dom-client.development.js:[2m17641:22[22m[39m
+[90m [2m❯[22m workLoopSync node_modules/react-dom/cjs/react-dom-client.development.js:[2m17469:41[22m[39m
+[90m [2m❯[22m renderRootSync node_modules/react-dom/cjs/react-dom-client.development.js:[2m17450:11[22m[39m
+[90m [2m❯[22m performWorkOnRoot node_modules/react-dom/cjs/react-dom-client.development.js:[2m16583:35[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/6]⎯[22m[39m
+
+
+

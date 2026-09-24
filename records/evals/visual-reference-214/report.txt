@@ -1,0 +1,10 @@
+Eval Comparisons
+  visual-reference-dict-214
+     Baseline  main-ae0b026-repr-strings
+    Candidate  pr214-dict-visual (1/1 pairs)
+    Pass rate  +0.0 pp (candidate 0.0%, baseline 0.0%)
+       Tokens  +5239823.0 (candidate 28383957.0, baseline 23144134.0)
+    Cache hit  -0.7 pp (candidate 97.7%, baseline 98.4%)
+      Latency  -1107297.7ms (candidate 3359811.3ms, baseline 4467108.9ms)
+  Latency p95  candidate 3359811.3ms (n=1), baseline 4467108.9ms (n=1)
+    Est. cost  +¥0.0000 (candidate ¥0.0000, baseline ¥0.0000)

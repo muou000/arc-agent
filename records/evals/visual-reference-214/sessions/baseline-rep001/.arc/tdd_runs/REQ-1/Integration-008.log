@@ -1,0 +1,28 @@
+Runner: Vitest
+Batch Test Type: Integration
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/homePage.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Frontend Targets:
+- tests/homePage.test.tsx
+
+Exit Code: 0
+
+=== Frontend Vitest Batch ===
+Exit Code: 0
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/frontend[39m
+
+ [32m✓[39m tests/homePage.test.tsx [2m([22m[2m2 tests[22m[2m)[22m[32m 133[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m2 passed[39m[22m[90m (2)[39m
+[2m   Start at [22m 01:56:31
+[2m   Duration [22m 1.99s[2m (transform 107ms, setup 388ms, import 127ms, tests 133ms, environment 1.04s)[22m
+
+
+

@@ -1,0 +1,132 @@
+{
+  "REQ-1-E2E-Register": {
+    "test_id": "REQ-1-E2E-Register",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-API-AuthRoutes",
+      "REQ-1-UI-RegisterPage",
+      "REQ-1-UI-HomePage",
+      "REQ-1-UI-SessionProvider"
+    ],
+    "type": "E2E",
+    "file_path": "backend/test-e2e/register.e2e.spec.js",
+    "passed": null,
+    "first_line": "// REQ-1 E2E: passenger registration flows against the backend-hosted app.",
+    "scenario_id": null
+  },
+  "REQ-1-Integration-AccountsRepository": {
+    "test_id": "REQ-1-Integration-AccountsRepository",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-FUNC-AccountsRepository"
+    ],
+    "type": "Integration",
+    "file_path": "backend/tests/accountsRepository.test.js",
+    "passed": null,
+    "first_line": "// REQ-1 backend service: registration validation.",
+    "scenario_id": null
+  },
+  "REQ-1-Integration-AuthRoutes": {
+    "test_id": "REQ-1-Integration-AuthRoutes",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-API-AuthRoutes",
+      "REQ-1-FUNC-App"
+    ],
+    "type": "Integration",
+    "file_path": "backend/tests/authRoutes.test.js",
+    "passed": null,
+    "first_line": "// REQ-1 API: POST /api/auth/register, GET /api/auth/me, POST /api/auth/logout.",
+    "scenario_id": null
+  },
+  "REQ-1-Integration-AuthService": {
+    "test_id": "REQ-1-Integration-AuthService",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-FUNC-AuthService",
+      "REQ-1-FUNC-AccountsRepository"
+    ],
+    "type": "Integration",
+    "file_path": "backend/tests/authService.test.js",
+    "passed": null,
+    "first_line": "// REQ-1 auth service: account creation + session lifecycle.",
+    "scenario_id": null
+  },
+  "REQ-1-Integration-HomePage": {
+    "test_id": "REQ-1-Integration-HomePage",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-UI-HomePage",
+      "REQ-1-UI-App",
+      "REQ-1-UI-HeaderAuthSlot"
+    ],
+    "type": "Integration",
+    "file_path": "frontend/tests/homePage.test.tsx",
+    "passed": null,
+    "first_line": "// REQ-1 frontend: shared home page composition test.",
+    "scenario_id": null
+  },
+  "REQ-1-Integration-RegisterPage": {
+    "test_id": "REQ-1-Integration-RegisterPage",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-UI-RegisterPage",
+      "REQ-1-UI-ID-TYPES",
+      "REQ-1-FUNC-RegisterApi"
+    ],
+    "type": "Integration",
+    "file_path": "frontend/tests/RegisterPage.test.tsx",
+    "passed": null,
+    "first_line": "// REQ-1: passenger registration page.",
+    "scenario_id": null
+  },
+  "REQ-1-Unit-RegisterApi": {
+    "test_id": "REQ-1-Unit-RegisterApi",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-FUNC-RegisterApi"
+    ],
+    "type": "Unit",
+    "file_path": "frontend/tests/registerApi.test.ts",
+    "passed": null,
+    "first_line": "// REQ-1 frontend API client for auth endpoints.",
+    "scenario_id": null
+  },
+  "REQ-1-Unit-RegisterValidation": {
+    "test_id": "REQ-1-Unit-RegisterValidation",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-FUNC-RegisterValidation"
+    ],
+    "type": "Unit",
+    "file_path": "backend/tests/registerValidation.test.js",
+    "passed": null,
+    "first_line": "// REQ-1 backend service: registration validation.",
+    "scenario_id": null
+  },
+  "REQ-1-Unit-RegisterValidation-Frontend": {
+    "test_id": "REQ-1-Unit-RegisterValidation-Frontend",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-UI-ID-TYPES"
+    ],
+    "type": "Unit",
+    "file_path": "frontend/tests/registerValidation.test.ts",
+    "passed": null,
+    "first_line": "// REQ-1 frontend: register form validation + password strength helpers.",
+    "scenario_id": null
+  },
+  "REQ-1-Unit-SessionContext": {
+    "test_id": "REQ-1-Unit-SessionContext",
+    "req_id": "REQ-1",
+    "interface_ids": [
+      "REQ-1-UI-SessionProvider",
+      "REQ-1-UI-HeaderAuthSlot"
+    ],
+    "type": "Unit",
+    "file_path": "frontend/tests/sessionContext.test.tsx",
+    "passed": null,
+    "first_line": "// REQ-1 frontend: shared session state.",
+    "scenario_id": null
+  }
+}

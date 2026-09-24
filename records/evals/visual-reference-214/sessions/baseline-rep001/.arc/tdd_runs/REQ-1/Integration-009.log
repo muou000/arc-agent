@@ -1,0 +1,86 @@
+Runner: Vitest
+Batch Test Type: Integration
+Web Port: 3301
+Base URL: http://localhost:3301
+Requested Test Files:
+- frontend/tests/RegisterPage.test.tsx
+Backend Working Directory: D:\code\.arc-eval-214\baseline-rep001\backend
+Frontend Working Directory: D:\code\.arc-eval-214\baseline-rep001\frontend
+Frontend Targets:
+- tests/RegisterPage.test.tsx
+
+Exit Code: 1
+
+=== Frontend Vitest Batch ===
+Exit Code: 1
+STDOUT:
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/code/.arc-eval-214/baseline-rep001/frontend[39m
+
+ [31m❯[39m tests/RegisterPage.test.tsx [2m([22m[2m7 tests[22m[2m | [22m[31m7 failed[39m[2m)[22m[33m 1310[2mms[22m[39m
+[31m     [31m×[31m renders every required control with its stable Chinese accessible name[39m[32m 44[2mms[22m[39m
+[31m     [31m×[31m shows the three-segment password strength meter reacting to input[39m[32m 14[2mms[22m[39m
+[31m     [31m×[31m blocks submission and shows role=alert Chinese errors when required fields are missing[39m[33m 1165[2mms[22m[39m
+[31m     [31m×[31m blocks submission when passwords do not match[39m[32m 21[2mms[22m[39m
+[31m     [31m×[31m blocks submission when the agreement is unchecked even with valid data[39m[32m 18[2mms[22m[39m
+[31m     [31m×[31m calls register with the payload, refreshes the session and navigates to / on success[39m[32m 22[2mms[22m[39m
+[31m     [31m×[31m renders backend field errors without navigating on duplicate username[39m[32m 23[2mms[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m7 failed[39m[22m[90m (7)[39m
+[2m   Start at [22m 01:56:38
+[2m   Duration [22m 3.25s[2m (transform 116ms, setup 396ms, import 258ms, tests 1.31s, environment 1.01s)[22m
+
+
+STDERR:
+[90mstderr[2m | tests/RegisterPage.test.tsx[2m > [22m[2mRegisterPage accessible-name contract (REQ-1-UI-RegisterPage)[2m > [22m[2mrenders every required control with its stable Chinese accessible name
+[22m[39mAn update to SessionProvider inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-a
+...[OUTPUT TRUNCATED]...
+an>[39m
+            [36m</li>[39m
+            [36m<li[39m
+              [33mclass[39m=[32m"flex flex-1 items-center justify-center gap-1 border-r border-blue-400/40 text-sm last:border-r-0"[39m
+            [36m>[39m
+              [36m<span>[39m
+                [0m时刻表[0m
+              [36m</span>[39m
+              [36m<span[39m
+                [33maria-hidden[39m=[32m"true"[39m
+                [33mclass[39m=[32m"text-xs opacity-80"[39m
+              [36m>[39m
+                [0m▾[0m
+              [36m</span>[39m
+            [36m</li>[39m
+            [36m<li[39m
+              [33mclass[39m=[32m"flex flex-1 items-center justify-center gap-1 border-r border-blue-400/40 text-sm last:border-r-0"[39m
+            [36m>[39m
+              [36m<span>[39m
+                [0m帮助[0m
+              [36m</span>[39m
+              ...
+[90m [2m❯[22m Object.getElementError node_modules/@testing-library/dom/dist/config.js:[2m37:19[22m[39m
+[90m [2m❯[22m getAllByLabelText node_modules/@testing-library/dom/dist/queries/label-text.js:[2m111:38[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/dom/dist/query-helpers.js:[2m52:17[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/dom/dist/query-helpers.js:[2m95:19[22m[39m
+[36m [2m❯[22m fillValidForm tests/RegisterPage.test.tsx:[2m51:26[22m[39m
+    [90m 49|[39m
+    [90m 50|[39m [35masync[39m [35mfunction[39m [34mfillValidForm[39m(user) {
+    [90m 51|[39m   [35mawait[39m user[33m.[39m[34mtype[39m(screen[33m.[39m[34mgetByLabelText[39m([32m'用户名'[39m)[33m,[39m [32m'tb-user-1'[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m 52|[39m   await user.type(screen.getByLabelText('登录密码'), 'Valid-password-123!'…
+    [90m 53|[39m   await user.type(screen.getByLabelText('确认密码'), 'Valid-password-123!'…
+[90m [2m❯[22m tests/RegisterPage.test.tsx:[2m179:11[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/7]⎯[22m[39m
+
+
+
