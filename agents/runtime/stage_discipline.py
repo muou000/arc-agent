@@ -749,11 +749,11 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         args = request.tool_call.get("args", {}) or {}
         path = _discipline_path(args)
         if name in _VALIDATION_TOOLS:
-            if _tool_result_failed(result):
+            if _tool_result_failed(result, tool=name):
                 self._validation_failed = True
                 self._failed_paths.update(self._written_paths)
             return
-        if _tool_result_failed(result):
+        if _tool_result_failed(result, tool=name):
             if path:
                 self._failed_paths.add(path)
                 # A failed write consumed budget at validation time; release
@@ -847,7 +847,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         name = str(request.tool_call.get("name", ""))
         if name not in _FILE_WRITE_TOOLS and name not in _ADDITIVE_FILE_WRITE_TOOLS:
             return result
-        if _tool_result_failed(result):
+        if _tool_result_failed(result, tool=name):
             return result
         path = _discipline_path(request.tool_call.get("args", {}) or {})
         if not path or not isinstance(result, ToolMessage) or not isinstance(result.content, str):
@@ -921,11 +921,36 @@ def _ranges_overlap(start: int, end: int, other_start: int, other_end: int) -> b
     return start < other_end and other_start < end
 
 
-def _tool_result_failed(result: ToolMessage | Any) -> bool:
+#: Tools whose result text is content the call fetched (file bodies, search
+#: matches, directory listings). deepagents renders these tools' own failures
+#: as ``ToolMessage(status="error")``, so their text is never a failure
+#: signal: "Exit Code: 1" inside a read of a build log says the *file*
+#: contains the marker, not that the read failed (arc-output-serial-4 REQ-1
+#: recorded exactly that read as a failed round-trip).
+_CONTENT_FETCH_TOOLS = frozenset({"ls", "read_file", "glob", "grep"})
+
+#: Tools whose rendered result text is an execution verdict the tool itself
+#: computed (process exit-code transcripts). The exit-code scan in
+#: ``_tool_result_failed`` applies only to these — for any other tool the
+#: same text would be content or receipt, not a verdict.
+_EXECUTION_VERDICT_TOOLS = frozenset({"run_build", "run_tests", "install_dependencies"})
+
+
+def _tool_result_failed(result: ToolMessage | Any, *, tool: str = "") -> bool:
+    """Whether a tool result represents a failed operation.
+
+    ``tool`` names the tool that produced the result; callers with a tool
+    name must pass it so the scan is narrowed by what the result text means
+    (fetched content vs. computed verdict). The empty default keeps the
+    conservative scan for callers without a name.
+    """
+
     if isinstance(result, ToolMessage) and result.status == "error":
         return True
     content = str(getattr(result, "content", "") or "")
-    if "Exit Code:" in content:
+    if tool in _CONTENT_FETCH_TOOLS:
+        return False
+    if tool in _EXECUTION_VERDICT_TOOLS and "Exit Code:" in content:
         # One tool result can carry several exit-code segments (run_build
         # renders the frontend and backend builds back to back), so "any
         # Exit Code: 0 present" let a failed half hide behind a passing one.

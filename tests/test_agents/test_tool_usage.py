@@ -164,6 +164,91 @@ def test_string_content_with_all_zero_exit_codes_is_recorded_as_ok() -> None:
     assert records[0].status == "ok"
 
 
+def test_read_of_log_with_failure_markers_is_recorded_as_ok() -> None:
+    # arc-output-serial-4 REQ-1: the 21:41:19 read_file of Integration-008.log
+    # returned its 6419 chars fine but was recorded status=error because the
+    # log text holds build-failure markers. A read's result text is the file's
+    # content, not a verdict the tool computed — the same transcription
+    # run_build produces (MIXED_BUILD_RESULT) reads as ok when it is what a
+    # read or a grep fetched.
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    middleware.wrap_tool_call(
+        make_request("read_file", {"file_path": "/workspace/Integration-008.log"}),
+        lambda request: ToolMessage(
+            content=MIXED_BUILD_RESULT, name="read_file", tool_call_id=request.tool_call["id"]
+        ),
+    )
+    middleware.wrap_tool_call(
+        make_request("grep", {"query": "Exit Code"}),
+        lambda request: ToolMessage(
+            content="/workspace/Integration-008.log:2: Exit Code: 1", name="grep", tool_call_id=request.tool_call["id"]
+        ),
+    )
+
+    assert [(record.tool, record.status) for record in records] == [("read_file", "ok"), ("grep", "ok")]
+
+
+def test_read_whose_content_starts_with_an_error_line_is_recorded_as_ok() -> None:
+    # Full content-fetch exemption: the result text is the file's body
+    # (line-numbered or verbatim, depending on the renderer), so even a file
+    # that opens with an error line cannot make the read itself a failure —
+    # deepagents marks read failures with ToolMessage status instead.
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    middleware.wrap_tool_call(
+        make_request("read_file", {"file_path": "/workspace/build.log"}),
+        lambda request: ToolMessage(
+            content="Error: build failed\nExit Code: 1\nSTDERR:\n...", name="read_file", tool_call_id=request.tool_call["id"]
+        ),
+    )
+
+    assert records[0].status == "ok"
+
+
+def test_failed_read_is_still_recorded_as_error() -> None:
+    # The narrowing only lifts content-inherited markers: a read that itself
+    # failed keeps its ToolMessage error status.
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    middleware.wrap_tool_call(
+        make_request("read_file", {"file_path": "/workspace/missing.log"}),
+        lambda request: ToolMessage(
+            content="Error: file not found",
+            name="read_file",
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        ),
+    )
+
+    assert records[0].status == "error"
+
+
+def test_run_tests_failure_output_is_recorded_as_error() -> None:
+    # run_tests carries the execution verdict: its failure transcript must
+    # stay status=error under the aggregate reading (#196), unchanged by the
+    # read-class narrowing (#220).
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+
+    middleware.wrap_tool_call(
+        make_request("run_tests"),
+        lambda request: ToolMessage(
+            content="Exit Code: 1\nSTDERR:\n2 failed, 3 passed in 1.2s", name="run_tests", tool_call_id=request.tool_call["id"]
+        ),
+    )
+
+    assert records[0].tool == "run_tests"
+    assert records[0].status == "error"
+
+
 def test_string_content_without_exit_code_is_recorded_as_ok() -> None:
     # Fail-open: text with no parseable exit-code segment keeps the old
     # ok-by-default reading (only Error-prefixed text reads as failed).

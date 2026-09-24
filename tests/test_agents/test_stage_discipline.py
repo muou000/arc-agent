@@ -254,6 +254,29 @@ def test_failed_read_unlocks_the_path_beyond_the_read_budget() -> None:
     assert run(middleware, make_request("read_file", read, call_id="r5")).content == "ok"
 
 
+def test_read_with_failure_markers_in_content_does_not_unlock_the_path() -> None:
+    # arc-output-serial-4 REQ-1 (issue #220): a successful read of a log whose
+    # text holds "Exit Code: 1" was judged by the failure predicate like a
+    # failed operation, which silently released the path's locks. A read that
+    # returned its content fine is not the failed file operation that unlocks.
+    middleware = make("implementation")
+    path = "/workspace/Integration-008.log"
+    read = {"file_path": path, "offset": 0, "limit": 100}
+    run(middleware, make_request("read_file", read, call_id="r1"))
+    run(middleware, make_request("read_file", read, call_id="r2"))
+    run(middleware, make_request("read_file", read, call_id="r3"))
+    blocked = run(middleware, make_request("read_file", read, call_id="r4"))
+    assert blocked.status == "error"
+
+    middleware._record_result(
+        make_request("read_file", read),
+        ToolMessage(content=MIXED_BUILD_RESULT, name="read_file", tool_call_id="t0"),
+    )
+    # The same text inside a run_tests result still unlocks (the verdict
+    # tools keep the aggregate reading); the read's does not.
+    assert run(middleware, make_request("read_file", read, call_id="r5")).status == "error"
+
+
 def test_validation_failure_unlocks_re_reads_beyond_the_budget() -> None:
     middleware = make("implementation")
     path = "/workspace/src/calc.py"
