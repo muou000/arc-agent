@@ -256,7 +256,30 @@ def _iter_tool_usage_events(path: Path) -> Iterator[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
             if isinstance(record, dict) and record.get("type") == "tool_usage":
+                _normalize_tool_path_audit(record)
                 yield record
+
+
+def _normalize_tool_path_audit(record: dict[str, Any]) -> None:
+    """Normalize optional virtual-path audit fields without changing totals.
+
+    Older ``tool_usage`` events do not carry these fields. Newer events may
+    carry the raw request, its classification, and the path passed to the
+    filesystem tool; the usage reader keeps those fields typed and available
+    to downstream readers while the existing aggregate buckets remain stable.
+    """
+
+    detail = record.get("detail")
+    if not isinstance(detail, dict):
+        return
+    if not any(field in detail for field in ("requested_path", "path_classification", "execution_path")):
+        return
+
+    for field in ("requested_path", "execution_path"):
+        value = detail.get(field)
+        detail[field] = str(value).strip() or None if value is not None else None
+    classification = detail.get("path_classification")
+    detail["path_classification"] = str(classification).strip() if classification is not None else ""
 
 
 def _accumulate_tool(bucket: dict[str, Any], record: dict[str, Any]) -> None:

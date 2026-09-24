@@ -25,7 +25,7 @@ python arc_main.py usage --project-dir path/to/output --json   # 机读 JSON
 
 ### `tool_usage` 事件与浪费信号
 
-agent 的每次工具往返（含被 stage discipline 拦截的调用）同样写入 `runner-events.jsonl`（`tool_usage` 事件：`tool` / `status`（`ok`、`error`、`blocked`）/ `detail`（文件路径、`read_file` 的 `offset`/`limit`、结果字符数与是否为空））。`usage` 命令聚合出每节点 / 每工具的往返次数，以及两个浪费信号：`unpaged_reads`（未带 `limit` 的整文件读取）和 `empty_results`（成功但返回为空，即无效 grep/读取），用于定位"全量读大文件""无效搜索"这类可修复的往返浪费。
+agent 的每次工具往返（含被 stage discipline 拦截的调用）同样写入 `runner-events.jsonl`（`tool_usage` 事件：`tool` / `status`（`ok`、`error`、`blocked`）/ `detail`（文件路径、`read_file` 的 `offset`/`limit`、结果字符数与是否为空））。文件工具若收到已知项目根但缺少 `/workspace` 前缀（例如 `/frontend/...` 或 `/backend/...`），会在安全条件下执行归一化；这类调用的 `detail` 还保留 `requested_path`、`path_classification` 和 `execution_path`，便于审计原始请求、分类结果和实际执行路径。宿主绝对路径、越界路径和其他 workspace 根不会被归一化。`usage` 命令聚合出每节点 / 每工具的往返次数，以及两个浪费信号：`unpaged_reads`（未带 `limit` 的整文件读取）和 `empty_results`（成功但返回为空，即无效 grep/读取），用于定位"全量读大文件""无效搜索"这类可修复的往返浪费。
 
 ### `layer_reverify` 事件与 TDD 迟到修复复验
 

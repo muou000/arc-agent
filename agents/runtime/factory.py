@@ -26,6 +26,7 @@ from agents.runtime.filesystem_adapters import (
 )
 from agents.runtime.stage_discipline import StageDisciplineMiddleware
 from agents.runtime.tool_usage import ToolUsageMiddleware
+from agents.runtime.virtual_paths import VirtualWorkspacePathMiddleware, project_roots_for_workspace
 from agents.tools.file_append import build_append_file_tool
 
 if TYPE_CHECKING:
@@ -444,10 +445,10 @@ def build_stage_agent(
     worktree. ``None`` (serial mode, non-worktree agents, feature off)
     mounts nothing.
 
-    Filesystem behaviors (delete not-found precedence, permission-denied
-    hints, Windows extended-path compatibility) are wired as build-time
-    adapters from ``agents.runtime.filesystem_adapters`` — the build path
-    never rewrites upstream classes or module attributes.
+    Filesystem behaviors (virtual-path normalization, delete not-found
+    precedence, permission-denied hints, Windows extended-path compatibility)
+    are wired as build-time adapters. The build path never rewrites upstream
+    classes or module attributes.
     """
 
     resolved_checkpointer = get_checkpointer() if checkpointer is _UNSET else checkpointer
@@ -508,6 +509,11 @@ def build_stage_agent(
         workspace_root=str(root),
     )
     middleware: list[Any] = [
+        # Normalize the small set of known project roots before stage
+        # discipline and filesystem permissions inspect the call. The
+        # middleware also exposes the raw/resolved path pair to tool usage
+        # observability.
+        VirtualWorkspacePathMiddleware(project_roots=project_roots_for_workspace(root)),
         ToolUsageMiddleware(),
         TruncatedToolCallGuardMiddleware(),
         ToolArgumentSanitizerMiddleware(),

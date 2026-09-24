@@ -81,6 +81,9 @@ def _make_tool_usage_sink(runtime: AgentRuntime) -> Any:
             offset=record.offset,
             limit=record.limit,
             result_chars=record.result_chars,
+            requested_path=record.requested_path,
+            path_classification=record.path_classification,
+            execution_path=record.execution_path,
         )
 
     return sink

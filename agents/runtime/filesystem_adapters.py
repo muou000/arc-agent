@@ -105,8 +105,10 @@ if TYPE_CHECKING:
 _PERMISSION_DENIED_PREFIX = "Error: permission denied for "
 _PERMISSION_DENIED_HINT = (
     " (ARC virtual filesystem: address files as /workspace/<path> for the "
-    "generated app and /skills/<name>/SKILL.md for attached skills; host or "
-    "relative paths are not valid tool paths.)"
+    "generated app and /skills/<name>/SKILL.md for attached skills. Known "
+    "project roots such as /frontend/... and /backend/... are normalized "
+    "when safe; host absolute, traversal, other-workspace, and unknown "
+    "relative roots remain invalid.)"
 )
 
 

@@ -14,7 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from arcbench_agent_runtime.usage import aggregate_llm_usage, aggregate_tool_usage, empty_tool_bucket, empty_usage_bucket
+from arcbench_agent_runtime.usage import (
+    _iter_tool_usage_events,
+    aggregate_llm_usage,
+    aggregate_tool_usage,
+    empty_tool_bucket,
+    empty_usage_bucket,
+)
 
 
 _UNSET = object()
@@ -375,4 +381,30 @@ class TestAggregateToolUsage:
         assert summary["totals"]["calls"] == 1
         assert summary["totals"]["empty_results"] == 0
         assert summary["totals"]["unpaged_reads"] == 0
+
+    def test_path_audit_fields_are_normalized_by_the_reader(self, tmp_path: Path) -> None:
+        events_path = _write_events(
+            tmp_path / "runner-events.jsonl",
+            [
+                _tool_event(
+                    tool="read_file",
+                    detail={
+                        "path": "/frontend/src/App.tsx",
+                        "offset": 0,
+                        "limit": 20,
+                        "result_chars": 10,
+                        "result_empty": False,
+                        "requested_path": " /frontend/src/App.tsx ",
+                        "path_classification": " missing_workspace_prefix ",
+                        "execution_path": " /workspace/frontend/src/App.tsx ",
+                    },
+                )
+            ],
+        )
+
+        records = list(_iter_tool_usage_events(events_path))
+        assert records[0]["detail"]["requested_path"] == "/frontend/src/App.tsx"
+        assert records[0]["detail"]["path_classification"] == "missing_workspace_prefix"
+        assert records[0]["detail"]["execution_path"] == "/workspace/frontend/src/App.tsx"
+        assert aggregate_tool_usage(events_path)["totals"]["calls"] == 1
 

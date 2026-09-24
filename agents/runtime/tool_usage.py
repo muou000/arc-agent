@@ -30,6 +30,7 @@ from agents.runtime.stage_discipline import (
     _discipline_path,
     _tool_result_failed,
 )
+from agents.runtime.virtual_paths import current_virtual_path_audit
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ class ToolUsageRecord:
     offset: int | None
     limit: int | None
     result_chars: int
+    requested_path: str | None = None
+    path_classification: str = ""
+    execution_path: str | None = None
 
 
 def set_tool_usage_sink(sink: UsageSink | None) -> None:
@@ -75,6 +79,9 @@ def record_tool_usage(
     offset: int | None = None,
     limit: int | None = None,
     result_chars: int = 0,
+    requested_path: str | None = None,
+    path_classification: str = "",
+    execution_path: str | None = None,
 ) -> None:
     """Best-effort tool-usage capture; never raises and needs no sink."""
 
@@ -93,6 +100,9 @@ def record_tool_usage(
                 offset=offset,
                 limit=limit,
                 result_chars=int(result_chars or 0),
+                requested_path=requested_path,
+                path_classification=str(path_classification or ""),
+                execution_path=execution_path,
             )
         )
     except Exception:
@@ -123,13 +133,18 @@ def _record(request: ToolCallRequest, result: ToolMessage | Any) -> None:
     tool = str(tool_call.get("name", ""))
     status = _result_status(result, tool=tool)
     is_read = tool == "read_file"
+    audit = current_virtual_path_audit(str(tool_call.get("id") or ""))
+    requested_path = audit.requested_path if audit is not None else _discipline_path(args) or None
     record_tool_usage(
         tool=tool,
         status=status,
-        path=_discipline_path(args) or None,
+        path=requested_path,
         offset=_optional_int(args.get("offset")) if is_read else None,
         limit=_optional_int(args.get("limit")) if is_read else None,
         result_chars=len(str(getattr(result, "content", "") or "")),
+        requested_path=requested_path if audit is not None else None,
+        path_classification=audit.classification if audit is not None else "",
+        execution_path=audit.execution_path if audit is not None else None,
     )
 
 
