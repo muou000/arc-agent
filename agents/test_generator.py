@@ -271,8 +271,9 @@ class TestGenerator:
                 node_id=node_id,
             )
         for path, fields in result.get("backfilled_fields", {}).items():
+            missing = ", ".join(f"`{field}`" for field in fields)
             await self._log(
-                f"Manifest entry `{path}` returned without {', '.join('`%s`' % field for field in fields)}; "
+                f"Manifest entry `{path}` returned without {missing}; "
                 "restored from the locked declaration (issue #233 audit backfill).",
                 status="warning",
                 node_id=node_id,
