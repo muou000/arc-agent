@@ -6,6 +6,14 @@ arc-agent 是 ARC（Agentic Requirement Compiler）需求编译器的实现仓�
 
 ### 调度与并行
 
+**阶段流水线（Stage Pipeline）**：
+在同一节点的 `VISUAL_ANALYSIS → INTERFACE_DESIGN → TEST_GENERATION → IMPLEMENTATION` 顺序不变的前提下，让写入集合不相交的相邻节点阶段在独立 worktree 中重叠执行；它只改变阶段执行和合并时机，不改变 requirements dependencies 或父子门禁。
+_避免_：把阶段流水线与门禁流水线化混为一谈
+
+**串行集成（Serial Integration）**：
+阶段 agent 可以在隔离 worktree 中同时运行，但所有阶段发布物仍由单一 merge queue 按拓扑顺序串行合并；“串行”描述的是 integration，不是 agent 执行数。
+_避免_：共享工作区并发写入
+
 **亲和组（Affinity Group）**：
 调度器把节点分进共享 worktree 的组，组内任务严格串行。默认按顶层子树划分；`ARC_AFFINITY_DEPTH` 配置切分深度，让宽子树的特性子树各自成组。
 _避免_：worktree 组、并行组
@@ -37,6 +45,14 @@ _避免_：暗依赖、隐式依赖
 _避免_：实际依赖
 
 ### 合并与仲裁
+
+**阶段发布物（Stage Publication）**：
+一个 stage worktree 完成后提交的不可变结果及其元数据，包括 `base_commit`、`artifact_commit`、声明的写入集合、契约哈希、测试 manifest 哈希和验证证据。发布物进入 merge queue 后才能改变 integration。
+_避免_：阶段结果、临时分支结果
+
+**写入集合（Write Set）**：
+一个阶段声明可能新建、修改或删除的项目文件集合。写入集合用于阶段启动前的冲突域判定；集合相交时禁止阶段重叠，不把所有冲突推迟到 Git 合并。
+_避免_：文件列表、修改范围
 
 **机械消解（Mechanical Resolution）**：
 合并层对“双方纯追加”冲突的自动消解（difflib 插入重放）。对语义重复失明——它正是让 run7 式双方代码共存的机制。
@@ -73,6 +89,14 @@ _避免_：以文案为准、以提示词为权威
 _避免_：文档层（暗示可有可无）、文案层
 
 ### 阶段边界
+
+**视觉就绪（Visual Ready）**：
+节点的视觉分析 stage 已成功持久化完整结果、缓存键和事件，因而可以进入 InterfaceDesigner。视觉就绪只释放本节点的视觉输入，不放宽父子或 declared dependency 门禁；失败节点进入可重试或终态失败。
+_避免_：视觉预分析完成、图片已处理
+
+**节点测试域（Node Test Domain）**：
+一个稳定节点 ID 对应的测试路径命名空间和 manifest 所有权。TestGenerator 与 TDD 可以修改本节点测试域内的文件；兄弟节点不得共享测试文件，公共测试配置和 fixture 在模板初始化后只读。
+_避免_：测试目录、测试分组
 
 **骨架（Skeleton）**：
 DESIGN 唯一可物化的文件形态，按形状判定而非长度：无函数体——只有 imports、类型/常量、带类型签名的导出、路由表到处理器名的映射、`// TODO(TDD): <行为>` 标记。
