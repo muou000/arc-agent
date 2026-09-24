@@ -26,7 +26,7 @@ from agents.runtime.filesystem_adapters import (
 )
 from agents.runtime.stage_discipline import StageDisciplineMiddleware
 from agents.runtime.tool_usage import ToolUsageMiddleware
-from agents.runtime.virtual_paths import VirtualWorkspacePathMiddleware
+from agents.runtime.virtual_paths import VirtualWorkspacePathMiddleware, project_roots_for_workspace
 from agents.tools.file_append import build_append_file_tool
 
 if TYPE_CHECKING:
@@ -513,7 +513,7 @@ def build_stage_agent(
         # discipline and filesystem permissions inspect the call. The
         # middleware also exposes the raw/resolved path pair to tool usage
         # observability.
-        VirtualWorkspacePathMiddleware(),
+        VirtualWorkspacePathMiddleware(project_roots=project_roots_for_workspace(root)),
         ToolUsageMiddleware(),
         TruncatedToolCallGuardMiddleware(),
         ToolArgumentSanitizerMiddleware(),

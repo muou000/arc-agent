@@ -18,6 +18,7 @@ from agents.runtime.virtual_paths import (
     PATH_CLASS_TRAVERSAL,
     VirtualWorkspacePathMiddleware,
     prepare_virtual_path_request,
+    project_roots_for_workspace,
 )
 from tests.helpers.faux import drive_scripted_tool_call
 
@@ -61,6 +62,27 @@ def test_normal_workspace_path_stays_normal_in_the_faux_harness(
 
     assert "module.exports = 1;" in content
     assert "path diagnostic" not in content
+
+
+def test_existing_cli_and_android_roots_are_discovered_safely(tmp_project_dir: Path) -> None:
+    (tmp_project_dir / "app").mkdir()
+    (tmp_project_dir / "tests").mkdir()
+    roots = project_roots_for_workspace(tmp_project_dir)
+
+    app_request, app_audit = prepare_virtual_path_request(
+        _request("read_file", {"file_path": "/app/main.py"}),
+        project_roots=roots,
+    )
+    tests_request, tests_audit = prepare_virtual_path_request(
+        _request("glob", {"path": "/tests", "pattern": "**/*.py"}),
+        project_roots=roots,
+    )
+
+    assert "app" in roots and "tests" in roots
+    assert app_audit is not None and app_audit.classification == PATH_CLASS_MISSING_PREFIX
+    assert app_request.tool_call["args"]["file_path"] == "/workspace/app/main.py"
+    assert tests_audit is not None and tests_audit.classification == PATH_CLASS_MISSING_PREFIX
+    assert tests_request.tool_call["args"]["path"] == "/workspace/tests"
 
 
 @pytest.mark.parametrize(
@@ -124,6 +146,29 @@ def test_unsafe_paths_are_not_rewritten_and_receive_structured_rejection(
     assert isinstance(result, ToolMessage)
     assert f"classification: {classification}" in result.content
     assert "execution_path: <rejected>" in result.content
+
+
+@pytest.mark.parametrize(
+    ("raw_path", "classification"),
+    [
+        (r"C:\Users\agent\frontend\src\App.tsx", PATH_CLASS_HOST_ABSOLUTE),
+        ("/workspace/../outside.txt", PATH_CLASS_TRAVERSAL),
+        ("/workspace-2/frontend/src/App.tsx", PATH_CLASS_OTHER_WORKSPACE),
+    ],
+)
+def test_unsafe_paths_are_rejected_by_the_faux_harness(
+    tmp_project_dir: Path,
+    raw_path: str,
+    classification: str,
+) -> None:
+    (content,) = drive_scripted_tool_call(
+        tmp_project_dir,
+        "read_file",
+        {"file_path": raw_path},
+    )
+
+    assert "[ARC path diagnostic]" in content
+    assert f"classification: {classification}" in content
 
 
 def test_path_audit_reaches_tool_usage_records() -> None:

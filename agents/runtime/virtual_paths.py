@@ -21,7 +21,8 @@ from __future__ import annotations
 import contextvars
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterable
 
 from deepagents.backends.utils import validate_path
 from langchain.agents.middleware.types import AgentMiddleware
@@ -49,6 +50,7 @@ PATH_ARGUMENTS: dict[str, str] = {
 }
 
 PROJECT_ROOTS = frozenset({"backend", "frontend"})
+PROJECT_ROOT_CANDIDATES = frozenset({"app", "backend", "frontend", "tests"})
 
 PATH_CLASS_WORKSPACE = "workspace"
 PATH_CLASS_VIRTUAL_ROOT = "virtual_root"
@@ -114,7 +116,26 @@ def _has_traversal(path: str) -> bool:
     return ".." in path.split("/") or path == "~" or path.startswith("~/")
 
 
-def classify_virtual_path(value: object) -> tuple[str, str | None, bool]:
+def project_roots_for_workspace(workspace_root: str | Path | None) -> frozenset[str]:
+    """Return safe known project roots present in one generated workspace."""
+
+    roots = set(PROJECT_ROOTS)
+    if workspace_root:
+        root = Path(workspace_root).expanduser()
+        for candidate in PROJECT_ROOT_CANDIDATES:
+            try:
+                if (root / candidate).is_dir():
+                    roots.add(candidate)
+            except OSError:
+                continue
+    return frozenset(roots)
+
+
+def classify_virtual_path(
+    value: object,
+    *,
+    project_roots: Iterable[str] = PROJECT_ROOTS,
+) -> tuple[str, str | None, bool]:
     """Return ``(classification, execution_path, normalized)`` for a path.
 
     ``execution_path`` is the canonical virtual path that downstream tools
@@ -149,7 +170,7 @@ def classify_virtual_path(value: object) -> tuple[str, str | None, bool]:
         return PATH_CLASS_VIRTUAL_ROOT, canonical, canonical != raw
 
     first_segment = canonical.removeprefix("/").split("/", 1)[0]
-    if first_segment in PROJECT_ROOTS:
+    if first_segment in project_roots:
         return PATH_CLASS_MISSING_PREFIX, f"/workspace{canonical}", True
 
     # A path that looks like a different workspace must remain distinguishable
@@ -161,7 +182,11 @@ def classify_virtual_path(value: object) -> tuple[str, str | None, bool]:
     return PATH_CLASS_UNKNOWN_ROOT, canonical, False
 
 
-def prepare_virtual_path_request(request: "ToolCallRequest") -> tuple["ToolCallRequest", VirtualPathAudit | None]:
+def prepare_virtual_path_request(
+    request: "ToolCallRequest",
+    *,
+    project_roots: Iterable[str] = PROJECT_ROOTS,
+) -> tuple["ToolCallRequest", VirtualPathAudit | None]:
     """Normalize one tool request and return its audit record."""
 
     call = request.tool_call
@@ -172,7 +197,10 @@ def prepare_virtual_path_request(request: "ToolCallRequest") -> tuple["ToolCallR
         return request, None
 
     requested = args.get(argument)
-    classification, execution_path, normalized = classify_virtual_path(requested)
+    classification, execution_path, normalized = classify_virtual_path(
+        requested,
+        project_roots=project_roots,
+    )
     audit = VirtualPathAudit(
         tool=tool,
         tool_call_id=str(call.get("id") or ""),
@@ -222,12 +250,15 @@ def _annotate_rejection(result: Any, audit: VirtualPathAudit) -> Any:
 class VirtualWorkspacePathMiddleware(AgentMiddleware[Any, Any, Any]):
     """Normalize known missing ``/workspace`` prefixes before tool execution."""
 
+    def __init__(self, *, project_roots: Iterable[str] | None = None) -> None:
+        self._project_roots = frozenset(project_roots) if project_roots is not None else PROJECT_ROOTS
+
     def wrap_tool_call(
         self,
         request: "ToolCallRequest",
         handler: "Callable[[ToolCallRequest], Any]",
     ) -> Any:
-        prepared, audit = prepare_virtual_path_request(request)
+        prepared, audit = prepare_virtual_path_request(request, project_roots=self._project_roots)
         if audit is None:
             return handler(prepared)
         token = _current_audit.set(audit)
@@ -241,7 +272,7 @@ class VirtualWorkspacePathMiddleware(AgentMiddleware[Any, Any, Any]):
         request: "ToolCallRequest",
         handler: "Callable[[ToolCallRequest], Awaitable[Any]]",
     ) -> Any:
-        prepared, audit = prepare_virtual_path_request(request)
+        prepared, audit = prepare_virtual_path_request(request, project_roots=self._project_roots)
         if audit is None:
             return await handler(prepared)
         token = _current_audit.set(audit)
