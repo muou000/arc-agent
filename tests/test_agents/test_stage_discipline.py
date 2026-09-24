@@ -145,10 +145,10 @@ def test_test_generation_repeated_write_block_lists_actionable_exits() -> None:
     # writes; the message must name the real ways out. Since the manifest
     # lock, "write the revision to a new path" is deliberately NOT an exit
     # for test files (rename churn is the failure mode the lock exists for);
-    # the ways out are delete-then-rewrite the same declared path or return
-    # the manifest.
+    # the ways out are a targeted `edit_file` repair (issue #240) or return
+    # the manifest — delete-rewrite stays as the expensive fallback.
     for stage, expected in (
-        ("test_generation", ("delete", "manifest")),
+        ("test_generation", ("edit_file", "manifest")),
         ("implementation", ("run the tests", "new path")),
         ("interface_design", ("response", "skeleton")),
     ):
@@ -551,7 +551,7 @@ def test_test_generator_delete_rewrite_budget_blocks_third_cycle() -> None:
     blocked = run(middleware, make_request("delete", {"file_path": path}, call_id="d-3rd"))
     assert blocked.status == "error"
     assert "Rewrite budget blocked" in blocked.content
-    assert "2 delete-rewrite cycles" in blocked.content
+    assert "2 repair attempts" in blocked.content
 
 
 def test_delete_rewrite_budget_message_points_to_final_response_when_manifest_complete() -> None:
@@ -649,6 +649,143 @@ def test_delete_rewrite_budget_is_per_path() -> None:
     assert run(middleware, make_request("write_file", {"file_path": other, "content": "v1\n"}, call_id="wo1")).content == "ok"
     fresh = run(middleware, make_request("delete", {"file_path": other}, call_id="do1"))
     assert not isinstance(fresh, ToolMessage) or fresh.status != "error"
+
+
+# ---------------------------------------------------------------------------
+# test_generation stage: budgeted same-path edit repair (issue #240)
+# ---------------------------------------------------------------------------
+
+
+def test_test_generator_same_path_edit_repairs_within_budget() -> None:
+    """arc-output-serial-6 REQ-1 evidence: a one-apostrophe defect the model
+    found by grep became a 6.2KB whole-file rewrite (11+ delete→write pairs,
+    $0.5-0.7 of the stage) because same-path ``edit_file`` was blocked and
+    delete+write was the only sanctioned channel. The targeted edit is the
+    cheap repair: allowed on a written test asset, budgeted per path."""
+
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="w1")).content == "ok"
+
+    first = run(
+        middleware,
+        make_request("edit_file", {"file_path": path, "old_string": "v1", "new_string": "v1 ok"}, call_id="e1"),
+    )
+    assert isinstance(first, ToolMessage) and first.status != "error"
+    second = run(
+        middleware,
+        make_request("edit_file", {"file_path": path, "old_string": "v1 ok", "new_string": "v1 ok ok"}, call_id="e2"),
+    )
+    assert isinstance(second, ToolMessage) and second.status != "error"
+
+    # The runaway cap holds: edit and delete-rewrite share one per-path
+    # budget, so the third repair attempt is refused.
+    blocked = run(
+        middleware,
+        make_request("edit_file", {"file_path": path, "old_string": "ok ok", "new_string": "v3"}, call_id="e3"),
+    )
+    assert blocked.status == "error"
+    assert "Repair budget blocked" in blocked.content
+    assert "return the manifest" in blocked.content
+
+
+def test_edit_and_delete_rewrite_share_one_repair_budget_per_path() -> None:
+    """One ledger, two channels: a targeted edit and a delete-rewrite cycle
+    each consume one repair attempt, so the combined count caps both."""
+
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="w1")).content == "ok"
+    assert run(middleware, make_request("edit_file", {"file_path": path, "old_string": "v1", "new_string": "v2"}, call_id="e1")).status != "error"
+    assert run(middleware, make_request("delete", {"file_path": path}, call_id="d1")).content == "ok"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v3\n"}, call_id="w2")).content == "ok"
+
+    blocked_edit = run(
+        middleware,
+        make_request("edit_file", {"file_path": path, "old_string": "v3", "new_string": "v4"}, call_id="e2"),
+    )
+    assert blocked_edit.status == "error" and "Repair budget blocked" in blocked_edit.content
+    blocked_delete = run(middleware, make_request("delete", {"file_path": path}, call_id="d2"))
+    assert blocked_delete.status == "error" and "Rewrite budget blocked" in blocked_delete.content
+
+
+def test_failed_edit_then_same_path_repair_edit_passes() -> None:
+    """The issue's pin: a character-level repair after a failed file-tool
+    round-trip goes through ``edit_file``. The stale-anchor failure records
+    the generic failure unlock, so the corrected retry is not charged and
+    not blocked — the budget limits self-review churn, not repair after an
+    error (mirroring the failed-delete rule)."""
+
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="w1")).content == "ok"
+
+    def failing_edit(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="Error: old_string not found",
+            name=request.tool_call["name"],
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+    failed = run(
+        middleware,
+        make_request("edit_file", {"file_path": path, "old_string": "nope", "new_string": "x"}, call_id="e0"),
+        failing_edit,
+    )
+    assert failed.status == "error"
+
+    # The failure unlocked the path; the corrected repair edit passes.
+    repaired = run(middleware, make_request("edit_file", {"file_path": path, "old_string": "v1", "new_string": "v2"}, call_id="e1"))
+    assert isinstance(repaired, ToolMessage) and repaired.status != "error"
+
+
+def test_parallel_edit_batch_cannot_overshoot_the_repair_budget() -> None:
+    """A batch's calls all validate before any of them settles (arc-output4
+    ROOT: a whole burst observed the same stale count), so the cap is judged
+    on settled units plus still-open reservations — four same-path edits in
+    one batch yield exactly two allowed validations, not four."""
+
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="w1")).content == "ok"
+
+    # Validate four same-path edits back to back without recording results —
+    # the concurrency shape of one parallel batch.
+    verdicts = [
+        middleware._validate_tool_call(
+            make_request("edit_file", {"file_path": path, "old_string": "v1", "new_string": f"x{i}"}, call_id=f"e{i}")
+        )
+        for i in range(4)
+    ]
+    assert verdicts[0] is None and verdicts[1] is None
+    assert verdicts[2] is not None and "Repair budget blocked" in verdicts[2]
+    assert verdicts[3] is not None and "Repair budget blocked" in verdicts[3]
+
+    # The batch's two reserved units settle normally; the blocked calls left
+    # nothing behind.
+    for i in range(2):
+        request = make_request("edit_file", {"file_path": path, "old_string": "v1", "new_string": f"x{i}"}, call_id=f"e{i}")
+        middleware._record_result(request, ok_tool(request))
+    assert middleware._path_budgets.spent("edit", path) == 2
+    assert middleware._path_budgets.reserved("edit", path) == 0
+
+
+def test_implementation_stage_edit_takes_the_generic_refinement_budget() -> None:
+    """IMPLEMENT has no #240 repair channel: its written files take #241's
+    generic refinement budget (first edits pass, the third is refused with
+    the stage's own exit text), and only a failing validation run unlocks
+    them beyond that. The #240 wording ("Repair budget", shared with
+    delete-rewrite) must not leak into this stage."""
+
+    middleware = make("implementation")
+    path = "/workspace/src/calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="w1")).content == "ok"
+    assert run(middleware, make_request("edit_file", {"file_path": path, "old_string": "v1", "new_string": "v2"}, call_id="e1")).status != "error"
+    assert run(middleware, make_request("edit_file", {"file_path": path, "old_string": "v2", "new_string": "v3"}, call_id="e2")).status != "error"
+    blocked = run(middleware, make_request("edit_file", {"file_path": path, "old_string": "v3", "new_string": "v4"}, call_id="e3"))
+    assert blocked.status == "error" and "Edit budget blocked" in blocked.content
+    assert "Repair budget" not in blocked.content
 
 
 def test_read_block_after_write_warns_against_rewrite_verification() -> None:
@@ -804,7 +941,9 @@ def test_edit_file_refinements_pass_within_the_per_path_budget() -> None:
     refinement seconds after the write, and each block forced the model into
     blocked-edit -> full-file re-read -> edit round trips. A written path now
     takes a bounded number of edit_file refinements before the lock bites;
-    the third refinement is refused."""
+    the third refinement is refused. test_generation test assets carry the
+    #240 shared-budget wording ("Repair budget") instead of the generic
+    one."""
     for stage in ("interface_design", "test_generation", "implementation"):
         middleware = make(stage)
         path = "/workspace/tests/unit/test_calc.py" if stage == "test_generation" else "/workspace/src/calc.py"
@@ -825,7 +964,10 @@ def test_edit_file_refinements_pass_within_the_per_path_budget() -> None:
             make_request("edit_file", {"file_path": path, "old_string": "v3", "new_string": "v4"}, call_id="e2"),
         )
         assert third.status == "error", f"{stage} third refinement must be blocked"
-        assert "Edit budget blocked" in third.content
+        if stage == "test_generation":
+            assert "Repair budget blocked" in third.content
+        else:
+            assert "Edit budget blocked" in third.content
 
 
 def test_edit_budget_block_lists_actionable_exits() -> None:
@@ -855,7 +997,11 @@ def test_edit_budget_block_lists_actionable_exits() -> None:
         )
         assert blocked.status == "error"
         assert blocked.content.startswith(BLOCKED_RESULT_PREFIX)
-        assert "Edit budget blocked" in blocked.content
+        if stage == "test_generation":
+            # #240: the test-asset repair channel names the shared budget.
+            assert "Repair budget blocked" in blocked.content
+        else:
+            assert "Edit budget blocked" in blocked.content
         for keyword in expected:
             assert keyword in blocked.content, f"{stage} edit budget block should mention {keyword!r}"
 
@@ -946,11 +1092,15 @@ def test_validation_failure_unlocks_edits_beyond_the_budget() -> None:
 
 
 def test_delete_rewrite_cycle_grants_a_fresh_edit_budget_and_keeps_the_cycle_cap() -> None:
-    """A delete erases the path's per-path state (read ranges, block counts —
-    and now the refinement count), so the rewritten file starts with a fresh
-    edit budget, while the delete-rewrite cycle cap still bounds the loop."""
-    middleware = make("test_generation")
-    path = "/workspace/tests/unit/test_calc.py"
+    """Outside the #240 shared repair budget (implementation stage), a delete
+    erases the path's per-path state (read ranges, block counts — and the
+    refinement count), so the rewritten file starts with a fresh edit
+    budget, while the delete-rewrite cycle cap still bounds the loop. In
+    test_generation the shared budget keeps its edit units across the
+    delete (pinned by
+    ``test_edit_and_delete_rewrite_share_one_repair_budget_per_path``)."""
+    middleware = make("implementation")
+    path = "/workspace/frontend/tests/diag.test.tsx"
     assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="c1")).content == "ok"
     for index in range(2):
         assert run(
