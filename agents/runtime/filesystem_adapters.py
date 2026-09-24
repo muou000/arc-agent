@@ -28,7 +28,13 @@ A fifth behavior, new rather than historical: the ``write_file``/``edit_file``
 success receipts gain an integrity trailer (``bytes_written`` plus the first 8
 hex chars of the content's sha256) built on the same upstream tool factory
 seams as the delete tool, plus a standing note that the context echo's
-``...(argument truncated)`` marker is display truncation only.
+``...(argument truncated)`` marker is display truncation only. Issue #247
+extends the trailer with the change region: a successful edit_file states
+``changed_lines: A-B`` (computed by comparing the pre-edit read against the
+post-edit read-back, both taken at the tool boundary) plus a short excerpt of
+the region's final lines, so confirming an edit never needs a whole-file
+re-read; a successful write_file — which replaced every line — reports
+``changed_lines: 1-N``.
 
 Two grep behaviors (issue #218): ``ArcCompositeBackend`` replaces the stock
 ``CompositeBackend`` in the build path and expands a pattern containing `|`
@@ -215,6 +221,26 @@ _WRITE_RECEIPT_NOTE = (
 _WHOLE_FILE_READ_LIMIT = 2**31 - 1
 
 
+# -- change region (issue #247) ------------------------------------------------
+#
+# A model that wants to confirm an edit re-reads the file it just edited — a
+# re-read the post-write budget then blocks, turning the confirmation into a
+# stall. The success receipt therefore states where the change landed:
+# `changed_lines: A-B`, plus a short excerpt of the region's final lines for
+# small-enough spans. The span is computed by comparing the pre-edit read
+# against the post-edit read-back (both taken at the tool boundary, the
+# freshest disk truth on either side of the write) — never inferred from the
+# receipt text or the call args, which cannot distinguish a landed edit from
+# a coincidental match under replace_all.
+
+_CHANGED_LINES_PREFIX = "changed_lines"
+_EXCERPT_HEADER = "changed_excerpt:"
+_EXCERPT_INDENT = "    "
+_EXCERPT_ELLIPSIS = "…"
+_EXCERPT_MAX_LINES = 3
+_EXCERPT_MAX_CHARS = 120
+
+
 def _integrity_lines(content: str) -> "list[str]":
     """``bytes_written``/``sha256`` receipt lines describing ``content``.
 
@@ -228,6 +254,97 @@ def _integrity_lines(content: str) -> "list[str]":
         f"bytes_written: {len(encoded)}",
         f"sha256: {hashlib.sha256(encoded).hexdigest()[:8]}",
     ]
+
+
+def _write_region_lines(content: str) -> "list[str]":
+    """The ``changed_lines`` entry for a write_file receipt.
+
+    A write replaces the entire file, so the change region is every line of
+    the content as persisted — counted the way upstream's read counts lines
+    (``splitlines``: a trailing terminator closes the last line, it does not
+    open an empty one). An empty write has no lines to span.
+    """
+
+    if not content:
+        return []
+    total = content.count("\n") + (0 if content.endswith("\n") else 1)
+    if total <= 0:
+        return []
+    return [f"{_CHANGED_LINES_PREFIX}: 1-{total}"]
+
+
+def _common_prefix_len(before: str, after: str) -> int:
+    limit = min(len(before), len(after))
+    index = 0
+    while index < limit and before[index] == after[index]:
+        index += 1
+    return index
+
+
+def _common_suffix_len(before: str, after: str, *, cap: int) -> int:
+    """Longest common tail, capped so it never meets the common prefix."""
+
+    index = 0
+    while index < cap and before[len(before) - 1 - index] == after[len(after) - 1 - index]:
+        index += 1
+    return index
+
+
+def _changed_region_lines(before: "str | None", after: str) -> "list[str]":
+    """``changed_lines`` (+ excerpt) describing how ``after`` differs from ``before``.
+
+    Both sides are utf-8 text read through the backend's universal-newline
+    read path — the pre-edit state may be CRLF on disk, but it compares
+    against the LF-only post-edit rewrite like-for-like. ``before is None``
+    (unreadable pre-edit state) and ``before == after`` (a normalized no-op
+    replacement) yield no region lines rather than a guessed one.
+    """
+
+    if before is None or before == after:
+        return []
+    prefix = _common_prefix_len(before, after)
+    suffix = _common_suffix_len(before, after, cap=min(len(before), len(after)) - prefix)
+    start_line = after.count("\n", 0, prefix) + 1
+    # Line of the last changed character. For a pure deletion the span in
+    # `after` is empty (prefix + suffix covers the whole surviving text); the
+    # max() then pins the seam line where the deleted content used to sit.
+    end_line = after.count("\n", 0, max(prefix, len(after) - suffix - 1)) + 1
+    return [f"{_CHANGED_LINES_PREFIX}: {start_line}-{end_line}", *_excerpt_lines(after, start_line, end_line)]
+
+
+def _excerpt_lines(after: str, start_line: int, end_line: int) -> "list[str]":
+    """The final lines at the reported region, capped for receipt size."""
+
+    lines = after.split("\n")
+    if after.endswith("\n"):
+        lines.pop()  # the artifact of the trailing terminator, not a line
+    window = lines[start_line - 1 : end_line]
+    excerpt = [_EXCERPT_HEADER]
+    for line in window[:_EXCERPT_MAX_LINES]:
+        truncated = line[:_EXCERPT_MAX_CHARS] + _EXCERPT_ELLIPSIS if len(line) > _EXCERPT_MAX_CHARS else line
+        excerpt.append(f"{_EXCERPT_INDENT}{truncated}" if truncated else "")
+    if len(window) > _EXCERPT_MAX_LINES:
+        excerpt.append(_EXCERPT_INDENT + _EXCERPT_ELLIPSIS)
+    return excerpt
+
+
+def _read_back_body(read_back: Any) -> "str | None":
+    """The utf-8 text of a backend read result, or ``None`` when unfaithful.
+
+    Error reads, binary payloads and the empty/whitespace-only reminder (which
+    carries no pagination metadata) all degrade to ``None``: a receipt line is
+    appended only when the read is known to describe the disk truth.
+    """
+
+    if read_back is None or getattr(read_back, "error", None) is not None:
+        return None
+    file_data = getattr(read_back, "file_data", None)
+    if not isinstance(file_data, dict) or file_data.get("encoding") != "utf-8":
+        return None
+    body = file_data.get("content")
+    if not isinstance(body, str) or getattr(read_back, "total_lines", None) is None:
+        return None
+    return body
 
 
 def _success_text(tool_result: Any) -> "str | None":
@@ -295,7 +412,11 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
     actually on disk, plus the standing note that the context echo's
     ``...(argument truncated)`` marker is display truncation only — without
     which a long write's echo truncation reads as "the file holds a truncated
-    placeholder" and triggers delete-rewrite loops.
+    placeholder" and triggers delete-rewrite loops. The edit receipt also
+    states the change region (``changed_lines: A-B`` computed from the pre-
+    and post-edit disk reads, plus a capped excerpt) so the post-edit
+    confirmation never motivates a whole-file re-read, which the post-write
+    budget would block anyway (issue #247).
     """
 
     # Matches the stock core-stack entry so ``create_deep_agent`` replaces it
@@ -449,7 +570,10 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
     ) -> "Callable[..., ToolMessage]":
         def sync_write(file_path: str, content: str, runtime: ToolRuntime) -> ToolMessage:
             result = upstream_write(file_path=file_path, content=content, runtime=runtime)
-            return _with_receipt_trailer(result, [*_integrity_lines(content), _WRITE_RECEIPT_NOTE])
+            return _with_receipt_trailer(
+                result,
+                [*_integrity_lines(content), *_write_region_lines(content), _WRITE_RECEIPT_NOTE],
+            )
 
         return sync_write
 
@@ -459,7 +583,10 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
     ) -> "Callable[..., Any]":
         async def async_write(file_path: str, content: str, runtime: ToolRuntime) -> ToolMessage:
             result = await upstream_write(file_path=file_path, content=content, runtime=runtime)
-            return _with_receipt_trailer(result, [*_integrity_lines(content), _WRITE_RECEIPT_NOTE])
+            return _with_receipt_trailer(
+                result,
+                [*_integrity_lines(content), *_write_region_lines(content), _WRITE_RECEIPT_NOTE],
+            )
 
         return async_write
 
@@ -486,6 +613,7 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
             *,
             replace_all: bool = False,
         ) -> ToolMessage:
+            before_body = _read_back_body(self._read_back(file_path))
             result = upstream_edit(
                 file_path=file_path,
                 old_string=old_string,
@@ -493,7 +621,10 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
                 runtime=runtime,
                 replace_all=replace_all,
             )
-            return _with_receipt_trailer(result, self._edit_trailer_lines(result, self._read_back(file_path)))
+            return _with_receipt_trailer(
+                result,
+                self._edit_trailer_lines(result, before_body, _read_back_body(self._read_back(file_path))),
+            )
 
         return sync_edit
 
@@ -509,6 +640,7 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
             *,
             replace_all: bool = False,
         ) -> ToolMessage:
+            before_body = _read_back_body(await self._aread_back(file_path))
             result = await upstream_edit(
                 file_path=file_path,
                 old_string=old_string,
@@ -516,7 +648,12 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
                 runtime=runtime,
                 replace_all=replace_all,
             )
-            return _with_receipt_trailer(result, self._edit_trailer_lines(result, await self._aread_back(file_path)))
+            return _with_receipt_trailer(
+                result,
+                self._edit_trailer_lines(
+                    result, before_body, _read_back_body(await self._aread_back(file_path))
+                ),
+            )
 
         return async_edit
 
@@ -535,8 +672,8 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
             return None
 
     @staticmethod
-    def _edit_trailer_lines(tool_result: Any, read_back: Any) -> "list[str]":
-        """Integrity trailer for an edit receipt, hashed from the file on disk.
+    def _edit_trailer_lines(tool_result: Any, before_body: "str | None", after_body: "str | None") -> "list[str]":
+        """Integrity + change-region trailer for an edit receipt.
 
         Unlike write_file, the edited content is upstream's internal
         composition (its universal-newline read plus replacement), so the only
@@ -548,23 +685,21 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
         A windowed or non-text read-back (error, binary payload; empty or
         whitespace-only files carry no pagination metadata and a reminder
         string instead of content) degrades to the note-only trailer: a
-        successful edit must never produce a missing or lying receipt.
+        successful edit must never produce a missing or lying receipt. An
+        unreadable *pre-edit* read only drops the change-region lines — the
+        post-edit integrity lines stay — and a no-op replacement (pre- and
+        post-edit text identical after normalization) reports no region.
         """
 
         if _success_text(tool_result) is None:
             return []
-        if read_back is None:
+        if after_body is None:
             return [_WRITE_RECEIPT_NOTE]
-        file_data = getattr(read_back, "file_data", None)
-        body = file_data.get("content") if isinstance(file_data, dict) else None
-        if (
-            getattr(read_back, "error", None) is not None
-            or not isinstance(body, str)
-            or (isinstance(file_data, dict) and file_data.get("encoding") != "utf-8")
-            or getattr(read_back, "total_lines", None) is None
-        ):
-            return [_WRITE_RECEIPT_NOTE]
-        return [*_integrity_lines(body), _WRITE_RECEIPT_NOTE]
+        return [
+            *_integrity_lines(after_body),
+            *_changed_region_lines(before_body, after_body),
+            _WRITE_RECEIPT_NOTE,
+        ]
 
 
 class WindowsCompatFilesystemBackend(FilesystemBackend):
