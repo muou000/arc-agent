@@ -310,7 +310,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if name in _ADDITIVE_FILE_WRITE_TOOLS:
             return self._validate_append(args)
         if name in _FILE_WRITE_TOOLS:
-            return self._validate_write(args, tool=name, call_id=str(request.tool_call.get("id", "")))
+            return self._validate_write(args, tool=name, call_id=_tool_call_id(request))
         return None
 
     def _validate_delete_channel(self, args: dict[str, Any]) -> str | None:
@@ -506,7 +506,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         path = _discipline_path(args)
         if not path or self._path_unlocked(path):
             return None
-        if self._repair_counts.get(path, 0) < _MAX_TEST_ASSET_REPAIRS_PER_PATH:
+        if self._repair_counts.get(path, 0) + self._outstanding_repair_reservations(path) < _MAX_TEST_ASSET_REPAIRS_PER_PATH:
             return None
         return self._repair_budget_blocked(path, prefix="Rewrite budget")
 
@@ -561,9 +561,21 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         validation ladder, after the manifest and import checks.
         """
 
-        if self._repair_counts.get(path, 0) < _MAX_TEST_ASSET_REPAIRS_PER_PATH:
+        if self._repair_counts.get(path, 0) + self._outstanding_repair_reservations(path) < _MAX_TEST_ASSET_REPAIRS_PER_PATH:
             return None
         return self._repair_budget_blocked(path, prefix="Repair budget")
+
+    def _outstanding_repair_reservations(self, path: str) -> int:
+        """Repair units reserved for ``path`` but not yet settled.
+
+        Parallel tool-call batches validate every call before any of them
+        reaches ``_record_result`` (arc-output4 ROOT: a whole batch observed
+        the same stale count), so the cap must be judged on settled units
+        plus the batch's still-open reservations — same reasoning as the
+        DESIGN write reservations.
+        """
+
+        return sum(1 for reserved in self._repair_reservations.values() if reserved == path)
 
     def _reserve_test_asset_edit(self, path: str, call_id: str) -> None:
         """Reserve one repair unit for a validated budgeted edit (#240).
@@ -625,7 +637,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return None
         return None
 
-    def _validate_write(self, args: dict[str, Any], *, tool: str = "write_file", call_id: str = "") -> str | None:
+    def _validate_write(self, args: dict[str, Any], *, tool: str, call_id: str) -> str | None:
         """Runtime gates on the writes the capability table already allowed.
 
         One deliberate, behavior-preserving check-order change from the
@@ -648,19 +660,15 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         path = _discipline_path(args)
         if not path:
             return None
+        written_and_locked = path in self._written_paths and not self._path_unlocked(path)
         # Whether this repeated write enters the budgeted same-path repair
         # channel (issue #240): a targeted ``edit_file`` fix on a written
         # test asset in test_generation. The decision is taken here but the
         # budget unit is only reserved at the end of the ladder, after the
         # manifest and import checks — a content-rejected repair edit must
         # not burn budget (same invariant as the DESIGN write budget).
-        repair_edit = (
-            tool == "edit_file"
-            and self._stage == "test_generation"
-            and path in self._written_paths
-            and not self._path_unlocked(path)
-        )
-        if path in self._written_paths and not self._path_unlocked(path) and not repair_edit:
+        repair_edit = tool == "edit_file" and self._stage == "test_generation" and written_and_locked
+        if written_and_locked and not repair_edit:
             exit_text = _WRITE_BLOCK_EXITS[self._stage]
             if self._write_block_counts is not None:
                 block_count = self._write_block_counts.get(path, 0) + 1
@@ -967,7 +975,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 # failed repair edit (e.g. a stale anchor) must not burn a
                 # unit; the failure itself unlocks the path anyway.
                 if name == "edit_file":
-                    self._repair_reservations.pop(str(request.tool_call.get("id", "")), None)
+                    self._repair_reservations.pop(_tool_call_id(request), None)
             return
         if name == "delete" and path:
             # The file is gone, so its write lock, read ranges, repeat-read
@@ -1016,7 +1024,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 # validator reserved before the handler ran — but settling
                 # defensively keeps the ledger exact even if a future check
                 # order change drops that invariant.
-                reserved_path = self._repair_reservations.pop(str(request.tool_call.get("id", "")), None)
+                reserved_path = self._repair_reservations.pop(_tool_call_id(request), None)
                 if reserved_path is not None:
                     self._repair_counts[reserved_path] = self._repair_counts.get(reserved_path, 0) + 1
             self._cache_written_path(request, path)
@@ -1125,6 +1133,17 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
 def _discipline_path(args: dict[str, Any]) -> str:
     raw = str(args.get("file_path", "") or "").replace("\\", "/").strip()
     return raw if raw.startswith("/") else f"/{raw}" if raw else ""
+
+
+def _tool_call_id(request: ToolCallRequest) -> str:
+    """The harness id of one tool call — the repair budget's reservation key.
+
+    Single-sourced because the reservation and its settle/release must key
+    identically across ``_validate_tool_call`` and both ``_record_result``
+    branches.
+    """
+
+    return str(request.tool_call.get("id", ""))
 
 
 def _as_nonnegative_int(value: Any, *, default: int) -> int:

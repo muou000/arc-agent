@@ -638,6 +638,37 @@ def test_failed_edit_then_same_path_repair_edit_passes() -> None:
     assert isinstance(repaired, ToolMessage) and repaired.status != "error"
 
 
+def test_parallel_edit_batch_cannot_overshoot_the_repair_budget() -> None:
+    """A batch's calls all validate before any of them settles (arc-output4
+    ROOT: a whole burst observed the same stale count), so the cap is judged
+    on settled units plus still-open reservations — four same-path edits in
+    one batch yield exactly two allowed validations, not four."""
+
+    middleware = make("test_generation")
+    path = "/workspace/tests/unit/test_calc.py"
+    assert run(middleware, make_request("write_file", {"file_path": path, "content": "v1\n"}, call_id="w1")).content == "ok"
+
+    # Validate four same-path edits back to back without recording results —
+    # the concurrency shape of one parallel batch.
+    verdicts = [
+        middleware._validate_tool_call(
+            make_request("edit_file", {"file_path": path, "old_string": "v1", "new_string": f"x{i}"}, call_id=f"e{i}")
+        )
+        for i in range(4)
+    ]
+    assert verdicts[0] is None and verdicts[1] is None
+    assert verdicts[2] is not None and "Repair budget blocked" in verdicts[2]
+    assert verdicts[3] is not None and "Repair budget blocked" in verdicts[3]
+
+    # The batch's two reserved units settle normally; the blocked calls left
+    # nothing behind.
+    for i in range(2):
+        request = make_request("edit_file", {"file_path": path, "old_string": "v1", "new_string": f"x{i}"}, call_id=f"e{i}")
+        middleware._record_result(request, ok_tool(request))
+    assert middleware._repair_counts[path] == 2
+    assert middleware._repair_reservations == {}
+
+
 def test_implementation_stage_same_path_edit_still_blocked() -> None:
     """The budgeted edit channel is test_generation-only: IMPLEMENT's written
     files stay locked until a failing validation run unlocks them."""
