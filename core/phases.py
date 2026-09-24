@@ -1618,6 +1618,7 @@ class WorkflowPhaseRunner:
             # mid-executor while the chain still holds the previous failure.
             # Optional by contract: minimal adapters (test stubs) may omit it.
             test_edit_hint=getattr(self.test_driven_developer, "test_edit_stall_hint", None),
+            progress_marker=getattr(self.test_driven_developer, "tdd_progress_marker", None),
         )
         ordered_types = executor.register_tests(tests)
         if not ordered_types:
@@ -1651,6 +1652,7 @@ class WorkflowPhaseRunner:
         # Files edited across every agent session of this TDD pass (the
         # adapter exposes only the latest session's writes).
         modified_files_round: list[str] = []
+        recorded_stall_layers: set[str] = set()
         for ordered_type in ordered_types:
             if executor.environment_failure:
                 # The workspace is broken; every remaining layer would fail the
@@ -1879,6 +1881,20 @@ class WorkflowPhaseRunner:
                         modified_files_round.append(path)
 
                 latest_result = executor.layer_result(ordered_type)
+                stall_stop = executor.stall_stop(ordered_type)
+                if stall_stop and ordered_type not in recorded_stall_layers:
+                    self.events.record_tdd_stall(
+                        node_id=node_id,
+                        layer=ordered_type,
+                        reason=str(stall_stop.get("reason") or ""),
+                        fingerprint=str(stall_stop.get("fingerprint") or ""),
+                        repetitions=stall_stop.get("repetitions", 0),
+                        threshold=stall_stop.get("threshold", 0),
+                        used=stall_stop.get("used", 0),
+                        budget=stall_stop.get("budget", 0),
+                        suggested_action=str(stall_stop.get("suggested_action") or ""),
+                    )
+                    recorded_stall_layers.add(ordered_type)
                 # Three-part cross-session handoff: the structured per-test
                 # digest (locations + expected/received), a diff hint of what
                 # the previous session edited, and the pointer to the persisted
@@ -1896,6 +1912,17 @@ class WorkflowPhaseRunner:
                 )
                 used_after = executor.usage(ordered_type)
                 if executor.layer_passed(ordered_type):
+                    break
+                if executor.is_hard_stopped(ordered_type):
+                    await self._log(
+                        "TestDrivenDeveloper",
+                        (
+                            f"TDD stopped `{ordered_type}` after a repeated failure fingerprint with no "
+                            f"effective source/environment change ({used_after}/{TDD_RUN_TESTS_BUDGET} calls)."
+                        ),
+                        status="error",
+                        node_id=node_id,
+                    )
                     break
                 if executor.budget_exhausted(ordered_type):
                     break
@@ -1970,7 +1997,14 @@ class WorkflowPhaseRunner:
                     )
                 failure_summaries.append(f"{test_type}: {failure_summary}")
             used = executor.usage(test_type)
-            if executor.environment_failure:
+            stall_stop = executor.stall_stop(test_type)
+            if stall_stop:
+                detail = (
+                    "deterministic stall stop "
+                    f"({stall_stop.get('repetitions', 0)}/{stall_stop.get('threshold', 0)} "
+                    "identical failures with no effective source/environment change)"
+                )
+            elif executor.environment_failure:
                 detail = f"environment failure ({executor.environment_failure})"
             elif used >= TDD_RUN_TESTS_BUDGET:
                 detail = "budget exhausted"
@@ -2013,6 +2047,11 @@ class WorkflowPhaseRunner:
                         test_type: executor.fingerprints(test_type)[-5:]
                         for test_type in ordered_types
                         if executor.fingerprints(test_type)
+                    },
+                    "stall_stops": {
+                        test_type: executor.stall_stop(test_type)
+                        for test_type in ordered_types
+                        if executor.stall_stop(test_type)
                     },
                 },
             },

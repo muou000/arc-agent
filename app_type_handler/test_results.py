@@ -38,6 +38,9 @@ class TestRunResult:
     #: Workspace-relative path of the persisted raw output; set by the TDD
     #: phase after persisting (the handler cannot know it).
     run_log_path: str = ""
+    #: Deterministic compiler/executor stop evidence when repeated failures
+    #: close the active layer before its ordinary run_tests budget is spent.
+    stall_stop: dict[str, Any] | None = None
 
     @property
     def passed_run(self) -> bool:

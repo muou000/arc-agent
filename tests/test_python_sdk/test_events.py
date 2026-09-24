@@ -498,6 +498,41 @@ class TestLayerReverifyEvents:
         assert lines[0]["used"] == 7
 
 
+class TestTddStallEvents:
+    """Pin the deterministic fingerprint-stall stop event (issue #264)."""
+
+    def test_record_tdd_stall_writes_stop_evidence(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_tdd_stall(
+            node_id=" REQ-2 ",
+            layer=" Integration ",
+            reason="repeated failure fingerprint with no effective source/environment change",
+            fingerprint="1|Error: Cannot find module 'missing-parser'",
+            repetitions=3,
+            threshold=3,
+            used=3,
+            budget=10,
+            suggested_action="repair the environment or choose a different implementation hypothesis",
+        )
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "tdd_stall",
+            "node_id": "REQ-2",
+            "layer": "Integration",
+            "reason": "repeated failure fingerprint with no effective source/environment change",
+            "fingerprint": "1|Error: Cannot find module 'missing-parser'",
+            "repetitions": 3,
+            "threshold": 3,
+            "used": 3,
+            "budget": 10,
+            "suggested_action": "repair the environment or choose a different implementation hypothesis",
+            "timestamp": lines[0]["timestamp"],
+        }
+
+
 class TestDemoTestStatus:
     """Demo helpers are documented as no-op with respect to disk state."""
 

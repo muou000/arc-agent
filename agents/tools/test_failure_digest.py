@@ -320,6 +320,7 @@ def format_failure_digest(
     build: str = "",
     served: str = "",
     test_edit_hint: str = "",
+    stall_stop: dict[str, Any] | None = None,
 ) -> str:
     """Render a digest dict into the handoff text block for the next session."""
 
@@ -359,7 +360,43 @@ def format_failure_digest(
         # Trailing on purpose: existing bullet order and the jsonl scan fields
         # stay byte-identical when no hint fires.
         blocks.append(f"- {test_edit_hint}")
+    if stall_stop:
+        blocks.extend(_format_stall_stop(stall_stop))
     return "\n".join(blocks)
+
+
+def _format_stall_stop(stall_stop: dict[str, Any]) -> list[str]:
+    """Render deterministic repeated-fingerprint stop evidence.
+
+    The executor owns the decision and supplies a structured payload; keeping
+    rendering here makes the in-session tool result and the cross-session
+    failure digest share one stable contract.
+    """
+
+    def text(key: str, fallback: str = "") -> str:
+        value = stall_stop.get(key, fallback)
+        return str(value or fallback).strip()
+
+    def count(key: str) -> int:
+        try:
+            return max(0, int(stall_stop.get(key, 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    repetitions = count("repetitions")
+    threshold = count("threshold")
+    used = count("used")
+    budget = count("budget")
+    fingerprint = text("fingerprint")
+    return [
+        "### Deterministic TDD Stop (STALL DETECTED)",
+        f"- stop_reason: {text('reason', 'repeated failure fingerprint with no effective source/environment change')}",
+        f"- stop_fingerprint: {fingerprint}",
+        f"- repeated_failures: {repetitions} (threshold {threshold})",
+        f"- budget_used: {used}/{budget} run_tests calls",
+        f"- suggested_action: {text('suggested_action', 'rotate your hypothesis and repair the implementation or environment in a fresh pass')}",
+        "- The current layer is closed by the compiler; do not call run_tests again in this pass.",
+    ]
 
 
 def persist_run_output(
