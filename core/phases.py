@@ -17,6 +17,8 @@ from agents.tools.test_contract_check import (
     build_satisfiability_universe,
     classify_test_hooks,
     collect_manifest_hooks,
+    format_http_status_diagnostics,
+    validate_http_status_contracts,
 )
 from core import sessions
 from core.service import get_runtime
@@ -401,6 +403,7 @@ class WorkflowPhaseRunner:
                 "recent_failure_summary": "",
                 "result_state": "",
                 "coverage_reuse": None,
+                "test_contract_diagnostics": [],
             },
         )
 
@@ -674,6 +677,13 @@ class WorkflowPhaseRunner:
             )
             return False
 
+        if not await self._validate_http_status_contracts(
+            node_id=node_id,
+            requirement_data=requirement_data,
+            tests=stored_tests,
+        ):
+            return False
+
         # Static satisfiability check, before any baseline run spends real
         # test executions: extract the observable hooks the E2E/Integration
         # tests drive and classify them against the requirement + interface
@@ -719,6 +729,12 @@ class WorkflowPhaseRunner:
             return False
         if baseline.get("revised_tests") is not None:
             stored_tests = baseline["revised_tests"]
+            if not await self._validate_http_status_contracts(
+                node_id=node_id,
+                requirement_data=requirement_data,
+                tests=stored_tests,
+            ):
+                return False
 
         self.traceability.clear_node_design_artifacts(node_id)
         await self._register_design_observably(node_id, prepared_interfaces, stored_tests)
@@ -1102,6 +1118,48 @@ class WorkflowPhaseRunner:
                 node_id=node_id,
             )
         return test_contract
+
+    async def _validate_http_status_contracts(
+        self,
+        *,
+        node_id: str,
+        requirement_data: dict[str, Any],
+        tests: list[dict[str, Any]],
+    ) -> bool:
+        """Fail DESIGN when generated HTTP status assertions lack a contract."""
+
+        interfaces = sessions.load_node_session(node_id).get("interfaces") or []
+        try:
+            diagnostics = validate_http_status_contracts(
+                self.workspace_path,
+                requirement_data,
+                interfaces,
+                tests,
+            )
+        except Exception as exc:
+            diagnostics = [
+                {
+                    "code": "status_code_needs_info",
+                    "message": (
+                        "needs-info: HTTP status contract validation could not complete; "
+                        f"resolve the status contract before continuing ({type(exc).__name__}: {exc})."
+                    ),
+                    "file_path": "",
+                }
+            ]
+        session_patch: dict[str, Any] = {"test_contract_diagnostics": diagnostics}
+        if diagnostics:
+            session_patch["test_contract_hooks"] = []
+        self._update_node_session(node_id, session_patch)
+        if not diagnostics:
+            return True
+        await self._log(
+            "TestGenerator",
+            format_http_status_diagnostics(diagnostics),
+            status="error",
+            node_id=node_id,
+        )
+        return False
 
     async def _enforce_design_baseline_red(
         self,

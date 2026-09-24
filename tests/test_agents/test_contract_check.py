@@ -12,12 +12,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agents.tools.test_contract_check import (
     build_satisfiability_universe,
     classify_test_hooks,
     collect_manifest_hooks,
+    extract_http_status_assertions,
     extract_test_hooks,
     format_test_contract_context,
+    validate_http_status_contracts,
 )
 
 
@@ -232,3 +236,432 @@ def test_normalize_strips_origin_to_path() -> None:
     assert _normalize_for_match("http://localhost:3301") == ""
     assert _normalize_for_match("https://example.com/api/auth") == "api/auth"
     assert _normalize_for_match(r"\/register$") == "/register"
+
+
+def test_extract_http_status_assertions_keeps_request_context() -> None:
+    content = """
+const response = await page.request.post('/api/notes');
+expect(response.status()).toBe(201);
+"""
+
+    assertions = extract_http_status_assertions("e2e/notes.spec.js", content)
+
+    assert assertions == [
+        {
+            "file_path": "e2e/notes.spec.js",
+            "line": 3,
+            "path": "/api/notes",
+            "method": "POST",
+            "assertion": "expect(response.status()).toBe(201)",
+            "expected_status_codes": [201],
+            "matcher": "toBe",
+        }
+    ]
+
+
+def test_extract_http_status_assertions_supports_supertest_request_chain() -> None:
+    content = """
+const response = await request(app).post('/api/notes');
+expect(response.status).toBe(201);
+"""
+
+    assertions = extract_http_status_assertions("tests/notes.test.js", content)
+
+    assert assertions[0]["path"] == "/api/notes"
+    assert assertions[0]["method"] == "POST"
+    assert assertions[0]["expected_status_codes"] == [201]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_codes"),
+    [
+        (
+            "const response = await request(app).post('/api/notes').expect(201);",
+            [201],
+        ),
+        (
+            "expect(response).toHaveProperty('status', 201);",
+            [201],
+        ),
+        (
+            "expect([200, 201]).toContain(response.status());",
+            [200, 201],
+        ),
+    ],
+)
+def test_extract_http_status_assertions_supports_status_assertion_shapes(
+    content: str, expected_codes: list[int]
+) -> None:
+    assertions = extract_http_status_assertions(
+        "tests/notes.test.js",
+        "const response = await request(app).post('/api/notes');\n" + content,
+    )
+
+    assert assertions
+    assert assertions[-1]["expected_status_codes"] == expected_codes
+
+
+def test_extract_http_status_assertions_ignores_supertest_header_expectation() -> None:
+    content = "const response = await request(app).get('/api/notes').expect('Content-Type', /json/);"
+
+    assert extract_http_status_assertions("tests/notes.test.js", content) == []
+
+
+@pytest.mark.parametrize("status_code", [200, 201, 206])
+def test_validate_http_status_contract_accepts_explicit_interface_status(
+    tmp_project_dir: Path, status_code: int
+) -> None:
+    test_path = tmp_project_dir / "e2e" / "notes.spec.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await page.request.post('/api/notes');\n"
+        f"expect(response.status()).toBe({status_code});\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "specification": "POST /api/notes returns HTTP status code "
+                f"{status_code}.",
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "E2E", "file_path": "e2e/notes.spec.js"}],
+    )
+
+    assert diagnostics == []
+
+
+def test_validate_http_status_contract_uses_interface_output_without_defaulting_to_200(
+    tmp_project_dir: Path,
+) -> None:
+    test_path = tmp_project_dir / "tests" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status()).toBe(201);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "outputs": {"status_code": 201},
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "tests/notes.test.js"}],
+    )
+
+    assert diagnostics == []
+
+
+def test_validate_http_status_contract_reads_top_level_status_field(tmp_project_dir: Path) -> None:
+    test_path = tmp_project_dir / "tests" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status()).toBe(201);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "status_code": 201,
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "tests/notes.test.js"}],
+    )
+
+    assert diagnostics == []
+
+
+def test_validate_http_status_contract_reads_nested_output_code_field(tmp_project_dir: Path) -> None:
+    test_path = tmp_project_dir / "tests" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status()).toBe(201);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "outputs": [{"code": 201, "body": "created"}],
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "tests/notes.test.js"}],
+    )
+
+    assert diagnostics == []
+
+
+def test_validate_http_status_contract_accepts_declared_response_status_set(tmp_project_dir: Path) -> None:
+    test_path = tmp_project_dir / "tests" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status()).toBeOneOf([200, 201]);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "outputs": {"status_codes": [200, 201]},
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "tests/notes.test.js"}],
+    )
+
+    assert diagnostics == []
+
+
+def test_validate_http_status_contract_uses_requirement_status_when_interface_is_silent(
+    tmp_project_dir: Path,
+) -> None:
+    test_path = tmp_project_dir / "tests" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status()).toBe(202);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "POST /api/notes returns HTTP status code 202."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "specification": "POST /api/notes creates a note.",
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "tests/notes.test.js"}],
+    )
+
+    assert diagnostics == []
+
+
+def test_validate_http_status_contract_reads_explicit_route_status(tmp_project_dir: Path) -> None:
+    route_path = tmp_project_dir / "backend" / "src" / "routes" / "notes.js"
+    route_path.parent.mkdir(parents=True)
+    route_path.write_text(
+        "const router = express.Router();\n"
+        "router.post('/notes', (req, res) => res.status(206).json({}));\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_project_dir / "e2e" / "notes.spec.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await page.request.post('/api/notes');\n"
+        "expect(response.status()).toBe(206);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "specification": "POST /api/notes",
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "E2E", "file_path": "e2e/notes.spec.js"}],
+    )
+
+    assert diagnostics == []
+
+
+def test_validate_http_status_contract_does_not_mix_statuses_from_sibling_routes(
+    tmp_project_dir: Path,
+) -> None:
+    route_path = tmp_project_dir / "backend" / "src" / "routes" / "notes.js"
+    route_path.parent.mkdir(parents=True)
+    route_path.write_text(
+        "const router = express.Router();\n"
+        "router.get('/users', (req, res) => res.status(200).json({}));\n"
+        "router.post('/notes', (req, res) => res.status(201).json({}));\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_project_dir / "integration" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request(app).post('/api/notes');\n"
+        "expect(response.status()).toBe(200);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "specification": "POST /api/notes creates a note.",
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "integration/notes.test.js"}],
+    )
+
+    assert diagnostics[0]["code"] == "status_code_conflict"
+    assert diagnostics[0]["contract_status_codes"] == [201]
+
+
+def test_validate_http_status_contract_rejects_requirement_interface_conflict(
+    tmp_project_dir: Path,
+) -> None:
+    test_path = tmp_project_dir / "integration" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status()).toBe(201);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "POST /api/notes returns 201."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "specification": "POST /api/notes returns 200.",
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "integration/notes.test.js"}],
+    )
+
+    assert diagnostics
+    assert diagnostics[0]["code"] == "status_code_conflict"
+    assert "201" in diagnostics[0]["message"]
+    assert "200" in diagnostics[0]["message"]
+
+
+def test_validate_http_status_contract_rejects_conflicting_assertion_with_diagnostic(
+    tmp_project_dir: Path,
+) -> None:
+    test_path = tmp_project_dir / "e2e" / "notes.spec.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await page.request.post('/api/notes');\n"
+        "expect(response.status()).toBe(200);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "specification": "POST /api/notes returns 201.",
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "E2E", "file_path": "e2e/notes.spec.js"}],
+    )
+
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic["code"] == "status_code_conflict"
+    assert diagnostic["file_path"] == "e2e/notes.spec.js"
+    assert diagnostic["assertion"] == "expect(response.status()).toBe(200)"
+    assert diagnostic["expected_status_codes"] == [200]
+    assert diagnostic["contract_status_codes"] == [201]
+    assert diagnostic["interface_id"] == "IF-NOTES"
+    assert "201" in diagnostic["message"]
+
+
+def test_validate_http_status_contract_reports_needs_info_without_status_source(
+    tmp_project_dir: Path,
+) -> None:
+    test_path = tmp_project_dir / "integration" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status()).toBe(200);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "specification": "POST /api/notes creates a note.",
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "integration/notes.test.js"}],
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_needs_info"
+    assert "needs-info" in diagnostics[0]["message"]
+    assert "not enough HTTP status" in diagnostics[0]["message"]
+
+
+def test_validate_http_status_contract_rejects_unbounded_2xx_matcher(tmp_project_dir: Path) -> None:
+    test_path = tmp_project_dir / "integration" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status()).toBeGreaterThanOrEqual(200);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "specification": "POST /api/notes returns 201.",
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "integration/notes.test.js"}],
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_needs_info"
+    assert "specific status code" in diagnostics[0]["message"]

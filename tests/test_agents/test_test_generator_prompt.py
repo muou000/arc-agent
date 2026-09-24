@@ -59,3 +59,17 @@ def test_user_prompt_requires_exact_current_contract_ids() -> None:
     assert "`interface_ids` must be non-empty" in prompt
     assert "exact ids from the Current Interface Contract" in prompt
     assert "Do not replace them with an empty list." in prompt
+
+
+def test_prompts_require_contract_http_statuses_without_a_200_default() -> None:
+    system_prompt = get_system_prompt()
+    user_prompt = get_user_prompt(
+        node_id="REQ-X",
+        requirement_data={"name": "Example", "description": "Example requirement"},
+        dynamic_context="",
+        interface_contract='{"interface_id":"REQ-X-API-EXAMPLE"}',
+    )
+
+    assert "Never invent or default to 200" in system_prompt
+    assert "including 201 or another non-default 2xx" in user_prompt
+    assert "report `needs-info` instead" in user_prompt

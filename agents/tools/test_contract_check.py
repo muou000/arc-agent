@@ -85,6 +85,697 @@ _ROLE_NAMES = {"link", "button", "checkbox", "textbox", "combobox", "heading", "
 #: node session; the cap keeps the hook list usable as a prompt block.
 _MAX_HOOKS_PER_FILE = 60
 
+_IDENTIFIER = r"[A-Za-z_$][\w$]*"
+_HTTP_METHODS = "get|post|put|patch|delete|head|options"
+_EXACT_STATUS_MATCHERS = {
+    "toBe",
+    "toEqual",
+    "toStrictEqual",
+    "toBeOneOf",
+    "toContain",
+    "toHaveProperty",
+    "expect",
+}
+_STATUS_ASSERTION_RE = re.compile(
+    rf"(?P<full>expect\(\s*(?P<receiver>{_IDENTIFIER})\s*\.\s*"
+    rf"(?P<property>status(?:Code)?)\s*(?:\(\s*\))?\s*\)\s*\.\s*"
+    rf"(?P<matcher>to[A-Za-z]+)\(\s*(?P<expected>[^;\n]*)\))",
+)
+_ASSERT_STATUS_RE = re.compile(
+    rf"(?P<full>assert\.(?P<matcher>strictEqual|equal)\(\s*"
+    rf"(?P<receiver>{_IDENTIFIER})\s*\.\s*(?P<property>status(?:Code)?)"
+    rf"\s*(?:\(\s*\))?\s*,\s*(?P<expected>[^;\n]*)\))",
+)
+_REQUEST_CALL_RE = re.compile(
+    rf"(?:(?:const|let|var)\s+(?P<variable>{_IDENTIFIER})\s*=\s*)?"
+    rf"(?:await\s+)?(?:(?:{_IDENTIFIER})\s*\.\s*)+"
+    rf"(?P<method>{_HTTP_METHODS})\s*\(\s*"
+    rf"(?P<quote>['\"])(?P<path>/[^'\"\n]*)",
+    re.IGNORECASE,
+)
+_STATUS_PROPERTY_ASSERTION_RE = re.compile(
+    rf"(?P<full>expect\(\s*(?P<receiver>{_IDENTIFIER})\s*\)\s*\.\s*"
+    rf"(?P<matcher>toHaveProperty)\(\s*['\"](?P<property>status(?:Code)?)['\"]"
+    rf"(?:\s*,\s*(?P<expected>[^)\n]+))?\s*\))",
+    re.IGNORECASE,
+)
+_REVERSED_STATUS_CONTAINS_RE = re.compile(
+    rf"(?P<full>expect\(\s*(?P<expected>\[[^\]]*\])\s*\)\s*\.\s*"
+    rf"(?P<matcher>toContain)\(\s*(?P<receiver>{_IDENTIFIER})\s*\.\s*"
+    rf"status(?:Code)?\s*(?:\(\s*\))?\s*\))",
+    re.IGNORECASE,
+)
+_REQUEST_EXPECT_RE = re.compile(
+    rf"(?P<full>(?:await\s+)?(?:{_IDENTIFIER}(?:\([^\n)]*\))?\s*\.\s*)+"
+    rf"(?P<method>{_HTTP_METHODS})\s*\(\s*(?P<quote>['\"])(?P<path>/[^'\"\n]*)"
+    rf"[^\n;]*?\)\s*\.\s*expect\(\s*(?P<expected>[^)\n]+)\))",
+    re.IGNORECASE,
+)
+_CHAIN_REQUEST_CALL_RE = re.compile(
+    rf"(?:(?:const|let|var)\s+(?P<variable>{_IDENTIFIER})\s*=\s*)?"
+    rf"(?:await\s+)?{_IDENTIFIER}\s*\([^)]*\)\s*\.\s*"
+    rf"(?P<method>{_HTTP_METHODS})\s*\(\s*"
+    rf"(?P<quote>['\"])(?P<path>/[^'\"\n]*)",
+    re.IGNORECASE,
+)
+_FETCH_CALL_RE = re.compile(
+    rf"(?:(?:const|let|var)\s+(?P<variable>{_IDENTIFIER})\s*=\s*)?"
+    rf"(?:await\s+)?fetch\(\s*(?P<quote>['\"])(?P<path>/[^'\"\n]*)",
+    re.IGNORECASE,
+)
+_ROUTE_DECLARATION_RE = re.compile(
+    rf"\b(?:router|app|server|api)\s*\.\s*(?P<method>{_HTTP_METHODS})\s*\(\s*"
+    rf"(?P<quote>['\"])(?P<path>/[^'\"\n]*)",
+    re.IGNORECASE,
+)
+_ROUTE_DECORATOR_RE = re.compile(
+    rf"@(?:app|router)\s*\.\s*(?P<method>{_HTTP_METHODS})\s*\(\s*"
+    rf"(?P<quote>['\"])(?P<path>/[^'\"\n]*)"
+    rf"(?P<options>[^)]*)\)",
+    re.IGNORECASE,
+)
+_ROUTE_STATUS_RE = re.compile(
+    r"(?:\.(?:status|sendStatus|code)\s*\(\s*|\b(?:statusCode|status_code)\s*[:=]\s*|\bctx\.status\s*=\s*)"
+    r"(?P<code>[1-5]\d{2})\b",
+    re.IGNORECASE,
+)
+_ROUTE_RETURN_STATUS_RE = re.compile(r"\breturn\b[\s\S]{0,160}?,\s*(?P<code>[1-5]\d{2})\b")
+_STATUS_TEXT_PATTERNS = (
+    re.compile(
+        r"\b(?:HTTP\s+)?status(?:\s+code|_code)?\s*(?:is|=|:|->|returns?|returned|为|是)\s*(?P<code>[1-5]\d{2})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:returns?|returning|responds?\s+with|response\s+is|expects?)\s+"
+        r"(?:HTTP\s+)?(?:status(?:\s+code)?\s*(?:is|=|:)?\s*)?"
+        r"(?P<code>[1-5]\d{2})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bHTTP\s+(?P<code>[1-5]\d{2})\b", re.IGNORECASE),
+    re.compile(
+        r"(?:返回|响应)\s*(?:HTTP\s*)?(?:状态码\s*)?(?:为|是|[:：])?\s*"
+        r"(?P<code>[1-5]\d{2})\b"
+    ),
+    re.compile(r"状态码\s*(?:为|是|[:：])?\s*(?P<code>[1-5]\d{2})\b"),
+)
+_STATUS_FIELD_NAMES = {
+    "status",
+    "statuscode",
+    "status_code",
+    "httpstatus",
+    "http_status",
+    "responsestatus",
+    "response_status",
+    "statuses",
+    "statuscodes",
+    "status_codes",
+}
+
+
+def _normalize_api_path(value: str) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    if text.startswith("/workspace/"):
+        text = text[len("/workspace") :]
+    if not text.startswith("/"):
+        return ""
+    text = text.split("?", 1)[0].split("#", 1)[0]
+    text = re.sub(r"/+$", "", text)
+    return text or "/"
+
+
+def _parse_status_codes(value: Any) -> list[int]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, int):
+        return [value] if 100 <= value <= 599 else []
+    if isinstance(value, float) and value.is_integer():
+        code = int(value)
+        return [code] if 100 <= code <= 599 else []
+    text = str(value or "")
+    codes: list[int] = []
+    for raw in re.findall(r"(?<!\d)([1-5]\d{2})(?!\d)", text):
+        code = int(raw)
+        if code not in codes:
+            codes.append(code)
+    return codes
+
+
+def _extract_status_codes_from_text(value: Any) -> list[int]:
+    text = str(value or "")
+    codes: list[int] = []
+    for pattern in _STATUS_TEXT_PATTERNS:
+        for match in pattern.finditer(text):
+            code = int(match.group("code"))
+            if code not in codes:
+                codes.append(code)
+    return codes
+
+
+def _extract_status_codes_from_value(value: Any, *, key_hint: str = "") -> list[int]:
+    if isinstance(value, dict):
+        codes: list[int] = []
+        for raw_key, nested in value.items():
+            key = re.sub(r"[^a-z0-9_]", "", str(raw_key).lower())
+            if key in _STATUS_FIELD_NAMES or (
+                key == "code" and key_hint in {"outputs", "responses", "response"}
+            ):
+                candidates = _parse_status_codes(nested)
+                if not candidates and isinstance(nested, str):
+                    candidates = _extract_status_codes_from_text(nested)
+            elif key in {"outputs", "responses", "response", "result", "data"}:
+                candidates = _extract_status_codes_from_value(nested, key_hint=key)
+            else:
+                candidates = _extract_status_codes_from_value(nested, key_hint=key)
+            for code in candidates:
+                if code not in codes:
+                    codes.append(code)
+        return codes
+    if isinstance(value, (list, tuple, set)):
+        codes: list[int] = []
+        for item in value:
+            for code in _extract_status_codes_from_value(item, key_hint=key_hint):
+                if code not in codes:
+                    codes.append(code)
+        return codes
+    if key_hint in _STATUS_FIELD_NAMES or key_hint in {"outputs", "responses", "response"}:
+        return _parse_status_codes(value)
+    return _extract_status_codes_from_text(value)
+
+
+def _read_workspace_text(workspace_root: str | Path, raw_path: str) -> str:
+    root = Path(workspace_root).expanduser().resolve()
+    relative = str(raw_path or "").strip().replace("\\", "/")
+    if relative.startswith("/workspace/"):
+        relative = relative[len("/workspace/") :]
+    candidate = (root / relative.lstrip("/")).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return ""
+    try:
+        return candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _extract_api_requests(content: str) -> list[dict[str, Any]]:
+    requests: list[dict[str, Any]] = []
+    for pattern in (_REQUEST_CALL_RE, _CHAIN_REQUEST_CALL_RE, _FETCH_CALL_RE):
+        for match in pattern.finditer(content):
+            path = _normalize_api_path(match.group("path"))
+            if not path:
+                continue
+            method = str(match.groupdict().get("method") or "").upper()
+            if not method and pattern is _FETCH_CALL_RE:
+                call_end = content.find(")", match.end())
+                options = content[match.end() : call_end if call_end != -1 else match.end() + 400]
+                method_match = re.search(r"\bmethod\s*:\s*['\"]([A-Za-z]+)", options, re.IGNORECASE)
+                method = str(method_match.group(1) if method_match else "GET").upper()
+            requests.append(
+                {
+                    "path": path,
+                    "method": method or "GET",
+                    "variable": str(match.groupdict().get("variable") or "").strip(),
+                    "start": match.start(),
+                }
+            )
+    return sorted(requests, key=lambda item: int(item["start"]))
+
+
+def _status_values_from_assertion(matcher: str, raw_expected: str) -> list[int]:
+    if matcher not in _EXACT_STATUS_MATCHERS:
+        return []
+    if matcher == "expect" and not re.fullmatch(
+        r"\s*(?:[1-5]\d{2}|\[[^\]]*\])(?:\s*,[^)]*)?\s*", raw_expected
+    ):
+        return []
+    return _parse_status_codes(raw_expected)
+
+
+def extract_http_status_assertions(file_path: str, content: str) -> list[dict[str, Any]]:
+    """Extract exact HTTP status assertions and their nearest request.
+
+    This deliberately recognizes only assertions that name a concrete status
+    code. Range assertions such as ``>= 200`` remain visible with an empty
+    ``expected_status_codes`` list so DESIGN can emit a needs-info diagnostic
+    instead of treating an arbitrary 2xx as contract-safe.
+    """
+
+    requests = _extract_api_requests(content)
+    matches = (
+        list(_STATUS_ASSERTION_RE.finditer(content))
+        + list(_ASSERT_STATUS_RE.finditer(content))
+        + list(_STATUS_PROPERTY_ASSERTION_RE.finditer(content))
+        + list(_REVERSED_STATUS_CONTAINS_RE.finditer(content))
+    )
+    assertions: list[dict[str, Any]] = []
+    for match in _REQUEST_EXPECT_RE.finditer(content):
+        groups = match.groupdict()
+        matcher = "expect"
+        expected = str(groups.get("expected") or "").strip()
+        expected_codes = _status_values_from_assertion(matcher, expected)
+        if not expected_codes:
+            continue
+        assertions.append(
+            {
+                "file_path": file_path,
+                "line": content.count("\n", 0, match.start()) + 1,
+                "path": _normalize_api_path(groups.get("path", "")),
+                "method": str(groups.get("method") or "").upper(),
+                "assertion": str(groups.get("full") or "").strip(),
+                "expected_status_codes": expected_codes,
+                "matcher": matcher,
+            }
+        )
+    for match in sorted(matches, key=lambda item: item.start()):
+        groups = match.groupdict()
+        receiver = str(groups.get("receiver") or "").strip()
+        request = next(
+            (
+                item
+                for item in reversed(requests)
+                if int(item["start"]) <= match.start()
+                and (not receiver or not item["variable"] or item["variable"] == receiver)
+            ),
+            None,
+        )
+        raw_expected = str(groups.get("expected") or "").strip()
+        matcher = str(groups.get("matcher") or "").strip()
+        assertions.append(
+            {
+                "file_path": file_path,
+                "line": content.count("\n", 0, match.start()) + 1,
+                "path": request["path"] if request else None,
+                "method": request["method"] if request else None,
+                "assertion": str(groups.get("full") or "").strip(),
+                "expected_status_codes": _status_values_from_assertion(matcher, raw_expected),
+                "matcher": matcher,
+            }
+        )
+    return assertions
+
+
+def collect_manifest_http_status_assertions(
+    workspace_root: str | Path,
+    tests: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read E2E/Integration manifest files and extract HTTP status assertions."""
+
+    assertions: list[dict[str, Any]] = []
+    seen_files: set[str] = set()
+    for item in tests or []:
+        if not isinstance(item, dict):
+            continue
+        test_type = str(item.get("type") or "").strip().lower()
+        if test_type not in {"e2e", "integration"}:
+            continue
+        file_path = str(item.get("file_path") or "").strip().replace("\\", "/")
+        if not file_path or file_path in seen_files:
+            continue
+        seen_files.add(file_path)
+        content = _read_workspace_text(workspace_root, file_path)
+        if content:
+            assertions.extend(extract_http_status_assertions(file_path, content))
+    return assertions
+
+
+def _extract_route_records(workspace_root: str | Path, interface: dict[str, Any]) -> list[dict[str, Any]]:
+    file_path = str(interface.get("file_path") or "").strip()
+    content = _read_workspace_text(workspace_root, file_path)
+    if not content:
+        return []
+    matches = list(_ROUTE_DECLARATION_RE.finditer(content))
+    matches.extend(_ROUTE_DECORATOR_RE.finditer(content))
+    matches.sort(key=lambda item: item.start())
+    routes: list[dict[str, Any]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+        segment = content[match.start() : end]
+        codes: list[int] = []
+        for status_match in _ROUTE_STATUS_RE.finditer(segment):
+            code = int(status_match.group("code"))
+            if code not in codes:
+                codes.append(code)
+        for status_match in _ROUTE_RETURN_STATUS_RE.finditer(segment):
+            code = int(status_match.group("code"))
+            if code not in codes:
+                codes.append(code)
+        for option_match in re.finditer(r"\bstatus_code\s*=\s*([1-5]\d{2})\b", segment, re.IGNORECASE):
+            code = int(option_match.group(1))
+            if code not in codes:
+                codes.append(code)
+        if codes:
+            routes.append(
+                {
+                    "method": str(match.group("method") or "").upper(),
+                    "path": _normalize_api_path(match.group("path")),
+                    "status_codes": codes,
+                    "source": f"route:{file_path}",
+                }
+            )
+    return routes
+
+
+def _extract_interface_route_paths(interface: dict[str, Any]) -> list[dict[str, str]]:
+    paths: list[dict[str, str]] = []
+    fields = (
+        ("name", interface.get("name")),
+        ("responsibility", interface.get("responsibility")),
+        ("specification", interface.get("specification")),
+        ("first_line", interface.get("first_line")),
+    )
+    for _field, value in fields:
+        text = str(value or "")
+        method_matches = list(
+            re.finditer(
+                r"\b(?P<method>(?:" + _HTTP_METHODS + r"))\s+"
+                r"(?P<path>/[A-Za-z0-9_./:{}?=&%-]+)",
+                text,
+                re.IGNORECASE,
+            )
+        )
+        for match in method_matches:
+            path = _normalize_api_path(match.group("path").rstrip(".,;"))
+            if path:
+                paths.append({"method": match.group("method").upper(), "path": path})
+        for raw_path in re.findall(r"['\"](/[^'\"\s)]+)", text):
+            path = _normalize_api_path(raw_path.rstrip(".,;"))
+            if path and not any(item["path"] == path for item in paths):
+                paths.append({"method": "", "path": path})
+    return paths
+
+
+def _interface_status_sources(workspace_root: str | Path, interface: dict[str, Any]) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for field in ("specification", "responsibility", "first_line", "test_focus"):
+        codes = _extract_status_codes_from_text(interface.get(field))
+        if codes:
+            sources.append({"codes": codes, "source": f"interface:{interface.get('interface_id')}:{field}"})
+    for field in (
+        "outputs",
+        "response",
+        "responses",
+        "status",
+        "status_code",
+        "status_codes",
+        "http_status",
+        "response_status",
+        "expected_status",
+        "expected_status_codes",
+    ):
+        codes = _extract_status_codes_from_value(interface.get(field), key_hint=field)
+        if codes:
+            sources.append({"codes": codes, "source": f"interface:{interface.get('interface_id')}:{field}"})
+    for route in _extract_route_records(workspace_root, interface):
+        sources.append({"codes": route["status_codes"], "source": route["source"], "route": route})
+    return sources
+
+
+def _path_matches(candidate: str, requested: str) -> bool:
+    left = _normalize_api_path(candidate)
+    right = _normalize_api_path(requested)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if left == "/":
+        return right == "/"
+    return right.endswith(left)
+
+
+def _status_contract_diagnostic(
+    *,
+    code: str,
+    assertion: dict[str, Any],
+    message: str,
+    contract_status_codes: list[int] | None = None,
+    interface_id: str = "",
+) -> dict[str, Any]:
+    return {
+        "code": code,
+        "message": message,
+        "file_path": assertion.get("file_path", ""),
+        "line": assertion.get("line"),
+        "assertion": assertion.get("assertion", ""),
+        "path": assertion.get("path"),
+        "method": assertion.get("method"),
+        "expected_status_codes": list(assertion.get("expected_status_codes") or []),
+        "contract_status_codes": list(contract_status_codes or []),
+        "interface_id": interface_id,
+    }
+
+
+def validate_http_status_contracts(
+    workspace_root: str | Path,
+    requirement_data: dict[str, Any],
+    interfaces: list[dict[str, Any]],
+    tests: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Validate generated HTTP status assertions against DESIGN contracts.
+
+    Status codes are resolved in this order: an exact status in the
+    requirement, an explicit status in the interface card, then an explicit
+    status in the route source file. There is intentionally no implicit 200
+    fallback: an assertion without one of those sources is a needs-info
+    diagnostic.
+    """
+
+    assertions = collect_manifest_http_status_assertions(workspace_root, tests)
+    if not assertions:
+        return []
+    api_interfaces = [
+        interface
+        for interface in interfaces or []
+        if isinstance(interface, dict) and str(interface.get("type") or "").strip().upper() == "API"
+    ]
+    requirement_text = "\n".join(
+        str(requirement_data.get(key) or "")
+        for key in ("name", "description")
+    )
+    for scenario in requirement_data.get("scenarios") or []:
+        if isinstance(scenario, dict):
+            requirement_text += "\n" + "\n".join(str(scenario.get(key) or "") for key in ("name", "given", "when", "then"))
+    requirement_codes = _extract_status_codes_from_text(requirement_text)
+    requirement_paths = [
+        _normalize_api_path(path.rstrip(".,;"))
+        for path in re.findall(r"['\"](/[^'\"\s)]+)", requirement_text)
+    ]
+
+    prepared: list[dict[str, Any]] = []
+    for interface in api_interfaces:
+        paths = _extract_interface_route_paths(interface)
+        sources = _interface_status_sources(workspace_root, interface)
+        interface_codes: list[int] = []
+        route_codes: list[int] = []
+        for source in sources:
+            route = source.get("route")
+            target = interface_codes if route is None else route_codes
+            for code in source.get("codes") or []:
+                if code not in target:
+                    target.append(code)
+            if route:
+                route_path = {"method": route.get("method", ""), "path": route.get("path", "")}
+                if route_path not in paths:
+                    paths.append(route_path)
+        prepared.append(
+            {
+                "interface": interface,
+                "interface_id": str(interface.get("interface_id") or "").strip(),
+                "paths": paths,
+                "interface_codes": interface_codes,
+                "route_codes": route_codes,
+                "routes": [
+                    source["route"]
+                    for source in sources
+                    if isinstance(source.get("route"), dict)
+                ],
+            }
+        )
+
+    diagnostics: list[dict[str, Any]] = []
+    for assertion in assertions:
+        path = str(assertion.get("path") or "").strip()
+        method = str(assertion.get("method") or "").strip().upper()
+        candidates = [
+            item
+            for item in prepared
+            if (
+                not path
+                or not item["paths"]
+                or any(
+                    _path_matches(route.get("path", ""), path)
+                    and (not method or not route.get("method") or route.get("method") == method)
+                    for route in item["paths"]
+                )
+            )
+        ]
+        if path:
+            path_candidates = [item for item in candidates if item["paths"]]
+            if path_candidates:
+                candidates = path_candidates
+        if not candidates and len(prepared) == 1:
+            candidates = prepared
+        if not candidates:
+            diagnostics.append(
+                _status_contract_diagnostic(
+                    code="status_code_needs_info",
+                    assertion=assertion,
+                    message=(
+                        "needs-info: the status assertion has no matching API interface or route "
+                        f"contract for {path or 'the request'}; do not guess an HTTP status code."
+                    ),
+                )
+            )
+            continue
+        if len(candidates) > 1:
+            matching = [
+                item
+                for item in candidates
+                if path
+                and any(_path_matches(route.get("path", ""), path) for route in item["paths"])
+            ]
+            if matching:
+                candidates = matching
+        candidate = candidates[0] if len(candidates) == 1 else None
+        if candidate is None:
+            diagnostics.append(
+                _status_contract_diagnostic(
+                    code="status_code_needs_info",
+                    assertion=assertion,
+                    message=(
+                        "needs-info: more than one API interface could own this status assertion; "
+                        "name the route or interface status before generating an exact assertion."
+                    ),
+                )
+            )
+            continue
+
+        interface = candidate["interface"]
+        candidate_paths = [route.get("path", "") for route in candidate["paths"]]
+        matching_routes = [
+            route
+            for route in candidate["routes"]
+            if (
+                (not path or _path_matches(route.get("path", ""), path))
+                and (not method or not route.get("method") or route.get("method") == method)
+            )
+        ]
+        matched_route_codes: list[int] = []
+        for route in matching_routes:
+            for code in route.get("status_codes") or []:
+                if code not in matched_route_codes:
+                    matched_route_codes.append(code)
+        route_codes = matched_route_codes if candidate["routes"] else candidate["route_codes"]
+        registered_codes = list(candidate["interface_codes"] or route_codes)
+        requirement_applies = bool(
+            requirement_codes
+            and (
+                not requirement_paths
+                or not path
+                or any(_path_matches(req_path, path) for req_path in requirement_paths)
+                or len(prepared) == 1
+            )
+        )
+        if candidate["interface_codes"] and route_codes and set(candidate["interface_codes"]).isdisjoint(route_codes):
+            diagnostics.append(
+                _status_contract_diagnostic(
+                    code="status_code_conflict",
+                    assertion=assertion,
+                    interface_id=candidate["interface_id"],
+                    contract_status_codes=registered_codes,
+                    message=(
+                        f"HTTP status sources for {candidate['interface_id'] or 'API interface'} "
+                        f"conflict: interface declares {', '.join(str(code) for code in candidate['interface_codes'])}, "
+                        f"but the matched route declares {', '.join(str(code) for code in route_codes)}."
+                    ),
+                )
+            )
+            continue
+        if requirement_applies and registered_codes and set(requirement_codes).isdisjoint(registered_codes):
+            diagnostics.append(
+                _status_contract_diagnostic(
+                    code="status_code_conflict",
+                    assertion=assertion,
+                    interface_id=candidate["interface_id"],
+                    contract_status_codes=registered_codes,
+                    message=(
+                        f"Requirement declares HTTP status {', '.join(str(code) for code in requirement_codes)}, "
+                        f"but registered contract {candidate['interface_id'] or 'API interface'} declares "
+                        f"{', '.join(str(code) for code in registered_codes)}."
+                    ),
+                )
+            )
+            continue
+        contract_codes = (
+            list(requirement_codes)
+            if requirement_applies
+            else registered_codes
+        )
+        if not contract_codes:
+            diagnostics.append(
+                _status_contract_diagnostic(
+                    code="status_code_needs_info",
+                    assertion=assertion,
+                    interface_id=candidate["interface_id"],
+                    message=(
+                        "needs-info: not enough HTTP status contract information exists for "
+                        f"{path or ', '.join(candidate_paths) or 'this request'}; the contract "
+                        "does not declare an HTTP status code. Remove the guessed assertion or "
+                        "record the exact status in the interface contract."
+                    ),
+                )
+            )
+            continue
+        expected = list(assertion.get("expected_status_codes") or [])
+        if not expected:
+            diagnostics.append(
+                _status_contract_diagnostic(
+                    code="status_code_needs_info",
+                    assertion=assertion,
+                    interface_id=candidate["interface_id"],
+                    contract_status_codes=contract_codes,
+                    message=(
+                        "needs-info: HTTP status assertions must name a specific status code "
+                        f"from the contract ({', '.join(str(code) for code in contract_codes)}); "
+                        "a range or arbitrary 2xx matcher is not contract-safe."
+                    ),
+                )
+            )
+            continue
+        if not set(expected).issubset(set(contract_codes)):
+            diagnostics.append(
+                _status_contract_diagnostic(
+                    code="status_code_conflict",
+                    assertion=assertion,
+                    interface_id=candidate["interface_id"],
+                    contract_status_codes=contract_codes,
+                    message=(
+                        f"HTTP status assertion in {assertion['file_path']} conflicts with the "
+                        f"registered contract {candidate['interface_id'] or 'API interface'}: "
+                        f"assertion expects {', '.join(str(code) for code in expected)}, "
+                        f"contract permits {', '.join(str(code) for code in contract_codes)}. "
+                        "Update the test to match the contract before TDD."
+                    ),
+                )
+            )
+    return diagnostics
+
+
+def format_http_status_diagnostics(diagnostics: list[dict[str, Any]]) -> str:
+    """Render deterministic DESIGN diagnostics with source locations."""
+
+    lines = ["DESIGN failed: HTTP status contract validation rejected generated tests."]
+    for diagnostic in diagnostics:
+        location = str(diagnostic.get("file_path") or "unknown test file")
+        line = diagnostic.get("line")
+        if line:
+            location += f":{line}"
+        assertion = str(diagnostic.get("assertion") or "").strip()
+        suffix = f" Assertion: `{assertion}`." if assertion else ""
+        lines.append(f"- {diagnostic.get('code', 'status_code_needs_info')} at {location}.{suffix}")
+        lines.append(f"  {diagnostic.get('message', '')}")
+    return "\n".join(lines)
+
 
 def extract_test_hooks(file_path: str, content: str) -> list[dict[str, str]]:
     """Extract the observable hooks a test file drives.

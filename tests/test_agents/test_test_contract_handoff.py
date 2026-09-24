@@ -250,3 +250,135 @@ def test_tdd_context_hooks_refresh_after_session_rewrite(tmp_project_dir: Path, 
     second = context_pipeline.build_agent_context(node_id=node_id, agent_type="TestDrivenDeveloper")
     assert "`new-hook`" in second
     assert "`old-hook`" not in second
+
+
+def _make_status_runner(
+    tmp_project_dir: Path,
+    status_code: int,
+    *,
+    interface_specification: str = "POST /api/notes returns 201.",
+) -> tuple[WorkflowPhaseRunner, list[tuple]]:
+    logs: list[tuple] = []
+
+    def log_cb(agent, message, status=None, node_id=None):
+        logs.append((agent, message, status, node_id))
+
+    requirements_dir = tmp_project_dir / "requirements"
+    requirements_dir.mkdir(parents=True, exist_ok=True)
+    runner = WorkflowPhaseRunner(
+        workspace_path=str(tmp_project_dir),
+        requirement_path=str(requirements_dir / "req.md"),
+        app_type="web",
+        interface_designer=_StubDesigner(
+            {
+                "summary": "Notes API contract.",
+                "interfaces": [
+                    {
+                        "interface_id": "IF-NOTES",
+                        "type": "API",
+                        "name": "notes-route",
+                        "responsibility": "Creates notes.",
+                        "specification": interface_specification,
+                        "file_path": "backend/src/routes/notes.js",
+                        "first_line": "router.post('/notes'",
+                    }
+                ],
+                "files_written": [],
+            }
+        ),
+        test_generator=_StubGenerator(
+            [
+                {
+                    "test_id": "T-NOTES-E2E",
+                    "req_id": "REQ-HOOK-STATUS",
+                    "interface_ids": ["IF-NOTES"],
+                    "coverage_scope": "owned",
+                    "type": "E2E",
+                    "file_path": E2E_TEST_FILE,
+                    "first_line": "const response = await page.request.post",
+                }
+            ]
+        ),
+        test_driven_developer=_StubTDD(),
+        log_cb=log_cb,
+    )
+    runner.app_handler = FakeAppHandler([failing_test_output()])
+    return runner, logs
+
+
+def _write_status_fixture(tmp_project_dir: Path, status_code: int) -> None:
+    route = tmp_project_dir / "backend" / "src" / "routes" / "notes.js"
+    route.parent.mkdir(parents=True, exist_ok=True)
+    route.write_text(
+        "const router = express.Router();\n"
+        f"router.post('/notes', (req, res) => res.status({status_code}).json({{}}));\n",
+        encoding="utf-8",
+    )
+    test = tmp_project_dir / E2E_TEST_FILE
+    test.parent.mkdir(parents=True, exist_ok=True)
+    test.write_text(
+        "const response = await page.request.post('/api/notes');\n"
+        f"expect(response.status()).toBe({status_code});\n",
+        encoding="utf-8",
+    )
+
+
+def test_design_phase_blocks_conflicting_http_status_before_baseline(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    node_id = "REQ-HOOK-STATUS"
+    arc_runtime.traceability.store_requirement_tree(
+        {"id": node_id, "name": "Create note", "description": "Create a note."}
+    )
+    runner, logs = _make_status_runner(tmp_project_dir, 200)
+    _write_status_fixture(tmp_project_dir, 200)
+
+    assert asyncio.run(runner.run_design_phase(node_id, {"name": "Create note"})) is False
+    diagnostics = sessions.load_node_session(node_id).get("test_contract_diagnostics") or []
+    assert diagnostics[0]["code"] == "status_code_conflict"
+    assert diagnostics[0]["assertion"].endswith("toBe(200)")
+    assert any("HTTP status contract validation rejected" in message for _, message, _, _ in logs)
+    assert runner.app_handler.calls == []
+
+
+def test_design_phase_accepts_explicit_non_default_route_status(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    node_id = "REQ-HOOK-STATUS"
+    arc_runtime.traceability.store_requirement_tree(
+        {"id": node_id, "name": "Create note", "description": "Create a note."}
+    )
+    runner, _logs = _make_status_runner(tmp_project_dir, 201)
+    _write_status_fixture(tmp_project_dir, 201)
+
+    assert asyncio.run(runner.run_design_phase(node_id, {"name": "Create note"})) is True
+    assert sessions.load_node_session(node_id).get("test_contract_diagnostics") == []
+    assert runner.app_handler.calls == [("E2E", [E2E_TEST_FILE])]
+
+
+def test_design_phase_reports_needs_info_when_status_contract_is_missing(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    node_id = "REQ-HOOK-STATUS"
+    arc_runtime.traceability.store_requirement_tree(
+        {"id": node_id, "name": "Create note", "description": "Create a note."}
+    )
+    runner, logs = _make_status_runner(
+        tmp_project_dir,
+        200,
+        interface_specification="POST /api/notes creates a note.",
+    )
+    _write_status_fixture(tmp_project_dir, 200)
+    route = tmp_project_dir / "backend" / "src" / "routes" / "notes.js"
+    route.write_text(
+        "const router = express.Router();\n"
+        "router.post('/notes', (req, res) => res.json({}));\n",
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(runner.run_design_phase(node_id, {"name": "Create note"})) is False
+    diagnostics = sessions.load_node_session(node_id).get("test_contract_diagnostics") or []
+    assert diagnostics[0]["code"] == "status_code_needs_info"
+    assert "needs-info" in diagnostics[0]["message"]
+    assert any("not enough HTTP status" in message for _, message, _, _ in logs)
+    assert runner.app_handler.calls == []
