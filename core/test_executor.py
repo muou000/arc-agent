@@ -37,9 +37,19 @@ from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 #: Total ``run_tests`` calls one layer may spend per TDD pass.
 TDD_RUN_TESTS_BUDGET = 10
 #: Consecutive identical failure fingerprints before stall governance fires.
+#: The threshold is intentionally a constant so the compiler stop policy is
+#: deterministic and can be pinned by the faux harness without environment
+#: dependent tuning.
 TDD_STALL_THRESHOLD = 3
 #: Ordered test layers the executor schedules (Unit -> Integration -> E2E).
 TDD_BATCH_ORDER = CANONICAL_TEST_TYPES
+#: Stable reason copied into the runner event and failure digest.
+TDD_STALL_STOP_REASON = "repeated failure fingerprint with no effective source/environment change"
+#: Stable next action copied into the runner event and failure digest.
+TDD_STALL_STOP_SUGGESTION = (
+    "rotate your hypothesis: repair the environment/configuration or choose a different "
+    "implementation hypothesis in a fresh TDD pass"
+)
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 #: The handler seam: layer, files, and the retry round's failed-case filter
@@ -48,6 +58,9 @@ RunGroup = Callable[[str, list[str], "list[str] | None"], Awaitable[TestRunResul
 #: Stall-hint source for the failure digest: ``(test_type, fingerprint) -> hint
 #: text`` (empty string when the hint does not fire). Owned by the TDD adapter.
 TestEditHint = Callable[[str, str], str]
+#: Workspace/environment progress marker sampled immediately before a test run.
+#: A changed marker permits the same fingerprint to earn a fresh streak.
+ProgressMarker = Callable[[], Any]
 
 #: Per-file verification state: ``"green"`` (passed), ``"red"`` (verifiably
 #: failing), or ``None`` (no verified state: never run, or the run stopped at
@@ -131,9 +144,9 @@ class TddTestExecutor:
     - **Layer advancement** — ``active_layer`` / ``layer_passed``; a passing
       full-layer run closes the layer and hands the active role to its
       successor immediately.
-    - **Stall copy** — ``fingerprints`` / ``is_stalled``; repeated identical
-      failure fingerprints inject the hypothesis-rotation directive into the
-      run_tests result.
+    - **Stall governance** — repeated identical failure fingerprints with no
+      effective workspace/environment change close the active layer at
+      :data:`TDD_STALL_THRESHOLD`, before the ordinary run budget is spent.
 
     The executor never opens agent sessions; the orchestrator decides when a
     layer gets a session and reads the contract surface between them.
@@ -148,6 +161,7 @@ class TddTestExecutor:
         log_cb: LogCallback | None = None,
         agent_name: str = "TestDrivenDeveloper",
         test_edit_hint: "TestEditHint | None" = None,
+        progress_marker: "ProgressMarker | None" = None,
     ) -> None:
         self._node_id = node_id
         self._workspace_path = str(workspace_path)
@@ -159,6 +173,11 @@ class TddTestExecutor:
         # Optional: the DESIGN baseline gate runs this executor without an
         # adapter and never renders a hint.
         self._test_edit_hint = test_edit_hint
+        # Optional adapter-owned evidence of successful source/environment
+        # changes between failures. A missing marker is intentionally treated
+        # as no progress, which keeps the executor deterministic for minimal
+        # test adapters as well as the real stage adapter.
+        self._progress_marker = progress_marker
         # Manifest groups keyed by lowercased raw type; only canonical types
         # are scheduled (non-canonical groups surface via unsupported_layers).
         self._groups: dict[str, list[dict[str, Any]]] = {}
@@ -167,6 +186,11 @@ class TddTestExecutor:
         self._file_states: dict[str, dict[str, FileState]] = {}
         self._layer_passed: dict[str, bool] = {}
         self._fingerprints: dict[str, list[str]] = {}
+        self._last_failure_fingerprint: dict[str, str] = {}
+        self._last_failure_marker: dict[str, Any] = {}
+        self._last_failure_files: dict[str, tuple[str, ...]] = {}
+        self._no_change_streak: dict[str, int] = {}
+        self._stall_stops: dict[str, dict[str, Any]] = {}
         self._install_attempts: dict[str, int] = {}
         self._retry_case_names: dict[str, list[str]] = {}
         self._results: dict[str, TestRunResult] = {}
@@ -191,6 +215,11 @@ class TddTestExecutor:
         }
         self._layer_passed = {t: False for t in self._ordered}
         self._fingerprints = {t: [] for t in self._ordered}
+        self._last_failure_fingerprint = {}
+        self._last_failure_marker = {}
+        self._last_failure_files = {}
+        self._no_change_streak = {t: 0 for t in self._ordered}
+        self._stall_stops = {}
         self._install_attempts = {t: 0 for t in self._ordered}
         # Failed-case names parsed from a layer's most recent failed run
         # digest (#115). A retry round re-runs only these cases through the
@@ -273,6 +302,17 @@ class TddTestExecutor:
         recent = history[-TDD_STALL_THRESHOLD :]
         return len(history) >= TDD_STALL_THRESHOLD and len(set(recent)) == 1
 
+    def stall_stop(self, test_type: str) -> dict[str, Any] | None:
+        """Return the structured deterministic stop evidence for a layer."""
+
+        stop = self._stall_stops.get(test_type)
+        return dict(stop) if stop is not None else None
+
+    def is_hard_stopped(self, test_type: str) -> bool:
+        """Whether repeated failures closed this layer before budget exhaustion."""
+
+        return test_type in self._stall_stops
+
     def unsupported_layers(self) -> list[str]:
         """Non-canonical manifest groups that will never be scheduled."""
 
@@ -297,6 +337,80 @@ class TddTestExecutor:
 
     def set_environment_failure(self, reason: str | None) -> None:
         self._env_failure = reason
+
+    def _read_progress_marker(self) -> Any:
+        if self._progress_marker is None:
+            return None
+        try:
+            return self._progress_marker()
+        except Exception:
+            # Progress evidence is advisory. A broken marker must not crash a
+            # test run; treating it as unchanged preserves the deterministic
+            # stop contract for the executor.
+            return None
+
+    def _observe_failure(
+        self,
+        test_type: str,
+        result: TestRunResult,
+        progress_marker: Any,
+        selected_files: list[str],
+    ) -> dict[str, Any] | None:
+        """Record one failure and close the layer after an unchanged streak."""
+
+        self._fingerprints[test_type].append(result.fingerprint)
+        if not result.has_error_fingerprint:
+            self._last_failure_fingerprint.pop(test_type, None)
+            self._last_failure_marker.pop(test_type, None)
+            self._last_failure_files.pop(test_type, None)
+            self._no_change_streak[test_type] = 0
+            return None
+
+        previous_fingerprint = self._last_failure_fingerprint.get(test_type)
+        previous_marker = self._last_failure_marker.get(test_type)
+        previous_files = self._last_failure_files.get(test_type)
+        current_files = tuple(selected_files)
+        if previous_fingerprint == result.fingerprint and previous_files == current_files:
+            changed = progress_marker != previous_marker
+            self._no_change_streak[test_type] = (
+                1 if changed else self._no_change_streak.get(test_type, 0) + 1
+            )
+        else:
+            self._no_change_streak[test_type] = 1
+        self._last_failure_fingerprint[test_type] = result.fingerprint
+        self._last_failure_marker[test_type] = progress_marker
+        self._last_failure_files[test_type] = current_files
+
+        if self._no_change_streak[test_type] < TDD_STALL_THRESHOLD:
+            return None
+
+        stop = {
+            "reason": TDD_STALL_STOP_REASON,
+            "fingerprint": result.fingerprint,
+            "repetitions": self._no_change_streak[test_type],
+            "threshold": TDD_STALL_THRESHOLD,
+            "used": self.usage(test_type),
+            "budget": TDD_RUN_TESTS_BUDGET,
+            "suggested_action": TDD_STALL_STOP_SUGGESTION,
+        }
+        self._stall_stops[test_type] = stop
+        result.stall_stop = dict(stop)
+        return stop
+
+    def _stall_rejection(self, test_type: str) -> TestRunResult:
+        stop = self._stall_stops[test_type]
+        return _rejection(
+            "Exit Code: 1\n"
+            "STDERR:\n"
+            "ARC_TDD_HARD_STOP: the active TDD layer was closed after repeated failures "
+            "with no effective source/environment change.\n"
+            f"layer={test_type}\n"
+            f"fingerprint={stop['fingerprint']}\n"
+            f"repeated_failures={stop['repetitions']}/{stop['threshold']}\n"
+            f"budget_used={stop['used']}/{stop['budget']} run_tests calls\n"
+            f"suggested_action={stop['suggested_action']}\n"
+            "Do not call run_tests again in this pass; return a concise failure report.\n"
+        )
 
     # -- execution -------------------------------------------------------------
 
@@ -339,6 +453,8 @@ class TddTestExecutor:
                     f"The active TDD layer is `{self._active_layer}`, but run_tests requested `{selected_type}`. "
                     "The system attempts layers in Unit -> Integration -> E2E order with independent budgets.\n"
                 )
+        if self.is_hard_stopped(selected_type):
+            return self._stall_rejection(selected_type)
 
         selected_files = [
             path
@@ -423,6 +539,7 @@ class TddTestExecutor:
                     "failing case(s) parsed from the previous round's digest."
                 )
             )
+        progress_marker = self._read_progress_marker()
         result = await self._run_group(
             selected_type,
             selected_files,
@@ -458,6 +575,7 @@ class TddTestExecutor:
                 "instead of re-running the tests.\n"
             )
         if not passed:
+            stall_stop = self._observe_failure(selected_type, result, progress_marker, selected_files)
             # Structured per-test digest appended to the tool result: the
             # model sees each failed test's location and expected/received
             # up front instead of mining the long raw output for them.
@@ -490,6 +608,7 @@ class TddTestExecutor:
                         if self._test_edit_hint is not None
                         else ""
                     ),
+                    stall_stop=stall_stop,
                 )
                 + "\n"
             )
@@ -498,6 +617,10 @@ class TddTestExecutor:
             # revalidates the full layer; a case-filtered green round only
             # proves the previously failing cases now pass.
             self._retry_case_names[selected_type] = []
+            self._last_failure_fingerprint.pop(selected_type, None)
+            self._last_failure_marker.pop(selected_type, None)
+            self._last_failure_files.pop(selected_type, None)
+            self._no_change_streak[selected_type] = 0
         await self._log(
             (
                 "run_tests raw output\n"
@@ -545,9 +668,17 @@ class TddTestExecutor:
             for path in selected_files:
                 if self._file_states[selected_type].get(path) != "green":
                     self._file_states[selected_type][path] = "red"
-            self._fingerprints[selected_type].append(result.fingerprint)
             failure_now = result.environment_failure or None
-            if self._env_failure is None:
+            if self.is_hard_stopped(selected_type):
+                await self._log(
+                    (
+                        f"`run_tests` {selected_type} reached the deterministic repeated-fingerprint "
+                        f"stop after {self.usage(selected_type)}/{TDD_RUN_TESTS_BUDGET} calls; "
+                        "no effective source/environment change was observed."
+                    ),
+                    status="error",
+                )
+            elif self._env_failure is None:
                 if failure_now:
                     self._env_failure = failure_now
                     await self._log(
@@ -619,7 +750,7 @@ class TddTestExecutor:
         # Stall governance: three consecutive identical failure fingerprints
         # mean the last repairs did not change the failure - the agent is
         # stuck on one hypothesis. Force an explicit rotation.
-        if not passed and self.is_stalled(selected_type):
+        if not passed and self.is_stalled(selected_type) and not self.is_hard_stopped(selected_type):
             recent = self._fingerprints[selected_type][-TDD_STALL_THRESHOLD :]
             await self._log(
                 (
@@ -700,6 +831,21 @@ class TddTestExecutor:
                 "\nARC_TEST_LAYER_STATUS:\n"
                 f"- {selected_type} passed (full layer).\n"
                 "- This is the last scheduled test layer. You may return IMPLEMENTED only if all earlier scheduled layers also passed.\n"
+            )
+        elif self.is_hard_stopped(selected_type):
+            stop = self._stall_stops[selected_type]
+            stop_instruction = (
+                "- Do not call run_tests again; return a short report naming the missing dependency instead.\n"
+                if self._env_failure
+                else "- Do not call run_tests again in this pass; return the failure report and suggested action.\n"
+            )
+            result.output += (
+                "\nARC_TEST_LAYER_STATUS:\n"
+                f"- {selected_type} is closed by deterministic stall governance after "
+                f"{stop['used']}/{stop['budget']} run_tests calls.\n"
+                "- This layer is closed without spending the remaining run_tests budget.\n"
+                "- The same failure fingerprint repeated with no effective source/environment change.\n"
+                + stop_instruction
             )
         elif self._env_failure and self._usage[selected_type] >= TDD_RUN_TESTS_BUDGET:
             result.output += (
@@ -785,6 +931,8 @@ __all__ = [
     "TDD_BATCH_ORDER",
     "TDD_RUN_TESTS_BUDGET",
     "TDD_STALL_THRESHOLD",
+    "TDD_STALL_STOP_REASON",
+    "TDD_STALL_STOP_SUGGESTION",
     "BaselineRun",
     "FileState",
     "TddTestExecutor",

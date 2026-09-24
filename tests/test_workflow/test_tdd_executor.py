@@ -20,6 +20,7 @@ from app_type_handler.test_output_filter import render_filter_footer
 from app_type_handler.test_results import TestRunResult, parse_test_run
 from core.test_executor import (
     TDD_RUN_TESTS_BUDGET,
+    TDD_STALL_THRESHOLD,
     TddTestExecutor,
     classify_file_state,
 )
@@ -66,11 +67,14 @@ def make_executor(
     tmp_path: Path,
     runner: ScriptedRunner,
     tests: list[dict[str, Any]],
+    *,
+    progress_marker=None,
 ) -> TddTestExecutor:
     executor = TddTestExecutor(
         node_id="REQ-EXEC",
         workspace_path=str(tmp_path),
         run_group=runner,
+        progress_marker=progress_marker,
     )
     executor.register_tests(tests)
     return executor
@@ -130,7 +134,7 @@ def test_budget_exhaustion_closes_layer_and_advances(tmp_path: Path) -> None:
 
 
 def test_budget_exhaustion_on_last_layer_reports_no_successor(tmp_path: Path) -> None:
-    runner = ScriptedRunner([failing_run() for _ in range(TDD_RUN_TESTS_BUDGET)])
+    runner = ScriptedRunner([failing_run(f"failure {i}") for i in range(TDD_RUN_TESTS_BUDGET)])
     executor = make_executor(tmp_path, runner, manifest(("Unit", UNIT_TEST_FILE)))
     executor.pin_active_layer("Unit")
 
@@ -298,6 +302,65 @@ def test_stall_copy_after_identical_fingerprints(tmp_path: Path) -> None:
     assert "rotate your hypothesis" in third.output
     assert len(executor.fingerprints("Unit")) == 3
     assert len(set(executor.fingerprints("Unit"))) == 1
+
+
+def test_repeated_fingerprint_without_progress_hard_stops_the_layer(tmp_path: Path) -> None:
+    """Identical failures with no effective change close the layer early."""
+
+    same_failure = failing_run("Error: Cannot find module 'missing-parser'")
+    runner = ScriptedRunner([same_failure, same_failure, same_failure])
+    executor = make_executor(
+        tmp_path,
+        runner,
+        manifest(("Unit", UNIT_TEST_FILE), ("Integration", INTEGRATION_TEST_FILE)),
+    )
+    executor.pin_active_layer("Unit")
+
+    results = [asyncio.run(executor.run_requested()) for _ in range(TDD_STALL_THRESHOLD)]
+
+    stop = executor.stall_stop("Unit")
+    assert stop is not None
+    assert stop["fingerprint"] == results[-1].stall_stop["fingerprint"]
+    assert stop["repetitions"] == TDD_STALL_THRESHOLD
+    assert stop["used"] == TDD_STALL_THRESHOLD
+    assert executor.usage("Unit") == TDD_STALL_THRESHOLD
+    assert len(runner.calls) == TDD_STALL_THRESHOLD
+    assert "Deterministic TDD Stop" in results[-1].output
+    assert "no effective source/environment change" in results[-1].output
+    assert "rotate your hypothesis" in results[-1].output
+
+    rejected = asyncio.run(executor.run_requested())
+    assert "ARC_TDD_HARD_STOP" in rejected.output
+    assert "Do not call run_tests again" in rejected.output
+    assert len(runner.calls) == TDD_STALL_THRESHOLD
+
+
+def test_effective_progress_resets_repeated_fingerprint_streak(tmp_path: Path) -> None:
+    """A changed progress marker earns new attempts for the same fingerprint."""
+
+    same_failure = failing_run("AssertionError: expected 2 got 1")
+    runner = ScriptedRunner([same_failure, same_failure, same_failure, same_failure])
+    marker = {"value": 0}
+    executor = make_executor(
+        tmp_path,
+        runner,
+        manifest(("Unit", UNIT_TEST_FILE)),
+        progress_marker=lambda: marker["value"],
+    )
+    executor.pin_active_layer("Unit")
+
+    first = asyncio.run(executor.run_requested())
+    assert first.stall_stop is None
+    marker["value"] = 1
+    second = asyncio.run(executor.run_requested())
+    assert second.stall_stop is None
+    third = asyncio.run(executor.run_requested())
+    assert third.stall_stop is None
+    fourth = asyncio.run(executor.run_requested())
+
+    assert fourth.stall_stop is not None
+    assert fourth.stall_stop["repetitions"] == TDD_STALL_THRESHOLD
+    assert executor.usage("Unit") == 4
 
 
 # ---------------------------------------------------------------------------

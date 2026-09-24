@@ -35,6 +35,7 @@ def build_install_dependencies_tool(
     app_handler: Any,
     node_id: str,
     log_cb: LogCallback | None = None,
+    on_successful_install: Callable[[], Awaitable[None] | None] | None = None,
 ):
     """Build the system-owned install_dependencies tool for the current workspace.
 
@@ -77,7 +78,12 @@ def build_install_dependencies_tool(
         # (observed: WinError 2 from npm on Windows crashed REQ-1's task and
         # blocked REQ-2/ROOT on the 2026-09-20 test1 run).
         try:
-            return await install(package, target)
+            result = await install(package, target)
+            if on_successful_install is not None and _has_success_exit_code(result):
+                progress = on_successful_install()
+                if inspect.isawaitable(progress):
+                    await progress
+            return result
         except Exception as exc:
             await _emit_log(
                 log_cb,
@@ -95,6 +101,12 @@ def build_install_dependencies_tool(
             )
 
     return install_dependencies
+
+
+def _has_success_exit_code(output: Any) -> bool:
+    """Whether an install response explicitly reports a successful command."""
+
+    return any(line.strip() == "Exit Code: 0" for line in str(output or "").splitlines())
 
 
 async def _emit_log(

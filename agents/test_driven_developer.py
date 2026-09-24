@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable
 from agents.context.pipeline import context_pipeline
 from agents.context.prompts.common import stage_skill_activation_policy
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
-from agents.runtime.capabilities import normalize_manifest_path
+from agents.runtime.capabilities import is_test_file_path, normalize_manifest_path
 from agents.runtime.factory import StageAgentBuild
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.runtime.rebase_gate import cached_rebase_gate
@@ -74,6 +74,11 @@ class TestDrivenDeveloper:
         # fingerprint plus the write-event position at that failure, so the
         # next same-fingerprint failure can ask "what was edited in between?".
         self._stall_chains: dict[str, tuple[str, int]] = {}
+        # Monotonic progress evidence shared by sessions of this adapter.
+        # Test-only edits stay out of the marker; the existing test-edit stall
+        # hint handles that churn separately.
+        self._effective_write_event_total = 0
+        self._environment_change_count = 0
 
     def _rebase_gate(self) -> Any | None:
         return cached_rebase_gate(self)
@@ -286,7 +291,10 @@ class TestDrivenDeveloper:
                 )
         else:
             install_dependencies = build_install_dependencies_tool(
-                app_handler=self.app_handler, node_id=node_id, log_cb=self.log_cb
+                app_handler=self.app_handler,
+                node_id=node_id,
+                log_cb=self.log_cb,
+                on_successful_install=self._record_environment_change,
             )
 
         traceability_tools = build_traceability_tools(node_id=node_id, log_cb=self.log_cb)
@@ -327,6 +335,7 @@ class TestDrivenDeveloper:
             normalize_manifest_path(path)
             for path in built.materialized_paths()
         ]
+        self._effective_write_event_total += len(self._effective_write_events())
         if self._test_budget_exhausted and stop_on_test_budget_exhausted:
             return "BUDGET_EXHAUSTED"
         if "IMPLEMENTED" in final_text.upper() and self._last_run_tests_exit_code != 0:
@@ -364,6 +373,31 @@ class TestDrivenDeveloper:
         """
 
         return list(self._last_modified_files)
+
+    def tdd_progress_marker(self) -> tuple[int, int]:
+        """Return source/environment progress visible to the TDD executor."""
+
+        return (
+            self._effective_write_event_total + len(self._effective_write_events()),
+            self._environment_change_count,
+        )
+
+    def _record_environment_change(self) -> None:
+        self._environment_change_count += 1
+
+    def _effective_write_events(self) -> list[str]:
+        manifest_tests = {
+            normalized
+            for path in self._current_test_files
+            if (normalized := normalize_manifest_path(path))
+        }
+        effective: list[str] = []
+        for path in self._stage_write_events():
+            normalized = normalize_manifest_path(path)
+            if not normalized or normalized in manifest_tests or is_test_file_path(normalized):
+                continue
+            effective.append(normalized)
+        return effective
 
     def test_edit_stall_hint(self, test_type: str, fingerprint: str) -> str:
         """The test-edit stall hint for a just-returned failed ``run_tests`` result.
@@ -470,6 +504,7 @@ class TestDrivenDeveloper:
             build=result.build_note,
             served=result.served_verdict,
             test_edit_hint=test_edit_hint,
+            stall_stop=result.stall_stop,
         )
         lines = [line for line in (result.output or "").splitlines() if line.strip()]
         excerpt = "\n".join(lines[-40:])

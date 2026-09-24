@@ -295,6 +295,38 @@ class EventClient:
             },
         )
 
+    def record_tdd_stall(
+        self,
+        *,
+        node_id: str = "",
+        layer: str = "",
+        reason: str = "",
+        fingerprint: str = "",
+        repetitions: int = 0,
+        threshold: int = 0,
+        used: int = 0,
+        budget: int = 0,
+        suggested_action: str = "",
+    ) -> None:
+        """Append deterministic repeated-fingerprint stop evidence (issue #264)."""
+
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "tdd_stall",
+                "node_id": str(node_id or "").strip(),
+                "layer": str(layer or "").strip(),
+                "reason": str(reason or "").strip(),
+                "fingerprint": str(fingerprint or "").strip(),
+                "repetitions": _nonneg_int(repetitions),
+                "threshold": _nonneg_int(threshold),
+                "used": _nonneg_int(used),
+                "budget": _nonneg_int(budget),
+                "suggested_action": str(suggested_action or "").strip(),
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def record_rebase_replay(
         self,
         *,

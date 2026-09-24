@@ -170,6 +170,30 @@ def test_format_includes_pointer_and_fingerprint() -> None:
     assert "instead of re-running tests" in text
 
 
+def test_format_includes_deterministic_tdd_stop_evidence() -> None:
+    text = format_failure_digest(
+        build_failure_digest("Exit Code: 1\nError: Cannot find module 'missing-parser'\n"),
+        test_type="Integration",
+        fingerprint="1|Error: Cannot find module 'missing-parser'",
+        stall_stop={
+            "reason": "repeated failure fingerprint with no effective source/environment change",
+            "fingerprint": "1|Error: Cannot find module 'missing-parser'",
+            "repetitions": 3,
+            "threshold": 3,
+            "used": 3,
+            "budget": 10,
+            "suggested_action": "repair the environment or choose a different implementation hypothesis",
+        },
+    )
+
+    assert "Deterministic TDD Stop" in text
+    assert "stop_reason: repeated failure fingerprint with no effective source/environment change" in text
+    assert "stop_fingerprint: 1|Error: Cannot find module 'missing-parser'" in text
+    assert "repeated_failures: 3 (threshold 3)" in text
+    assert "budget_used: 3/10 run_tests calls" in text
+    assert "suggested_action: repair the environment or choose a different implementation hypothesis" in text
+
+
 def test_format_without_failed_tests_explains_fallback() -> None:
     text = format_failure_digest(build_failure_digest("Exit Code: 1\n"), test_type="Unit")
     assert "no per-test structure recognized" in text

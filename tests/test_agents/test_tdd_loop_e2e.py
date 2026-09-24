@@ -1360,50 +1360,46 @@ def test_subset_pass_after_insession_advance_reports_pending_files(tmp_project_d
 # ---------------------------------------------------------------------------
 
 
-def test_stall_detection_forces_hypothesis_rotation(tmp_project_dir: Path, arc_runtime) -> None:
-    """Three identical consecutive fingerprints must trigger STALL DETECTED.
-
-    The run_tests result tells the agent to stop patching neighbors and
-    rotate its hypothesis; a follow-up session carries the same governance
-    context so the rotation survives session boundaries.
-    """
+def test_stall_detection_hard_stops_without_progress(tmp_project_dir: Path, arc_runtime) -> None:
+    """Three identical failures close the layer without opening another session."""
 
     node_id = "REQ-TDD-STALL"
     tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
     seed_node(arc_runtime, node_id, tests)
 
-    # Session 1: three failed runs with the SAME fingerprint (budget 3/10),
-    # so the session ends without the layer passing. Session 2 (opened with
-    # the stall handoff) rotates and passes.
+    # The executor closes the layer after the third failure, so the scripted
+    # model only needs to finish its current turn.
     model = FauxChatModel(
         responses=[
             faux_tool_call("run_tests", {}, call_id="s1"),
             faux_tool_call("run_tests", {}, call_id="s2"),
             faux_tool_call("run_tests", {}, call_id="s3"),
             faux_text("session one ends, still failing"),
-            faux_tool_call("run_tests", {}, call_id="s4"),
-            faux_text("IMPLEMENTED"),
+            faux_text("hard stop already recorded"),
+            faux_text("no more attempts"),
         ]
     )
-    # Baseline + three same-fingerprint failures + one pass.
+    # Baseline + three same-fingerprint failures.
     same_failure = failing_test_output(detail="AssertionError: expected 'Login' to equal 'Log in'")
-    fake = FakeAppHandler([same_failure, same_failure, same_failure, same_failure, passing_test_output()])
+    fake = FakeAppHandler([same_failure, same_failure, same_failure, same_failure])
     tdd = make_tdd(tmp_project_dir, model, fake)
     session_types = track_tdd_sessions(tdd)
     runner = make_runner(tmp_project_dir, tdd, fake)
 
     final_ok = asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests))
 
-    assert final_ok is True
-    # Two sessions: the first ends failing, the second carries the stall handoff.
-    assert session_types == ["Unit", "Unit"]
+    assert final_ok is False
+    assert session_types == ["Unit"]
     all_tool_results = tool_results_text(model)
     assert "STALL DETECTED" in all_tool_results
     assert "rotate your hypothesis" in all_tool_results
-    # The follow-up session's task message carries the stall governance handoff.
-    second_session_messages = "\n".join(str(m.content) for m in model.calls[4])
-    assert "Stall Governance Handoff" in second_session_messages
-    assert arc_runtime.traceability.get_test("T1")["passed"] is True
+    stall_events = [
+        event for event in read_jsonl(arc_runtime.paths.runner_events_path) if event["type"] == "tdd_stall"
+    ]
+    assert len(stall_events) == 1
+    assert stall_events[0]["layer"] == "Unit"
+    assert stall_events[0]["used"] == 3
+    assert arc_runtime.traceability.get_test("T1")["passed"] is False
 
 
 # ---------------------------------------------------------------------------
