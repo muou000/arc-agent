@@ -9,7 +9,11 @@ click
 jsonschema
 tiktoken
 httpx[socks]
-deepagents
+# >=0.7.15: read_file body renders verbatim (0.7.13 rendered a line-number
+# gutter that edit_file anchors mistook for indentation); <0.8: the runtime
+# adapters bind deepagents private internals (by-name middleware swap,
+# symlink guard, grep regex-literal helper).
+deepagents>=0.7.15,<0.8
 langchain-openai
 pytest>=8.0
 pytest-cov>=4.1
