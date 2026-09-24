@@ -40,12 +40,90 @@ QUEUE_FILENAME = "processing_queue.json"
 PHASE_DESIGN = "DESIGN"
 PHASE_IMPLEMENT = "IMPLEMENT"
 
+STAGE_VISUAL_ANALYSIS = "VISUAL_ANALYSIS"
+STAGE_INTERFACE_DESIGN = "INTERFACE_DESIGN"
+STAGE_TEST_GENERATION = "TEST_GENERATION"
+STAGE_IMPLEMENTATION = "IMPLEMENTATION"
+STAGE_PIPELINE = (
+    STAGE_VISUAL_ANALYSIS,
+    STAGE_INTERFACE_DESIGN,
+    STAGE_TEST_GENERATION,
+    STAGE_IMPLEMENTATION,
+)
+STAGE_TASK_SCHEMA_VERSION = 1
+
 TaskStatus = Literal["PENDING", "RUNNING", "COMPLETED", "FAILED", "BLOCKED"]
 TASK_PENDING: TaskStatus = "PENDING"
 TASK_RUNNING: TaskStatus = "RUNNING"
 TASK_COMPLETED: TaskStatus = "COMPLETED"
 TASK_FAILED: TaskStatus = "FAILED"
 TASK_BLOCKED: TaskStatus = "BLOCKED"
+
+StageTaskStatus = Literal[
+    "PENDING",
+    "RUNNING",
+    "RETRY_WAIT",
+    "READY",
+    "READY_TO_MERGE",
+    "PUBLISHED",
+    "SKIPPED",
+    "FAILED",
+    "BLOCKED",
+]
+STAGE_PENDING: StageTaskStatus = "PENDING"
+STAGE_RUNNING: StageTaskStatus = "RUNNING"
+STAGE_RETRY_WAIT: StageTaskStatus = "RETRY_WAIT"
+STAGE_READY: StageTaskStatus = "READY"
+STAGE_READY_TO_MERGE: StageTaskStatus = "READY_TO_MERGE"
+STAGE_PUBLISHED: StageTaskStatus = "PUBLISHED"
+STAGE_SKIPPED: StageTaskStatus = "SKIPPED"
+STAGE_FAILED: StageTaskStatus = "FAILED"
+STAGE_BLOCKED: StageTaskStatus = "BLOCKED"
+_STAGE_STATUS_VALUES = frozenset(
+    {
+        STAGE_PENDING,
+        STAGE_RUNNING,
+        STAGE_RETRY_WAIT,
+        STAGE_READY,
+        STAGE_READY_TO_MERGE,
+        STAGE_PUBLISHED,
+        STAGE_SKIPPED,
+        STAGE_FAILED,
+        STAGE_BLOCKED,
+    }
+)
+_STAGE_TERMINAL_SUCCESS = frozenset({STAGE_PUBLISHED, STAGE_SKIPPED})
+_STAGE_ACTIVE = frozenset({STAGE_RUNNING, STAGE_READY, STAGE_READY_TO_MERGE})
+_STAGE_ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
+    STAGE_PENDING: frozenset(
+        {
+            STAGE_RUNNING,
+            STAGE_RETRY_WAIT,
+            STAGE_READY,
+            STAGE_PUBLISHED,
+            STAGE_SKIPPED,
+            STAGE_FAILED,
+            STAGE_BLOCKED,
+        }
+    ),
+    STAGE_RUNNING: frozenset(
+        {
+            STAGE_READY,
+            STAGE_READY_TO_MERGE,
+            STAGE_PUBLISHED,
+            STAGE_RETRY_WAIT,
+            STAGE_FAILED,
+            STAGE_BLOCKED,
+        }
+    ),
+    STAGE_RETRY_WAIT: frozenset({STAGE_PENDING, STAGE_RUNNING, STAGE_FAILED, STAGE_BLOCKED}),
+    STAGE_READY: frozenset({STAGE_READY_TO_MERGE, STAGE_PUBLISHED, STAGE_FAILED}),
+    STAGE_READY_TO_MERGE: frozenset({STAGE_PUBLISHED, STAGE_FAILED}),
+    STAGE_PUBLISHED: frozenset(),
+    STAGE_SKIPPED: frozenset(),
+    STAGE_FAILED: frozenset({STAGE_PENDING, STAGE_RETRY_WAIT, STAGE_BLOCKED}),
+    STAGE_BLOCKED: frozenset({STAGE_PENDING, STAGE_RETRY_WAIT, STAGE_FAILED}),
+}
 
 NodeState = Literal[
     "UNSEEN",
@@ -140,6 +218,117 @@ def task_status(queue_state: dict[str, Any], task: dict[str, Any]) -> str:
     return TASK_PENDING
 
 
+def stage_task_status(queue_state: dict[str, Any], task: dict[str, Any]) -> str:
+    """Return a normalized persisted stage-task status.
+
+    Stage task status is intentionally independent from the legacy aggregate
+    task projection. The aggregate DESIGN/IMPLEMENT tasks remain the
+    compatibility surface until the stage scheduler adopts this list.
+    Unknown values from a hand-edited or future queue are treated as pending
+    so the queue cannot silently claim a stage completed.
+    """
+
+    raw = str(task.get("status", "") or "").strip().upper()
+    return raw if raw in _STAGE_STATUS_VALUES else STAGE_PENDING
+
+
+def stage_task_of(
+    queue_state: dict[str, Any], node_id: str, stage: str
+) -> dict[str, Any] | None:
+    """Return one node stage task, or ``None`` for legacy queue shapes."""
+
+    for task in queue_state.get("stage_tasks", []):
+        if (
+            str(task.get("node_id", "")) == node_id
+            and str(task.get("stage", "")) == stage
+        ):
+            return task
+    return None
+
+
+def stage_status_of(queue_state: dict[str, Any], node_id: str, stage: str) -> str | None:
+    """Return a node stage status, or ``None`` when stage tasks are absent."""
+
+    task = stage_task_of(queue_state, node_id, stage)
+    return None if task is None else stage_task_status(queue_state, task)
+
+
+def aggregate_phase_status(
+    queue_state: dict[str, Any], node_id: str, phase: str
+) -> str | None:
+    """Project stage tasks back to the legacy DESIGN/IMPLEMENT vocabulary.
+
+    This projection is additive: queues without ``stage_tasks`` fall back to
+    the existing task projection, and the existing ``design_status_of`` /
+    ``implement_status_of`` functions remain unchanged until a later stage
+    scheduler issue explicitly switches their callers over.
+    """
+
+    if phase == PHASE_DESIGN:
+        stages = (STAGE_INTERFACE_DESIGN, STAGE_TEST_GENERATION)
+        fallback = design_status_of(queue_state, node_id)
+    elif phase == PHASE_IMPLEMENT:
+        stages = (STAGE_IMPLEMENTATION,)
+        fallback = implement_status_of(queue_state, node_id)
+    else:
+        raise ValueError(f"Unknown aggregate phase: {phase}")
+
+    statuses = [stage_status_of(queue_state, node_id, stage) for stage in stages]
+    if any(status is None for status in statuses):
+        return fallback
+    normalized = [str(status) for status in statuses]
+    if any(status == STAGE_FAILED for status in normalized):
+        return TASK_FAILED
+    if any(status == STAGE_BLOCKED for status in normalized):
+        return TASK_BLOCKED
+    if all(status in _STAGE_TERMINAL_SUCCESS for status in normalized):
+        return TASK_COMPLETED
+    if any(status in _STAGE_ACTIVE for status in normalized):
+        return TASK_RUNNING
+    return TASK_PENDING
+
+
+def transition_stage_task(
+    queue_state: dict[str, Any],
+    node_id: str,
+    stage: str,
+    status: str,
+    *,
+    publication: dict[str, Any] | None = None,
+    error: str | None = None,
+    retry_at: str | None = None,
+) -> dict[str, Any]:
+    """Apply one validated stage transition and return the task payload.
+
+    Retry resets are intentionally handled by :func:`reset_node_for_retry`,
+    not by allowing arbitrary transitions from published stages. This keeps a
+    landed publication immutable until an explicit node retry is requested.
+    """
+
+    task = stage_task_of(queue_state, node_id, stage)
+    if task is None:
+        raise ValueError(f"Stage task {node_id}:{stage} is missing")
+    next_status = str(status or "").strip().upper()
+    if next_status not in _STAGE_STATUS_VALUES:
+        raise ValueError(f"Unknown stage status: {status}")
+    current = stage_task_status(queue_state, task)
+    if next_status != current and next_status not in _STAGE_ALLOWED_TRANSITIONS[current]:
+        raise ValueError(f"Invalid stage transition {current} -> {next_status} for {node_id}:{stage}")
+
+    task["status"] = next_status
+    if next_status == STAGE_RUNNING and next_status != current:
+        task["attempt_count"] = int(task.get("attempt_count", 0) or 0) + 1
+    if retry_at is not None or (next_status != STAGE_RETRY_WAIT and next_status != current):
+        task["retry_at"] = retry_at
+    if publication is not None:
+        task["publication"] = dict(publication)
+    if error is not None:
+        task["error"] = error
+    elif next_status not in {STAGE_FAILED, STAGE_RETRY_WAIT}:
+        task["error"] = None
+    return task
+
+
 def design_status_of(queue_state: dict[str, Any], node_id: str) -> str | None:
     """The node's DESIGN task status (derived), or None without a DESIGN task."""
 
@@ -206,6 +395,78 @@ def _sync_all_task_statuses(queue_state: dict[str, Any]) -> None:
         _sync_task_statuses(queue_state, node_id)
 
 
+def _set_stage_status_if_present(
+    queue_state: dict[str, Any],
+    node_id: str,
+    stage: str,
+    status: str,
+) -> None:
+    """Best-effort projection for the legacy aggregate transitions."""
+
+    task = stage_task_of(queue_state, node_id, stage)
+    if task is None:
+        return
+    current = stage_task_status(queue_state, task)
+    if current == status or current in _STAGE_TERMINAL_SUCCESS:
+        return
+    if status not in _STAGE_ALLOWED_TRANSITIONS[current]:
+        return
+    transition_stage_task(queue_state, node_id, stage, status)
+
+
+def _reset_stage_tasks_for_retry(
+    queue_state: dict[str, Any],
+    node_id: str,
+    *,
+    reset_design: bool,
+    reset_implementation: bool,
+    preserve_published: bool = False,
+) -> None:
+    """Reset stage task state while preserving attempt history."""
+
+    for task in queue_state.get("stage_tasks", []):
+        if str(task.get("node_id", "")) != node_id:
+            continue
+        stage = str(task.get("stage", ""))
+        if stage in {STAGE_VISUAL_ANALYSIS, STAGE_INTERFACE_DESIGN, STAGE_TEST_GENERATION}:
+            if not reset_design:
+                continue
+        elif stage == STAGE_IMPLEMENTATION:
+            if not reset_implementation:
+                continue
+        else:
+            continue
+        if preserve_published and stage_task_status(queue_state, task) in _STAGE_TERMINAL_SUCCESS:
+            continue
+        if not bool(task.get("applicable", True)):
+            task["status"] = STAGE_SKIPPED
+        else:
+            task["status"] = STAGE_PENDING
+        task["retry_at"] = None
+        task["publication"] = None
+        task["error"] = None
+
+
+def _block_pending_stage_tasks(queue_state: dict[str, Any], node_id: str) -> None:
+    for task in queue_state.get("stage_tasks", []):
+        if str(task.get("node_id", "")) != node_id:
+            continue
+        status = stage_task_status(queue_state, task)
+        if status in {STAGE_PENDING, STAGE_RETRY_WAIT}:
+            task["status"] = STAGE_BLOCKED
+
+
+def _release_stage_task_blocks(queue_state: dict[str, Any], node_id: str) -> None:
+    for task in queue_state.get("stage_tasks", []):
+        if str(task.get("node_id", "")) != node_id:
+            continue
+        if stage_task_status(queue_state, task) != STAGE_BLOCKED:
+            continue
+        task["status"] = STAGE_SKIPPED if not bool(task.get("applicable", True)) else STAGE_PENDING
+        task["error"] = None
+        task["retry_at"] = None
+
+
 def begin_task(
     queue_state: dict[str, Any],
     task: dict[str, Any],
@@ -214,8 +475,13 @@ def begin_task(
     """A task starts: its node enters the phase's in-flight state."""
 
     phase = str(task.get("phase", ""))
+    node_id = str(task.get("node_id", ""))
+    if phase == PHASE_DESIGN:
+        _set_stage_status_if_present(queue_state, node_id, STAGE_INTERFACE_DESIGN, STAGE_RUNNING)
+    else:
+        _set_stage_status_if_present(queue_state, node_id, STAGE_IMPLEMENTATION, STAGE_RUNNING)
     state = NODE_DESIGNING if phase == PHASE_DESIGN else NODE_IMPLEMENTING
-    _set_node_state(queue_state, str(task.get("node_id", "")), state, on_state_change)
+    _set_node_state(queue_state, node_id, state, on_state_change)
     queue_state["last_task_id"] = task.get("task_id")
 
 
@@ -236,6 +502,12 @@ def complete_task(
     if phase == PHASE_DESIGN:
         new_state = NODE_DESIGNED
         queue_state.setdefault("node_design_done", {})[node_id] = True
+        _set_stage_status_if_present(queue_state, node_id, STAGE_VISUAL_ANALYSIS, STAGE_PUBLISHED)
+        _set_stage_status_if_present(queue_state, node_id, STAGE_INTERFACE_DESIGN, STAGE_PUBLISHED)
+        test_task = stage_task_of(queue_state, node_id, STAGE_TEST_GENERATION)
+        if test_task is not None:
+            target = STAGE_SKIPPED if not bool(test_task.get("applicable", True)) else STAGE_PUBLISHED
+            _set_stage_status_if_present(queue_state, node_id, STAGE_TEST_GENERATION, target)
     else:
         session = sessions.load_node_session(node_id)
         result_state = str(session.get("result_state", "") or "").strip().upper()
@@ -245,6 +517,7 @@ def complete_task(
             new_state = NODE_CONVERGED
         else:
             new_state = NODE_PASSED
+        _set_stage_status_if_present(queue_state, node_id, STAGE_IMPLEMENTATION, STAGE_PUBLISHED)
     _set_node_state(queue_state, node_id, new_state, on_state_change)
     return new_state
 
@@ -256,6 +529,11 @@ def fail_task(
 ) -> None:
     """A phase failed: the node fails; remaining tasks read FAILED."""
 
+    previous_state = node_state(queue_state, node_id)
+    if previous_state == NODE_DESIGNING:
+        _set_stage_status_if_present(queue_state, node_id, STAGE_INTERFACE_DESIGN, STAGE_FAILED)
+    elif previous_state == NODE_IMPLEMENTING:
+        _set_stage_status_if_present(queue_state, node_id, STAGE_IMPLEMENTATION, STAGE_FAILED)
     _set_node_state(queue_state, node_id, NODE_FAILED, on_state_change)
 
 
@@ -300,6 +578,7 @@ def propagate_dependency_blocks(
             blocked_by = failed_prerequisite_ids(queue_state, node_id)
             if not blocked_by:
                 continue
+            _block_pending_stage_tasks(queue_state, node_id)
             _set_node_state(queue_state, node_id, NODE_BLOCKED_BY_DEPENDENCY, on_state_change)
             changed.append((node_id, blocked_by))
             progress = True
@@ -328,6 +607,7 @@ def release_dependency_blocks(
                 continue
             if failed_prerequisite_ids(queue_state, node_id):
                 continue
+            _release_stage_task_blocks(queue_state, node_id)
             _set_node_state(
                 queue_state,
                 node_id,
@@ -385,6 +665,22 @@ def recover_interrupted(
                 "phase_status": {phase.lower(): "interrupted"},
             },
         )
+        if phase == PHASE_DESIGN:
+            _reset_stage_tasks_for_retry(
+                queue_state,
+                node_id,
+                reset_design=True,
+                reset_implementation=False,
+                preserve_published=True,
+            )
+        else:
+            _reset_stage_tasks_for_retry(
+                queue_state,
+                node_id,
+                reset_design=False,
+                reset_implementation=True,
+                preserve_published=True,
+            )
         _set_node_state(queue_state, node_id, fallback, on_state_change)
         recovered.append({"node_id": node_id, "phase": phase, "task_id": task_id})
     queue_state["recovered_interrupted_tasks"] = recovered
@@ -541,6 +837,12 @@ def reset_node_for_retry(
         # full retry of a passed node is the same retraction: without it a
         # later FAILED state would still derive its DESIGN as COMPLETED).
         queue_state.setdefault("node_design_done", {})[node_id] = False
+    _reset_stage_tasks_for_retry(
+        queue_state,
+        node_id,
+        reset_design=kind in {"design", "full"},
+        reset_implementation=kind in {"implement", "full"},
+    )
     _set_node_state(queue_state, node_id, new_state, on_state_change)
     sessions.merge_node_session(node_id, base_patch)
     return plan
@@ -606,6 +908,10 @@ def save_queue(queue_state: dict[str, Any], path: str) -> None:
         {**task, "status": task_status(queue_state, task)}
         for task in queue_state.get("tasks", [])
     ]
+    projection["stage_tasks"] = [
+        {**task, "status": stage_task_status(queue_state, task)}
+        for task in queue_state.get("stage_tasks", [])
+    ]
     write_json_file(path, projection)
 
 
@@ -629,6 +935,7 @@ def load_or_create_queue(
     root_id = str(requirement_tree.get("id", ""))
     expected_tasks = build_processing_tasks(requirement_tree)
     expected_task_ids = [task["task_id"] for task in expected_tasks]
+    expected_stage_tasks = build_stage_tasks(requirement_tree)
     node_ids = collect_node_ids(expected_tasks)
     descendants = build_descendants_map(requirement_tree)
     parents = build_parents_map(requirement_tree)
@@ -685,6 +992,8 @@ def load_or_create_queue(
         # representation).
         if "node_design_done" not in queue_state:
             queue_state["node_design_done"] = _migrate_design_done(queue_state)
+        queue_state["stage_tasks"] = _migrate_stage_tasks(queue_state, expected_stage_tasks)
+        queue_state["stage_task_schema_version"] = STAGE_TASK_SCHEMA_VERSION
         # Queues saved before dependency gating lack the map. A restored map
         # is the durable contract, but it is not trusted blindly: an edge
         # that references a node this queue cannot schedule (a hand-edited
@@ -719,6 +1028,8 @@ def load_or_create_queue(
     return {
         "root_id": root_id,
         "tasks": expected_tasks,
+        "stage_tasks": expected_stage_tasks,
+        "stage_task_schema_version": STAGE_TASK_SCHEMA_VERSION,
         "node_states": {node_id: NODE_UNSEEN for node_id in node_ids},
         "node_design_done": {node_id: False for node_id in node_ids},
         "descendants": descendants,
@@ -750,6 +1061,79 @@ def _migrate_design_done(queue_state: dict[str, Any]) -> dict[str, bool]:
             migrated[node_id] = True
         else:
             migrated[node_id] = False
+    return migrated
+
+
+def _legacy_stage_status(
+    queue_state: dict[str, Any], node_id: str, stage: str, *, applicable: bool
+) -> str:
+    """Seed stage status from the aggregate state of a pre-stage queue."""
+
+    if not applicable:
+        return STAGE_SKIPPED
+    state = node_state(queue_state, node_id)
+    design_finished = design_done(queue_state, node_id)
+    if state in {NODE_PASSED, NODE_CONVERGED, NODE_CONVERGED_WITH_FAILED_CHILDREN}:
+        return STAGE_PUBLISHED
+    if stage != STAGE_IMPLEMENTATION and design_finished:
+        return STAGE_PUBLISHED
+    if stage == STAGE_IMPLEMENTATION:
+        legacy_status = implement_status_of(queue_state, node_id)
+        if legacy_status == TASK_COMPLETED:
+            return STAGE_PUBLISHED
+        if legacy_status == TASK_FAILED:
+            return STAGE_FAILED
+        if legacy_status == TASK_BLOCKED:
+            return STAGE_BLOCKED
+        if state == NODE_IMPLEMENTING:
+            return STAGE_RUNNING
+        return STAGE_PENDING
+    if state == NODE_DESIGNING:
+        return STAGE_RUNNING if stage == STAGE_INTERFACE_DESIGN else STAGE_PENDING
+    if state == NODE_FAILED:
+        return STAGE_FAILED if stage == STAGE_INTERFACE_DESIGN else STAGE_PENDING
+    if state == NODE_BLOCKED_BY_DEPENDENCY:
+        return STAGE_BLOCKED
+    return STAGE_PENDING
+
+
+def _migrate_stage_tasks(
+    queue_state: dict[str, Any], expected_stage_tasks: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Add or normalize stage tasks without discarding existing publications."""
+
+    existing = {
+        str(task.get("stage_task_id", "")): task
+        for task in queue_state.get("stage_tasks", [])
+        if isinstance(task, dict) and str(task.get("stage_task_id", ""))
+    }
+    migrated: list[dict[str, Any]] = []
+    for template in expected_stage_tasks:
+        task_id = str(template["stage_task_id"])
+        current = existing.get(task_id)
+        if current is None:
+            current = {
+                **template,
+                "status": _legacy_stage_status(
+                    queue_state,
+                    str(template["node_id"]),
+                    str(template["stage"]),
+                    applicable=bool(template.get("applicable", True)),
+                ),
+            }
+        else:
+            current = {**template, **current}
+            current["applicable"] = bool(template.get("applicable", True))
+            raw_status = str(current.get("status", "") or "").strip().upper()
+            if not current["applicable"]:
+                current["status"] = STAGE_SKIPPED
+            elif raw_status not in _STAGE_STATUS_VALUES:
+                current["status"] = STAGE_PENDING
+        current.setdefault("attempt_count", 0)
+        current.setdefault("retry_at", None)
+        current.setdefault("publication", None)
+        current.setdefault("error", None)
+        migrated.append(current)
     return migrated
 
 
@@ -788,6 +1172,38 @@ def build_processing_tasks(root_node: dict[str, Any]) -> list[dict[str, Any]]:
     return tasks
 
 
+def build_stage_tasks(root_node: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build the persisted per-node stage task list.
+
+    The list is deliberately separate from ``tasks``: existing DESIGN and
+    IMPLEMENT consumers keep their aggregate task order while the stage
+    scheduler can later select individual pipeline stages.
+    """
+
+    tasks: list[dict[str, Any]] = []
+
+    def walk(node: dict[str, Any]) -> None:
+        node_id = str(node.get("id", "")).strip()
+        if not node_id:
+            return
+        is_leaf = not bool(node.get("children"))
+        for stage in STAGE_PIPELINE:
+            tasks.append(
+                _make_stage_task(
+                    node_id,
+                    stage,
+                    len(tasks),
+                    applicable=stage != STAGE_TEST_GENERATION or is_leaf,
+                )
+            )
+        for child in node.get("children", []) or []:
+            if isinstance(child, dict):
+                walk(child)
+
+    walk(root_node)
+    return tasks
+
+
 def _make_task(node_id: str, phase: str, order: int) -> dict[str, Any]:
     return {
         "task_id": f"{node_id}:{phase}",
@@ -795,6 +1211,27 @@ def _make_task(node_id: str, phase: str, order: int) -> dict[str, Any]:
         "phase": phase,
         "order": order,
         "status": TASK_PENDING,
+    }
+
+
+def _make_stage_task(
+    node_id: str,
+    stage: str,
+    order: int,
+    *,
+    applicable: bool = True,
+) -> dict[str, Any]:
+    return {
+        "stage_task_id": f"{node_id}:{stage}",
+        "node_id": node_id,
+        "stage": stage,
+        "order": order,
+        "status": STAGE_PENDING if applicable else STAGE_SKIPPED,
+        "applicable": applicable,
+        "attempt_count": 0,
+        "retry_at": None,
+        "publication": None,
+        "error": None,
     }
 
 
