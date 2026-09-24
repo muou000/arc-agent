@@ -652,6 +652,75 @@ class TestZeroTestLeafEvents:
         assert lines[0]["summary"] is None
 
 
+class TestDesignConvergenceEvents:
+    """Pin the audit event for deterministic DESIGN coverage reuse."""
+
+    def test_record_design_convergence_writes_canonical_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_design_convergence(
+            node_id=" REQ-3 ",
+            status="CONVERGED",
+            interface_ids=["IF-A", " "],
+            interface_status={"IF-A": "implemented"},
+            test_ids=["T-A"],
+            coverage=[
+                {
+                    "test_id": "T-A",
+                    "file_path": "tests/unit/test_a.py",
+                    "coverage_scope": "dependency",
+                    "interface_ids": ["IF-A"],
+                    "state": "green",
+                }
+            ],
+            checkpoint_ids=["REQ-OWNER"],
+            checkpoint_paths={"IF-A": "src/calc.py"},
+            message="complete reused coverage",
+        )
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert len(lines) == 1
+        assert lines[0] == {
+            "type": "design_convergence",
+            "node_id": "REQ-3",
+            "status": "converged",
+            "result_state": "CONVERGED",
+            "interface_ids": ["IF-A"],
+            "interface_status": {"IF-A": "implemented"},
+            "test_ids": ["T-A"],
+            "coverage": [
+                {
+                    "test_id": "T-A",
+                    "file_path": "tests/unit/test_a.py",
+                    "coverage_scope": "dependency",
+                    "interface_ids": ["IF-A"],
+                    "state": "green",
+                }
+            ],
+            "checkpoint_ids": ["REQ-OWNER"],
+            "checkpoint_paths": {"IF-A": "src/calc.py"},
+            "message": "complete reused coverage",
+            "timestamp": lines[0]["timestamp"],
+        }
+
+    def test_defaults_and_invalid_status_are_normalized(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_design_convergence(status="unknown")
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["node_id"] == ""
+        assert lines[0]["status"] == "reused"
+        assert lines[0]["result_state"] == "CONVERGED"
+        assert lines[0]["interface_ids"] == []
+        assert lines[0]["interface_status"] == {}
+        assert lines[0]["test_ids"] == []
+        assert lines[0]["coverage"] == []
+        assert lines[0]["checkpoint_ids"] == []
+        assert lines[0]["checkpoint_paths"] == {}
+        assert lines[0]["message"] is None
+
+
 class TestEdgeReconcileEvents:
     """Pin the ``edge_reconcile`` schema: the compile-wrap-up dangling-edge
     sweep over every stored interface's callers/callees (issue #238). The

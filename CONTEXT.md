@@ -107,5 +107,5 @@ _避免_：脚手架代码、半成品实现、小型实现
 _避免_：拆块续写、分块绕过
 
 **回填阶梯（Backfill Ladder）**：
-字段级校验判负之前的确定性补全顺序：条目自身字段 → 已存储的追溯行 → 机械推导（interface_id 的类型段、节点前缀机械 test_id、词汇表默认值）。全部来源穷尽才允许一次 repair，repair 穷尽才判负；没有回填来源且无法登记的条目丢弃但必须可观察。`coverage_scope` 缺失按 `owned` 处理——保守默认：错误地按 owned 处理会在基线 RED 门与 owned-覆盖检查中响亮失败，按 dependency/shared 默认则会静默豁免 witness（ADR 0007）。
+字段级校验判负之前的确定性补全顺序：条目自身字段 → 已存储的追溯行 → 机械推导（interface_id 的类型段、节点前缀机械 test_id、词汇表默认值）。全部来源穷尽才允许一次 repair，repair 穷尽才判负；没有回填来源且无法登记的条目丢弃但必须可观察。`coverage_scope` 缺失按 `owned` 处理——保守默认：错误地按 owned 处理会在基线 RED 门与 owned-覆盖检查中响亮失败，按 dependency/shared 默认则会静默豁免 witness（ADR 0007）。既有实现复用只有在接口状态、历史 implement checkpoint、完整覆盖映射和当前绿测结果同时成立时才记录为 `reused/converged`；任一证据缺失仍要求当前节点的 owned RED witness。
 _避免_：校验即终判、静默丢弃

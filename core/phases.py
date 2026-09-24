@@ -53,6 +53,246 @@ DESIGN_BASELINE_MAX_REJECTIONS = 2
 TDD_RUN_LOG_RETENTION = 20
 
 
+def _is_reused_interface(interface: dict[str, Any]) -> bool:
+    """Return whether a prepared interface is explicitly inherited.
+
+    The registry keeps the model's relation marker in the prepared row.  Do
+    not infer reuse from a shared file path or from an existing row alone:
+    those signals are intentionally insufficient to waive the current-node
+    coverage gate.
+    """
+
+    relation = str(interface.get("relation") or "").strip().lower()
+    return relation in {"reused", "dependency", "parent"}
+
+
+def _required_reuse_checkpoint_ids(
+    node_id: str,
+    interfaces: list[dict[str, Any]],
+) -> set[str]:
+    """Return the implementation owners whose checkpoints prove reuse.
+
+    A reused row must point at its canonical existing owner.  ``req_ids`` is
+    append-only, so the first foreign id is the original owner; later ids are
+    consumers that reused the same contract and must not each provide a
+    separate implementation checkpoint.
+    """
+
+    required: set[str] = set()
+    normalized_node_id = str(node_id or "").strip()
+    for interface in interfaces:
+        owners = [
+            owner
+            for owner in normalize_string_list(interface.get("_existing_req_ids"))
+            if owner and owner != normalized_node_id
+        ]
+        if owners:
+            required.add(owners[0])
+    return required
+
+
+def assess_reused_coverage(
+    *,
+    node_id: str,
+    interfaces: list[dict[str, Any]],
+    tests: list[dict[str, Any]],
+    file_state: dict[str, str | None],
+    checkpoint_ids: set[str],
+    checkpoint_interface_ids: set[str] | None = None,
+    checkpoint_paths: dict[str, str] | None = None,
+    existing_tests: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Decide whether a node is completely covered by existing behavior.
+
+    This is deliberately a pure, fail-closed decision over the four pieces of
+    evidence required by issue #261: interface implementation status, the
+    test manifest and its coverage scopes, implementation checkpoints, and
+    the actual current baseline result for every current manifest file. A
+    previously passed traceability test may fill only an explicitly reused
+    interface mapping; it cannot satisfy the current node's owned witness.
+    """
+
+    interface_rows = [
+        item
+        for item in interfaces
+        if isinstance(item, dict) and str(item.get("interface_id") or "").strip()
+    ]
+    interface_ids = list(dict.fromkeys(str(item["interface_id"]).strip() for item in interface_rows))
+    if not interface_ids:
+        return {"eligible": False, "reason": "no interfaces"}
+
+    checkpoint_interface_ids = set(checkpoint_interface_ids or set())
+    checkpoint_paths = dict(checkpoint_paths or {})
+    current_owned_interface_ids = [
+        str(item["interface_id"]).strip()
+        for item in interface_rows
+        if not _is_reused_interface(item)
+    ]
+
+    unimplemented = []
+    interface_status: dict[str, str] = {}
+    for item in interface_rows:
+        interface_id = str(item["interface_id"]).strip()
+        if bool(item.get("_existing_implemented")) or bool(item.get("implemented")):
+            interface_status[interface_id] = "implemented"
+        elif interface_id in checkpoint_interface_ids:
+            interface_status[interface_id] = "checkpoint"
+        else:
+            unimplemented.append(interface_id)
+    if unimplemented:
+        return {
+            "eligible": False,
+            "reason": "interface implementation is not proven",
+            "unimplemented_interface_ids": list(dict.fromkeys(unimplemented)),
+        }
+
+    manifest_rows = [
+        item
+        for item in tests
+        if isinstance(item, dict)
+        and str(item.get("test_id") or "").strip()
+        and str(item.get("file_path") or "").strip()
+    ]
+    if not manifest_rows:
+        return {"eligible": False, "reason": "manifest has no test rows"}
+
+    covered_interface_ids: set[str] = set()
+    test_evidence: list[dict[str, Any]] = []
+    current_test_ids: list[str] = []
+    unverified_paths: list[str] = []
+    for item in manifest_rows:
+        test_id = str(item.get("test_id") or "").strip()
+        file_path = str(item.get("file_path") or "").strip()
+        interface_ids_for_test = normalize_string_list(item.get("interface_ids"))
+        covered_interface_ids.update(interface_ids_for_test)
+        current_test_ids.append(test_id)
+        state = file_state.get(file_path)
+        if state != "green":
+            unverified_paths.append(file_path)
+        test_evidence.append(
+            {
+                "test_id": test_id,
+                "file_path": file_path,
+                "coverage_scope": normalize_coverage_scope(item.get("coverage_scope")) or "owned",
+                "interface_ids": interface_ids_for_test,
+                "state": state,
+                "source": "current_manifest",
+            }
+        )
+
+    existing_test_ids: list[str] = []
+    current_test_id_set = set(current_test_ids)
+    for item in existing_tests or []:
+        if not isinstance(item, dict) or item.get("passed") is not True:
+            continue
+        test_id = str(item.get("test_id") or "").strip()
+        if not test_id or test_id in current_test_id_set:
+            continue
+        interface_ids_for_test = normalize_string_list(item.get("interface_ids"))
+        if not set(interface_ids_for_test) & set(interface_ids):
+            continue
+        covered_interface_ids.update(interface_ids_for_test)
+        existing_test_ids.append(test_id)
+        stored_scope = item.get("coverage_scope")
+        coverage_scope = (
+            normalize_coverage_scope(stored_scope)
+            if stored_scope is not None
+            else "dependency"
+        ) or "dependency"
+        test_evidence.append(
+            {
+                "test_id": test_id,
+                "req_id": str(item.get("req_id") or "").strip(),
+                "file_path": str(item.get("file_path") or "").strip(),
+                "coverage_scope": coverage_scope,
+                "interface_ids": interface_ids_for_test,
+                "state": "green",
+                "source": "traceability",
+            }
+        )
+
+    coverage_targets = current_owned_interface_ids or interface_ids
+    missing_interface_ids = [
+        interface_id for interface_id in coverage_targets if interface_id not in covered_interface_ids
+    ]
+    if missing_interface_ids:
+        return {
+            "eligible": False,
+            "reason": "manifest does not cover every interface",
+            "missing_interface_ids": missing_interface_ids,
+        }
+    if current_owned_interface_ids:
+        owned_covered_interface_ids = set()
+        for item in manifest_rows:
+            if normalize_coverage_scope(item.get("coverage_scope")) != "owned":
+                continue
+            owned_covered_interface_ids.update(normalize_string_list(item.get("interface_ids")))
+        missing_owned_witness_ids = [
+            interface_id
+            for interface_id in current_owned_interface_ids
+            if interface_id not in owned_covered_interface_ids
+        ]
+        if missing_owned_witness_ids:
+            return {
+                "eligible": False,
+                "reason": "current-node owned coverage is missing",
+                "missing_owned_interface_ids": missing_owned_witness_ids,
+            }
+    if unverified_paths:
+        return {
+            "eligible": False,
+            "reason": "not every manifest file passed the baseline",
+            "unverified_paths": list(dict.fromkeys(unverified_paths)),
+        }
+
+    required_checkpoint_ids = _required_reuse_checkpoint_ids(node_id, interface_rows)
+    missing_checkpoint_ids = sorted(required_checkpoint_ids - set(checkpoint_ids))
+    if missing_checkpoint_ids:
+        return {
+            "eligible": False,
+            "reason": "implementation checkpoint evidence is incomplete",
+            "missing_checkpoint_ids": missing_checkpoint_ids,
+        }
+    missing_interface_checkpoints = [
+        interface_id
+        for interface_id in current_owned_interface_ids
+        if interface_id not in checkpoint_interface_ids and node_id not in checkpoint_ids
+    ]
+    if missing_interface_checkpoints:
+        return {
+            "eligible": False,
+            "reason": "current interface has no implementation checkpoint",
+            "missing_interface_checkpoint_ids": missing_interface_checkpoints,
+        }
+
+    return {
+        "eligible": True,
+        "status": "reused",
+        "result_state": "CONVERGED",
+        "interface_ids": interface_ids,
+        "interface_status": interface_status,
+        "reused_interface_ids": [
+            str(item["interface_id"]).strip()
+            for item in interface_rows
+            if _is_reused_interface(item)
+        ],
+        "test_ids": current_test_ids + existing_test_ids,
+        "manifest_test_ids": current_test_ids,
+        "existing_test_ids": existing_test_ids,
+        "coverage": test_evidence,
+        "checkpoint_ids": sorted(required_checkpoint_ids),
+        "checkpoint_paths": {
+            interface_id: checkpoint_paths[interface_id]
+            for interface_id in interface_ids
+            if interface_id in checkpoint_paths
+        },
+        "baseline_files": {
+            path: file_state.get(path)
+            for path in dict.fromkeys(str(item.get("file_path") or "").strip() for item in manifest_rows)
+        },
+    }
+
+
 def _tdd_retry_fresh_thread_attempt(node_session: dict[str, Any]) -> int:
     """Retry-round number a TDD pass should fork a fresh thread for, else 0.
 
@@ -159,6 +399,8 @@ class WorkflowPhaseRunner:
                     "dependencies": requirement_data.get("dependencies") or [],
                 },
                 "recent_failure_summary": "",
+                "result_state": "",
+                "coverage_reuse": None,
             },
         )
 
@@ -463,6 +705,8 @@ class WorkflowPhaseRunner:
             requirement_data=requirement_data,
             prepared_tests=stored_tests,
             owned_interface_ids=owned_interface_ids,
+            prepared_interfaces=prepared_interfaces,
+            materialized_files=set(files_written),
         )
         # The E2E baseline runs may have started the session-scoped backend
         # runtime; DESIGN must not leave it holding the task's port (the
@@ -478,18 +722,52 @@ class WorkflowPhaseRunner:
 
         self.traceability.clear_node_design_artifacts(node_id)
         await self._register_design_observably(node_id, prepared_interfaces, stored_tests)
+        reuse_evidence = baseline.get("coverage_reuse")
+        if isinstance(reuse_evidence, dict):
+            self.traceability.set_test_pass_statuses(
+                {
+                    str(item.get("test_id") or "").strip(): True
+                    for item in stored_tests
+                    if str(item.get("test_id") or "").strip()
+                }
+            )
         context_pipeline.cache.invalidate_file_layers(node_id)
         context_pipeline.cache.invalidate_db_layers(node_id)
-        self._update_node_session(
-            node_id,
-            {
-                "interfaces": prepared_interfaces,
-                "test_artifacts": stored_tests,
-                "test_summary": testgen_summary_text,
-                "phase_status": {"design": "completed", "test": "completed"},
-                "design_baseline": baseline["file_state"],
-            },
-        )
+        session_patch = {
+            "interfaces": prepared_interfaces,
+            "test_artifacts": stored_tests,
+            "test_summary": testgen_summary_text,
+            "phase_status": {"design": "completed", "test": "completed"},
+            "design_baseline": baseline["file_state"],
+            "coverage_reuse": reuse_evidence,
+        }
+        if isinstance(reuse_evidence, dict):
+            session_patch["result_state"] = "CONVERGED"
+        if isinstance(reuse_evidence, dict):
+            self.events.record_design_convergence(
+                node_id=node_id,
+                status=str(reuse_evidence.get("status") or "reused"),
+                interface_ids=reuse_evidence.get("interface_ids"),
+                interface_status=reuse_evidence.get("interface_status"),
+                test_ids=reuse_evidence.get("test_ids"),
+                coverage=reuse_evidence.get("coverage"),
+                checkpoint_ids=reuse_evidence.get("checkpoint_ids"),
+                checkpoint_paths=reuse_evidence.get("checkpoint_paths"),
+                message=(
+                    "DESIGN converged by reusing an implemented interface set and "
+                    "passing manifest coverage."
+                ),
+            )
+            await self._log(
+                "TestGenerator",
+                (
+                    "DESIGN converged by reusing complete existing coverage; no "
+                    "owned green-baseline repair or duplicate TDD implementation is required."
+                ),
+                status="info",
+                node_id=node_id,
+            )
+        self._update_node_session(node_id, session_patch)
         await self._log(
             "InterfaceDesigner",
             f"Stored {len(prepared_interfaces)} interface definition(s) into traceability DB.",
@@ -528,6 +806,55 @@ class WorkflowPhaseRunner:
 
         del requirement_data
         self._update_node_session(node_id, {"phase_status": {"implement": "in_progress"}})
+        node_session = sessions.load_node_session(node_id)
+        reuse_evidence = node_session.get("coverage_reuse")
+        if isinstance(reuse_evidence, dict) and reuse_evidence.get("status") == "reused":
+            interfaces = self.traceability.list_interfaces(req_id=node_id)
+            tests = self.traceability.list_tests(req_id=node_id)
+            baseline = node_session.get("design_baseline")
+            baseline = baseline if isinstance(baseline, dict) else {}
+            evidence_test_ids = {
+                str(test_id or "").strip()
+                for test_id in reuse_evidence.get("test_ids") or []
+                if str(test_id or "").strip()
+            }
+            valid_reuse = bool(interfaces) and bool(tests) and all(
+                str(test.get("test_id") or "").strip() in evidence_test_ids
+                and baseline.get(str(test.get("file_path") or "").strip()) == "green"
+                for test in tests
+            )
+            if valid_reuse:
+                self.registry.mark_interfaces_implemented(interfaces)
+                self.traceability.set_test_pass_statuses(
+                    {
+                        str(test.get("test_id") or "").strip(): True
+                        for test in tests
+                        if str(test.get("test_id") or "").strip()
+                    }
+                )
+                self._update_node_session(
+                    node_id,
+                    {
+                        "phase_status": {"implement": "completed"},
+                        "result_state": "CONVERGED",
+                    },
+                )
+                await self._log(
+                    "TestDrivenDeveloper",
+                    (
+                        "Skipped duplicate TDD implementation: DESIGN recorded complete "
+                        "reused coverage and its checkpoint/green-test evidence remains valid."
+                    ),
+                    status="info",
+                    node_id=node_id,
+                )
+                return True
+            # A stale or malformed evidence record must never leave CONVERGED
+            # behind when IMPLEMENT falls through to ordinary TDD.
+            self._update_node_session(
+                node_id,
+                {"coverage_reuse": None, "result_state": ""},
+            )
         interfaces = self.traceability.list_interfaces(req_id=node_id)
         tests = self.traceability.list_tests(req_id=node_id)
         if not tests:
@@ -783,6 +1110,8 @@ class WorkflowPhaseRunner:
         requirement_data: dict[str, Any],
         prepared_tests: list[dict[str, Any]],
         owned_interface_ids: set[str],
+        prepared_interfaces: list[dict[str, Any]],
+        materialized_files: set[str],
     ) -> dict[str, Any] | None:
         """System-run baseline gate over the freshly generated manifest.
 
@@ -799,6 +1128,8 @@ class WorkflowPhaseRunner:
           the IMPLEMENT baseline (``None`` = environmental failure);
         - ``revised_tests``: the final manifest when a rejection round
           changed it, else ``None``.
+        - ``coverage_reuse``: auditable ``reused`` evidence when the existing
+          implementation and passing manifest completely cover this node.
 
         Two legitimate-green situations do not reject: an empty manifest
         (nothing to gate) and a node whose git history already contains an
@@ -849,22 +1180,58 @@ class WorkflowPhaseRunner:
         # The anchor relies on core.commits.build_commit_message, which
         # prefixes every checkpoint with "<node_id> (<phase>):" — a coupling
         # tests/test_workflow/test_design_baseline_red_gate.py locks in.
-        prior_implementation = False
+        required_checkpoint_ids = _required_reuse_checkpoint_ids(node_id, prepared_interfaces)
+        checkpoint_candidates = set(required_checkpoint_ids)
+        if node_id:
+            checkpoint_candidates.add(node_id)
+        path_checkpoint_owner_ids = set(required_checkpoint_ids)
+        path_checkpoint_owner_ids.update(normalize_string_list(requirement_data.get("dependencies")))
+        parent_id = str(requirement_data.get("parent_id") or "").strip()
+        if parent_id:
+            path_checkpoint_owner_ids.add(parent_id)
+        if node_id:
+            path_checkpoint_owner_ids.add(node_id)
+        checkpoint_ids: set[str] = set()
+        checkpoint_interface_ids: set[str] = set()
+        checkpoint_paths: dict[str, str] = {}
         try:
             git_log = get_runtime().git.run(["log", "--oneline", "--all", "-i", "--grep", "(implement", "--"], check=False)
             # --oneline lines are "<short-sha> <commit message>"; the commit
             # builder starts every message with the node id, so anchor the
             # match to the message start to keep REQ-1 from matching REQ-10.
-            message_prefix = f"{node_id} (implement"
-            prior_implementation = any(
-                line.split(" ", 1)[-1].startswith(message_prefix) if " " in line else False
-                for line in (git_log.stdout or "").splitlines()
-            )
+            log_lines = (git_log.stdout or "").splitlines()
+            for candidate in checkpoint_candidates:
+                message_prefix = f"{candidate} (implement"
+                if any(
+                    line.split(" ", 1)[-1].startswith(message_prefix) if " " in line else False
+                    for line in log_lines
+                ):
+                    checkpoint_ids.add(candidate)
+            for interface in prepared_interfaces:
+                interface_id = str(interface.get("interface_id") or "").strip()
+                path = str(interface.get("file_path") or "").strip()
+                if not interface_id or not path or path in materialized_files:
+                    continue
+                path_log = get_runtime().git.run(
+                    ["log", "--oneline", "--all", "-i", "--grep", "(implement", "--", path],
+                    check=False,
+                )
+                path_checkpoint_owner = None
+                for line in (path_log.stdout or "").splitlines():
+                    if " " not in line:
+                        continue
+                    message = line.split(" ", 1)[-1].strip()
+                    match = re.match(r"^(.+?) \(implement", message, re.IGNORECASE)
+                    if match and match.group(1).strip() in path_checkpoint_owner_ids:
+                        path_checkpoint_owner = match.group(1).strip()
+                        break
+                if path_checkpoint_owner:
+                    checkpoint_interface_ids.add(interface_id)
+                    checkpoint_paths[interface_id] = path
         except Exception as exc:
             # A git failure must not silently degrade a full-retry node's
             # legitimate-green path into a rejection spiral; make the
             # degraded mode visible in the run log.
-            prior_implementation = False
             await self._log(
                 "TestGenerator",
                 (
@@ -876,11 +1243,41 @@ class WorkflowPhaseRunner:
                 node_id=node_id,
             )
 
+        prior_implementation = node_id in checkpoint_ids
         current_tests = prepared_tests
         manifest_revised = False
         file_state: dict[str, str | None] = {}
         green_evidence: list[dict[str, Any]] = []
         exempt_green_evidence: list[dict[str, Any]] = []
+        existing_tests = [
+            row
+            for row in self.traceability.list_tests()
+            if str(row.get("req_id") or "").strip() != node_id
+        ]
+
+        async def complete_reuse_result(
+            *,
+            revised_tests: list[dict[str, Any]] | None,
+            message: str,
+        ) -> dict[str, Any] | None:
+            decision = assess_reused_coverage(
+                node_id=node_id,
+                interfaces=prepared_interfaces,
+                tests=current_tests,
+                file_state=file_state,
+                checkpoint_ids=checkpoint_ids,
+                checkpoint_interface_ids=checkpoint_interface_ids,
+                checkpoint_paths=checkpoint_paths,
+                existing_tests=existing_tests,
+            )
+            if not decision.get("eligible"):
+                return None
+            await self._log("TestGenerator", message, status="info", node_id=node_id)
+            return {
+                "file_state": file_state,
+                "revised_tests": revised_tests,
+                "coverage_reuse": decision,
+            }
         owned_paths = {
             path
             for _test_type, path, scope in layer_files
@@ -947,6 +1344,16 @@ class WorkflowPhaseRunner:
                 status="info",
                 node_id=node_id,
             )
+
+        reuse_result = await complete_reuse_result(
+            revised_tests=None,
+            message=(
+                "Complete reused coverage verified from implemented interfaces, manifest "
+                "mappings, implementation checkpoints, and green baseline files."
+            ),
+        )
+        if reuse_result is not None:
+            return reuse_result
 
         if owned_interface_ids and not owned_paths:
             await self._log(
@@ -1140,6 +1547,15 @@ class WorkflowPhaseRunner:
             for item in current_tests
             if normalize_coverage_scope(item.get("coverage_scope")) == "owned"
         }
+        reuse_result = await complete_reuse_result(
+            revised_tests=current_tests if manifest_revised else None,
+            message=(
+                "Complete reused coverage verified after green-baseline repair; the node "
+                "is converged without an owned witness."
+            ),
+        )
+        if reuse_result is not None:
+            return reuse_result
         if owned_interface_ids and not final_owned_paths:
             await self._log(
                 "TestGenerator",

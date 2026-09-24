@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import core.config as core_config
+from core import sessions
 from core.queue_state import (
     PHASE_DESIGN,
     PHASE_IMPLEMENT,
@@ -283,6 +284,7 @@ def test_implement_retry_preserves_design_publications_and_resets_implementation
         item for item in queue["stage_tasks"] if item["stage_task_id"] == "L:IMPLEMENTATION"
     )
     implementation["status"] = STAGE_FAILED
+    sessions.merge_node_session("L", {"coverage_reuse": {"status": "reused"}})
 
     plan = reset_node_for_retry(queue, "L")
 
@@ -290,3 +292,21 @@ def test_implement_retry_preserves_design_publications_and_resets_implementation
     assert stage_status_of(queue, "L", STAGE_INTERFACE_DESIGN) == STAGE_PUBLISHED
     assert stage_status_of(queue, "L", STAGE_TEST_GENERATION) == STAGE_PUBLISHED
     assert stage_status_of(queue, "L", STAGE_IMPLEMENTATION) == STAGE_PENDING
+    assert sessions.load_node_session("L")["coverage_reuse"] == {"status": "reused"}
+
+
+def test_design_retry_clears_stale_coverage_reuse_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(core_config, "_workspace_root", tmp_path.resolve())
+    monkeypatch.setenv("ARC_WORKSPACE_ROOT", str(tmp_path))
+    queue = _queue(tmp_path)
+    queue["node_states"]["L"] = "FAILED"
+    design = next(item for item in queue["tasks"] if item["task_id"] == "L:DESIGN")
+    design["status"] = TASK_FAILED
+    sessions.merge_node_session("L", {"coverage_reuse": {"status": "reused"}})
+
+    plan = reset_node_for_retry(queue, "L")
+
+    assert plan.kind == "design"
+    assert sessions.load_node_session("L")["coverage_reuse"] is None
