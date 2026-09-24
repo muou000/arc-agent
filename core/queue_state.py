@@ -831,6 +831,7 @@ def reset_node_for_retry(
             "phase_status": {"design": "pending", "test": "pending", "implement": "pending"},
             "resume_context": {},
             "result_state": "",
+            "coverage_reuse": None,
             "recent_failure_summary": "",
             # Fresh DESIGN pass: the baseline gate will rebuild the
             # per-file states from the new manifest.
@@ -852,6 +853,7 @@ def reset_node_for_retry(
             "phase_status": {"design": "pending", "test": "pending", "implement": "pending"},
             "resume_context": {},
             "result_state": "",
+            "coverage_reuse": None,
         }
         if not requeue:
             # Today's design-retry payload also wipes the failure summary

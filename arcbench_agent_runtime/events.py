@@ -380,6 +380,62 @@ class EventClient:
             },
         )
 
+    def record_design_convergence(
+        self,
+        *,
+        node_id: str = "",
+        status: str = "reused",
+        interface_ids: list[Any] | None = None,
+        interface_status: dict[str, Any] | None = None,
+        test_ids: list[Any] | None = None,
+        coverage: list[dict[str, Any]] | None = None,
+        checkpoint_ids: list[Any] | None = None,
+        checkpoint_paths: dict[str, Any] | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Append auditable evidence for a DESIGN reuse/convergence decision.
+
+        This event is emitted only after the deterministic green-baseline
+        reuse gate has verified interface status, complete manifest coverage,
+        implementation checkpoints, and current passing test files.  The
+        event complements the persisted node session and traceability rows so
+        resume/retry consumers can distinguish reuse from an ordinary RED
+        witness path.
+        """
+
+        normalized_status = str(status or "reused").strip().lower()
+        if normalized_status not in {"reused", "converged"}:
+            normalized_status = "reused"
+
+        def normalized_strings(values: list[Any] | None) -> list[str]:
+            return [str(value or "").strip() for value in (values or []) if str(value or "").strip()]
+
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "design_convergence",
+                "node_id": str(node_id or "").strip(),
+                "status": normalized_status,
+                "result_state": "CONVERGED",
+                "interface_ids": normalized_strings(interface_ids),
+                "interface_status": {
+                    str(interface_id or "").strip(): str(state or "").strip()
+                    for interface_id, state in (interface_status or {}).items()
+                    if str(interface_id or "").strip() and str(state or "").strip()
+                },
+                "test_ids": normalized_strings(test_ids),
+                "coverage": list(coverage or []),
+                "checkpoint_ids": normalized_strings(checkpoint_ids),
+                "checkpoint_paths": {
+                    str(interface_id or "").strip(): str(path or "").strip()
+                    for interface_id, path in (checkpoint_paths or {}).items()
+                    if str(interface_id or "").strip() and str(path or "").strip()
+                },
+                "message": message,
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def record_edge_reconcile(
         self,
         *,

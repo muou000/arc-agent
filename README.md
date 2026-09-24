@@ -23,7 +23,7 @@ flowchart LR
 核心设计要点（继承自 ARC 基座）：
 
 - **需求树驱动**：非叶节点只做 UI 壳层设计，叶节点拥有完整的 UI → API → FUNC → DB 接口链。
-- **测试先行 + manifest 锁定**：TestGenerator 先声明并锁定测试清单再写测试文件，写入/编辑/删除只落在已声明路径上；每个节点至少保留一个 `owned` 测试作为 RED witness，由 TDD 智能体实现直至通过，防止"先写实现再配测试"的假绿。
+- **测试先行 + manifest 锁定**：TestGenerator 先声明并锁定测试清单再写测试文件，写入/编辑/删除只落在已声明路径上；每个需要新增行为的节点至少保留一个 `owned` 测试作为 RED witness，由 TDD 智能体实现直至通过，防止"先写实现再配测试"的假绿。若接口已有实现 checkpoint、完整 manifest 映射和实际绿测证据，DESIGN 可审计地记录 `reused/converged` 并跳过重复实现；证据不完整时仍执行 owned witness 门禁。
 - **DESIGN 空接口骨架修复**：flash 级模型交白卷（schema 合法但 `interfaces` 为空）时，从物化文件机械推导契约骨架做逐行填空；叶节点复用回填仍为空则 DESIGN 直接失败，避免矛盾推迟到整树等待后才爆出。
 - **技能系统**（`skills/`）：技能目录全量注入各 stage agent 系统提示词、按需读取（渐进式披露），没有独立的技能规划 agent，每节点零额外 LLM 调用。
 - **可追溯性**（`arcbench_agent_runtime/`）：requirements / scenarios / interfaces / tests / call_edges / node_states / node_contracts 七张表落盘于 `.arc/traceability/`，事件流写入 `.arc/runner-events.jsonl`，满足比赛"可复现、可审计"的要求。

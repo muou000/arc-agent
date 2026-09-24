@@ -23,6 +23,7 @@ from tests.helpers.faux import (
     failing_test_output,
     passing_test_output,
 )
+from tests.helpers.jsonl import read_jsonl
 
 # Reuse the process-wide runtime fixture so WorkflowPhaseRunner.traceability,
 # core.sessions and context_pipeline all resolve inside tmp_project_dir.
@@ -134,10 +135,55 @@ def _make_runner(
     return runner, logs
 
 
-def _seed_leaf_requirement(runtime, node_id: str) -> None:
+def _seed_leaf_requirement(runtime, node_id: str, dependencies: list[str] | None = None) -> None:
     runtime.traceability.store_requirement_tree(
-        {"id": node_id, "name": "Calculator", "description": "Add two numbers"}
+        {
+            "id": node_id,
+            "name": "Calculator",
+            "description": "Add two numbers",
+            "dependencies": list(dependencies or []),
+        }
     )
+
+
+def _seed_reused_interface(runtime, interface_id: str, owner_id: str, *, implemented: bool = True) -> None:
+    runtime.traceability.upsert_interface(
+        interface_id=interface_id,
+        req_ids=[owner_id],
+        type="FUNC",
+        content=json.dumps(
+            {
+                "interface_id": interface_id,
+                "req_id": owner_id,
+                "type": "FUNC",
+                "name": interface_id.lower(),
+                "responsibility": "Existing implementation",
+                "relation": "reused",
+                "file_path": "src/calc.py",
+                "first_line": "def add(a, b):",
+            }
+        ),
+        file_path="src/calc.py",
+        first_line="def add(a, b):",
+        implemented=implemented,
+    )
+
+
+def _seed_implementation_checkpoint(tmp_project_dir: Path, node_id: str) -> None:
+    import subprocess
+
+    def _git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(tmp_project_dir), check=True, capture_output=True)
+
+    _git("init", "-q")
+    _git("config", "user.name", "arc-test")
+    _git("config", "user.email", "arc-test@example.com")
+    (tmp_project_dir / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_project_dir / "src" / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8"
+    )
+    _git("add", "src/calc.py")
+    _git("commit", "-q", "-m", f"{node_id} (implement): existing calculator")
 
 
 def _run_design(runner: WorkflowPhaseRunner, node_id: str) -> bool:
@@ -261,6 +307,290 @@ def test_design_baseline_allows_green_dependency_regression_with_owned_red_witne
     assert any("dependency/shared test file(s) as exempt coverage" in entry[1] for entry in logs)
     baseline = sessions.load_node_session(node_id).get("design_baseline")
     assert baseline == {UNIT_TEST_FILE: "red", UNIT_TEST_FILE_2: "green"}
+
+
+def test_design_baseline_converges_on_complete_reused_coverage(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """Complete reused coverage records convergence and skips duplicate TDD."""
+
+    node_id = "REQ-BASE-REUSED-COMPLETE"
+    owner_id = "REQ-BASE-REUSED-OWNER"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    _seed_reused_interface(arc_runtime, "IF-REUSED", owner_id)
+    _seed_implementation_checkpoint(tmp_project_dir, owner_id)
+    generator = _StubGenerator(
+        [[
+            _manifest_item(
+                "T-REUSED",
+                UNIT_TEST_FILE,
+                coverage_scope="dependency",
+                interface_ids=["IF-REUSED"],
+            )
+        ]]
+    )
+    fake = FakeAppHandler([passing_test_output()])
+    runner, logs = _make_runner(
+        tmp_project_dir,
+        generator,
+        fake,
+        designer_payload={
+            "summary": "Reuse the existing calculator contract.",
+            "interfaces": [
+                {
+                    "interface_id": "IF-REUSED",
+                    "type": "FUNC",
+                    "relation": "reused",
+                    "file_path": "src/calc.py",
+                    "first_line": "def add(a, b):",
+                }
+            ],
+            "files_written": [],
+        },
+    )
+
+    assert _run_design(runner, node_id) is True
+    assert generator.rejection_calls == []
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])]
+    session = sessions.load_node_session(node_id)
+    assert session["coverage_reuse"]["status"] == "reused"
+    assert session["result_state"] == "CONVERGED"
+    assert arc_runtime.traceability.list_tests(req_id=node_id)[0]["passed"] is True
+    assert any("complete existing coverage" in entry[1] for entry in logs)
+
+    convergence_events = [
+        event
+        for event in read_jsonl(arc_runtime.paths.runner_events_path)
+        if event.get("type") == "design_convergence" and event.get("node_id") == node_id
+    ]
+    assert len(convergence_events) == 1
+    assert convergence_events[0]["interface_ids"] == ["IF-REUSED"]
+    assert convergence_events[0]["checkpoint_ids"] == [owner_id]
+
+    assert asyncio.run(
+        runner.run_implement_phase(node_id, {"name": "Calculator", "description": "Add two numbers"})
+    ) is True
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])]
+    assert sessions.load_node_session(node_id)["phase_status"]["implement"] == "completed"
+
+
+def test_design_baseline_converges_for_owned_interface_with_existing_file_checkpoint(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """A no-write owned contract can reuse a prior implementation checkpoint."""
+
+    node_id = "REQ-BASE-REUSED-OWNED-FILE"
+    owner_id = "REQ-BASE-REUSED-OWNED-FILE-OWNER"
+    _seed_leaf_requirement(arc_runtime, node_id, dependencies=[owner_id])
+    _seed_reused_interface(arc_runtime, "IF-REUSED-DEP", owner_id)
+    _seed_implementation_checkpoint(tmp_project_dir, owner_id)
+    arc_runtime.traceability.upsert_test(
+        test_id="T-REUSED-DEP-EXISTING",
+        req_id=owner_id,
+        interface_ids=["IF-REUSED-DEP"],
+        type="Unit",
+        file_path="tests/unit/test_existing.py",
+        passed=True,
+    )
+    generator = _StubGenerator(
+        [[
+            _manifest_item(
+                "T-REUSED-OWNED",
+                UNIT_TEST_FILE,
+                coverage_scope="owned",
+                interface_ids=["IF-OWNED-EXISTING"],
+            )
+        ]]
+    )
+    fake = FakeAppHandler([passing_test_output()])
+    runner, _logs = _make_runner(
+        tmp_project_dir,
+        generator,
+        fake,
+        designer_payload={
+            "summary": "The current UI behavior is already implemented in the existing page.",
+            "interfaces": [
+                {
+                    "interface_id": "IF-OWNED-EXISTING",
+                    "type": "UI",
+                    "relation": "owned",
+                    "file_path": "src/calc.py",
+                    "first_line": "def add(a, b):",
+                },
+                {
+                    "interface_id": "IF-REUSED-DEP",
+                    "type": "FUNC",
+                    "relation": "reused",
+                    "file_path": "src/calc.py",
+                    "first_line": "def add(a, b):",
+                },
+            ],
+            "files_written": [],
+        },
+    )
+
+    assert _run_design(runner, node_id) is True
+    assert generator.rejection_calls == []
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])]
+    event = next(
+        event
+        for event in read_jsonl(arc_runtime.paths.runner_events_path)
+        if event.get("type") == "design_convergence" and event.get("node_id") == node_id
+    )
+    assert event["checkpoint_paths"] == {
+        "IF-OWNED-EXISTING": "src/calc.py",
+        "IF-REUSED-DEP": "src/calc.py",
+    }
+
+
+def test_design_baseline_does_not_use_unrelated_file_checkpoint_for_reuse(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """A same-path checkpoint from an undeclared sibling is insufficient."""
+
+    node_id = "REQ-BASE-REUSED-UNRELATED-CHECKPOINT"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    _seed_implementation_checkpoint(tmp_project_dir, "REQ-UNRELATED")
+    generator = _StubGenerator(
+        [[
+            _manifest_item(
+                "T-OWNED",
+                UNIT_TEST_FILE,
+                coverage_scope="owned",
+                interface_ids=["IF-OWNED"],
+            )
+        ]]
+    )
+    fake = FakeAppHandler([passing_test_output()])
+    runner, _logs = _make_runner(
+        tmp_project_dir,
+        generator,
+        fake,
+        designer_payload={
+            "summary": "Current interface has no declared existing owner.",
+            "interfaces": [
+                {
+                    "interface_id": "IF-OWNED",
+                    "type": "UI",
+                    "relation": "owned",
+                    "file_path": "src/calc.py",
+                    "first_line": "def add(a, b):",
+                }
+            ],
+            "files_written": [],
+        },
+    )
+
+    assert _run_design(runner, node_id) is False
+    assert len(generator.rejection_calls) == 1
+    assert [item["file_path"] for item in generator.rejection_calls[0]] == [UNIT_TEST_FILE]
+    assert not any(
+        event.get("type") == "design_convergence"
+        for event in read_jsonl(arc_runtime.paths.runner_events_path)
+    )
+
+
+def test_design_baseline_reused_coverage_requires_complete_interface_mapping(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """Partial reused coverage cannot replace a current-node RED witness."""
+
+    node_id = "REQ-BASE-REUSED-PARTIAL"
+    owner_id = "REQ-BASE-REUSED-PARTIAL-OWNER"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    _seed_reused_interface(arc_runtime, "IF-REUSED-A", owner_id)
+    _seed_reused_interface(arc_runtime, "IF-REUSED-B", owner_id)
+    _seed_implementation_checkpoint(tmp_project_dir, owner_id)
+    generator = _StubGenerator(
+        [[
+            _manifest_item(
+                "T-REUSED-A",
+                UNIT_TEST_FILE,
+                coverage_scope="dependency",
+                interface_ids=["IF-REUSED-A"],
+            )
+        ]]
+    )
+    fake = FakeAppHandler([passing_test_output()])
+    runner, logs = _make_runner(
+        tmp_project_dir,
+        generator,
+        fake,
+        designer_payload={
+            "summary": "Reuse both existing calculator contracts.",
+            "interfaces": [
+                {
+                    "interface_id": "IF-REUSED-A",
+                    "type": "FUNC",
+                    "relation": "reused",
+                    "file_path": "src/calc.py",
+                    "first_line": "def add(a, b):",
+                },
+                {
+                    "interface_id": "IF-REUSED-B",
+                    "type": "FUNC",
+                    "relation": "reused",
+                    "file_path": "src/calc.py",
+                    "first_line": "def add(a, b):",
+                },
+            ],
+            "files_written": [],
+        },
+    )
+
+    assert _run_design(runner, node_id) is False
+    assert generator.rejection_calls == []
+    assert any("no `owned` coverage witness" in entry[1] for entry in logs)
+    assert sessions.load_node_session(node_id).get("coverage_reuse") is None
+
+
+def test_design_baseline_green_reused_coverage_without_checkpoint_fails(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """A green duplicate without an implementation checkpoint is unproven."""
+
+    node_id = "REQ-BASE-REUSED-NO-CHECKPOINT"
+    owner_id = "REQ-BASE-REUSED-NO-CHECKPOINT-OWNER"
+    _seed_leaf_requirement(arc_runtime, node_id)
+    _seed_reused_interface(arc_runtime, "IF-REUSED", owner_id)
+    generator = _StubGenerator(
+        [[
+            _manifest_item(
+                "T-REUSED",
+                UNIT_TEST_FILE,
+                coverage_scope="shared",
+                interface_ids=["IF-REUSED"],
+            )
+        ]]
+    )
+    fake = FakeAppHandler([passing_test_output()])
+    runner, logs = _make_runner(
+        tmp_project_dir,
+        generator,
+        fake,
+        designer_payload={
+            "summary": "Reuse an existing calculator contract.",
+            "interfaces": [
+                {
+                    "interface_id": "IF-REUSED",
+                    "type": "FUNC",
+                    "relation": "reused",
+                    "file_path": "src/calc.py",
+                    "first_line": "def add(a, b):",
+                }
+            ],
+            "files_written": [],
+        },
+    )
+
+    assert _run_design(runner, node_id) is False
+    assert generator.rejection_calls == []
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])]
+    assert any("no `owned` coverage witness" in entry[1] for entry in logs)
+    assert not any(
+        event.get("type") == "design_convergence"
+        for event in read_jsonl(arc_runtime.paths.runner_events_path)
+    )
 
 
 def test_design_baseline_rejects_manifest_without_owned_witness(
