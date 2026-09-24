@@ -18,7 +18,7 @@ exact text.
 Issue #247 adds the change region to the same trailer: a successful edit_file
 receipt states ``changed_lines: A-B`` (computed by comparing the pre-edit and
 post-edit on-disk reads, not inferred from the receipt) plus a short excerpt
-of the region's final lines, so a model that wants to confirm its edit has
+of the region's leading lines, so a model that wants to confirm its edit has
 the answer in the receipt instead of re-reading the whole file (a re-read the
 post-write budget then blocks). A successful write_file replaces the whole
 file, so its region is ``changed_lines: 1-N``. Region lines degrade honestly:

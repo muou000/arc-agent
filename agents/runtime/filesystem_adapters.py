@@ -32,7 +32,7 @@ seams as the delete tool, plus a standing note that the context echo's
 extends the trailer with the change region: a successful edit_file states
 ``changed_lines: A-B`` (computed by comparing the pre-edit read against the
 post-edit read-back, both taken at the tool boundary) plus a short excerpt of
-the region's final lines, so confirming an edit never needs a whole-file
+the region's leading lines, so confirming an edit never needs a whole-file
 re-read; a successful write_file — which replaced every line — reports
 ``changed_lines: 1-N``.
 
@@ -226,12 +226,13 @@ _WHOLE_FILE_READ_LIMIT = 2**31 - 1
 # A model that wants to confirm an edit re-reads the file it just edited — a
 # re-read the post-write budget then blocks, turning the confirmation into a
 # stall. The success receipt therefore states where the change landed:
-# `changed_lines: A-B`, plus a short excerpt of the region's final lines for
-# small-enough spans. The span is computed by comparing the pre-edit read
-# against the post-edit read-back (both taken at the tool boundary, the
-# freshest disk truth on either side of the write) — never inferred from the
-# receipt text or the call args, which cannot distinguish a landed edit from
-# a coincidental match under replace_all.
+# `changed_lines: A-B`, plus a short excerpt of the region's leading lines.
+# For edit_file the span is computed by comparing the pre-edit read against
+# the post-edit read-back (both taken at the tool boundary, the freshest disk
+# truth on either side of the write) — deriving it from the call args cannot
+# distinguish a landed edit from a coincidental match under replace_all. For
+# write_file the written content is itself the exact disk truth (PR #134
+# hashes it the same way), so the region is just its full line span.
 
 _CHANGED_LINES_PREFIX = "changed_lines"
 _EXCERPT_HEADER = "changed_excerpt:"
@@ -239,6 +240,24 @@ _EXCERPT_INDENT = "    "
 _EXCERPT_ELLIPSIS = "…"
 _EXCERPT_MAX_LINES = 3
 _EXCERPT_MAX_CHARS = 120
+
+
+def _file_lines(text: str) -> "list[str]":
+    """``text`` as the lines upstream's read would count (``splitlines``).
+
+    A trailing terminator closes the last line, it does not open an empty
+    one, and an empty string has no lines at all (``"".splitlines() ==
+    []``, where a bare ``split("\\n")`` would return one empty line); both
+    the write region's ``1-N`` span and the edit excerpt's line indexing
+    follow this convention.
+    """
+
+    if not text:
+        return []
+    lines = text.split("\n")
+    if text.endswith("\n"):
+        lines.pop()  # the artifact of the trailing terminator, not a line
+    return lines
 
 
 def _integrity_lines(content: str) -> "list[str]":
@@ -260,17 +279,13 @@ def _write_region_lines(content: str) -> "list[str]":
     """The ``changed_lines`` entry for a write_file receipt.
 
     A write replaces the entire file, so the change region is every line of
-    the content as persisted — counted the way upstream's read counts lines
-    (``splitlines``: a trailing terminator closes the last line, it does not
-    open an empty one). An empty write has no lines to span.
+    the content as persisted. An empty write has no lines to span.
     """
 
-    if not content:
+    lines = _file_lines(content)
+    if not lines:
         return []
-    total = content.count("\n") + (0 if content.endswith("\n") else 1)
-    if total <= 0:
-        return []
-    return [f"{_CHANGED_LINES_PREFIX}: 1-{total}"]
+    return [f"{_CHANGED_LINES_PREFIX}: 1-{len(lines)}"]
 
 
 def _common_prefix_len(before: str, after: str) -> int:
@@ -313,11 +328,13 @@ def _changed_region_lines(before: "str | None", after: str) -> "list[str]":
 
 
 def _excerpt_lines(after: str, start_line: int, end_line: int) -> "list[str]":
-    """The final lines at the reported region, capped for receipt size."""
+    """The leading lines of the reported region, capped for receipt size.
 
-    lines = after.split("\n")
-    if after.endswith("\n"):
-        lines.pop()  # the artifact of the trailing terminator, not a line
+    Line numbers index ``after`` the way upstream's read counts lines, so the
+    excerpt shows exactly what ``read_file(offset=start_line, ...)`` would.
+    """
+
+    lines = _file_lines(after)
     window = lines[start_line - 1 : end_line]
     excerpt = [_EXCERPT_HEADER]
     for line in window[:_EXCERPT_MAX_LINES]:
