@@ -120,6 +120,39 @@ class EventClient:
     def mark_test_failed(self, node_id: str, message: str | None = None) -> None:
         self._emit_requirement_state(node_id, "test", "failed", message)
 
+    def record_visual_analysis(
+        self,
+        *,
+        node_id: str = "",
+        status: str = "",
+        attempt: int = 0,
+        retry_at: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Append one node-level ``visual_analysis`` stage event.
+
+        The event is deliberately separate from ``requirement_state``: visual
+        analysis can be running or retrying while the aggregate DESIGN task is
+        still pending. ``retry_at`` is an ISO timestamp when the stage is in
+        backoff and otherwise remains null.
+        """
+
+        normalized_node_id = str(node_id or "").strip()
+        if not normalized_node_id:
+            return
+        append_jsonl(
+            self.paths.runner_events_path,
+            {
+                "type": "visual_analysis",
+                "node_id": normalized_node_id,
+                "status": str(status or "").strip(),
+                "attempt": _nonneg_int(attempt),
+                "retry_at": str(retry_at or "").strip() or None,
+                "message": message,
+                "timestamp": utc_timestamp(),
+            },
+        )
+
     def record_llm_usage(
         self,
         *,

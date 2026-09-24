@@ -29,6 +29,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 | `ARC_MAX_CONCURRENT_TASKS` | `3` | 并行模式同时运行任务数（上限 8） |
 | `ARC_AFFINITY_DEPTH` | `1` | 亲和分组切分深度 |
 | `ARC_DESIGN_GATE_PIPELINE` | 关 | 依赖方 DESIGN 只等依赖 DESIGN 完成即放行 |
+| `ARC_STAGE_PIPELINE` | 关 | 节点级视觉就绪门禁与阶段任务流水线（实验性） |
 | `ARC_MERGE_ARBITRATION` | 关 | 合并层语义冲突 LLM 仲裁 |
 | `ARC_REBASE_ON_MERGE` | 关 | 兄弟合并落地后执行任务的下一文件工具边界即 rebase 重放 |
 | `ARC_VISUAL_PRECOMPUTE` | 开 | 编译前并发预分析需求参考图 |
@@ -70,6 +71,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 - `ARC_MAX_CONCURRENT_TASKS`：同时运行的任务数（仅并行模式生效，默认 3，钳制在 1-8）。
 - `ARC_AFFINITY_DEPTH`：亲和分组切分深度。默认 1 = 顶层子树一组；设 2 起宽子树的深层子树各自成组并行（如 simple-keep 的 REQ-2），组内仍串行。
 - `ARC_DESIGN_GATE_PIPELINE`：DESIGN 依赖门禁流水线化（默认关闭，设 `1/true/yes/on` 启用）。开启后依赖方 DESIGN 的等待条件从「依赖 IMPLEMENT 完成并合并」放宽为「依赖 DESIGN 完成并合并」，依赖方从依赖节点已登记的接口卡（带 `implemented` 标志，可区分已设计未落地的面）做增量设计；依赖方 IMPLEMENT 仍等依赖 IMPLEMENT 落地。开启后依赖 IMPLEMENT 合并时会对 DESIGN 写时登记的契约锚点（`file_path` + `first_line`）做漂移校验：实现偏离登记契约时记 `contract_drift` runner 事件并告警，启用 `ARC_MERGE_ARBITRATION` 且节点仲裁预算未花时升级仲裁修复一次，否则不阻塞、靠下游 TDD 红灯兜底。
+- `ARC_STAGE_PIPELINE`：节点级阶段流水线开关（默认关闭，设 `1/true/yes/on` 启用）。开启后视觉分析在协调器中按节点后台运行，正式 DESIGN 只等待自己的 `visual-ready` 结果；瞬时视觉错误按有限次数退避重试，终态失败只影响该节点及其后续阶段。关闭时保留原有编译前视觉预分析和串行阶段行为。
 - `ARC_MERGE_ARBITRATION`：合并层语义冲突 LLM 仲裁（默认关闭，设 `1/true/yes/on` 启用）。
 - `ARC_REBASE_ON_MERGE`：合并落地不打断执行任务的饿式重放（默认关闭，设 `1/true/yes/on` 启用，仅并行模式生效）。兄弟合并落地时给执行中任务挂未应用合并（变更文件集）；执行中 agent 的**下一次任意文件工具调用**（read/edit/write/append/delete，无论触碰哪个路径）在工具边界先 WIP commit（`wip:` 前缀提交工作树脏状态）再 rebase 到最新 integration HEAD（一次重放消费全部 pending，非文件工具不触发），然后服务本次调用并在工具结果附变更清单。冲突以标记落文件、交执行 agent 用文件工具消解，消解是**强制**的——标记未清期间冲突集之外的**写**被拒绝（读豁免：消解者可读任何文件以产出正确消解；冲突集自身可写，验证工具保持可用）；软护栏只计实际执行过 git 动作的冲突轮次，同一阶段 3 次后停用剩余时间的重放并 abort 悬挂中的 rebase。全程 fail-open——任何机械失败（含 Windows 残留 dev server 锁文件）静默跳过、恢复重放前状态、落回既有合并轨道（机械消解/仲裁/重排），不新增终态、重排与仲裁预算互不消费。git 机械操作全部系统侧（rebase 段持 #91 读写门的 reader），agent 无 shell、无 git。重放生命周期（started/resolved/conflicts/aborted）留痕 `rebase_replay` runner 事件。配套模板补丁把 Playwright 易变产物（test-results/、playwright-report/）加入 backend .gitignore，使其不进检查点、合并与重放。
 

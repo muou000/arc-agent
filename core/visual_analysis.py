@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import threading
+from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Awaitable, Callable
 
@@ -27,11 +28,44 @@ MAX_VISUAL_IMAGE_BYTES = 10 * 1024 * 1024
 # provider rate limits; tune with ARC_VISUAL_ANALYSIS_CONCURRENCY.
 DEFAULT_VISUAL_ANALYSIS_CONCURRENCY = 4
 MAX_VISUAL_ANALYSIS_CONCURRENCY = 8
+MAX_VISUAL_STAGE_CONCURRENCY = 8
+VISUAL_STAGE_MAX_ATTEMPTS = 3
+VISUAL_STAGE_RETRY_BACKOFF_SECONDS = 0.5
 
 # One client per endpoint avoids a fresh TCP+TLS handshake per image, mirroring
 # the model adapter's client cache.
 _VISUAL_CLIENT_CACHE: dict[tuple[str, str], OpenAI] = {}
 _VISUAL_CLIENT_LOCK = threading.Lock()
+_VISUAL_INFLIGHT: dict[tuple[int, str], asyncio.Task[str]] = {}
+_VISUAL_INFLIGHT_LOCK = threading.Lock()
+
+
+@dataclass
+class VisualAnalysisError(RuntimeError):
+    """A classified visual-stage failure used by the coordinator gate."""
+
+    message: str
+    transient: bool = False
+    image_path: str | None = None
+    attempts: int = 1
+
+    def __post_init__(self) -> None:
+        super().__init__(self.message)
+
+    @classmethod
+    def combine(cls, errors: list["VisualAnalysisError"]) -> "VisualAnalysisError":
+        if not errors:
+            return cls("Visual analysis failed without a recorded cause.")
+        details = "; ".join(
+            f"{error.image_path}: {error.message}" if error.image_path else error.message
+            for error in errors
+        )
+        return cls(
+            details,
+            transient=all(error.transient for error in errors),
+            image_path=None,
+            attempts=max(error.attempts for error in errors),
+        )
 
 
 def _max_visual_analysis_concurrency() -> int:
@@ -43,6 +77,62 @@ def _max_visual_analysis_concurrency() -> int:
     except ValueError:
         return DEFAULT_VISUAL_ANALYSIS_CONCURRENCY
     return max(1, min(value, MAX_VISUAL_ANALYSIS_CONCURRENCY))
+
+
+def _is_transient_visual_error(error: BaseException) -> bool:
+    """Classify transport/provider availability failures for bounded retries."""
+
+    if isinstance(error, (ValueError, FileNotFoundError, PermissionError)):
+        return False
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+    try:
+        if int(status_code) in {408, 409, 425, 429, 500, 502, 503, 504}:
+            return True
+    except (TypeError, ValueError):
+        pass
+    if isinstance(error, (TimeoutError, ConnectionError, OSError)):
+        return True
+    name = type(error).__name__.lower()
+    return any(token in name for token in ("timeout", "connection", "connecterror"))
+
+
+def _classified_visual_error(error: BaseException, image_path: str | None = None) -> VisualAnalysisError:
+    if isinstance(error, VisualAnalysisError):
+        return error
+    return VisualAnalysisError(
+        str(error) or type(error).__name__,
+        transient=_is_transient_visual_error(error),
+        image_path=image_path,
+    )
+
+
+async def _deduplicated_visual_request(
+    full_path: Path,
+    cache_key: str,
+    *,
+    dedupe_scope: str,
+) -> str:
+    """Share one in-flight request for equivalent image/model inputs."""
+
+    request_key = (
+        id(asyncio.get_running_loop()),
+        f"{Path(dedupe_scope).resolve()}::{cache_key}",
+    )
+    with _VISUAL_INFLIGHT_LOCK:
+        request = _VISUAL_INFLIGHT.get(request_key)
+        if request is None:
+            request = asyncio.create_task(_request_visual_analysis(full_path))
+            _VISUAL_INFLIGHT[request_key] = request
+    try:
+        return await asyncio.shield(request)
+    finally:
+        if request.done():
+            with _VISUAL_INFLIGHT_LOCK:
+                if _VISUAL_INFLIGHT.get(request_key) is request:
+                    _VISUAL_INFLIGHT.pop(request_key, None)
 
 
 def _get_visual_client() -> OpenAI:
@@ -155,6 +245,12 @@ def _precompute_concurrency() -> int:
     return 4
 
 
+def visual_precompute_concurrency() -> int:
+    """Return the bounded number of node-level visual jobs."""
+
+    return max(1, min(_precompute_concurrency(), MAX_VISUAL_STAGE_CONCURRENCY))
+
+
 async def precompute_visual_references(
     *,
     workspace_path: str,
@@ -230,6 +326,8 @@ async def analyze_and_attach_visual_references(
     requirements_dir: str,
     requirement_data: dict[str, Any],
     log_cb: LogCallback | None = None,
+    strict: bool = False,
+    deduplicate: bool = False,
 ) -> dict[str, Any]:
     req_id = str(requirement_data.get("req_id") or requirement_data.get("id") or "").strip()
     if not req_id:
@@ -246,6 +344,7 @@ async def analyze_and_attach_visual_references(
     # the sequential implementation regardless of analysis completion order.
     visual_references: list[dict[str, Any] | None] = [None] * len(candidates)
     pending: list[tuple[int, str, Path, str]] = []
+    errors: list[VisualAnalysisError] = []
 
     for index, item in enumerate(candidates):
         image_path = str(item.get("image_path") or "").strip()
@@ -259,25 +358,64 @@ async def analyze_and_attach_visual_references(
         try:
             full_path = _resolve_image_path(image_path, workspace_path, requirements_dir)
         except ValueError as exc:
+            if strict:
+                errors.append(_classified_visual_error(exc, image_path))
             await _log(log_cb, "System", f"Rejected image path {image_path}: {exc}", "warning", req_id)
             continue
         if not full_path.exists():
+            missing = FileNotFoundError(f"Image not found: {full_path}")
+            if strict:
+                errors.append(_classified_visual_error(missing, image_path))
             await _log(log_cb, "System", f"Image not found: {full_path}", "warning", req_id)
             continue
 
         try:
             cache_key = _build_visual_cache_key(full_path)
         except Exception as exc:
+            if strict:
+                errors.append(_classified_visual_error(exc, image_path))
             await _log(log_cb, "System", f"Failed to analyze image {image_path}: {exc}", "error", req_id)
             continue
-        cached_entry = cache.get(cache_key)
+        path_cache_key = _build_visual_cache_path_key(cache_key, full_path)
+        cached_entry = cache.get(path_cache_key)
+        if not isinstance(cached_entry, dict) or not cached_entry.get("analysis"):
+            canonical_entry = cache.get(cache_key)
+            if isinstance(canonical_entry, dict) and canonical_entry.get("analysis"):
+                cached_path = str(canonical_entry.get("full_path") or "").strip()
+                cached_image_path = str(canonical_entry.get("image_path") or "").strip()
+                # Cache entries written by older versions had no content
+                # identity beyond the logical path. Do not let one such entry
+                # accidentally satisfy a different path; newly written
+                # entries carry ``full_path`` and can safely use the
+                # content-addressed key across equivalent copies.
+                if cached_path or cached_image_path == image_path:
+                    cached_entry = canonical_entry
         if isinstance(cached_entry, dict) and cached_entry.get("analysis"):
             visual_references[index] = _reference_payload(image_path, str(cached_entry["analysis"]), str(full_path))
             await _log(log_cb, "System", f"Reusing cached visual analysis: {image_path}", None, req_id)
             continue
         pending.append((index, image_path, full_path, cache_key))
 
-    cache_updated = await _analyze_pending_images(pending, cache, visual_references, req_id, log_cb)
+    cache_updated, pending_errors = await _analyze_pending_images(
+        pending,
+        cache,
+        visual_references,
+        req_id,
+        log_cb,
+        dedupe_scope=workspace_path if deduplicate else None,
+    )
+    errors.extend(pending_errors)
+
+    if strict and errors:
+        # Keep successful cache entries so a later retry only has to repeat the
+        # failed images, but do not publish a partial requirement row as
+        # visual-ready. The coordinator owns the terminal stage transition.
+        if cache_updated:
+            with _PERSIST_LOCK:
+                merged_cache = _load_visual_cache(workspace_path)
+                merged_cache.update(cache)
+                _save_visual_cache(workspace_path, merged_cache)
+        raise VisualAnalysisError.combine(errors)
 
     stored_references = [payload for payload in visual_references if payload is not None]
     if cache_updated or stored_references:
@@ -300,13 +438,45 @@ async def analyze_and_attach_visual_references(
     return requirement_data
 
 
+def has_visual_references(requirement_data: dict[str, Any]) -> bool:
+    """Return whether a requirement owns at least one reference image."""
+
+    return bool(_collect_visual_candidates(requirement_data))
+
+
+async def analyze_visual_ready_references(
+    *,
+    workspace_path: str,
+    requirements_dir: str,
+    requirement_data: dict[str, Any],
+    log_cb: LogCallback | None = None,
+) -> dict[str, Any]:
+    """Analyze and publish all references, raising on any incomplete result.
+
+    This is the coordinator-facing API for the node-level visual-ready gate.
+    The legacy API remains best-effort by default so the disabled pipeline
+    flag preserves the historical DESIGN behavior.
+    """
+
+    return await analyze_and_attach_visual_references(
+        workspace_path=workspace_path,
+        requirements_dir=requirements_dir,
+        requirement_data=requirement_data,
+        log_cb=log_cb,
+        strict=True,
+        deduplicate=True,
+    )
+
+
 async def _analyze_pending_images(
     pending: list[tuple[int, str, Path, str]],
     cache: dict[str, Any],
     visual_references: list[dict[str, Any] | None],
     req_id: str,
     log_cb: LogCallback | None,
-) -> bool:
+    *,
+    dedupe_scope: str | None = None,
+) -> tuple[bool, list[VisualAnalysisError]]:
     """Analyze the cache-miss images with bounded concurrency.
 
     Every analysis is an independent request, so up to
@@ -316,18 +486,27 @@ async def _analyze_pending_images(
     the previous serial loop.
     """
     if not pending:
-        return False
+        return False, []
 
     semaphore = asyncio.Semaphore(_max_visual_analysis_concurrency())
     cache_updated = False
+    errors: list[VisualAnalysisError] = []
 
     async def analyze_one(index: int, image_path: str, full_path: Path, cache_key: str) -> None:
         nonlocal cache_updated
         try:
             async with semaphore:
                 await _log(log_cb, "System", f"Analyzing visual element: {image_path}", None, req_id)
-                analysis = await _request_visual_analysis(full_path)
-            cache[cache_key] = {
+                if dedupe_scope is None:
+                    analysis = await _request_visual_analysis(full_path)
+                else:
+                    analysis = await _deduplicated_visual_request(
+                        full_path,
+                        cache_key,
+                        dedupe_scope=dedupe_scope,
+                    )
+            storage_key = _cache_storage_key(cache, cache_key, full_path)
+            cache[storage_key] = {
                 "image_path": image_path,
                 "full_path": str(full_path),
                 "prompt_version": VISUAL_ANALYSIS_PROMPT_VERSION,
@@ -336,13 +515,14 @@ async def _analyze_pending_images(
             cache_updated = True
             visual_references[index] = _reference_payload(image_path, analysis, str(full_path))
         except Exception as exc:
+            errors.append(_classified_visual_error(exc, image_path))
             await _log(log_cb, "System", f"Failed to analyze image {image_path}: {exc}", "error", req_id)
 
     results = await asyncio.gather(*(analyze_one(*entry) for entry in pending), return_exceptions=True)
     for result in results:
         if isinstance(result, BaseException):
             raise result
-    return cache_updated
+    return cache_updated, errors
 
 
 def _collect_visual_candidates(requirement_data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -402,13 +582,39 @@ def _save_visual_cache(workspace_path: str, cache: dict[str, Any]) -> None:
 
 
 def _build_visual_cache_key(full_path: Path) -> str:
-    stat = full_path.stat()
+    image_digest = hashlib.sha256(full_path.read_bytes()).hexdigest()
     model_name = _normalize_openai_model_name(os.environ.get("VISUAL_MODEL") or os.environ.get("MODEL", ""))
     raw_key = (
-        f"{full_path}::{int(stat.st_mtime_ns)}::{stat.st_size}::{VISUAL_ANALYSIS_PROMPT_VERSION}"
+        f"{image_digest}::{VISUAL_ANALYSIS_PROMPT_VERSION}"
         f"::{_resolve_visual_base_url()}::{model_name}"
     )
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def _build_visual_cache_path_key(cache_key: str, full_path: Path) -> str:
+    """Return a stable alias for same-content images at different paths."""
+
+    raw_key = f"{cache_key}::path::{full_path.resolve()}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def _cache_storage_key(cache: dict[str, Any], cache_key: str, full_path: Path) -> str:
+    current = cache.get(cache_key)
+    if not isinstance(current, dict) or not current.get("analysis"):
+        return cache_key
+    current_path = str(current.get("full_path") or "").strip()
+    if current_path and Path(current_path).resolve() == full_path.resolve():
+        return cache_key
+    if not current_path and str(current.get("image_path") or "").strip() == full_path.name:
+        return cache_key
+    # Keep the canonical content key pointing at the newest successful
+    # analysis, while preserving the displaced path under an alias. This
+    # handles legacy entries that lack ``full_path`` and keeps cache readers
+    # that only know the canonical key correct.
+    displaced_path = Path(current_path) if current_path else full_path.parent / str(current.get("image_path") or "")
+    displaced_alias = _build_visual_cache_path_key(cache_key, displaced_path)
+    cache.setdefault(displaced_alias, current)
+    return cache_key
 
 
 def _build_image_data_url(full_path: Path) -> str:

@@ -329,6 +329,55 @@ def transition_stage_task(
     return task
 
 
+def fail_stage_task(
+    queue_state: dict[str, Any],
+    node_id: str,
+    stage: str,
+    *,
+    error: str,
+    on_state_change: StateChangeCallback | None = None,
+) -> dict[str, Any]:
+    """Fail one stage and project the node into the legacy FAILED state.
+
+    Stage workers use this helper when a stage-specific gate fails before the
+    aggregate DESIGN/IMPLEMENT task starts. Keeping the node projection here
+    makes a visual-stage failure visible to the existing scheduler and result
+    builder without duplicating queue invariants in the coordinator.
+    """
+
+    task = transition_stage_task(
+        queue_state,
+        node_id,
+        stage,
+        STAGE_FAILED,
+        error=error,
+    )
+    try:
+        failed_index = STAGE_PIPELINE.index(stage)
+    except ValueError:
+        failed_index = -1
+    if failed_index >= 0:
+        for later_stage in STAGE_PIPELINE[failed_index + 1 :]:
+            later_task = stage_task_of(queue_state, node_id, later_stage)
+            if later_task is None:
+                continue
+            later_status = stage_task_status(queue_state, later_task)
+            if later_status in {STAGE_PENDING, STAGE_RETRY_WAIT}:
+                later_task["status"] = STAGE_BLOCKED
+                later_task["error"] = f"blocked by failed {stage} stage"
+                later_task["retry_at"] = None
+            elif later_status in {STAGE_RUNNING, STAGE_READY, STAGE_READY_TO_MERGE}:
+                transition_stage_task(
+                    queue_state,
+                    node_id,
+                    later_stage,
+                    STAGE_FAILED,
+                    error=f"blocked by failed {stage} stage",
+                )
+    _set_node_state(queue_state, node_id, NODE_FAILED, on_state_change)
+    return task
+
+
 def design_status_of(queue_state: dict[str, Any], node_id: str) -> str | None:
     """The node's DESIGN task status (derived), or None without a DESIGN task."""
 
