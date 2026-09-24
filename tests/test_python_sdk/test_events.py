@@ -163,6 +163,38 @@ class TestVisualAnalysisEvents:
         assert read_jsonl(event_paths.runner_events_path) == []
 
 
+class TestTestContractPreflightEvents:
+    def test_record_test_contract_preflight_writes_diagnostic_schema(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_test_contract_preflight(
+            node_id=" REQ-1 ",
+            status="blocked",
+            classification="deterministic",
+            files=["backend/tests/login.test.js", "  "],
+            issues=[{"kind": "runner_global", "classification": "deterministic"}, "ignored"],
+            message="blocked before TDD",
+        )
+
+        event = read_jsonl(event_paths.runner_events_path)[0]
+        assert event == {
+            "type": "test_contract_preflight",
+            "node_id": "REQ-1",
+            "status": "blocked",
+            "classification": "deterministic",
+            "files": ["backend/tests/login.test.js"],
+            "issues": [{"kind": "runner_global", "classification": "deterministic"}],
+            "message": "blocked before TDD",
+            "timestamp": event["timestamp"],
+        }
+
+    def test_record_test_contract_preflight_ignores_empty_node_id(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        events.record_test_contract_preflight(status="blocked")
+        assert read_jsonl(event_paths.runner_events_path) == []
+
+
 class TestRunnerStateEvents:
     @pytest.mark.parametrize(
         "method_name,state",

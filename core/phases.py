@@ -44,6 +44,7 @@ from core.test_types import canonical_test_type  # noqa: F401
 from core.visual_analysis import analyze_and_attach_visual_references
 from app_type_handler.test_results import TestRunResult
 from agents.runtime.capabilities import is_test_file_path
+from agents.runtime.test_contract_preflight import run_test_contract_preflight
 from agents.tools.test_manifest import normalize_coverage_scope
 
 
@@ -1666,6 +1667,58 @@ class WorkflowPhaseRunner:
         node_id: str,
         tests: list[dict[str, Any]],
     ) -> bool:
+        try:
+            preflight = run_test_contract_preflight(
+                self.workspace_path,
+                app_type=self.app_type,
+                tests=tests,
+            )
+        except Exception as exc:  # pragma: no cover - defensive fail-open boundary
+            await self._log(
+                "TestDrivenDeveloper",
+                f"Test contract preflight was unavailable; continuing to the normal TDD runner: {exc}",
+                status="warning",
+                node_id=node_id,
+            )
+            preflight = None
+
+        if preflight is not None and preflight.applicable:
+            diagnostic = preflight.to_dict()
+            self._update_node_session(node_id, {"test_contract_preflight": diagnostic})
+            try:
+                self.events.record_test_contract_preflight(
+                    node_id=node_id,
+                    status=preflight.status,
+                    classification=preflight.primary_classification,
+                    files=preflight.checked_files,
+                    issues=[issue.to_dict() for issue in preflight.issues],
+                    message=preflight.render(),
+                )
+            except Exception as exc:  # pragma: no cover - diagnostics must not alter TDD semantics
+                await self._log(
+                    "TestDrivenDeveloper",
+                    f"Could not persist test contract preflight diagnostics; continuing with the result: {exc}",
+                    status="warning",
+                    node_id=node_id,
+                )
+            if not preflight.can_start_tdd:
+                message = preflight.render()
+                await self._log(
+                    "TestDrivenDeveloper",
+                    message,
+                    status="error",
+                    node_id=node_id,
+                )
+                self._update_node_session(node_id, {"recent_failure_summary": message})
+                return False
+            if preflight.issues:
+                await self._log(
+                    "TestDrivenDeveloper",
+                    preflight.render(),
+                    status="warning",
+                    node_id=node_id,
+                )
+
         executor = TddTestExecutor(
             node_id=node_id,
             workspace_path=self.workspace_path,
