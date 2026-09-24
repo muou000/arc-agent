@@ -21,6 +21,8 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 | `ARC_MODEL_RETRY_DELAY` | `5` | 重试间隔秒数 |
 | `ARC_MODEL_RETRY_MAX_DELAY` | `60` | 重试间隔上限（服务端 Retry-After 优先） |
 | `ARC_MODEL_MAX_CONSECUTIVE_FAILURES` | `5` | 跨调用连续失败熔断阈值（设 0 关闭） |
+| `ARC_PROVIDER_OUTAGE_THRESHOLD` | `1` | 运行级 provider outage fingerprint 命中次数（设 0 关闭） |
+| `ARC_PROVIDER_OUTAGE_WINDOW_SECONDS` | `300` | outage fingerprint 聚合时间窗口 |
 | `ARC_MODEL_STREAM_TRANSPORT` | `stream` | 流式传输策略（stream / retry / off） |
 | `ARC_MODEL_STREAM_CHUNK_TIMEOUT` | `90` | 流式响应相邻 SSE chunk 最大间隔秒数（设 0 关闭看门狗） |
 | `ARC_MODEL_STREAM_USAGE` | 开 | 流式请求携带 `stream_options.include_usage` |
@@ -52,6 +54,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 - `ARC_MODEL_CONNECT_TIMEOUT`：连接建立超时；连接被静默丢弃时快速失败，不必等满读超时。
 - `ARC_MODEL_MAX_RETRIES` / `ARC_MODEL_RETRY_DELAY` / `ARC_MODEL_RETRY_MAX_DELAY`：适配器重试循环。固定短延迟起步，服务端 `Retry-After` 头优先，间隔钳制在上限内。
 - `ARC_MODEL_MAX_CONSECUTIVE_FAILURES`：跨调用熔断。同一端点连续 N 次模型调用失败后，后续调用立即失败并提示 `--resume`；任一成功即重置计数。设 0 关闭。
+- `ARC_PROVIDER_OUTAGE_THRESHOLD` / `ARC_PROVIDER_OUTAGE_WINDOW_SECONDS`：运行级 outage gate 按 provider、base URL 和错误类别聚合明确的 `EndpointUnreachable` 错误；达到阈值后暂停新的模型任务，将当前任务恢复为可续跑状态，并把 provider 信息、命中次数和时间戳写入 `.arc/processing_queue.json`。`--resume` 会先对保存的 base URL 做 `/models` 可达性检查，检查通过后才继续，已完成节点不会重复执行。设 threshold 为 0 可关闭该运行级 gate。
 
 流式传输三开关：
 

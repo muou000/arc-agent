@@ -47,6 +47,9 @@ from agents.model.openai_api_adapter import (
     acall_model_with_retries,
     call_model_with_retries,
     empty_stream_error,
+    is_provider_outage_error,
+    model_api_error_category,
+    model_api_error_details,
     probe_endpoint_reachable,
     resolve_retry_policy,
     reset_consecutive_failure_budget_for_tests,
@@ -854,6 +857,64 @@ def test_zero_budget_disables_the_circuit_breaker(
         with pytest.raises(ARCModelAPIError):
             _call_engine(recorder, **endpoint)
         assert recorder.calls["plain"] == 1
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 429])
+def test_authentication_and_rate_limit_failures_do_not_trip_outage_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    """Only endpoint reachability failures feed the cross-call outage budget.
+
+    Authentication and throttling are provider responses, not evidence that
+    the endpoint is unreachable. They must keep their own error semantics even
+    when the outage budget is configured to trip after one failure.
+    """
+
+    monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+    monkeypatch.setenv("ARC_MODEL_MAX_CONSECUTIVE_FAILURES", "1")
+    endpoint = {"base_url": "https://model.test/v1", "api_key": "test-key"}
+
+    recorder = _Recorder(plain_errors=[_status_error(status_code)])
+    with pytest.raises(ARCModelAPIError):
+        _call_engine(recorder, **endpoint)
+
+    second = _Recorder(plain_errors=[_status_error(status_code)])
+    with pytest.raises(ARCModelAPIError) as excinfo:
+        _call_engine(second, **endpoint)
+    assert "consecutive failed model calls" not in str(excinfo.value)
+    assert second.calls["plain"] == 1
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 429, 503])
+def test_provider_responses_with_outage_word_are_not_reclassified_as_endpoint_outage(
+    status_code: int,
+) -> None:
+    error = ARCModelAPIError(
+        "endpoint unreachable was reported by the provider response",
+        api_mode="chat_completions",
+        model="test-model",
+        status_code=status_code,
+        error_type="provider_response",
+    )
+
+    assert not is_provider_outage_error(error)
+    assert model_api_error_category(error) != "provider_outage"
+
+
+def test_outage_details_use_canonical_default_endpoint_without_leaking_credentials() -> None:
+    error = ARCModelAPIError(
+        "Model API endpoint unreachable; Bearer sk-secret-value",
+        api_mode="chat_completions",
+        model="test-model",
+        error_type="EndpointUnreachable",
+    )
+
+    details = model_api_error_details(error)
+
+    assert details["base_url"] == "https://api.openai.com/v1"
+    assert details["provider"] == "api.openai.com"
+    assert "sk-secret-value" not in details["message"]
 
 
 def test_failure_budget_is_scoped_per_endpoint(

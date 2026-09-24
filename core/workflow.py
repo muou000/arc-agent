@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from agents.interface_designer import InterfaceDesigner
+from agents.model.openai_api_adapter import (
+    is_provider_outage_error,
+    model_api_error_details,
+    probe_endpoint_reachable,
+)
 from agents.test_driven_developer import TestDrivenDeveloper
 from agents.test_generator import TestGenerator
 from app_type_handler import create_app_type_handler, normalize_app_type
@@ -55,8 +60,14 @@ from core.queue_state import (
     design_status_of,
     load_or_create_queue,
     node_state,
+    outage_is_open,
     propagate_dependency_blocks,
+    record_provider_outage,
+    mark_provider_outage_health_check,
+    defer_provider_outage_task,
+    clear_provider_outage_deferred_tasks,
     recover_interrupted,
+    recover_interrupted_task,
     release_dependency_blocks,
     reset_node_for_retry,
     save_queue,
@@ -82,6 +93,11 @@ from core.merge_arbitration import (
     read_workspace_file,
 )
 from core.path_safety import validate_clean_target
+from core.provider_outage import (
+    RUN_STATUS_PROVIDER_OUTAGE,
+    provider_outage_threshold,
+    provider_outage_window_seconds,
+)
 from core.scheduling import (
     next_affinity_task,
     next_runnable_task,
@@ -400,7 +416,6 @@ class ARCWorkflowManager:
             web_port=self.web_port,
         )
         self.runtime.traceability.init_store(reset=False)
-        self.runtime.events.mark_run_resumed("ARC compilation resumed from processing queue.")
         self._prune_worktrees()
 
     async def start_compilation(
@@ -440,6 +455,13 @@ class ARCWorkflowManager:
         if result.get("ok"):
             self.runtime.events.mark_run_completed("ARC compilation completed.")
             await self._log("Compiler", "Compilation finished successfully.")
+        elif result.get("run_status") == RUN_STATUS_PROVIDER_OUTAGE:
+            await self._log(
+                "Compiler",
+                "Compilation paused because the model provider is unreachable; completed checkpoints "
+                "and the pending queue were preserved for --resume.",
+                "warning",
+            )
         else:
             self.runtime.events.mark_run_failed("ARC compilation finished with failures.")
             failed_nodes = result.get("failed_nodes", [])
@@ -485,6 +507,19 @@ class ARCWorkflowManager:
         except ValueError as exc:
             await self._log("Compiler", str(exc), "error")
             return {"ok": False, "failed_nodes": []}
+        had_provider_outage = outage_is_open(queue_state)
+        if resume_from_queue:
+            if not await self._resume_provider_outage(queue_state):
+                self._save_processing_queue(queue_state)
+                return self._build_compile_result(queue_state)
+            if not had_provider_outage:
+                # An earlier run may have observed an outage without reaching
+                # its threshold before the drain ran out of independent work.
+                # A later explicit resume starts a fresh observation window
+                # for those deferred tasks.
+                clear_provider_outage_deferred_tasks(queue_state)
+            if not had_provider_outage:
+                self.runtime.events.mark_run_resumed("ARC compilation resumed from processing queue.")
         self._sync_queue_node_states(queue_state)
         recovered_tasks = self._recover_interrupted_queue(queue_state)
         retry_plan = self._apply_retry_plan(
@@ -982,6 +1017,8 @@ class ARCWorkflowManager:
         max_concurrency = self._max_concurrent_tasks()
         if max_concurrency <= 1:
             while True:
+                if outage_is_open(queue_state):
+                    break
                 await self._propagate_dependency_blocks(queue_state)
                 task = next_runnable_task(queue_state)
                 if task is None:
@@ -999,7 +1036,7 @@ class ARCWorkflowManager:
         in_flight: dict[asyncio.Task[None], dict[str, Any]] = {}
         try:
             while True:
-                while len(in_flight) < max_concurrency:
+                while len(in_flight) < max_concurrency and not outage_is_open(queue_state):
                     # Propagation runs before every pick because a task that
                     # just finished may have failed and blocked its dependents.
                     # It cannot race the in-flight executions: the marking
@@ -1158,6 +1195,9 @@ class ARCWorkflowManager:
             if visual_ready and (ctx is not None or not self._parallel_mode):
                 task_ok = await self._run_task(task, ctx)
         except Exception as exc:
+            if provider_outage_threshold() > 0 and is_provider_outage_error(exc):
+                await self._handle_provider_outage_task(task, queue_state, ctx, exc)
+                return
             await self._log(
                 "Compiler",
                 f"{phase} task for node {node_id} crashed: {type(exc).__name__}: {exc}",
@@ -1275,6 +1315,65 @@ class ARCWorkflowManager:
         if ctx is not None:
             await self._settle_task_workspace(
                 ctx, WorktreeTaskResult.MERGED if merged else WorktreeTaskResult.FAILED
+            )
+
+    async def _handle_provider_outage_task(
+        self,
+        task: dict[str, Any],
+        queue_state: dict[str, Any],
+        ctx: _TaskWorkspace | None,
+        error: BaseException,
+    ) -> None:
+        """Requeue one outage-interrupted task and update the run breaker."""
+
+        details = model_api_error_details(error)
+        opened, state = record_provider_outage(
+            queue_state,
+            details,
+            threshold=provider_outage_threshold(),
+            window_seconds=provider_outage_window_seconds(),
+        )
+        git_status_lines: list[str] = []
+        if self.runtime is not None:
+            try:
+                git_status_lines = self.runtime.git.status_porcelain().splitlines()
+            except Exception:
+                git_status_lines = []
+        recovered = recover_interrupted_task(
+            queue_state,
+            str(task.get("node_id") or ""),
+            git_status_lines,
+            on_state_change=self._upsert_node_state,
+        )
+        if recovered is not None:
+            queue_state.setdefault("provider_outage_recovered_tasks", []).append(recovered)
+        if not opened:
+            defer_provider_outage_task(queue_state, str(task.get("task_id") or ""))
+        self._save_processing_queue(queue_state)
+        if ctx is not None:
+            await self._settle_task_workspace(ctx, WorktreeTaskResult.FAILED)
+
+        provider = str(state.get("provider") or state.get("base_url") or "provider").strip()
+        count = int(state.get("failure_count") or 0)
+        threshold = int(state.get("threshold") or 0)
+        if opened:
+            self.runtime.events.mark_run_paused(
+                f"Provider outage circuit opened for {provider} after {count} matching outage observation(s)."
+            )
+            await self._log(
+                "Compiler",
+                f"Provider outage circuit opened for {provider} after {count}/{threshold} matching "
+                "outage observation(s). New model tasks are paused; completed checkpoints remain intact. "
+                "Use --resume after the provider health check passes.",
+                status="warning",
+            )
+        else:
+            await self._log(
+                "Compiler",
+                f"Provider outage observed for {provider} ({count}/{threshold}); the {task.get('phase')} "
+                f"task for node {task.get('node_id')} was returned to the queue without a node failure.",
+                status="warning",
+                node_id=str(task.get("node_id") or "") or None,
             )
 
     async def _open_task_workspace(self, task: dict[str, Any], queue_state: dict[str, Any]) -> _TaskWorkspace:
@@ -2323,6 +2422,51 @@ class ARCWorkflowManager:
             require_compatible_existing_queue=require_compatible_existing_queue,
         )
 
+    async def _resume_provider_outage(self, queue_state: dict[str, Any]) -> bool:
+        """Require a fresh provider reachability check before resuming an outage."""
+
+        if not outage_is_open(queue_state):
+            return True
+        outage = queue_state.get("provider_outage") or {}
+        base_url = str(outage.get("base_url") or "https://api.openai.com/v1").strip()
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get(
+            "OPENAI_KEY", ""
+        ).strip()
+        try:
+            healthy = await asyncio.to_thread(
+                probe_endpoint_reachable,
+                base_url=base_url,
+                api_key=api_key,
+            )
+            check_message = "provider health check passed" if healthy else "provider is still unreachable"
+        except Exception as exc:  # noqa: BLE001 - a failed probe keeps the run paused
+            healthy = False
+            check_message = f"provider health check failed: {type(exc).__name__}: {exc}"
+        mark_provider_outage_health_check(
+            queue_state,
+            healthy=healthy,
+            message=check_message,
+        )
+        self._save_processing_queue(queue_state)
+        provider = str(outage.get("provider") or base_url or "provider").strip()
+        if not healthy:
+            await self._log(
+                "Compiler",
+                f"Provider outage remains active for {provider}; health check did not pass. "
+                "The queue and completed checkpoints are preserved; retry with --resume later.",
+                status="warning",
+            )
+            return False
+        self.runtime.events.mark_run_resumed(
+            f"Provider health check passed for {provider}; resuming from the saved queue."
+        )
+        await self._log(
+            "Compiler",
+            f"Provider health check passed for {provider}; resuming from the saved queue.",
+            status="warning",
+        )
+        return True
+
     def _recover_interrupted_queue(self, queue_state: dict[str, Any]) -> list[dict[str, str]]:
         git_status = ""
         if self.runtime is not None:
@@ -2403,15 +2547,20 @@ class ARCWorkflowManager:
             for task in queue_state["tasks"]
             if task_status(queue_state, task) not in {TASK_COMPLETED, TASK_FAILED, TASK_BLOCKED}
         ]
-        accepted = all_completed and not failed_nodes and not blocked_nodes
+        provider_outage = queue_state.get("provider_outage")
+        paused = outage_is_open(queue_state)
+        accepted = all_completed and not failed_nodes and not blocked_nodes and not paused
+        run_status = RUN_STATUS_PROVIDER_OUTAGE if paused else ("COMPLETED" if accepted else "FAILED")
         return {
             "ok": accepted,
-            "status": "PASS" if accepted else "FAIL",
+            "status": "PROVIDER_OUTAGE" if paused else ("PASS" if accepted else "FAIL"),
+            "run_status": run_status,
             "failed_nodes": failed_nodes,
             "blocked_nodes": blocked_nodes,
             "unvalidated_tasks": pending_tasks,
             "visit_order": completed_tasks,
             "states": dict(queue_state["node_states"]),
+            "provider_outage": dict(provider_outage) if isinstance(provider_outage, dict) else None,
         }
 
     async def _reconcile_call_edges(self) -> None:

@@ -30,10 +30,21 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Iterable, Literal
 
 from core import sessions
 from core.files import read_json_file, write_json_file
+from core.provider_outage import (
+    OUTAGE_OPEN,
+    RUN_STATUS_PROVIDER_OUTAGE,
+    RUN_STATUS_RUNNING,
+    build_provider_outage_health_state,
+    build_provider_outage_state,
+    current_open_provider_outage,
+    provider_outage_threshold,
+    provider_outage_window_seconds,
+)
 
 QUEUE_FILENAME = "processing_queue.json"
 
@@ -175,6 +186,89 @@ def node_state(queue_state: dict[str, Any], node_id: str) -> str:
 
     raw = (queue_state.get("node_states") or {}).get(node_id)
     return str(raw or "").strip().upper() or NODE_UNSEEN
+
+
+def outage_is_open(queue_state: dict[str, Any]) -> bool:
+    """Whether the queue currently requires provider recovery before resume."""
+
+    outage = queue_state.get("provider_outage")
+    return isinstance(outage, dict) and str(outage.get("status", "")).upper() == OUTAGE_OPEN
+
+
+def record_provider_outage(
+    queue_state: dict[str, Any],
+    details: dict[str, Any],
+    *,
+    threshold: int | None = None,
+    window_seconds: int | None = None,
+    now: datetime | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """Apply one provider outage transition to the owned queue state."""
+
+    opened, state, fingerprints, new_window = build_provider_outage_state(
+        queue_state.get("provider_outage_fingerprints"),
+        details,
+        threshold=provider_outage_threshold() if threshold is None else threshold,
+        window_seconds=provider_outage_window_seconds() if window_seconds is None else window_seconds,
+        now=now,
+    )
+    queue_state["provider_outage_fingerprints"] = fingerprints
+    open_state = current_open_provider_outage(fingerprints)
+    queue_state["provider_outage"] = open_state if open_state is not None else state
+    if new_window:
+        queue_state["provider_outage_deferred_task_ids"] = []
+    if open_state is not None or opened:
+        queue_state["run_status"] = RUN_STATUS_PROVIDER_OUTAGE
+    else:
+        queue_state.setdefault("run_status", RUN_STATUS_RUNNING)
+    return opened, state
+
+
+def mark_provider_outage_health_check(
+    queue_state: dict[str, Any],
+    *,
+    healthy: bool,
+    now: datetime | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    """Apply a resume-time provider health-check result to the queue."""
+
+    state = build_provider_outage_health_state(
+        queue_state.get("provider_outage"),
+        healthy=healthy,
+        now=now,
+        message=message,
+    )
+    queue_state["provider_outage"] = state
+    fingerprints = queue_state.get("provider_outage_fingerprints")
+    if not isinstance(fingerprints, dict):
+        fingerprints = {}
+    if state.get("fingerprint"):
+        fingerprints[str(state["fingerprint"])] = state
+    queue_state["provider_outage_fingerprints"] = fingerprints
+    if healthy:
+        queue_state["run_status"] = RUN_STATUS_RUNNING
+        clear_provider_outage_deferred_tasks(queue_state)
+    else:
+        queue_state["run_status"] = RUN_STATUS_PROVIDER_OUTAGE
+    return state
+
+
+def defer_provider_outage_task(queue_state: dict[str, Any], task_id: str) -> None:
+    """Keep one outage-interrupted task out of the current observation pass."""
+
+    normalized = str(task_id or "").strip()
+    if not normalized:
+        return
+    deferred = queue_state.setdefault("provider_outage_deferred_task_ids", [])
+    if normalized not in deferred:
+        deferred.append(normalized)
+
+
+def clear_provider_outage_deferred_tasks(queue_state: dict[str, Any]) -> None:
+    """Allow deferred outage tasks to participate in a fresh resume pass."""
+
+    queue_state["provider_outage_deferred_task_ids"] = []
 
 
 def design_done(queue_state: dict[str, Any], node_id: str) -> bool:
@@ -686,54 +780,73 @@ def recover_interrupted(
 
     recovered: list[dict[str, str]] = []
     for node_id in list(queue_state.get("node_states", {})):
-        state = node_state(queue_state, node_id)
-        if state == NODE_DESIGNING:
-            phase, fallback = PHASE_DESIGN, NODE_UNSEEN
-        elif state == NODE_IMPLEMENTING:
-            phase, fallback = PHASE_IMPLEMENT, NODE_DESIGNED
-        else:
-            continue
-        task = _node_task(queue_state, node_id, phase)
-        task_id = str((task or {}).get("task_id", "") or "")
-        sessions.merge_node_session(
+        record = recover_interrupted_task(
+            queue_state,
             node_id,
-            {
-                "resume_context": {
-                    "interrupted": True,
-                    "task_id": task_id,
-                    "phase": phase,
-                    "previous_node_state": state,
-                    "recovered_node_state": fallback,
-                    "git_status": list(git_status_lines[:80]),
-                    "instruction": (
-                        "This node is resuming after an interrupted agent stage. "
-                        "Preserve useful existing source, test, and traceability artifacts; inspect the listed dirty files "
-                        "and current-node records before regenerating or overwriting work."
-                    ),
-                },
-                "phase_status": {phase.lower(): "interrupted"},
-            },
+            git_status_lines,
+            on_state_change=on_state_change,
         )
-        if phase == PHASE_DESIGN:
-            _reset_stage_tasks_for_retry(
-                queue_state,
-                node_id,
-                reset_design=True,
-                reset_implementation=False,
-                preserve_published=True,
-            )
-        else:
-            _reset_stage_tasks_for_retry(
-                queue_state,
-                node_id,
-                reset_design=False,
-                reset_implementation=True,
-                preserve_published=True,
-            )
-        _set_node_state(queue_state, node_id, fallback, on_state_change)
-        recovered.append({"node_id": node_id, "phase": phase, "task_id": task_id})
+        if record is not None:
+            recovered.append(record)
     queue_state["recovered_interrupted_tasks"] = recovered
     return recovered
+
+
+def recover_interrupted_task(
+    queue_state: dict[str, Any],
+    node_id: str,
+    git_status_lines: list[str],
+    on_state_change: StateChangeCallback | None = None,
+) -> dict[str, str] | None:
+    """Recover one in-flight node without touching other active tasks."""
+
+    state = node_state(queue_state, node_id)
+    if state == NODE_DESIGNING:
+        phase, fallback = PHASE_DESIGN, NODE_UNSEEN
+    elif state == NODE_IMPLEMENTING:
+        phase, fallback = PHASE_IMPLEMENT, NODE_DESIGNED
+    else:
+        return None
+
+    task = _node_task(queue_state, node_id, phase)
+    task_id = str((task or {}).get("task_id", "") or "")
+    sessions.merge_node_session(
+        node_id,
+        {
+            "resume_context": {
+                "interrupted": True,
+                "task_id": task_id,
+                "phase": phase,
+                "previous_node_state": state,
+                "recovered_node_state": fallback,
+                "git_status": list(git_status_lines[:80]),
+                "instruction": (
+                    "This node is resuming after an interrupted agent stage. "
+                    "Preserve useful existing source, test, and traceability artifacts; inspect the listed dirty files "
+                    "and current-node records before regenerating or overwriting work."
+                ),
+            },
+            "phase_status": {phase.lower(): "interrupted"},
+        },
+    )
+    if phase == PHASE_DESIGN:
+        _reset_stage_tasks_for_retry(
+            queue_state,
+            node_id,
+            reset_design=True,
+            reset_implementation=False,
+            preserve_published=True,
+        )
+    else:
+        _reset_stage_tasks_for_retry(
+            queue_state,
+            node_id,
+            reset_design=False,
+            reset_implementation=True,
+            preserve_published=True,
+        )
+    _set_node_state(queue_state, node_id, fallback, on_state_change)
+    return {"node_id": node_id, "phase": phase, "task_id": task_id}
 
 
 # ---------------------------------------------------------------------------
@@ -1005,6 +1118,9 @@ def load_or_create_queue(
     existing_queue = read_json_file(path)
     if _is_compatible_queue(existing_queue, root_id, expected_task_ids):
         queue_state = existing_queue
+        queue_state.setdefault("run_status", RUN_STATUS_RUNNING)
+        queue_state.setdefault("provider_outage", None)
+        queue_state.setdefault("provider_outage_fingerprints", {})
         # Queues saved before node states existed lack the map.
         had_node_states = "node_states" in queue_state
         queue_state.setdefault("node_states", {})
@@ -1087,6 +1203,9 @@ def load_or_create_queue(
         "dependencies": dependencies,
         "dropped_dependency_edges": dropped_dependency_edges,
         "last_task_id": None,
+        "run_status": RUN_STATUS_RUNNING,
+        "provider_outage": None,
+        "provider_outage_fingerprints": {},
     }
 
 

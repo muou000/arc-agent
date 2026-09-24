@@ -169,13 +169,20 @@ def check_config() -> dict[str, Any]:
         "ARC_MODEL_RETRY_DELAY": (0, 3600),
         "ARC_MODEL_RETRY_MAX_DELAY": (0, 3600),
         "ARC_MODEL_MAX_CONSECUTIVE_FAILURES": (0, 100),
+        "ARC_PROVIDER_OUTAGE_THRESHOLD": (0, 100),
+        "ARC_PROVIDER_OUTAGE_WINDOW_SECONDS": (1, 86400),
     }
     for name, (low, high) in numeric_env_checks.items():
         raw = os.environ.get(name, "").strip()
         if not raw:
             continue
         try:
-            value = int(raw) if name in {"ARC_MODEL_MAX_RETRIES", "ARC_MODEL_MAX_CONSECUTIVE_FAILURES"} else float(raw)
+            value = int(raw) if name in {
+                "ARC_MODEL_MAX_RETRIES",
+                "ARC_MODEL_MAX_CONSECUTIVE_FAILURES",
+                "ARC_PROVIDER_OUTAGE_THRESHOLD",
+                "ARC_PROVIDER_OUTAGE_WINDOW_SECONDS",
+            } else float(raw)
         except ValueError:
             warnings.append(f"{name} must be a number, got: {raw}")
             continue
