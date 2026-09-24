@@ -7,16 +7,22 @@ strips it and dispatches the compile to the pre-#214 checkout (main @
 ae0b026, includes #215 compact JSON). The candidate arm runs the fix
 branch's checkout. Both checkouts share the same .env (copied from the main
 workspace), so the only delta is the code.
+
+Checkout roots come from ``ARC_EVAL_BASELINE_ROOT`` / ``ARC_EVAL_CANDIDATE_ROOT``
+and default to the host paths of the recorded run below (the eval evidence in
+this directory was produced with exactly these defaults on 2026-09-23); set
+them to re-run the comparison from another machine or checkout layout.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-MAIN = Path(r"D:\code\arc-agent")
-CANDIDATE = Path(r"D:\code\arc-visual-reference-dict-214")
+MAIN = Path(os.environ.get("ARC_EVAL_BASELINE_ROOT") or r"D:\code\arc-agent")
+CANDIDATE = Path(os.environ.get("ARC_EVAL_CANDIDATE_ROOT") or r"D:\code\arc-visual-reference-dict-214")
 MARKER = "__BASELINE_214__"
 
 
