@@ -160,3 +160,35 @@ def test_interface_designer_user_prompt_pins_leaf_interfaces_non_empty() -> None
     assert "its `interfaces` array must be non-empty" in prompt
     assert "original `interface_id`" in prompt
     assert "Only a non-leaf node without visual references may return an empty list" in prompt
+
+
+def test_interface_designer_user_prompt_leads_serialization_rules_with_type_mandatory() -> None:
+    """Issue #230 (serial-5): all 11 interface records omitted `type` because
+    the interface_id already encodes it and the mandatory-field rule was
+    buried mid-list. The rule must lead the serialization rules and name the
+    exact trap: the id segment does not substitute for the field."""
+
+    prompt = get_user_prompt(
+        node_id="REQ-LEAF-1",
+        requirement_data={
+            "id": "REQ-LEAF-1",
+            "name": "Registration",
+            "description": "Register an account.",
+            "children_ids": [],
+        },
+        dynamic_context="",
+    )
+
+    assert "Every interface record must carry a `type` field" in prompt
+    assert "even when the `interface_id` already contains the type segment" in prompt
+    # Prominence: the rule is the first serialization rule of the response
+    # contract, ahead of the response-shape and field-inventory statements
+    # it used to be buried under.
+    assert prompt.index("Every interface record must carry a `type` field") < prompt.index(
+        "Return `summary`, `interfaces`, and `files_written`"
+    )
+    assert prompt.index("Every interface record must carry a `type` field") < prompt.index(
+        "Each interface should include"
+    )
+    # The old buried one-liner is gone; the promoted rule is the only statement.
+    assert "The `type` field must be exactly one of" not in prompt

@@ -264,6 +264,9 @@ class InterfaceDesigner:
                 bundle["interfaces"] = repaired["interfaces"]
                 if repaired.get("summary"):
                     bundle["summary"] = repaired["summary"]
+        await self._repair_missing_interface_types(
+            session, built, node_id=node_id, interfaces=bundle["interfaces"]
+        )
         await self._log(
             f"Interface design returned {len(bundle.get('interfaces', []))} interface(s).",
             node_id=node_id,
@@ -467,6 +470,116 @@ class InterfaceDesigner:
             node_id=node_id,
         )
         return {}
+
+    def _stored_interface_lookup(self) -> Callable[[str], dict[str, Any] | None] | None:
+        """Traceability row lookup for the `type` backfill pre-check.
+
+        ``None`` when the runtime is unavailable (standalone adapter use): the
+        pre-check then degrades to prefix-only and may spend its repair ask on
+        records the registration layer would have backfilled from a stored
+        row — harmless, because the registry re-checks before anything is
+        judged.
+        """
+
+        try:
+            from core.service import get_runtime
+
+            return get_runtime().traceability.get_interface
+        except Exception:
+            return None
+
+    async def _repair_missing_interface_types(
+        self,
+        session: StageSession,
+        built: StageAgentBuild,
+        *,
+        node_id: str,
+        interfaces: list[dict[str, Any]],
+    ) -> None:
+        """One targeted re-ask for records whose `type` no backfill source resolves.
+
+        Serial-5 (2026-09-24): the model treats the interface_id's type segment
+        (``REQ-2-UI-LoginPage``) as making the ``type`` field redundant and
+        omits it from every record; the registry raised on the first record
+        with no backfill source and the whole round was judged failed. The
+        registry backfills from the stored row and the id segment, so only
+        records with no source at all reach this ask; the answer patches the
+        ``type`` field in place by interface_id and nothing else — the
+        registration layer stays the authority, and its judgment on whatever
+        remains is final (no second ask).
+        """
+
+        from core.design_artifacts import ALLOWED_INTERFACE_TYPES, unresolvable_interface_types
+
+        lookup = self._stored_interface_lookup()
+        missing_ids = unresolvable_interface_types(
+            interfaces, get_stored_interface=lookup or (lambda _interface_id: None)
+        )
+        if not missing_ids:
+            return
+        await self._log(
+            f"{len(missing_ids)} interface record(s) have no resolvable `type` (no field "
+            f"value, no stored contract, no id type segment): {', '.join(missing_ids)}; "
+            "requesting one targeted re-serialization.",
+            status="warning",
+            node_id=node_id,
+        )
+        try:
+            payload = await session.invoke(built, message=self._type_repair_message(missing_ids))
+            repaired = await self._normalize_with_recovery(payload, node_id=node_id, built=built)
+        except Exception as exc:
+            await self._log(
+                f"Type re-serialization pass failed with {type(exc).__name__} for "
+                f"{len(missing_ids)} record(s): {', '.join(missing_ids)}; "
+                "leaving them to the registration layer's judgment.",
+                status="warning",
+                node_id=node_id,
+            )
+            return
+        by_id = {
+            str(record.get("interface_id") or "").strip(): record
+            for record in repaired.get("interfaces") or []
+            if isinstance(record, dict)
+        }
+        patched: list[str] = []
+        still_missing: list[str] = []
+        for interface_id in missing_ids:
+            candidate = str(by_id.get(interface_id, {}).get("type") or "").strip().upper()
+            if candidate in ALLOWED_INTERFACE_TYPES:
+                for interface in interfaces:
+                    if str(interface.get("interface_id") or "").strip() == interface_id:
+                        interface["type"] = candidate
+                patched.append(interface_id)
+            else:
+                still_missing.append(interface_id)
+        if still_missing:
+            await self._log(
+                f"Type re-serialization left {len(still_missing)} record(s) still missing a "
+                f"resolvable `type`: {', '.join(still_missing)}; the DESIGN phase will be "
+                "judged on them.",
+                status="warning",
+                node_id=node_id,
+            )
+        if patched:
+            await self._log(
+                f"Type re-serialization filled `type` for {len(patched)} record(s): "
+                f"{', '.join(patched)}.",
+                node_id=node_id,
+            )
+
+    @staticmethod
+    def _type_repair_message(missing_ids: list[str]) -> str:
+        listed = "\n".join(f"- {interface_id}" for interface_id in missing_ids)
+        return "\n".join(
+            [
+                "Your design pass returned the interface record(s) below without a usable `type` field:",
+                listed,
+                "The registry backfills `type` from the stored contract row and the interface_id type segment (-UI-/-API-/-FUNC-/-DB-); these ids have neither, so only the `type` you return here can save them. A record missing `type` fails the whole DESIGN phase.",
+                "Return now a single `InterfaceDesignResponse` whose `interfaces` array contains exactly one record per id listed above, each carrying its exact `interface_id` unchanged and the correct `type` (one of `UI`, `API`, `FUNC`, or `DB`) for what that contract is: UI page/component, API endpoint/client, FUNC service/helper, DB table/seed.",
+                "Do not re-mint ids and do not return records beyond this list; keep every other field as it was.",
+                "Return the structured fields themselves. Do NOT wrap the JSON in markdown code fences and do NOT nest the response JSON inside the `summary` string.",
+            ]
+        )
 
     async def _leaf_reuse_candidates(self, *, node_id: str) -> list[dict[str, str]] | None:
         """Parent/dependency interfaces a write-less leaf can anchor reuse to.
