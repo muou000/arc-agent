@@ -236,16 +236,19 @@ class WorkflowPhaseRunner:
             )
 
         dropped_entries: list[dict[str, Any]] = []
+        prepare_error: ValueError | None = None
         try:
             prepared_interfaces = self.registry.prepare_interfaces(
                 node_id, interfaces, on_dropped_entry=dropped_entries.append
             )
         except ValueError as exc:
+            prepare_error = exc
             await self._log("InterfaceDesigner", str(exc), status="error", node_id=node_id)
-            return False
         if dropped_entries:
             # Id-less records never reach the traceability store; surface the
-            # hole instead of swallowing it (issue #230).
+            # hole instead of swallowing it (issue #230). Flushed on the raise
+            # path too: entries collected before the failing record must not
+            # vanish into the ValueError return.
             hints = ", ".join(
                 hint
                 for hint in (
@@ -262,6 +265,8 @@ class WorkflowPhaseRunner:
                 status="warning",
                 node_id=node_id,
             )
+        if prepare_error is not None:
+            return False
         context_pipeline.cache.invalidate_file_layers(node_id)
         context_pipeline.cache.invalidate_db_layers(node_id)
         self._update_node_session(

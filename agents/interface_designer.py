@@ -529,8 +529,9 @@ class InterfaceDesigner:
             repaired = await self._normalize_with_recovery(payload, node_id=node_id, built=built)
         except Exception as exc:
             await self._log(
-                f"Type re-serialization pass failed with {type(exc).__name__}; "
-                "leaving the records to the registration layer's judgment.",
+                f"Type re-serialization pass failed with {type(exc).__name__} for "
+                f"{len(missing_ids)} record(s): {', '.join(missing_ids)}; "
+                "leaving them to the registration layer's judgment.",
                 status="warning",
                 node_id=node_id,
             )

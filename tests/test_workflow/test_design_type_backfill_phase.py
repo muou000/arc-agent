@@ -307,3 +307,35 @@ def test_design_phase_warns_on_dropped_idless_interface_entries(
     assert any("without an `interface_id`" in message and "Ghost.tsx" in message for message in warnings)
     # The well-formed sibling is unaffected.
     assert arc_runtime.traceability.get_interface(f"{node_id}-UI-LoginPage")["type"] == "UI"
+
+
+def test_design_phase_dropped_warning_survives_a_type_judgment_failure(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """A payload can carry BOTH shapes: an id-less record and an unresolvable
+    type. The registry raises on the latter, but the dropped-record warning
+    must still be emitted before the phase is judged (PR #237 review round 1)."""
+
+    node_id = "REQ-S5-F"
+    _seed_shell_requirement(arc_runtime, node_id)
+    runner, logs = _make_runner(
+        tmp_project_dir,
+        {
+            "summary": "Shell wired.",
+            "interfaces": [
+                {"type": "UI", "file_path": "frontend/src/pages/Ghost.tsx", "name": "Ghost"},
+                {"interface_id": "IF-ORPHAN", "file_path": "src/orphan.py"},
+            ],
+            "files_written": [],
+        },
+    )
+
+    ok = asyncio.run(
+        runner.run_design_phase(node_id, {"name": "Auth Shell", "description": "Shell"})
+    )
+
+    assert ok is False
+    errors = [entry[1] for entry in logs if entry[2] == "error"]
+    assert any("invalid `type`" in message and "IF-ORPHAN" in message for message in errors)
+    warnings = [entry[1] for entry in logs if entry[2] == "warning"]
+    assert any("without an `interface_id`" in message and "Ghost.tsx" in message for message in warnings)
