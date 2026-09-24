@@ -463,6 +463,10 @@ class TestAdapterIntegration:
     def test_sync_generate_reports_usage(self, monkeypatch: pytest.MonkeyPatch) -> None:
         records: list[LLMUsageRecord] = []
         set_llm_usage_sink(records.append)
+        # The stub replaces the generate boundary, not the HTTP layer: without
+        # transport=0 stream-first (the ambient default) bypasses the stub and
+        # hits the real endpoint (issue #227).
+        monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
         metadata_result = self._metadata_result()
 
         def fake_generate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -487,6 +491,9 @@ class TestAdapterIntegration:
 
         records: list[LLMUsageRecord] = []
         set_llm_usage_sink(records.append)
+        # Same boundary shape as test_sync_generate_reports_usage: pin the
+        # transport off or stream-first bypasses the stub (issue #227).
+        monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
         metadata_result = self._metadata_result()
 
         async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -511,6 +518,12 @@ class TestAdapterIntegration:
         records: list[LLMUsageRecord] = []
         set_llm_usage_sink(records.append)
         monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "0")
+        # Pin the transport off so the injected error is what surfaces: with
+        # stream-first the stub is bypassed, the real endpoint answers 401,
+        # and the old bare pytest.raises(RuntimeError) passed on that
+        # wrong-path exception (ARCModelAPIError subclasses RuntimeError;
+        # issue #227).
+        monkeypatch.setenv("ARC_MODEL_STREAM_TRANSPORT", "0")
 
         async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
             raise RuntimeError("not a model api error")
@@ -526,7 +539,9 @@ class TestAdapterIntegration:
             )
             await model._agenerate([{"role": "user", "content": "hi"}])
 
-        with pytest.raises(RuntimeError):
+        # match pins the passthrough contract: the injected non-model error
+        # surfaces unwrapped, not re-wrapped as an ARCModelAPIError.
+        with pytest.raises(RuntimeError, match="not a model api error"):
             asyncio.run(run())
         assert records == []
 
