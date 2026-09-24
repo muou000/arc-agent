@@ -685,6 +685,16 @@ def recover_interrupted(
     """
 
     recovered: list[dict[str, str]] = []
+    recovered_stage_tasks: list[str] = []
+    for task in queue_state.get("stage_tasks", []) or []:
+        if stage_task_status(queue_state, task) != STAGE_RUNNING:
+            continue
+        stage_task_id = str(task.get("stage_task_id", "") or "")
+        task["status"] = STAGE_SKIPPED if not bool(task.get("applicable", True)) else STAGE_PENDING
+        task["retry_at"] = None
+        task["error"] = "stage task was interrupted before publication"
+        recovered_stage_tasks.append(stage_task_id)
+    queue_state["recovered_interrupted_stage_tasks"] = recovered_stage_tasks
     for node_id in list(queue_state.get("node_states", {})):
         state = node_state(queue_state, node_id)
         if state == NODE_DESIGNING:
@@ -1232,10 +1242,15 @@ def build_stage_tasks(root_node: dict[str, Any]) -> list[dict[str, Any]]:
 
     tasks: list[dict[str, Any]] = []
 
+    next_node_order = 0
+
     def walk(node: dict[str, Any]) -> None:
+        nonlocal next_node_order
         node_id = str(node.get("id", "")).strip()
         if not node_id:
             return
+        node_order = next_node_order
+        next_node_order += 1
         is_leaf = not bool(node.get("children"))
         for stage in STAGE_PIPELINE:
             tasks.append(
@@ -1243,6 +1258,7 @@ def build_stage_tasks(root_node: dict[str, Any]) -> list[dict[str, Any]]:
                     node_id,
                     stage,
                     len(tasks),
+                    node_order=node_order,
                     applicable=stage != STAGE_TEST_GENERATION or is_leaf,
                 )
             )
@@ -1269,6 +1285,7 @@ def _make_stage_task(
     stage: str,
     order: int,
     *,
+    node_order: int | None = None,
     applicable: bool = True,
 ) -> dict[str, Any]:
     return {
@@ -1276,6 +1293,7 @@ def _make_stage_task(
         "node_id": node_id,
         "stage": stage,
         "order": order,
+        "node_order": node_order,
         "status": STAGE_PENDING if applicable else STAGE_SKIPPED,
         "applicable": applicable,
         "attempt_count": 0,

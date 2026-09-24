@@ -16,6 +16,7 @@ from core.queue_state import (
     STAGE_READY_TO_MERGE,
     STAGE_TEST_GENERATION,
     STAGE_VISUAL_ANALYSIS,
+    recover_interrupted,
 )
 from core.scheduling import (
     next_runnable_stage_task,
@@ -33,12 +34,14 @@ def _stage(
     status: str = STAGE_PENDING,
     *,
     writes: list[str] | None = None,
+    node_order: int | None = None,
 ) -> dict[str, Any]:
     task: dict[str, Any] = {
         "stage_task_id": f"{node_id}:{stage}",
         "node_id": node_id,
         "stage": stage,
         "order": order,
+        "node_order": node_order,
         "status": status,
         "applicable": True,
         "attempt_count": 0,
@@ -197,6 +200,23 @@ def test_stage_selector_skips_conflicting_earlier_work_and_keeps_later_work_fair
     assert pick is ready_test_generation
 
 
+def test_stage_selector_rejects_non_adjacent_overlap_even_when_writes_are_disjoint() -> None:
+    active_design = _stage(
+        "A", STAGE_INTERFACE_DESIGN, 1, STAGE_READY_TO_MERGE,
+        writes=["src/a.ts"], node_order=0,
+    )
+    candidate = _stage(
+        "C", STAGE_TEST_GENERATION, 2, writes=["tests/c.test.ts"], node_order=2,
+    )
+    queue = _queue(
+        _stage("C", STAGE_VISUAL_ANALYSIS, 3, STAGE_PUBLISHED, node_order=2),
+        _stage("C", STAGE_INTERFACE_DESIGN, 4, STAGE_PUBLISHED, node_order=2),
+        candidate,
+    )
+
+    assert next_runnable_stage_task(queue, [active_design], max_in_flight=2) is None
+
+
 def test_stage_backpressure_stops_new_work_when_publications_are_queued() -> None:
     ready_to_merge = _stage("A", STAGE_INTERFACE_DESIGN, 0, STAGE_READY_TO_MERGE, writes=["src/a.ts"])
     candidate = _stage("B", STAGE_TEST_GENERATION, 1, writes=["tests/b.test.ts"])
@@ -211,17 +231,27 @@ def test_stage_backpressure_stops_new_work_when_publications_are_queued() -> Non
     assert next_runnable_stage_task(queue, [], max_in_flight=2, max_ready_to_merge=2) is candidate
 
 
+def test_resume_requeues_orphaned_running_stage_tasks() -> None:
+    running = _stage("A", STAGE_INTERFACE_DESIGN, 0, "RUNNING")
+    queue = _queue(running)
+
+    assert recover_interrupted(queue, git_status_lines=[]) == []
+    assert running["status"] == STAGE_PENDING
+    assert queue["recovered_interrupted_stage_tasks"] == ["A:INTERFACE_DESIGN"]
+
+
 def test_stage_drain_uses_bounded_slots_and_the_approved_overlap_window(
-    tmp_path: Path, monkeypatch
+    tmp_project_dir: Path, runtime, monkeypatch
 ) -> None:
     monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
     manager = ARCWorkflowManager(
-        workspace_path=str(tmp_path),
+        workspace_path=str(tmp_project_dir),
         requirement_path="",
         web_port=4000,
         log_cb=lambda *_args, **_kwargs: None,
     )
+    manager.runtime = runtime
     manager._save_processing_queue = lambda _queue: None
     queue = _queue(
         _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED),
@@ -246,3 +276,42 @@ def test_stage_drain_uses_bounded_slots_and_the_approved_overlap_window(
 
     assert peak == 2
     assert all(task["status"] == STAGE_PUBLISHED for task in queue["stage_tasks"])
+
+
+def test_serial_stage_pipeline_compile_uses_the_stage_drain(
+    tmp_project_dir: Path, runtime, monkeypatch
+) -> None:
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
+    monkeypatch.delenv("ARC_NODE_WORKTREES", raising=False)
+    tree = {"id": "A", "name": "A", "description": "A", "children": []}
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_project_dir),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = runtime
+
+    class _Runner:
+        async def run_design_phase(self, _node_id: str, _requirement: dict[str, Any]) -> bool:
+            return True
+
+        async def run_implement_phase(self, _node_id: str, _requirement: dict[str, Any]) -> bool:
+            return True
+
+    manager.phase_runner = _Runner()
+    manager._commit_phase_checkpoint = lambda *_args, **_kwargs: asyncio.sleep(0)
+    manager._reconcile_call_edges = lambda: asyncio.sleep(0)
+    calls: list[str] = []
+    original_drain = manager._drain_stage_tasks
+
+    async def recording_drain(queue_state: dict[str, Any], execute_stage_task: Any) -> None:
+        calls.append("stage")
+        await original_drain(queue_state, execute_stage_task)
+
+    manager._drain_stage_tasks = recording_drain
+
+    result = asyncio.run(manager.compile_requirement_tree(tree))
+
+    assert calls == ["stage"]
+    assert result["ok"] is True

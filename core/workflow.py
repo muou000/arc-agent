@@ -33,6 +33,8 @@ from core.queue_state import (
     QUEUE_FILENAME,
     STAGE_BLOCKED,
     STAGE_FAILED,
+    STAGE_INTERFACE_DESIGN,
+    STAGE_IMPLEMENTATION,
     STAGE_PENDING,
     STAGE_PUBLISHED,
     STAGE_READY,
@@ -40,6 +42,7 @@ from core.queue_state import (
     STAGE_RETRY_WAIT,
     STAGE_RUNNING,
     STAGE_SKIPPED,
+    STAGE_TEST_GENERATION,
     STAGE_VISUAL_ANALYSIS,
     TASK_BLOCKED,
     TASK_COMPLETED,
@@ -545,7 +548,16 @@ class ARCWorkflowManager:
         else:
             await self._precompute_visual_references(requirement_tree)
 
-        await self._drain_runnable_tasks(queue_state)
+        if self._stage_pipeline and not self._parallel_mode:
+            # The current phase runner still owns the bundled DESIGN phase;
+            # use the stage scheduler in the safe shared-workspace mode and
+            # leave the stage/worktree combination behind its later gate.
+            await self._drain_stage_tasks(
+                queue_state,
+                lambda stage_task: self._execute_stage_task(stage_task, queue_state),
+            )
+        else:
+            await self._drain_runnable_tasks(queue_state)
 
         if self._stage_pipeline:
             await self._finish_visual_ready_tasks(queue_state)
@@ -559,7 +571,13 @@ class ARCWorkflowManager:
         if self._auto_tdd_retry_enabled():
             retry_node_ids = await self._prepare_auto_tdd_retry(queue_state)
             if retry_node_ids:
-                await self._drain_runnable_tasks(queue_state)
+                if self._stage_pipeline and not self._parallel_mode:
+                    await self._drain_stage_tasks(
+                        queue_state,
+                        lambda stage_task: self._execute_stage_task(stage_task, queue_state),
+                    )
+                else:
+                    await self._drain_runnable_tasks(queue_state)
 
         await self._reconcile_call_edges()
 
@@ -1057,6 +1075,7 @@ class ARCWorkflowManager:
         self._inflight.clear()
         max_concurrency = self._max_concurrent_tasks()
         in_flight: dict[asyncio.Task[Any], dict[str, Any]] = {}
+        self._ensure_background_visual_stage_tasks(queue_state)
         try:
             while True:
                 while len(in_flight) < max_concurrency:
@@ -1070,7 +1089,64 @@ class ARCWorkflowManager:
                         ),
                     )
                     if stage_task is None:
+                        if not in_flight:
+                            pending_formal = any(
+                                str(item.get("stage", "")).strip().upper()
+                                in {
+                                    STAGE_INTERFACE_DESIGN,
+                                    STAGE_TEST_GENERATION,
+                                    STAGE_IMPLEMENTATION,
+                                }
+                                and str(item.get("status", "")).strip().upper() == STAGE_PENDING
+                                for item in queue_state.get("stage_tasks", []) or []
+                            )
+                            waiting_visual = [
+                                task
+                                for task in self._visual_stage_tasks.values()
+                                if not task.done()
+                            ]
+                            if pending_formal and waiting_visual:
+                                await asyncio.wait(
+                                    set(waiting_visual),
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                continue
+                            ready_to_merge = sum(
+                                1
+                                for item in queue_state.get("stage_tasks", []) or []
+                                if str(item.get("status", "")).strip().upper()
+                                == STAGE_READY_TO_MERGE
+                            )
+                            pending = sum(
+                                1
+                                for item in queue_state.get("stage_tasks", []) or []
+                                if str(item.get("status", "")).strip().upper() == STAGE_PENDING
+                            )
+                            ready_limit = queue_state.get(
+                                "stage_max_ready_to_merge", max_concurrency
+                            )
+                            try:
+                                ready_limit = max(1, int(ready_limit))
+                            except (TypeError, ValueError):
+                                ready_limit = max_concurrency
+                            if pending and ready_to_merge >= ready_limit:
+                                queue_state["stage_backpressure"] = {
+                                    "ready_to_merge": ready_to_merge,
+                                    "limit": ready_limit,
+                                    "pending": pending,
+                                }
+                                self._save_processing_queue(queue_state)
+                                await self._log(
+                                    "Compiler",
+                                    (
+                                        "Stage drain paused by backpressure: "
+                                        f"{ready_to_merge} publication(s) await merge, "
+                                        f"limit {ready_limit}, {pending} pending stage task(s)."
+                                    ),
+                                    status="warning",
+                                )
                         break
+                    queue_state.pop("stage_backpressure", None)
                     transition_stage_task(
                         queue_state,
                         stage_task["node_id"],
@@ -1094,7 +1170,11 @@ class ARCWorkflowManager:
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        result = {"status": STAGE_FAILED, "error": str(exc) or type(exc).__name__}
+                        detail = str(exc) or type(exc).__name__
+                        result = {
+                            "status": STAGE_FAILED,
+                            "error": f"{type(exc).__name__}: {detail}",
+                        }
 
                     if result is False or (
                         isinstance(result, dict)
@@ -1133,6 +1213,24 @@ class ARCWorkflowManager:
                     pending.cancel()
             if in_flight:
                 await asyncio.gather(*in_flight, return_exceptions=True)
+
+    def _ensure_background_visual_stage_tasks(
+        self,
+        queue_state: dict[str, Any],
+    ) -> None:
+        """Start pending visual stages without consuming formal stage slots."""
+
+        if self.runtime is None:
+            return
+        for task in queue_state.get("stage_tasks", []) or []:
+            if str(task.get("stage", "")).strip().upper() != STAGE_VISUAL_ANALYSIS:
+                continue
+            if str(task.get("status", "")).strip().upper() != STAGE_PENDING:
+                continue
+            node_id = str(task.get("node_id", "") or "")
+            requirement_data = self.runtime.traceability.get_requirement(node_id) or {}
+            if has_visual_references(requirement_data):
+                self._ensure_visual_stage_task(node_id, requirement_data, queue_state)
 
     async def _cleanup_reusable_worktrees(self) -> None:
         if self._worktree_manager is None:
@@ -2457,6 +2555,82 @@ class ARCWorkflowManager:
         for node_id, plan in resets:
             self._apply_reset_side_effects(node_id, plan)
         return [node_id for node_id, _plan in resets]
+
+    async def _execute_stage_task(
+        self,
+        stage_task: dict[str, Any],
+        queue_state: dict[str, Any],
+    ) -> dict[str, Any] | bool:
+        """Run a stage through the currently available phase-runner seam.
+
+        DESIGN is still a bundled InterfaceDesigner + TestGenerator pass in
+        this slice. Running it behind INTERFACE_DESIGN publishes both design
+        stages through the existing aggregate transition; the later runner
+        split can replace this adapter without changing the scheduler.
+        """
+
+        node_id = str(stage_task.get("node_id", "") or "")
+        stage = str(stage_task.get("stage", "") or "").strip().upper()
+        requirement_data = self.runtime.traceability.get_requirement(node_id) or {}
+
+        if stage == STAGE_VISUAL_ANALYSIS:
+            ready = await self._await_visual_ready(node_id, requirement_data, queue_state)
+            status = stage_status_of(queue_state, node_id, STAGE_VISUAL_ANALYSIS)
+            if not ready or status in {STAGE_FAILED, STAGE_BLOCKED}:
+                return {
+                    "status": STAGE_FAILED,
+                    "error": str(
+                        (stage_task_of(queue_state, node_id, STAGE_VISUAL_ANALYSIS) or {}).get(
+                            "error", "visual analysis did not reach ready"
+                        )
+                    ),
+                }
+            return {"status": STAGE_SKIPPED if status == STAGE_SKIPPED else STAGE_PUBLISHED}
+
+        if stage == STAGE_TEST_GENERATION:
+            # The current aggregate DESIGN runner already generated and
+            # published this stage. This branch only repairs a restored queue
+            # whose aggregate state is complete but whose stage projection is
+            # still pending.
+            if design_status_of(queue_state, node_id) == TASK_COMPLETED:
+                return {"status": STAGE_PUBLISHED}
+            return {
+                "status": STAGE_FAILED,
+                "error": "TEST_GENERATION is not independently runnable until the phase runner split",
+            }
+
+        if stage == STAGE_INTERFACE_DESIGN:
+            phase = PHASE_DESIGN
+        elif stage == STAGE_IMPLEMENTATION:
+            phase = PHASE_IMPLEMENT
+        else:
+            return {"status": STAGE_FAILED, "error": f"unsupported stage {stage or '(missing)'}"}
+
+        aggregate_task = next(
+            (
+                task
+                for task in queue_state.get("tasks", [])
+                if str(task.get("node_id", "")) == node_id
+                and str(task.get("phase", "")) == phase
+            ),
+            None,
+        )
+        if aggregate_task is None:
+            return {"status": STAGE_FAILED, "error": f"aggregate {phase} task is missing"}
+
+        self._begin_task(aggregate_task, queue_state)
+        await self._execute_task(aggregate_task, queue_state)
+        status = stage_status_of(queue_state, node_id, stage)
+        if status in {STAGE_PUBLISHED, STAGE_SKIPPED}:
+            return {"status": STAGE_PUBLISHED}
+        return {
+            "status": STAGE_FAILED,
+            "error": str(
+                (stage_task_of(queue_state, node_id, stage) or {}).get(
+                    "error", f"{stage} did not publish"
+                )
+            ),
+        }
 
     async def _run_task(self, task: dict[str, Any], ctx: "_TaskWorkspace | None" = None) -> bool:
         node_id = task["node_id"]

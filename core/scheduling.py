@@ -44,6 +44,7 @@ from core.queue_state import (
     design_status_of,
     implement_status_of,
     node_state,
+    stage_task_of,
     stage_task_status,
     task_status,
 )
@@ -205,14 +206,7 @@ def _stage_node_id(task: Mapping[str, Any]) -> str:
 
 
 def _stage_from_in_flight(item: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    """Unwrap the stage task shape used by a coordinator drain.
-
-    The stage scheduler is deliberately independent from the stage worktree
-    implementation. Callers may therefore pass the persisted task directly,
-    or a small execution wrapper containing it under ``stage_task`` or
-    ``task``. Treating an unknown wrapper as opaque lets the capacity guard
-    fail closed without coupling this module to ``core.workflow``.
-    """
+    """Unwrap a direct stage task or a coordinator execution wrapper."""
 
     if "stage" in item and "node_id" in item:
         return item
@@ -226,10 +220,13 @@ def _stage_from_in_flight(item: Mapping[str, Any]) -> Mapping[str, Any] | None:
 def _stage_status(queue_state: Mapping[str, Any], task: Mapping[str, Any]) -> str:
     """Read a stage status from the queue when the task is persisted there."""
 
-    stage_task_id = _stage_task_id(task)
-    for stored in queue_state.get("stage_tasks", []) or []:
-        if isinstance(stored, Mapping) and _stage_task_id(stored) == stage_task_id:
-            return stage_task_status(dict(queue_state), dict(stored))
+    stored = stage_task_of(
+        dict(queue_state),
+        _stage_node_id(task),
+        _stage_name(task),
+    )
+    if stored is not None:
+        return stage_task_status(dict(queue_state), stored)
     return stage_task_status(dict(queue_state), dict(task))
 
 
@@ -240,16 +237,7 @@ def _stage_success(
     *,
     allow_ready: bool = False,
 ) -> bool:
-    task = next(
-        (
-            item
-            for item in queue_state.get("stage_tasks", []) or []
-            if isinstance(item, Mapping)
-            and _stage_node_id(item) == node_id
-            and _stage_name(item) == stage
-        ),
-        None,
-    )
+    task = stage_task_of(dict(queue_state), node_id, stage)
     if task is None:
         # Legacy queues have no persisted VISUAL_ANALYSIS task. Their formal
         # stages already use the old synchronous visual path, so preserve that
@@ -355,16 +343,7 @@ def stage_task_dependencies_met(
     if stage == STAGE_IMPLEMENTATION:
         if not _stage_success(queue_state, node_id, STAGE_INTERFACE_DESIGN):
             return False
-        test_task = next(
-            (
-                item
-                for item in queue_state.get("stage_tasks", []) or []
-                if isinstance(item, Mapping)
-                and _stage_node_id(item) == node_id
-                and _stage_name(item) == STAGE_TEST_GENERATION
-            ),
-            None,
-        )
+        test_task = stage_task_of(dict(queue_state), node_id, STAGE_TEST_GENERATION)
         if test_task is not None and bool(test_task.get("applicable", True)):
             if not _stage_success(queue_state, node_id, STAGE_TEST_GENERATION):
                 return False
@@ -381,34 +360,20 @@ def _declared_stage_write_set(task: Mapping[str, Any]) -> set[str] | None:
     therefore refuse the overlap before either stage starts.
     """
 
-    value: Any = None
-    found = False
-    for key in ("declared_write_set", "write_set", "writes"):
-        if key in task:
-            value = task.get(key)
-            found = True
-            break
-    if not found or value is None:
-        publication = task.get("publication")
-        if isinstance(publication, Mapping):
-            for key in ("declared_write_set", "write_set", "writes"):
-                if key in publication:
-                    value = publication.get(key)
-                    found = True
-                    break
-    if not found or value is None:
-        return None
-    if isinstance(value, (str, bytes)):
-        values = [value]
-    elif isinstance(value, Iterable):
-        values = value
-    else:
+    value = task.get("declared_write_set")
+    if value is None and isinstance(task.get("publication"), Mapping):
+        value = task["publication"].get("declared_write_set")
+    if value is None or not isinstance(value, (list, tuple)):
         return None
     normalized: set[str] = set()
-    for path in values:
-        text = str(path or "").strip().replace("\\", "/")
-        if text:
-            normalized.add(text.casefold())
+    for path in value:
+        if not isinstance(path, str):
+            return None
+        text = path.strip().replace("\\", "/")
+        parts = [part for part in text.split("/") if part not in {"", "."}]
+        if not parts or ".." in parts or text.startswith("/") or ":" in parts[0]:
+            return None
+        normalized.add("/".join(parts).casefold())
     return normalized
 
 
@@ -441,6 +406,57 @@ def stage_overlap_allowed(left: Mapping[str, Any], right: Mapping[str, Any]) -> 
     if frozenset({left_stage, right_stage}) not in _APPROVED_STAGE_OVERLAPS:
         return False
     return stage_write_sets_disjoint(left, right)
+
+
+def _stage_node_order(task: Mapping[str, Any]) -> int | None:
+    if "node_order" in task:
+        raw = task.get("node_order")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    stage = _stage_name(task)
+    try:
+        stage_offset = STAGE_PIPELINE.index(stage)
+        order = int(task.get("order", ""))
+    except (TypeError, ValueError):
+        return None
+    if order < stage_offset or (order - stage_offset) % len(STAGE_PIPELINE):
+        return None
+    return (order - stage_offset) // len(STAGE_PIPELINE)
+
+
+def _approved_stage_overlap_for_queue(
+    candidate: Mapping[str, Any], blocker: Mapping[str, Any]
+) -> bool:
+    """Apply the n/n+1 adjacency rule when queue metadata can prove it."""
+
+    if not stage_overlap_allowed(candidate, blocker):
+        return False
+    candidate_order = _stage_node_order(candidate)
+    blocker_order = _stage_node_order(blocker)
+    if candidate_order is None and blocker_order is None:
+        # Hand-built queue fixtures and legacy callers may omit the optional
+        # node-order metadata; preserve their stage-type/write-set decision.
+        return True
+    if candidate_order is None or blocker_order is None:
+        # An incomplete persisted queue must fail closed rather than guessing
+        # its adjacency relationship.
+        return False
+    first, second = (
+        (candidate, blocker)
+        if candidate_order < blocker_order
+        else (blocker, candidate)
+    )
+    return abs(candidate_order - blocker_order) == 1 and (
+        (_stage_name(first), _stage_name(second))
+        in {
+            (STAGE_TEST_GENERATION, STAGE_INTERFACE_DESIGN),
+            (STAGE_IMPLEMENTATION, STAGE_TEST_GENERATION),
+        }
+    )
 
 
 def _configured_stage_capacity(
@@ -573,6 +589,10 @@ def next_runnable_stage_task(
     for candidate in candidates:
         node_id = _stage_node_id(candidate)
         stage = _stage_name(candidate)
+        # #252 owns visual analysis as bounded background work, not as a
+        # product worktree competing for a formal stage slot.
+        if stage == STAGE_VISUAL_ANALYSIS:
+            continue
         if not node_id or node_id in busy_nodes:
             continue
         if not stage_task_dependencies_met(queue_state, candidate):
@@ -585,16 +605,13 @@ def next_runnable_stage_task(
         )
         if stage_counts.get(stage, 0) >= capacity:
             continue
-        if any(not stage_overlap_allowed(candidate, blocker) for blocker in blockers):
+        if any(
+            not _approved_stage_overlap_for_queue(candidate, blocker)
+            for blocker in blockers
+        ):
             continue
         return candidate
     return None
-
-
-# Short aliases keep the scheduler seam readable to callers that use
-# "next_stage_task" and "stage_ready" terminology in integration code.
-next_stage_task = next_runnable_stage_task
-stage_ready = stage_task_dependencies_met
 
 
 def next_runnable_task(
