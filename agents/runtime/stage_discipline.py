@@ -48,6 +48,22 @@ MAX_NON_LEAF_DESIGN_WRITES = _MAX_NON_LEAF_DESIGN_WRITES
 # shape-only skeleton definition plus the mutation sniffing below.
 MAX_APPEND_LINES = 80
 MAX_APPENDS_PER_FILE = 3
+# Read-only probe stall (issue #217): a stage agent that keeps probing the
+# same artifact without ever writing is archaeology, not progress. The
+# arc-output-serial-4 REQ-1 storm burned 85 greps plus a dozen 10-line window
+# reads on one Integration log with zero writes for 35 minutes; the only
+# guardrail was the 300-step recursion ceiling. Calibration across six full
+# serial runs (37 stage passes): a healthy pass never exceeds 11 probes of
+# one target between writes, while the two storm passes reached 65 and 92 -
+# the threshold sits in that gap. Counted per normalized target since the
+# last successful write-family call; other tools (run_tests, traceability
+# queries) neither count nor reset, because the issue's condition is "zero
+# writes", not "no other activity". A nudge fires once per zero-write window
+# and re-arms on the next write - guidance, not a gate.
+_PROBE_TOOLS = frozenset({"read_file", "grep", "glob", "ls"})
+_WRITE_FAMILY_TOOLS = frozenset({"write_file", "edit_file", "append_file", "delete"})
+_MAX_PROBES_PER_TARGET = 20
+MAX_PROBES_PER_TARGET = _MAX_PROBES_PER_TARGET
 
 
 def append_line_limit_message(received_lines: int) -> str:
@@ -60,6 +76,27 @@ def append_line_limit_message(received_lines: int) -> str:
         "material - put the behavior in your stage response for TestDrivenDeveloper "
         "instead of extending this file."
     )
+
+
+def probe_stall_hint(*, target: str, target_probes: int) -> str:
+    """One convergence nudge for the read-only probe storm (issue #217).
+
+    Single-sourced here so the middleware and the pin tests cannot drift
+    apart. The text names the concrete shape - which artifact was probed how
+    often - instead of a generic "stop searching" lecture, and demands one of
+    the two exits the issue asks for: a repair action, or an explicit
+    abandonment with a summary.
+    """
+
+    where = f"`{target}`" if target else "the whole workspace"
+    return (
+        f"PROBE STALL: {target_probes} read-only lookups on {where} with zero writes since "
+        "your last edit - the context you already gathered is enough to form a repair "
+        "hypothesis. Either apply the fix now (write_file/edit_file), or explicitly declare "
+        "this lead abandoned: summarize what you ruled out and move on. Another identical "
+        "lookup only returns text you already have."
+    )
+
 _MAX_READ_LIMIT = 200
 # Fresh overlapping re-reads allowed per path before the block returns. The
 # hard block exists for the run7 loop (50 consecutive offset probes), but the
@@ -203,24 +240,33 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         self._append_counts: dict[str, int] = {}
         self._rewrite_counts: dict[str, int] = {}
         self._write_block_counts: dict[str, int] | None = {} if stage == "interface_design" else None
+        # Read-only probe ledger (issue #217): probes per normalized target
+        # since the last successful write-family call, plus whether this
+        # zero-write window's nudge already fired.
+        self._probe_counts: dict[str, int] = {}
+        self._probe_nudge_fired = False
 
     def wrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
         blocked = self._validate_tool_call(request)
         if blocked:
             return self._blocked(request, blocked)
         request = self._with_bounded_read(request)
+        nudge = self._track_probe(request)
         result = handler(request)
         self._record_result(request, result)
-        return self._annotate_pending_contract(request, result)
+        result = self._annotate_pending_contract(request, result)
+        return self._append_probe_stall(result, nudge)
 
     async def awrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
         blocked = self._validate_tool_call(request)
         if blocked:
             return self._blocked(request, blocked)
         request = self._with_bounded_read(request)
+        nudge = self._track_probe(request)
         result = await handler(request)
         self._record_result(request, result)
-        return self._annotate_pending_contract(request, result)
+        result = self._annotate_pending_contract(request, result)
+        return self._append_probe_stall(result, nudge)
 
     def _validate_tool_call(self, request: ToolCallRequest) -> str | None:
         name = str(request.tool_call.get("name", ""))
@@ -744,6 +790,62 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         args["limit"] = min(_as_nonnegative_int(args.get("limit"), default=100), _MAX_READ_LIMIT)
         return request.override(tool_call={**request.tool_call, "args": args})
 
+    def _track_probe(self, request: ToolCallRequest) -> str:
+        """Count a read-only probe and return the stall nudge when due.
+
+        Runs after the discipline's validation, so a blocked call never
+        counts (its own block message already steers the model) and a probe
+        that later errors in the tool still counts (it burned a round trip
+        for nothing - the serial-4 storm opened with Windows-path rejections
+        before settling into no-evidence greps). The count is per normalized
+        target; a grep without a path searches the whole workspace and shares
+        one bucket. Returns the nudge text exactly once per zero-write
+        window, at the call that crosses :data:`MAX_PROBES_PER_TARGET`.
+        """
+
+        name = str(request.tool_call.get("name", ""))
+        if name in _WRITE_FAMILY_TOOLS:
+            # The window closes in _record_result, on a write that succeeded.
+            return ""
+        if name not in _PROBE_TOOLS:
+            return ""
+        args = request.tool_call.get("args", {}) or {}
+        target = normalize_manifest_path(str(args.get("file_path") or args.get("path") or ""))
+        count = self._probe_counts.get(target, 0) + 1
+        self._probe_counts[target] = count
+        if self._probe_nudge_fired or count < _MAX_PROBES_PER_TARGET:
+            return ""
+        self._probe_nudge_fired = True
+        logging.getLogger(__name__).info(
+            "probe-stall nudge injected: %d read-only lookups on %s with zero writes",
+            count,
+            target or "the whole workspace",
+        )
+        return probe_stall_hint(target=target, target_probes=count)
+
+    @staticmethod
+    def _append_probe_stall(result: ToolMessage | Any, nudge: str) -> ToolMessage | Any:
+        """Ride the convergence nudge on the probe's own tool result.
+
+        The nudge must be the last thing the model reads before it decides
+        what to do next, exactly like the DESIGN pending-contract notice.
+        A result that is not a string ToolMessage is returned untouched -
+        the annotation is an optimization, never a failure.
+        """
+
+        if not nudge or not isinstance(result, ToolMessage) or not isinstance(result.content, str):
+            return result
+        result.content = f"{result.content}\n[{nudge}]"
+        return result
+
+    def _close_probe_window(self) -> None:
+        """Close the zero-write window: a write landed, so probing that
+        target again starts a fresh count - and a fresh storm is nudged
+        again rather than suppressed by an earlier window's nudge."""
+
+        self._probe_counts.clear()
+        self._probe_nudge_fired = False
+
     def _record_result(self, request: ToolCallRequest, result: ToolMessage | Any) -> None:
         name = str(request.tool_call.get("name", ""))
         args = request.tool_call.get("args", {}) or {}
@@ -783,6 +885,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
                 self._rewrite_counts[path] = self._rewrite_counts.get(path, 0) + 1
             self._write_events.append(path)
             self._discard_written_path(request, path)
+            self._close_probe_window()
             return
         if name == "read_file" and path:
             offset = _as_nonnegative_int(args.get("offset"), default=0)
@@ -804,6 +907,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             if self._write_block_counts is not None:
                 self._write_block_counts.pop(path, None)
             self._cache_written_path(request, path)
+            self._close_probe_window()
 
     def materialized_paths(self) -> list[str]:
         """Paths successfully written by this stage run, sorted.

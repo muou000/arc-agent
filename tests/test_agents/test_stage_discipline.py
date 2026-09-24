@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 
@@ -1488,3 +1490,211 @@ def test_append_notice_covers_only_newly_registered_ids(tmp_path) -> None:
     )
     assert "REQ-2-DB-SessionsTable" in grown.content
     assert "REQ-2-DB-UsersTable" not in grown.content.split("ok\n", 1)[1], "only the new id is announced"
+
+
+# ---------------------------------------------------------------------------
+# Read-only probe stall nudge (issue #217)
+# ---------------------------------------------------------------------------
+
+PROBE_LOG = "/workspace/.arc/tdd_runs/REQ-1/Integration-008.log"
+
+
+def fire_probes(
+    middleware: StageDisciplineMiddleware,
+    count: int,
+    *,
+    path: str = PROBE_LOG,
+    tool: str = "grep",
+    handler=ok_tool,
+    start: int = 0,
+) -> list[Any]:
+    """Fire ``count`` read-only probe calls and return their results."""
+
+    results = []
+    for index in range(start, start + count):
+        if tool == "grep":
+            args = {"path": path, "pattern": f"probe-{index}", "output_mode": "content"}
+        else:
+            args = {"file_path": path, "offset": index * 100, "limit": 100}
+        results.append(
+            run(middleware, make_request(tool, args, call_id=f"probe-{tool}-{index}"), handler)
+        )
+    return results
+
+
+def successful_write(middleware: StageDisciplineMiddleware, path: str) -> Any:
+    return run(
+        middleware,
+        make_request(
+            "write_file",
+            {"file_path": f"/workspace/{path}", "content": "export const fix = 1;\n"},
+            call_id=f"write-{path.replace('/', '-')}",
+        ),
+    )
+
+
+@pytest.mark.parametrize("stage", ("interface_design", "test_generation", "implementation"))
+def test_read_only_probe_storm_injects_convergence_nudge_at_threshold(stage: str) -> None:
+    """The 20th read-only probe on one target carries the convergence nudge.
+
+    The arc-output-serial-4 REQ-1 shape: 85 greps + a dozen 10-line reads on
+    one Integration log with zero writes. The nudge rides the tool result that
+    crosses the threshold, names the probed file, and demands a repair action
+    or an explicit surrender - and fires once per zero-write window.
+    """
+
+    middleware = make(stage)
+    results = fire_probes(middleware, 25)
+
+    for result in results[:19]:
+        assert "PROBE STALL" not in str(getattr(result, "content", ""))
+    nudged = results[19]
+    assert isinstance(nudged, ToolMessage)
+    assert "PROBE STALL" in nudged.content
+    # The message names the concrete shape: the probed file and the count.
+    assert ".arc/tdd_runs/REQ-1/Integration-008.log" in nudged.content
+    assert "20 read-only lookups" in nudged.content
+    # The two demanded exits: a repair action, or an explicit surrender.
+    assert "write_file/edit_file" in nudged.content
+    assert "abandon" in nudged.content.lower()
+    # The underlying probe result is preserved ahead of the nudge.
+    assert nudged.content.startswith("ok")
+    # One nudge per zero-write window: the storm continuing past it stays silent.
+    for result in results[20:]:
+        assert "PROBE STALL" not in str(getattr(result, "content", ""))
+
+
+def test_probe_stall_nudge_rearms_after_a_successful_write() -> None:
+    """A write closes the zero-write window; a later storm is nudged again."""
+
+    middleware = make("implementation")
+    results = fire_probes(middleware, 21)
+    assert "PROBE STALL" in results[19].content
+    assert all("PROBE STALL" not in str(r.content) for index, r in enumerate(results) if index != 19)
+
+    assert successful_write(middleware, "src/services/repair.js").content == "ok"
+
+    results = fire_probes(middleware, 21, start=100)
+    assert "PROBE STALL" in results[19].content
+    assert all("PROBE STALL" not in str(r.content) for index, r in enumerate(results) if index != 19)
+
+
+def test_probe_stall_window_resets_on_write_so_normal_rhythm_stays_silent() -> None:
+    """Probes interleaved with writes never accumulate to the threshold."""
+
+    middleware = make("implementation")
+    for cycle in range(6):
+        results = fire_probes(middleware, 5, start=cycle * 10)
+        assert all("PROBE STALL" not in str(r.content) for r in results)
+        assert successful_write(middleware, f"src/module-{cycle}.js").content == "ok"
+    # 19 probes is one short of the threshold even inside a single window.
+    middleware = make("implementation")
+    results = fire_probes(middleware, 19)
+    assert all("PROBE STALL" not in str(r.content) for r in results)
+
+
+def test_probe_stall_persists_across_validation_tools() -> None:
+    """run_tests neither counts as a probe nor resets the zero-write window.
+
+    A model that greps the same log between test re-runs is still storming:
+    only a write closes the window (the issue's "zero writes" condition).
+    """
+
+    middleware = make("implementation")
+    fire_probes(middleware, 19)
+    for index in range(3):
+        result = run(middleware, make_request("run_tests", {"test_type": "Integration"}, call_id=f"rt-{index}"))
+        assert isinstance(result, ToolMessage)
+        assert "PROBE STALL" not in result.content
+    nudged = fire_probes(middleware, 1, start=19)[0]
+    assert "PROBE STALL" in nudged.content
+
+
+def test_probe_stall_counts_targets_separately() -> None:
+    """Probes spread over distinct targets do not trip a single target's count."""
+
+    middleware = make("implementation")
+    fire_probes(middleware, 19)
+    results = fire_probes(middleware, 19, path="/workspace/backend/src/services/authService.js")
+    assert all("PROBE STALL" not in str(r.content) for r in results)
+    nudged = fire_probes(middleware, 1, start=19)[0]
+    assert "PROBE STALL" in nudged.content
+    assert ".arc/tdd_runs/REQ-1/Integration-008.log" in nudged.content
+
+
+def test_probe_stall_names_whole_workspace_for_pathless_searches() -> None:
+    """A grep without a path searches the whole workspace; the nudge says so."""
+
+    middleware = make("implementation")
+    results = [
+        run(
+            middleware,
+            make_request("grep", {"pattern": f"probe-{index}"}, call_id=f"p-{index}"),
+        )
+        for index in range(20)
+    ]
+    assert "PROBE STALL" in results[19].content
+    assert "the whole workspace" in results[19].content
+
+
+def test_probe_stall_counts_failed_probe_results() -> None:
+    """Probes that error out still count: they burned a round trip for nothing.
+
+    The serial-4 storm opened with grep calls rejected for Windows absolute
+    paths - the shape below - before settling into 85 no-evidence greps.
+    """
+
+    middleware = make("implementation")
+
+    def windows_path_error(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="Error: Windows absolute paths are not supported: D:\\code\\run\\.arc\\tdd_runs\\REQ-1\\Integration-008.log.",
+            name=request.tool_call["name"],
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+    results = fire_probes(middleware, 20, handler=windows_path_error)
+    assert "PROBE STALL" in results[19].content
+
+
+def test_probe_stall_mixes_grep_and_read_file_on_one_target() -> None:
+    """read_file and grep count against the same target's budget.
+
+    The storm mixed 85 greps with 10-line window reads of the same log;
+    shifting read offsets dodge the repeated-read block but must not dodge
+    the probe stall.
+    """
+
+    middleware = make("implementation")
+    greps = fire_probes(middleware, 12)
+    reads = fire_probes(middleware, 8, tool="read_file", start=12)
+    assert all("PROBE STALL" not in str(r.content) for r in greps)
+    nudged = reads[-1]
+    assert "PROBE STALL" in nudged.content
+    assert ".arc/tdd_runs/REQ-1/Integration-008.log" in nudged.content
+
+
+def test_probe_stall_blocked_repeated_reads_still_count_toward_the_storm() -> None:
+    """A discipline-blocked re-read still burned a turn on the same target.
+
+    The block message itself already steers the model; the probe count only
+    must not crash on it - and the storm keeps converging toward the nudge.
+    """
+
+    middleware = make("implementation")
+    fire_probes(middleware, 10)
+    # Overlapping re-reads of an already-read range get blocked after the
+    # fresh re-read budget; the blocked turns must not break the counter.
+    results = [
+        run(
+            middleware,
+            make_request(
+                "read_file",
+                {"file_path": PROBE_LOG, "offset": 0, "limit": 100},
+                call_id=f"reread-{index}",
+            ),
+        )
+        for index in range(10)
+    ]
+    assert any("Repeated read blocked" in str(r.content) for r in results)
