@@ -485,8 +485,8 @@ def _make_drain_manager(tmp_path: Path, node_ids: list[str], with_events_file: b
     checks, event emission) needs either the stub to carry that surface
     (``_Traceability.interfaces``) or ``with_events_file=True`` for a real
     ``runner_events.jsonl`` at ``runtime.paths``. The full real-runtime path
-    is covered by the keep-req2 faux e2e; anything beyond these two surfaces
-    belongs there, not here.
+    is covered by the focused drain-level tests in this module; anything beyond
+    these two surfaces belongs in a dedicated fixture-backed integration test.
     """
     from types import SimpleNamespace
 

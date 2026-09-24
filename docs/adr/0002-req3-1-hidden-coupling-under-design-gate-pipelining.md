@@ -1,6 +1,6 @@
 # REQ-3.1 隐藏耦合推演：DESIGN 门禁流水线化下的行为边界（issue #83）
 
-依据：ADR 0001 Consequences 指出「放松门禁会暴露隐藏耦合（如 REQ-3.1 实际需要 REQ-2.7.3 的默认标签但只声明了父链），靠 IMPLEMENT 合并时的契约对照 + 仲裁发现，不再被过度串行顺带掩盖」。本文用 #80 fixture（`arc-bench-test/keep`，keep-req2 为其 REQ-2 子树切片）逐条推演该节点在两种门禁模式下的调度与失败路径，并给出放宽/不放宽的边界结论。
+依据：ADR 0001 Consequences 指出「放松门禁会暴露隐藏耦合（如 REQ-3.1 实际需要 REQ-2.7.3 的默认标签但只声明了父链），靠 IMPLEMENT 合并时的契约对照 + 仲裁发现，不再被过度串行顺带掩盖」。本文用 #80 fixture（`arc-bench-test/keep` 的 REQ-2 子树切片）逐条推演该节点在两种门禁模式下的调度与失败路径，并给出放宽/不放宽的边界结论。
 
 ## 事实
 
@@ -35,6 +35,6 @@ REQ-3.1 的 DESIGN 等 REQ-1.1 的 IMPLEMENT。但 REQ-3（父）的 DESIGN 等 
 
 ## 验证方式
 
-- 调度顺序：`tests/test_workflow/test_keep_req2_faux_compile.py::test_keep_req2_pipeline_mode_starts_dependent_design_before_dependency_implement`（keep-req2 真实管线 + faux 模型，断言流水线模式下 REQ-2.2 的 DESIGN 在 REQ-2.1 的 IMPLEMENT 未完成时已 runnable）。
+- 调度门禁与契约漂移行为：`tests/test_workflow/test_design_gate_pipelining.py` 中的 drain 级测试，覆盖流水线模式下依赖方 DESIGN 的可运行性以及 IMPLEMENT 合并前的契约校验。
 - 漂移捕获：`tests/test_workflow/test_design_gate_pipelining.py`（drift 纯函数 8 测 + drain 级事件落盘/仲裁升级/预算耗尽 3 测）。
 - 环图健康：`test_cycle_breaking_catches_the_pipelined_design_vertex_cycle`（checker 边传递覆盖流水线边的 soundness 论证随测试注释留档）。

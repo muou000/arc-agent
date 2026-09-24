@@ -138,8 +138,6 @@ make clean       # 清理 pytest 缓存与 __pycache__
   语义冲突仲裁。
 - 阶段门禁：DESIGN 基线红门、接口硬门禁、DESIGN 门禁流水线化与契约漂移校验。
 - TDD 测试执行器、IMPLEMENT 诊断产物清理、测试类型词汇表单一 owner。
-- keep-req2 fixture 与 faux compile 端到端（`queue_faker.py` 从任务状态推导队列
-  节点状态）。
 
 ### `test_app_type_handler/`
 
