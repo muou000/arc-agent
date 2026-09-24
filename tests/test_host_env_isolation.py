@@ -59,7 +59,7 @@ def test_scheduling_switch_never_inherits_a_host_value(name: str) -> None:
 def test_scheduling_helpers_fall_back_to_defaults() -> None:
     """With no switch in the environment the helpers yield default semantics."""
 
-    assert workflow._worktrees_enabled() is True
+    assert workflow._worktrees_enabled() is False
     assert workflow._affinity_depth() == 1
     assert design_pipelining_enabled() is False
     assert workflow.ARCWorkflowManager._auto_tdd_retry_enabled() is True

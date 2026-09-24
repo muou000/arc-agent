@@ -25,7 +25,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 | `ARC_MODEL_STREAM_CHUNK_TIMEOUT` | `90` | 流式响应相邻 SSE chunk 最大间隔秒数（设 0 关闭看门狗） |
 | `ARC_MODEL_STREAM_USAGE` | 开 | 流式请求携带 `stream_options.include_usage` |
 | `ARC_STRUCTURED_OUTPUT` | `auto` | 结构化输出开关（auto / on / off） |
-| `ARC_NODE_WORKTREES` | 开 | 每节点隔离 worktree 并行 |
+| `ARC_NODE_WORKTREES` | 关 | 每节点隔离 worktree 并行（设 `1/true/yes/on` 启用） |
 | `ARC_MAX_CONCURRENT_TASKS` | `3` | 并行模式同时运行任务数（上限 8） |
 | `ARC_AFFINITY_DEPTH` | `1` | 亲和分组切分深度 |
 | `ARC_DESIGN_GATE_PIPELINE` | 关 | 依赖方 DESIGN 只等依赖 DESIGN 完成即放行 |
@@ -64,9 +64,9 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 
 ## 并行调度
 
-默认开启每节点 worktree 并行：每个运行中的任务在自己的 git worktree、独立 web 端口和独立 E2E 数据库中执行，阶段完成后合并回主工作区。三个旋钮：
+默认共享工作区的严格串行调度；设 `ARC_NODE_WORKTREES=1/true/yes/on` 启用每节点 worktree 并行：每个运行中的任务在自己的 git worktree、独立 web 端口和独立 E2E 数据库中执行，阶段完成后合并回主工作区。并行模式的旋钮：
 
-- `ARC_NODE_WORKTREES`：总开关。设 `0/false/no/off` 恢复共享工作区的严格串行调度。
+- `ARC_NODE_WORKTREES`：总开关。默认关闭；设 `1/true/yes/on` 启用每节点 worktree 并行。
 - `ARC_MAX_CONCURRENT_TASKS`：同时运行的任务数（仅并行模式生效，默认 3，钳制在 1-8）。
 - `ARC_AFFINITY_DEPTH`：亲和分组切分深度。默认 1 = 顶层子树一组；设 2 起宽子树的深层子树各自成组并行（如 simple-keep 的 REQ-2），组内仍串行。
 - `ARC_DESIGN_GATE_PIPELINE`：DESIGN 依赖门禁流水线化（默认关闭，设 `1/true/yes/on` 启用）。开启后依赖方 DESIGN 的等待条件从「依赖 IMPLEMENT 完成并合并」放宽为「依赖 DESIGN 完成并合并」，依赖方从依赖节点已登记的接口卡（带 `implemented` 标志，可区分已设计未落地的面）做增量设计；依赖方 IMPLEMENT 仍等依赖 IMPLEMENT 落地。开启后依赖 IMPLEMENT 合并时会对 DESIGN 写时登记的契约锚点（`file_path` + `first_line`）做漂移校验：实现偏离登记契约时记 `contract_drift` runner 事件并告警，启用 `ARC_MERGE_ARBITRATION` 且节点仲裁预算未花时升级仲裁修复一次，否则不阻塞、靠下游 TDD 红灯兜底。

@@ -10,8 +10,9 @@ contract required before concurrent tasks may run:
 - a merge conflict fails exactly the conflicting node and leaves the
   integration workspace (and the other node) untouched;
 - a parent's IMPLEMENT waits for all descendant IMPLEMENTs;
-- parallel mode is the default; with ARC_NODE_WORKTREES=0 the drain stays
-  strictly serial.
+- serial shared-workspace mode is the default; ARC_NODE_WORKTREES=1 opts into
+  the parallel drain, and with worktrees disabled the drain stays strictly
+  serial.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import pytest
 from core.scheduling import task_dependencies_met
 from core.workflow import (
     ARCWorkflowManager,
+    DEFAULT_MAX_CONCURRENT_TASKS,
     NODE_BLOCKED_BY_DEPENDENCY,
     NODE_DESIGNED,
     NODE_DESIGNING,
@@ -480,8 +482,16 @@ def test_merge_conflict_fails_only_the_conflicting_node(
     assert len(preserved) == 1 and conflicting[0] in preserved[0].name
 
 
-def test_parallel_mode_is_the_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_serial_mode_is_the_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ARC_NODE_WORKTREES", raising=False)
+    manager = _make_parallel_manager(tmp_path)
+
+    assert manager._parallel_mode is False
+    assert manager._max_concurrent_tasks() == DEFAULT_MAX_CONCURRENT_TASKS
+
+
+def test_parallel_mode_is_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     manager = _make_parallel_manager(tmp_path)
 
     assert manager._parallel_mode is True

@@ -755,7 +755,7 @@ def test_resume_after_interrupted_replay_keeps_pending_records_consistent(
     assert outcome.status in {ReplayOutcome.REPLAYED, ReplayOutcome.ABORTED, ReplayOutcome.CONFLICTS}
 
 
-def test_task_runner_gate_provider_builds_a_middleware(tmp_path: Path) -> None:
+def test_task_runner_gate_provider_builds_a_middleware(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The provider closure the adapters hold must build (not name-error).
 
     This pins the wiring bug the first mini benchmark caught: the closure
@@ -763,6 +763,8 @@ def test_task_runner_gate_provider_builds_a_middleware(tmp_path: Path) -> None:
     DESIGN agent build crashed with a NameError before any model call.
     """
 
+    # The gate provider is wired in parallel (worktree) mode only.
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     previous = os.environ.get(REBASE_ON_MERGE_ENV)
     os.environ[REBASE_ON_MERGE_ENV] = "1"
     try:

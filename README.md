@@ -31,7 +31,7 @@ flowchart LR
 
 相对 ARC 基座的主要定制：
 
-- **每节点 worktree 并行调度**：任务按子树亲和分组、依赖参与调度门禁、合并冲突分级消解（配置见 [`docs/configuration.md`](docs/configuration.md)）；
+- **每节点 worktree 并行调度**（可选，`ARC_NODE_WORKTREES=1` 启用；默认共享工作区串行）：任务按子树亲和分组、依赖参与调度门禁、合并冲突分级消解（配置见 [`docs/configuration.md`](docs/configuration.md)）；
 - **A/B 评测与用量观测**：`arc eval` 五指标对比报告、`usage` 命令聚合 token / 成本 / 缓存命中 / 工具往返（见 [`docs/evals.md`](docs/evals.md)）；
 - **通用化技能选择**：目录注入 + 按需读取取代早期每节点一次规划调用的 SkillPlanner；
 - **运行后 auto TDD re-prompt**（`core/tdd_retry.py`）：扫描失败节点自动构造 TDD 修复提示，为重试提供上下文。

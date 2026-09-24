@@ -98,14 +98,15 @@ LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | Non
 
 QUEUE_FILENAME = "processing_queue.json"
 
-# Per-node worktree parallelism is the default: each in-flight task gets its
-# own git worktree, web port slot and worktree-local E2E database, so up to
+# The historical mode is the default: every task runs against the one shared
+# workspace in strict queue order, because stage agents, git checkpoints
+# (`git add .`) and test runners (one web port, one E2E database) would
+# otherwise interfere with each other. Setting ARC_NODE_WORKTREES=1 opts into
+# per-node worktree parallelism: each in-flight task gets its own git
+# worktree, web port slot and worktree-local E2E database, so up to
 # ARC_MAX_CONCURRENT_TASKS (default PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS,
-# capped at MAX_PARALLEL_TASKS) tasks may run at once. Setting
-# ARC_NODE_WORKTREES=0 restores the historical mode: every task runs against
-# the one shared workspace in strict queue order, because stage agents, git
-# checkpoints (`git add .`) and test runners (one web port, one E2E database)
-# would otherwise interfere with each other. Tasks are scheduled with subtree
+# capped at MAX_PARALLEL_TASKS) tasks may run at once. Tasks are scheduled
+# with subtree
 # affinity: consecutive tasks of one subtree reuse one worktree directory and
 # run sequentially inside it, so siblings never race on shared files;
 # different subtrees drain in parallel and a freed slot steals work from
@@ -136,8 +137,9 @@ MAX_PARALLEL_TASKS = 8
 
 def _worktrees_enabled() -> bool:
     raw = os.environ.get(ARC_NODE_WORKTREES, "").strip().lower()
-    # Parallel mode is the default; only an explicit falsy value disables it.
-    return raw not in {"0", "false", "no", "off"}
+    # Serial shared-workspace mode is the default; an explicit truthy value
+    # opts into per-node worktree parallelism.
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _affinity_depth() -> int:
@@ -213,8 +215,8 @@ class ARCWorkflowManager:
         self.queue_path = os.path.join(self.arc_dir, QUEUE_FILENAME)
         self.runtime = None
 
-        # Per-node worktree parallelism (default on; ARC_NODE_WORKTREES=0
-        # restores the shared-workspace serial mode).
+        # Per-node worktree parallelism (default off; ARC_NODE_WORKTREES=1
+        # opts in) instead of the shared-workspace serial mode.
         self._parallel_mode = _worktrees_enabled()
         # Captured once per process like ARC_NODE_WORKTREES: one CLI run, one
         # grouping; a mid-run flip would put queued tasks in two groups' files.

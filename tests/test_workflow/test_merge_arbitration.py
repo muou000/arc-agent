@@ -95,6 +95,9 @@ def test_workflow_budget_lives_in_the_node_session(
     workspace.mkdir()
     set_workspace_root(str(workspace))
     monkeypatch.setenv(ARBITRATION_ENV, "1")
+    # The arbitration hooks read conflict stages through the worktree manager,
+    # which only exists in parallel (worktree) mode.
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     manager = ARCWorkflowManager(
         workspace_path=str(workspace),
         requirement_path="",
@@ -140,6 +143,9 @@ def test_workflow_budget_marks_spent_even_when_the_model_crashes(
     workspace.mkdir()
     set_workspace_root(str(workspace))
     monkeypatch.setenv(ARBITRATION_ENV, "1")
+    # The arbitration hooks read conflict stages through the worktree manager,
+    # which only exists in parallel (worktree) mode.
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     manager = ARCWorkflowManager(
         workspace_path=str(workspace),
         requirement_path="",
@@ -178,6 +184,9 @@ def test_workflow_run_hook_emits_audit_runner_events(
     workspace.mkdir()
     set_workspace_root(str(workspace))
     monkeypatch.setenv(ARBITRATION_ENV, "1")
+    # The arbitration hooks read conflict stages through the worktree manager,
+    # which only exists in parallel (worktree) mode.
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     manager = ARCWorkflowManager(
         workspace_path=str(workspace),
         requirement_path="",
@@ -562,6 +571,8 @@ def test_production_hooks_drive_a_semantic_conflict_merge_over_real_git(
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(workspace), check=True, capture_output=True)
 
     monkeypatch.setenv(ARBITRATION_ENV, "1")
+    # The merge path under test is the parallel-mode worktree integration.
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     set_workspace_root(str(workspace))
     manager = ARCWorkflowManager(
         workspace_path=str(workspace),
