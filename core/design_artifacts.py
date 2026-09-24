@@ -19,13 +19,74 @@ module never clears on its own.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 from agents.tools.test_manifest import normalize_coverage_scope
 from core.path_compat import normalize_workspace_relative_path
 
 #: Valid interface contract types (UI/API/FUNC/DB).
 ALLOWED_INTERFACE_TYPES = {"UI", "API", "FUNC", "DB"}
+
+
+def infer_interface_type_from_id(interface_id: str) -> str:
+    """Infer the contract type from the interface_id's type segment.
+
+    Models systematically omit `type` when the id already encodes it
+    (`REQ-2-UI-LoginPage`), so the segment is the last deterministic backfill
+    source before a record is judged invalid. The match is segment-exact
+    (`REQ-2-UI-APIKeys` must not read as API), case-insensitive.
+    """
+
+    segments = {segment.strip().upper() for segment in str(interface_id).split("-")}
+    for candidate in ("UI", "API", "FUNC", "DB"):
+        if candidate in segments:
+            return candidate
+    return ""
+
+
+def resolve_interface_type(
+    interface: dict[str, Any], stored_row: dict[str, Any] | None = None
+) -> str:
+    """Resolve an interface record's `type` through the backfill ladder.
+
+    Ordered sources: the record's own field, the stored traceability row for
+    a reused interface_id, then the interface_id's type segment. Returns ""
+    when every source fails — the caller owns the judgment.
+    """
+
+    for source in (
+        str(interface.get("type") or "").strip(),
+        str((stored_row or {}).get("type") or "").strip(),
+    ):
+        candidate = source.upper()
+        if candidate in ALLOWED_INTERFACE_TYPES:
+            return candidate
+    return infer_interface_type_from_id(interface.get("interface_id", ""))
+
+
+def unresolvable_interface_types(
+    interfaces: list[dict[str, Any]],
+    *,
+    get_stored_interface: Callable[[str], dict[str, Any] | None],
+) -> list[str]:
+    """Interface ids whose `type` no backfill source can resolve.
+
+    The same ladder :func:`resolve_interface_type` enforces, as a pure
+    pre-check: the DESIGN adapter uses it to spend its one repair ask only on
+    records the registration layer would actually reject.
+    """
+
+    missing: list[str] = []
+    for interface in interfaces:
+        if not isinstance(interface, dict):
+            continue
+        interface_id = str(interface.get("interface_id", "")).strip()
+        if not interface_id:
+            continue
+        if resolve_interface_type(interface, stored_row=get_stored_interface(interface_id)):
+            continue
+        missing.append(interface_id)
+    return missing
 
 
 def normalize_string_list(value: Any) -> list[str]:
@@ -88,21 +149,31 @@ class DesignArtifactRegistry:
     # -- interfaces ---------------------------------------------------------
 
     def prepare_interfaces(
-        self, node_id: str, interfaces: list[dict[str, Any]]
+        self,
+        node_id: str,
+        interfaces: list[dict[str, Any]],
+        *,
+        on_dropped_entry: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Validate and normalize interface contracts for one node.
 
         Reused contracts merge the stored row's content under the new pass
         (cross-node reuse keeps ``req_ids`` and ``implemented`` through the
         ``_existing_*`` markers, re-attached by :meth:`register_design`).
-        Raises ``ValueError`` with an agent-facing message on the first
-        invalid contract.
+        Each record's ``type`` resolves through the backfill ladder (own
+        field, stored row, interface_id segment) before it may fail. Raises
+        ``ValueError`` with an agent-facing message on the first invalid
+        contract; records without an ``interface_id`` are dropped and
+        reported through ``on_dropped_entry`` so the caller can surface them
+        (issue #230: the drop used to be silent).
         """
 
         prepared: list[dict[str, Any]] = []
         for interface in interfaces:
             interface_id = str(interface.get("interface_id", "")).strip()
             if not interface_id:
+                if on_dropped_entry is not None:
+                    on_dropped_entry(interface)
                 continue
             existing = self.traceability.get_interface(interface_id)
             if existing:
@@ -112,15 +183,12 @@ class DesignArtifactRegistry:
                     existing_content = {}
                 if isinstance(existing_content, dict):
                     interface = {**existing_content, **interface}
-            interface_type = (
-                str(interface.get("type") or (existing or {}).get("type") or "")
-                .strip()
-                .upper()
-            )
-            if interface_type not in ALLOWED_INTERFACE_TYPES:
+            interface_type = resolve_interface_type(interface, stored_row=existing)
+            if not interface_type:
                 raise ValueError(
                     f"Generated interface `{interface_id}` has invalid `type` {interface.get('type')!r}. "
-                    "Interface type must be one of UI, API, FUNC, or DB."
+                    "Interface type must be one of UI, API, FUNC, or DB; no stored contract "
+                    "or interface_id type segment (-UI-/-API-/-FUNC-/-DB-) supplies one either."
                 )
             normalized = {
                 **interface,

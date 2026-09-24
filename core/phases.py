@@ -235,11 +235,33 @@ class WorkflowPhaseRunner:
                 node_id=node_id,
             )
 
+        dropped_entries: list[dict[str, Any]] = []
         try:
-            prepared_interfaces = self.registry.prepare_interfaces(node_id, interfaces)
+            prepared_interfaces = self.registry.prepare_interfaces(
+                node_id, interfaces, on_dropped_entry=dropped_entries.append
+            )
         except ValueError as exc:
             await self._log("InterfaceDesigner", str(exc), status="error", node_id=node_id)
             return False
+        if dropped_entries:
+            # Id-less records never reach the traceability store; surface the
+            # hole instead of swallowing it (issue #230).
+            hints = ", ".join(
+                hint
+                for hint in (
+                    str(entry.get("file_path") or entry.get("name") or "").strip()
+                    for entry in dropped_entries
+                )
+                if hint
+            ) or "no identifiable fields"
+            await self._log(
+                "InterfaceDesigner",
+                f"Dropped {len(dropped_entries)} interface record(s) without an `interface_id` "
+                f"({hints}); they never reach the traceability store. Every interface record "
+                "must carry a non-empty `interface_id`.",
+                status="warning",
+                node_id=node_id,
+            )
         context_pipeline.cache.invalidate_file_layers(node_id)
         context_pipeline.cache.invalidate_db_layers(node_id)
         self._update_node_session(

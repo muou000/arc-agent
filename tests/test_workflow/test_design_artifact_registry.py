@@ -15,7 +15,7 @@ import json
 
 import pytest
 
-from core.design_artifacts import DesignArtifactRegistry
+from core.design_artifacts import DesignArtifactRegistry, unresolvable_interface_types
 from tests.helpers.faux import FakeAppHandler
 
 # Reuse the process-wide runtime fixture so the real traceability store
@@ -92,6 +92,121 @@ def test_prepare_interfaces_rejects_invalid_type(tmp_project_dir, arc_runtime) -
     registry = _make_registry(tmp_project_dir, arc_runtime)
     with pytest.raises(ValueError, match="invalid `type`"):
         registry.prepare_interfaces("REQ-1", [_iface("IF-BAD", type="SCHEDULE")])
+
+
+# ---------------------------------------------------------------------------
+# prepare_interfaces: `type` backfill ladder (issue #230, serial-5 incident)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "interface_id,expected",
+    [
+        ("REQ-2-UI-LoginPage", "UI"),
+        ("REQ-2-API-AuthApi", "API"),
+        ("REQ-2-FUNC-AuthService", "FUNC"),
+        ("REQ-2-DB-UsersTable", "DB"),
+        ("req-2-ui-navbar", "UI"),
+    ],
+)
+def test_prepare_interfaces_backfills_type_from_id_prefix(
+    tmp_project_dir, arc_runtime, interface_id, expected
+) -> None:
+    """A typeless entry whose interface_id carries the type segment resolves
+    from it — the serial-5 incident's dominant recoverable shape."""
+
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    prepared = registry.prepare_interfaces(
+        "REQ-2", [{"interface_id": interface_id, "file_path": "src/x.py"}]
+    )
+    assert prepared[0]["type"] == expected
+
+
+def test_prepare_interfaces_backfills_type_from_stored_row(tmp_project_dir, arc_runtime) -> None:
+    """A reused id without a type segment still resolves from its stored row."""
+
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    registry.register_design("REQ-1", registry.prepare_interfaces("REQ-1", [_iface("IF-SHARED")]), [])
+
+    prepared = registry.prepare_interfaces(
+        "REQ-2", [{"interface_id": "IF-SHARED", "responsibility": "Updated"}]
+    )
+    assert prepared[0]["type"] == "FUNC"
+
+
+def test_prepare_interfaces_type_ladder_prefers_own_field_over_stored(
+    tmp_project_dir, arc_runtime
+) -> None:
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    registry.register_design(
+        "REQ-1", registry.prepare_interfaces("REQ-1", [_iface("REQ-1-UI-Shell", type="FUNC")]), []
+    )
+
+    prepared = registry.prepare_interfaces("REQ-2", [_iface("REQ-1-UI-Shell", type="API")])
+    assert prepared[0]["type"] == "API"
+
+
+def test_prepare_interfaces_invalid_type_falls_back_before_raising(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """A non-empty but invalid own type goes through the ladder instead of
+    dying on it: stored row first, then the id prefix."""
+
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    registry.register_design("REQ-1", registry.prepare_interfaces("REQ-1", [_iface("IF-SHARED")]), [])
+
+    from_stored = registry.prepare_interfaces("REQ-2", [_iface("IF-SHARED", type="SCHEDULE")])
+    assert from_stored[0]["type"] == "FUNC"
+
+    from_prefix = registry.prepare_interfaces("REQ-2", [_iface("REQ-2-UI-Nav", type="SCHEDULE")])
+    assert from_prefix[0]["type"] == "UI"
+
+
+def test_prepare_interfaces_raises_only_after_ladder_exhausted(tmp_project_dir, arc_runtime) -> None:
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    with pytest.raises(ValueError, match="no stored contract or interface_id type segment"):
+        registry.prepare_interfaces("REQ-2", [_iface("IF-ORPHAN", type="")])
+
+
+def test_prepare_interfaces_reports_dropped_entries_to_callback(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """Entries without an interface_id are dropped, but no longer silently:
+    the caller receives them for an observable warning (issue #230)."""
+
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    dropped: list[dict] = []
+    prepared = registry.prepare_interfaces(
+        "REQ-1",
+        [{"type": "FUNC", "file_path": "src/ghost.py", "name": "Ghost"}, _iface("IF-A")],
+        on_dropped_entry=dropped.append,
+    )
+
+    assert [row["interface_id"] for row in prepared] == ["IF-A"]
+    assert len(dropped) == 1
+    assert dropped[0]["name"] == "Ghost"
+
+
+def test_unresolvable_interface_types_lists_only_unbackfillable_ids(
+    tmp_project_dir, arc_runtime
+) -> None:
+    """The DESIGN adapter's pre-check: only entries that every backfill source
+    fails qualify for the one-shot type repair nudge."""
+
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    registry.register_design("REQ-1", registry.prepare_interfaces("REQ-1", [_iface("IF-SHARED")]), [])
+
+    missing = unresolvable_interface_types(
+        [
+            {"interface_id": "REQ-2-UI-Nav", "file_path": "src/nav.py"},
+            {"interface_id": "IF-SHARED", "responsibility": "Reused"},
+            "not-a-dict",
+            {"file_path": "src/no-id.py"},
+            {"interface_id": "IF-GHOST", "file_path": "src/orphan.py"},
+        ],
+        get_stored_interface=arc_runtime.traceability.get_interface,
+    )
+    assert missing == ["IF-GHOST"]
 
 
 def test_prepare_interfaces_drops_rows_without_id(tmp_project_dir, arc_runtime) -> None:
