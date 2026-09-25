@@ -568,7 +568,67 @@ def _path_matches(candidate: str, requested: str) -> bool:
         return True
     if left == "/":
         return right == "/"
-    return right.endswith(left)
+    if right.endswith(left):
+        return True
+    return _parameterized_path_matches(left, right)
+
+
+def _parameterized_path_matches(candidate: str, requested: str) -> bool:
+    """Express ``:param``/``*`` segments match one non-empty concrete segment.
+
+    Interface cards and route skeletons declare parameterized routes
+    (``GET /api/workbooks/:id/state``) while generated tests drive concrete
+    paths (``/api/workbooks/q3-sales/state``); a literal-only comparison can
+    never hit those contracts. Segments keep the suffix semantics of the
+    literal match: a shorter candidate aligns to the tail of the requested
+    path, which covers router-relative declarations under a mount prefix.
+    """
+
+    pattern = candidate.strip("/").split("/")
+    if not any(segment.startswith(":") or segment.startswith("*") for segment in pattern):
+        return False
+    concrete = requested.strip("/").split("/")
+    if len(pattern) > len(concrete):
+        return False
+    aligned = concrete[len(concrete) - len(pattern) :]
+    for expected, actual in zip(pattern, aligned):
+        if expected.startswith(":") or expected.startswith("*"):
+            if not actual:
+                return False
+        elif expected != actual:
+            return False
+    return True
+
+
+def _assertion_status_codes(
+    item: dict[str, Any], path: str, method: str
+) -> tuple[list[int], list[int]]:
+    """The contract one candidate would validate an assertion against.
+
+    Returns ``(route_codes, registered_codes)``: route codes come from the
+    candidate's routes matching this assertion's path/method (all route codes
+    when the card has no route records); registered codes prefer the
+    interface card's declared codes. The single-candidate verdict and the
+    ambiguity disambiguation share this so both compute the contract the
+    same way.
+    """
+
+    matching_routes = [
+        route
+        for route in item["routes"]
+        if (
+            (not path or _path_matches(route.get("path", ""), path))
+            and (not method or not route.get("method") or route.get("method") == method)
+        )
+    ]
+    matched_route_codes: list[int] = []
+    for route in matching_routes:
+        for code in route.get("status_codes") or []:
+            if code not in matched_route_codes:
+                matched_route_codes.append(code)
+    route_codes = matched_route_codes if item["routes"] else item["route_codes"]
+    registered_codes = list(item["interface_codes"] or route_codes)
+    return route_codes, registered_codes
 
 
 def _status_contract_diagnostic(
@@ -591,6 +651,27 @@ def _status_contract_diagnostic(
         "contract_status_codes": list(contract_status_codes or []),
         "interface_id": interface_id,
     }
+
+
+def _manifest_interface_ids(tests: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """Interface ids each manifest test row declares, keyed by file path.
+
+    Conflict reporting prefers a candidate the manifest actually names; a
+    missing or empty ``interface_ids`` field simply contributes nothing.
+    """
+
+    declared: dict[str, set[str]] = {}
+    for item in tests or []:
+        if not isinstance(item, dict):
+            continue
+        file_key = str(item.get("file_path") or "").strip().replace("\\", "/")
+        raw_ids = item.get("interface_ids")
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+        ids = {str(value).strip() for value in raw_ids or [] if str(value).strip()}
+        if file_key and ids:
+            declared.setdefault(file_key, set()).update(ids)
+    return declared
 
 
 def validate_http_status_contracts(
@@ -628,6 +709,7 @@ def validate_http_status_contracts(
         _normalize_api_path(path.rstrip(".,;"))
         for path in re.findall(r"['\"](/[^'\"\s)]+)", requirement_text)
     ]
+    manifest_interface_ids = _manifest_interface_ids(tests)
 
     prepared: list[dict[str, Any]] = []
     for interface in api_interfaces:
@@ -704,6 +786,39 @@ def validate_http_status_contracts(
             ]
             if matching:
                 candidates = matching
+                # A bare no-method path (the quoted ``app.use('/x', ...)``
+                # extraction) is ownership-neutral: when another candidate
+                # matches the assertion's method, bare-path-only candidates
+                # step out of the contest instead of manufacturing ambiguity.
+                if method:
+                    method_matched = [
+                        item
+                        for item in candidates
+                        if any(
+                            _path_matches(route.get("path", ""), path)
+                            and route.get("method") == method
+                            for route in item["paths"]
+                        )
+                    ]
+                    if method_matched:
+                        candidates = method_matched
+                if len(candidates) > 1:
+                    # Candidates whose registered status sets are identical
+                    # are interchangeable: any choice yields the same
+                    # verdict, so proceed instead of reporting ambiguity.
+                    code_sets = [
+                        frozenset(_assertion_status_codes(item, path, method)[1])
+                        for item in candidates
+                    ]
+                    shared = code_sets[0]
+                    if shared and all(codes == shared for codes in code_sets[1:]):
+                        named_ids = manifest_interface_ids.get(
+                            str(assertion.get("file_path") or ""), set()
+                        )
+                        named = [
+                            item for item in candidates if item["interface_id"] in named_ids
+                        ]
+                        candidates = [named[0] if named else candidates[0]]
         candidate = candidates[0] if len(candidates) == 1 else None
         if candidate is None:
             diagnostics.append(
@@ -718,23 +833,8 @@ def validate_http_status_contracts(
             )
             continue
 
-        interface = candidate["interface"]
         candidate_paths = [route.get("path", "") for route in candidate["paths"]]
-        matching_routes = [
-            route
-            for route in candidate["routes"]
-            if (
-                (not path or _path_matches(route.get("path", ""), path))
-                and (not method or not route.get("method") or route.get("method") == method)
-            )
-        ]
-        matched_route_codes: list[int] = []
-        for route in matching_routes:
-            for code in route.get("status_codes") or []:
-                if code not in matched_route_codes:
-                    matched_route_codes.append(code)
-        route_codes = matched_route_codes if candidate["routes"] else candidate["route_codes"]
-        registered_codes = list(candidate["interface_codes"] or route_codes)
+        route_codes, registered_codes = _assertion_status_codes(candidate, path, method)
         requirement_applies = bool(
             requirement_codes
             and (

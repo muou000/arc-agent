@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from agents.tools.test_contract_check import (
+    _path_matches,
     build_satisfiability_universe,
     classify_test_hooks,
     collect_manifest_hooks,
@@ -977,3 +978,383 @@ def test_validate_http_status_contract_ignores_arrow_without_route_path(tmp_proj
 
     assert len(diagnostics) == 1
     assert diagnostics[0]["code"] == "status_code_needs_info"
+
+
+def test_path_matches_parameterized_routes() -> None:
+    """Express ``:param``/``*`` segments match one non-empty concrete segment.
+
+    The 2026-09-25 hackathon-sheet REQ-1-1-1 card declared ``GET
+    /api/workbooks/:id/state`` while the generated test drove
+    ``/api/workbooks/q3-sales/state``; literal-only matching reported "no
+    matching API interface" for every such assertion.
+    """
+
+    assert _path_matches("/api/workbooks/:id/state", "/api/workbooks/q3-sales/state")
+    # Router-relative declarations align to the tail of the requested path,
+    # mirroring the suffix semantics of the literal match.
+    assert _path_matches("/:id/state", "/api/workbooks/q3-sales/state")
+    assert _path_matches("/api/*/state", "/api/workbooks/state")
+    # Literal equality and suffix semantics are preserved.
+    assert _path_matches("/api/workbooks", "/api/workbooks")
+    assert _path_matches("/register", "/api/auth/register")
+    assert not _path_matches("/api/workbooks/:id/state", "/api/workbooks")
+    assert not _path_matches("/api/workbooks/:id/state", "/api/workbooks/q3-sales")
+    assert not _path_matches("/:id", "/")
+
+
+def test_validate_http_status_contract_parameterized_route_card_matches_concrete_paths(
+    tmp_project_dir: Path,
+) -> None:
+    """A card declaring a parameterized route owns assertions on concrete ids.
+
+    The sibling users card keeps the assertion away from the single-card
+    fallback, so this test only passes when the parameterized path actually
+    matches.
+    """
+
+    test_path = tmp_project_dir / "tests" / "workbooks.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const state = await request.get('/api/workbooks/q3-sales/state');\n"
+        "expect(state.status).toBe(200);\n"
+        "const missing = await request.get('/api/workbooks/unknown-id/state');\n"
+        "expect(missing.status).toBe(404);\n",
+        encoding="utf-8",
+    )
+
+    assert validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "View and open a workbook."},
+        [
+            {
+                "interface_id": "REQ-1-1-1-API-Workbooks",
+                "type": "API",
+                "specification": (
+                    "GET /api/workbooks -> 200 { workbooks } ; "
+                    "GET /api/workbooks/:id/state -> 200 { workbook } ; 404 { error }."
+                ),
+                "outputs": {"status_codes": [200, 404]},
+                "file_path": "backend/src/routes/workbooks.js",
+            },
+            {
+                "interface_id": "IF-USERS",
+                "type": "API",
+                "specification": "GET /api/users -> 200 { users }.",
+                "file_path": "backend/src/routes/users.js",
+            },
+        ],
+        [{"type": "Integration", "file_path": "tests/workbooks.test.js"}],
+    ) == []
+
+
+def test_validate_http_status_contract_bare_mount_path_does_not_compete_for_method_assertions(
+    tmp_project_dir: Path,
+) -> None:
+    """hackathon-sheet REQ-1-1-1: the mount card's only path is the quoted
+    ``app.use('/api/workbooks', ...)`` extraction, which carries no method.
+
+    A no-method bare path must not make the router card's method-bearing
+    assertions ambiguous: when a candidate matches with the assertion's
+    method, bare-path-only candidates step out of the ownership contest.
+    """
+
+    test_path = tmp_project_dir / "tests" / "workbooks.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const res = await request.get('/api/workbooks');\n"
+        "expect(res.status).toBe(200);\n",
+        encoding="utf-8",
+    )
+
+    assert validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "View available workbooks."},
+        [
+            {
+                "interface_id": "REQ-1-1-1-API-Workbooks",
+                "type": "API",
+                "specification": "GET /api/workbooks -> 200 { workbooks }.",
+                "outputs": {"status_codes": [200]},
+                "file_path": "backend/src/routes/workbooks.js",
+            },
+            {
+                "interface_id": "REQ-1-1-1-API-AppMount",
+                "type": "API",
+                "specification": (
+                    "Add `app.use('/api/workbooks', require('./routes/workbooks'))` "
+                    "at the established mount point."
+                ),
+                "file_path": "backend/src/app.js",
+            },
+        ],
+        [{"type": "Integration", "file_path": "tests/workbooks.test.js"}],
+    ) == []
+
+
+def test_validate_http_status_contract_same_status_set_candidates_are_interchangeable(
+    tmp_project_dir: Path,
+) -> None:
+    """Same-path candidates declaring identical status sets are interchangeable.
+
+    Picking among them cannot change the verdict, so the gate proceeds; the
+    conflict diagnostic names the card the test manifest declared.
+    """
+
+    test_path = tmp_project_dir / "tests" / "things.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const res = await request.post('/api/things');\n"
+        "expect(res.status).toBe(201);\n"
+        "expect(res.status).toBe(500);\n",
+        encoding="utf-8",
+    )
+    cards = [
+        {
+            "interface_id": interface_id,
+            "type": "API",
+            "specification": "POST /api/things -> 201 { thing } ; 400 { errors }.",
+            "outputs": {"status_codes": [201, 400]},
+            "file_path": "backend/src/routes/things.js",
+        }
+        for interface_id in ("IF-THINGS-A", "IF-THINGS-B")
+    ]
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a thing."},
+        cards,
+        [
+            {
+                "type": "Integration",
+                "file_path": "tests/things.test.js",
+                "interface_ids": ["IF-THINGS-B"],
+            }
+        ],
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_conflict"
+    assert diagnostics[0]["interface_id"] == "IF-THINGS-B"
+    assert diagnostics[0]["contract_status_codes"] == [201, 400]
+
+
+def test_validate_http_status_contract_inconsistent_candidate_status_sets_stay_ambiguous(
+    tmp_project_dir: Path,
+) -> None:
+    """Disambiguation must not weaken conflict detection.
+
+    Same-path candidates whose contract status sets differ keep the
+    ambiguity needs-info: picking either one could flip the verdict.
+    """
+
+    test_path = tmp_project_dir / "tests" / "things.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const res = await request.post('/api/things');\n"
+        "expect(res.status).toBe(201);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a thing."},
+        [
+            {
+                "interface_id": "IF-THINGS-A",
+                "type": "API",
+                "specification": "POST /api/things returns 201.",
+                "file_path": "backend/src/routes/thingsA.js",
+            },
+            {
+                "interface_id": "IF-THINGS-B",
+                "type": "API",
+                "specification": "POST /api/things returns 409.",
+                "file_path": "backend/src/routes/thingsB.js",
+            },
+        ],
+        [{"type": "Integration", "file_path": "tests/things.test.js"}],
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_needs_info"
+    assert "more than one API interface" in diagnostics[0]["message"]
+
+
+def test_validate_http_status_contract_accepts_hackathon_sheet_workbooks_shape(
+    tmp_project_dir: Path,
+) -> None:
+    """Inline replay of the 2026-09-25 hackathon-sheet REQ-1-1-1 rejection.
+
+    The gate reported three needs-info diagnostics on this exact shape —
+    param-route assertions matched no interface, and the router + mount
+    cards made GET /api/workbooks ambiguous — although every assertion
+    matched the declared contract exactly.
+    """
+
+    routes_path = tmp_project_dir / "backend" / "src" / "routes" / "workbooks.js"
+    routes_path.parent.mkdir(parents=True)
+    routes_path.write_text(
+        "const express = require('express');\n"
+        "const router = express.Router();\n"
+        "\n"
+        "// REQ-1-1-1 workbook API.\n"
+        "// GET /api/workbooks            -> 200 { workbooks: [...] }\n"
+        "// GET /api/workbooks/:id/state  -> 200 { workbook, worksheets }\n"
+        "//                               -> 404 { error: 'WORKBOOK_NOT_FOUND' }\n"
+        "router.get('/', (req, res) => {\n"
+        "  res.status(200).json({ workbooks: [] });\n"
+        "});\n"
+        "\n"
+        "router.get('/:id/state', (req, res) => {\n"
+        "  res.status(404).json({ error: 'WORKBOOK_NOT_FOUND' });\n"
+        "});\n"
+        "\n"
+        "module.exports = router;\n",
+        encoding="utf-8",
+    )
+    app_path = tmp_project_dir / "backend" / "src" / "app.js"
+    app_path.write_text(
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.get('/api/health', (req, res) => {\n"
+        "  res.json({ code: 200, message: 'Backend Ready' });\n"
+        "});\n"
+        "app.get('/', (req, res) => {\n"
+        "  res.status(503).type('html').send('frontend build missing');\n"
+        "});\n"
+        "module.exports = app;\n",
+        encoding="utf-8",
+    )
+    test_path = (
+        tmp_project_dir / "backend" / "tests" / "generated" / "req_1_1_1" / "workbooks_api.test.js"
+    )
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const res = await request.get('/api/workbooks');\n"
+        "expect(res.status).toBe(200);\n"
+        "const state = await request.get('/api/workbooks/q3-sales/state');\n"
+        "expect(state.status).toBe(200);\n"
+        "const missing = await request.get('/api/workbooks/unknown-id/state');\n"
+        "expect(missing.status).toBe(404);\n",
+        encoding="utf-8",
+    )
+    interfaces = [
+        {
+            "interface_id": "REQ-1-1-1-API-Workbooks",
+            "type": "API",
+            "specification": (
+                "GET /api/workbooks -> 200 { workbooks } ; "
+                "GET /api/workbooks/:id/state -> 200 { workbook, worksheets } ; "
+                "404 { error: 'WORKBOOK_NOT_FOUND' }. Mounted at /api/workbooks in app.js."
+            ),
+            "outputs": {"status_codes": [200, 404]},
+            "file_path": "backend/src/routes/workbooks.js",
+        },
+        {
+            "interface_id": "REQ-1-1-1-API-AppMount",
+            "type": "API",
+            "specification": (
+                "Add `app.use('/api/workbooks', require('./routes/workbooks'))` "
+                "at the established mount point (after /api/health)."
+            ),
+            "file_path": "backend/src/app.js",
+        },
+    ]
+    manifest = [
+        {
+            "test_id": "REQ-1-1-1-INT-WorkbooksApi",
+            "req_id": "REQ-1-1-1",
+            "interface_ids": ["REQ-1-1-1-API-Workbooks", "REQ-1-1-1-API-AppMount"],
+            "type": "Integration",
+            "file_path": "backend/tests/generated/req_1_1_1/workbooks_api.test.js",
+        }
+    ]
+
+    assert validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "View and open a workbook."},
+        interfaces,
+        manifest,
+    ) == []
+
+
+def test_validate_http_status_contract_accepts_hackathon_sheet_create_shape(
+    tmp_project_dir: Path,
+) -> None:
+    """Inline replay of the hackathon-sheet REQ-1-2-1 rejection.
+
+    The reused+updated router card and the reused mount card made every
+    POST /api/workbooks assertion ambiguous although the router card's
+    declared codes (201/400/409) matched each assertion exactly.
+    """
+
+    routes_path = tmp_project_dir / "backend" / "src" / "routes" / "workbooks.js"
+    routes_path.parent.mkdir(parents=True)
+    routes_path.write_text(
+        "const express = require('express');\n"
+        "const router = express.Router();\n"
+        "\n"
+        "// REQ-1-1-1 workbook API + REQ-1-2-1 creation.\n"
+        "// POST /api/workbooks -> 201 { workbook: { id, name } }\n"
+        "//                                -> 400 { error: 'VALIDATION_ERROR' }\n"
+        "//                                -> 409 { error: 'DUPLICATE_WORKBOOK_NAME' }\n"
+        "// GET  /api/workbooks -> 200 { workbooks }\n"
+        "router.post('/', (req, res) => {\n"
+        "  res.status(501).json({ error: 'NOT_IMPLEMENTED' });\n"
+        "});\n"
+        "router.get('/', (req, res) => {\n"
+        "  res.status(200).json({ workbooks: [] });\n"
+        "});\n"
+        "\n"
+        "module.exports = router;\n",
+        encoding="utf-8",
+    )
+    test_path = (
+        tmp_project_dir / "backend" / "tests" / "generated" / "req_1_2_1" / "workbooksCreateApi.test.js"
+    )
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const res = await request.post('/api/workbooks');\n"
+        "expect(res.status).toBe(201);\n"
+        "expect(res.status).toBe(400);\n"
+        "expect(res.status).toBe(409);\n",
+        encoding="utf-8",
+    )
+    interfaces = [
+        {
+            "interface_id": "REQ-1-1-1-API-Workbooks",
+            "type": "API",
+            "specification": (
+                "POST /api/workbooks -> 201 { workbook: { id, name } } ; "
+                "400 { error: 'VALIDATION_ERROR' } ; 409 { error: 'DUPLICATE_WORKBOOK_NAME' }. "
+                "GET routes unchanged."
+            ),
+            "outputs": "status_codes [201, 400, 409]",
+            "file_path": "backend/src/routes/workbooks.js",
+        },
+        {
+            "interface_id": "REQ-1-1-1-API-AppMount",
+            "type": "API",
+            "specification": (
+                "Unchanged: app.use('/api/workbooks', ...) already mounts the router "
+                "that now owns POST creation."
+            ),
+            "file_path": "backend/src/app.js",
+        },
+    ]
+    manifest = [
+        {
+            "test_id": "REQ-1-2-1-INT-WorkbooksCreateApi",
+            "req_id": "REQ-1-2-1",
+            "interface_ids": ["REQ-1-1-1-API-Workbooks"],
+            "type": "Integration",
+            "file_path": "backend/tests/generated/req_1_2_1/workbooksCreateApi.test.js",
+        }
+    ]
+
+    assert validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a blank workbook."},
+        interfaces,
+        manifest,
+    ) == []
