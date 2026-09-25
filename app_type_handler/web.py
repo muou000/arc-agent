@@ -592,6 +592,16 @@ class WebAppType(AppTypeHandler):
             "frontend/src/api/index.ts",
         }
     )
+    shared_test_resources: frozenset[str] = frozenset(
+        {
+            "frontend/test/setup.ts",
+            "frontend/vite.config.js",
+            "backend/vitest.config.js",
+            "backend/playwright.config.js",
+            "backend/src/database/prepare_e2e.js",
+            "backend/src/database/test_harness.js",
+        }
+    )
 
     def __init__(self, *args, backend_runtime: BackendRuntime | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -725,6 +735,7 @@ class WebAppType(AppTypeHandler):
             "Unit tests: place under `frontend/tests/...` for UI/unit code or `backend/tests/...` for backend/service code.",
             "Integration tests: place under `frontend/tests/...` for frontend integration or `backend/tests/...` for API/service/database integration.",
             "E2E tests: place under `backend/test-e2e/...` and use a JavaScript or TypeScript test filename.",
+            "When the stage pipeline is active, place node-local tests and fixtures under the matching root's `generated/<stable-node-id>/...` namespace; shared runner configuration and fixtures are read-only.",
             "Database-using tests must use the app-type-provided isolated test harness/scaffold.",
         ]
 

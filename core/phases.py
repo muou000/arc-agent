@@ -328,6 +328,7 @@ class WorkflowPhaseRunner:
         log_cb: LogCallback | None = None,
         web_port: int | None = None,
         context_workspace_path: str | None = None,
+        enforce_stage_domains: bool = False,
     ) -> None:
         self.workspace_path = str(Path(workspace_path).expanduser().resolve())
         self.requirement_path = requirement_path
@@ -342,6 +343,13 @@ class WorkflowPhaseRunner:
         # Shared-workspace root for traceability-adjacent reads (visual cache),
         # distinct from workspace_path when this runner works in a worktree.
         self.context_workspace_path = context_workspace_path or self.workspace_path
+        self.enforce_stage_domains = bool(enforce_stage_domains)
+        # Adapters remain independently usable in legacy serial mode.  The
+        # guarded stage-pipeline runner opts them into the node-domain and
+        # write-set locks without changing their public construction contract.
+        for adapter in (self.interface_designer, self.test_generator, self.test_driven_developer):
+            if hasattr(adapter, "enforce_stage_domains"):
+                adapter.enforce_stage_domains = self.enforce_stage_domains
         self.app_handler = create_app_type_handler(
             app_type=app_type,
             workspace_path=self.workspace_path,

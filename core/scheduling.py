@@ -22,6 +22,11 @@ import os
 from collections.abc import Mapping
 from typing import Any, Iterable
 
+from agents.runtime.capabilities import (
+    is_node_test_path,
+    is_shared_test_resource,
+    is_test_asset,
+)
 from core.queue_state import (
     NODE_FAILED,
     PHASE_DESIGN,
@@ -373,7 +378,19 @@ def _declared_stage_write_set(task: Mapping[str, Any]) -> set[str] | None:
         parts = [part for part in text.split("/") if part not in {"", "."}]
         if not parts or ".." in parts or text.startswith("/") or ":" in parts[0]:
             return None
-        normalized.add("/".join(parts).casefold())
+        normalized_path = "/".join(parts).casefold()
+        node_id = str(task.get("node_id", "") or "").strip()
+        strict_domain = bool(
+            task.get("enforce_node_test_domain")
+            or task.get("node_test_namespace")
+            or task.get("test_domain")
+        )
+        if strict_domain:
+            if is_shared_test_resource(normalized_path):
+                return None
+            if node_id and is_test_asset(normalized_path) and not is_node_test_path(normalized_path, node_id):
+                return None
+        normalized.add(normalized_path)
     return normalized
 
 

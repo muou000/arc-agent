@@ -21,6 +21,7 @@ from agents.tools.test_failure_digest import (
     format_failure_digest,
 )
 from agents.tools.test_manifest import DeclaredTestFile, TestManifestLock
+from agents.tools.stage_write_set import StageWriteSetLock, build_declare_stage_write_set_tool
 from agents.tools.traceability import build_traceability_tools
 from app_type_handler.test_results import TestRunResult
 from core.test_types import canonical_test_type
@@ -45,6 +46,7 @@ class TestDrivenDeveloper:
         app_handler: Any | None = None,
         context_workspace_root: str | None = None,
         rebase_gate_provider: Callable[[], Any | None] | None = None,
+        enforce_stage_domains: bool = False,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
@@ -58,6 +60,7 @@ class TestDrivenDeveloper:
         # Optional per-pass mid-phase replay gate (issue #127), shared by
         # every TDD-layer agent build of this adapter.
         self._rebase_gate_provider = rebase_gate_provider
+        self.enforce_stage_domains = bool(enforce_stage_domains)
         self._last_run_tests_result: str | None = None
         self._last_run_tests_exit_code: int | None = None
         self._last_verifier_report_text = ""
@@ -83,7 +86,11 @@ class TestDrivenDeveloper:
     def _rebase_gate(self) -> Any | None:
         return cached_rebase_gate(self)
 
-    def _build_import_manifest_lock(self, node_tests: list[dict[str, Any]]) -> TestManifestLock | None:
+    def _build_import_manifest_lock(
+        self,
+        node_tests: list[dict[str, Any]],
+        node_id: str = "",
+    ) -> TestManifestLock | None:
         """Build read-only import-check metadata from the current test manifest.
 
         IMPLEMENT must repair the same test files TestGenerator declared, but
@@ -107,7 +114,10 @@ class TestDrivenDeveloper:
             rows.append(row)
         if not rows:
             return None
-        lock = TestManifestLock()
+        lock = TestManifestLock(
+            node_id=node_id,
+            enforce_node_namespace=self.enforce_stage_domains,
+        )
         lock.declare(rows)
         return lock
 
@@ -146,7 +156,11 @@ class TestDrivenDeveloper:
         self._current_test_files = [str(path or "").strip() for path in test_files if str(path or "").strip()]
         self._current_test_type = test_type
         current_node_tests = [item for item in (node_tests or []) if isinstance(item, dict)]
-        manifest_lock = self._build_import_manifest_lock(current_node_tests)
+        manifest_lock = self._build_import_manifest_lock(current_node_tests, node_id=node_id)
+        stage_write_set_lock = (
+            StageWriteSetLock(stage="implementation", node_id=node_id)
+            if self.enforce_stage_domains else None
+        )
         thread_suffix = self._current_test_type or "batch"
         if retry_attempt:
             thread_suffix = f"{thread_suffix}@retry{int(retry_attempt)}"
@@ -298,6 +312,14 @@ class TestDrivenDeveloper:
             )
 
         traceability_tools = build_traceability_tools(node_id=node_id, log_cb=self.log_cb)
+        stage_tools: list[Any] = []
+        if stage_write_set_lock is not None:
+            stage_tools.append(
+                build_declare_stage_write_set_tool(
+                    stage="implementation",
+                    lock=stage_write_set_lock,
+                )
+            )
         built = session.build_agent(
             name="test_driven_developer",
             stage="implementation",
@@ -306,9 +328,11 @@ class TestDrivenDeveloper:
             ),
             response_format=None,
             rebase_gate=self._rebase_gate(),
-            tools=[run_tests, run_build, install_dependencies, *traceability_tools],
+            tools=[*stage_tools, run_tests, run_build, install_dependencies, *traceability_tools],
             skills=[SKILLS_SOURCE],
             test_manifest_lock=manifest_lock,
+            stage_write_set_lock=stage_write_set_lock,
+            enforce_node_test_domain=self.enforce_stage_domains,
         )
         # Live handle for the stall hint: the discipline's write-event log is
         # queryable mid-session, while materialized_paths is read only at the

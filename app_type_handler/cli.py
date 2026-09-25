@@ -115,6 +115,7 @@ class CliAppType(AppTypeHandler):
             "Unit tests: place under `tests/unit/...` and use a `test_*.py` or `*_test.py` filename.",
             "Integration tests: place under `tests/integration/...` and use a `test_*.py` or `*_test.py` filename.",
             "E2E tests: place under `tests/e2e/...` and use a `test_*.py` or `*_test.py` filename.",
+            "When the stage pipeline is active, place node-local tests and fixtures under `tests/generated/<stable-node-id>/<unit|integration|e2e>/...`; shared runner configuration and fixtures are read-only.",
             "CLI tests should verify `python -m app ...` behavior through exit codes, stdout/stderr, and owned side effects when command execution is part of the requirement.",
         ]
 
@@ -153,11 +154,15 @@ class CliAppType(AppTypeHandler):
         if normalized_type not in {"unit", "integration", "e2e"}:
             return "CLI test `type` must be one of `Unit`, `Integration`, or `E2E`."
         expected_prefix = f"tests/{normalized_type}/"
+        generated_prefix = "tests/generated/"
         # `_normalize_cli_test_path` already returns "" for unsafe paths, so the
         # prefix check rejects them.
-        if not normalized_path.startswith(expected_prefix):
+        legacy_layout = normalized_path.startswith(expected_prefix)
+        generated_layout = normalized_path.startswith(generated_prefix) and f"/{normalized_type}/" in normalized_path[len(generated_prefix) :]
+        if not legacy_layout and not generated_layout:
             return (
-                f"CLI {test_type} tests must live under `{expected_prefix}...`. "
+                f"CLI {test_type} tests must live under `{expected_prefix}...` or the "
+                "stage-pipeline namespace `tests/generated/<stable-node-id>/...`. "
                 f"Received: {file_path}"
             )
         if not _is_valid_cli_test_filename(normalized_path):

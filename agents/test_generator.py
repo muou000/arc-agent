@@ -22,9 +22,11 @@ from agents.tools.test_manifest import (
     TestManifestLock,
     build_declare_test_manifest_tool,
     canonical_test_type,
+    get_test_manifest_ownership_registry,
     normalize_coverage_scope,
     reconcile_declared_manifest,
 )
+from agents.tools.stage_write_set import StageWriteSetLock, build_declare_stage_write_set_tool
 from agents.tools.traceability import build_traceability_tools
 from langgraph.errors import GraphRecursionError
 
@@ -66,6 +68,7 @@ class TestGenerator:
         app_type: str | None = None,
         context_workspace_root: str | None = None,
         rebase_gate_provider: Callable[[], Any | None] | None = None,
+        enforce_stage_domains: bool = False,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
@@ -78,6 +81,7 @@ class TestGenerator:
         # Optional per-pass mid-phase replay gate (issue #127), shared by
         # every agent build of this adapter's passes.
         self._rebase_gate_provider = rebase_gate_provider
+        self.enforce_stage_domains = bool(enforce_stage_domains)
 
     def _rebase_gate(self) -> Any | None:
         return cached_rebase_gate(self)
@@ -105,7 +109,41 @@ class TestGenerator:
         interface_contract = context_pipeline.get_interface_contract_context(node_id)
         current_interfaces = self._current_node_interfaces(node_id)
         current_interface_ids = self._current_interface_ids(node_id, current_interfaces)
-        manifest_lock = TestManifestLock()
+        manifest_lock = TestManifestLock(
+            node_id=node_id,
+            enforce_node_namespace=self.enforce_stage_domains,
+        )
+        stage_write_set_lock = (
+            StageWriteSetLock(stage="test_generation", node_id=node_id)
+            if self.enforce_stage_domains else None
+        )
+        ownership_registry = (
+            get_test_manifest_ownership_registry(session.claims_workspace_root)
+            if self.enforce_stage_domains
+            else None
+        )
+        stage_tools = [
+            build_declare_test_manifest_tool(
+                node_id=node_id,
+                manifest_lock=manifest_lock,
+                validate_test_path=self._make_path_validator(session.app_type, session.workspace_root),
+                log_cb=self.log_cb,
+                current_interface_ids=current_interface_ids,
+                require_interface_coverage=bool(current_interface_ids),
+                ownership_registry=ownership_registry,
+                existing_owner_for_path=(
+                    self._existing_manifest_owner if self.enforce_stage_domains else None
+                ),
+            )
+        ]
+        if stage_write_set_lock is not None:
+            stage_tools.insert(
+                0,
+                build_declare_stage_write_set_tool(
+                    stage="test_generation",
+                    lock=stage_write_set_lock,
+                ),
+            )
         built = session.build_agent(
             name="test_generator",
             stage="test_generation",
@@ -120,17 +158,12 @@ class TestGenerator:
                     log_cb=self.log_cb,
                     current_interfaces=current_interfaces,
                 ),
-                build_declare_test_manifest_tool(
-                    node_id=node_id,
-                    manifest_lock=manifest_lock,
-                    validate_test_path=self._make_path_validator(session.app_type, session.workspace_root),
-                    log_cb=self.log_cb,
-                    current_interface_ids=current_interface_ids,
-                    require_interface_coverage=bool(current_interface_ids),
-                ),
+                *stage_tools,
             ],
             skills=[SKILLS_SOURCE],
             test_manifest_lock=manifest_lock,
+            stage_write_set_lock=stage_write_set_lock,
+            enforce_node_test_domain=self.enforce_stage_domains,
         )
 
         message = get_user_prompt(
@@ -142,21 +175,25 @@ class TestGenerator:
         await self._log(f"required-skills: {', '.join(required_skill_names) or 'none'}", node_id=node_id)
         await self._log("Invoking test generation.", node_id=node_id)
         try:
-            raw_payload = await session.invoke(built, message=message)
-        except GraphRecursionError as exc:
-            raw_payload = await self._salvage_step_budget(
-                node_id=node_id, manifest_lock=manifest_lock, built=built, exc=exc
+            try:
+                raw_payload = await session.invoke(built, message=message)
+            except GraphRecursionError as exc:
+                raw_payload = await self._salvage_step_budget(
+                    node_id=node_id, manifest_lock=manifest_lock, built=built, exc=exc
+                )
+                if raw_payload is None:
+                    raise
+            tests = normalize_test_manifest_payload(raw_payload)
+            tests, output_text = await self._reconcile_first_pass(
+                node_id=node_id,
+                tests=tests,
+                raw_payload=raw_payload,
+                manifest_lock=manifest_lock,
+                built=built,
             )
-            if raw_payload is None:
-                raise
-        tests = normalize_test_manifest_payload(raw_payload)
-        tests, output_text = await self._reconcile_first_pass(
-            node_id=node_id,
-            tests=tests,
-            raw_payload=raw_payload,
-            manifest_lock=manifest_lock,
-            built=built,
-        )
+        finally:
+            if ownership_registry is not None:
+                ownership_registry.release_node(node_id)
         if tests is None:
             return None, output_text
         await self._log(f"Test generation returned {len(tests)} test artifact(s).", node_id=node_id)
@@ -287,6 +324,25 @@ class TestGenerator:
             )
         return tests, output_text
 
+    @staticmethod
+    def _existing_manifest_owner(file_path: str) -> str | None:
+        """Return the published node that already owns a test path."""
+
+        try:
+            from core.service import get_runtime
+
+            rows = get_runtime().traceability.list_tests()
+        except Exception:
+            return None
+        normalized = normalize_manifest_path(file_path)
+        for row in rows:
+            if normalize_manifest_path(row.get("file_path")) != normalized:
+                continue
+            owner = str(row.get("req_id") or "").strip()
+            if owner:
+                return owner
+        return None
+
     def _make_path_validator(self, app_type: str, workspace_root: str) -> Callable[[str, str], str | None] | None:
         """App-type placement validator for the declare tool (early check).
 
@@ -372,8 +428,41 @@ class TestGenerator:
             if isinstance(item, dict) and (row := DeclaredTestFile.from_manifest_item(item)) is not None
         ]
         manifest_lock = TestManifestLock(
-            declared_files={row.file_path: row for row in seeded_rows}
+            declared_files={row.file_path: row for row in seeded_rows},
+            node_id=node_id,
+            enforce_node_namespace=self.enforce_stage_domains,
         )
+        stage_write_set_lock = (
+            StageWriteSetLock(stage="test_generation", node_id=node_id)
+            if self.enforce_stage_domains else None
+        )
+        ownership_registry = (
+            get_test_manifest_ownership_registry(session.claims_workspace_root)
+            if self.enforce_stage_domains
+            else None
+        )
+        stage_tools = [
+            build_declare_test_manifest_tool(
+                node_id=node_id,
+                manifest_lock=manifest_lock,
+                validate_test_path=self._make_path_validator(session.app_type, session.workspace_root),
+                log_cb=self.log_cb,
+                current_interface_ids=current_interface_ids,
+                require_interface_coverage=bool(current_interface_ids),
+                ownership_registry=ownership_registry,
+                existing_owner_for_path=(
+                    self._existing_manifest_owner if self.enforce_stage_domains else None
+                ),
+            )
+        ]
+        if stage_write_set_lock is not None:
+            stage_tools.insert(
+                0,
+                build_declare_stage_write_set_tool(
+                    stage="test_generation",
+                    lock=stage_write_set_lock,
+                ),
+            )
         built = session.build_agent(
             name="test_generator",
             stage="test_generation",
@@ -388,17 +477,12 @@ class TestGenerator:
                     log_cb=self.log_cb,
                     current_interfaces=current_interfaces,
                 ),
-                build_declare_test_manifest_tool(
-                    node_id=node_id,
-                    manifest_lock=manifest_lock,
-                    validate_test_path=self._make_path_validator(session.app_type, session.workspace_root),
-                    log_cb=self.log_cb,
-                    current_interface_ids=current_interface_ids,
-                    require_interface_coverage=bool(current_interface_ids),
-                ),
+                *stage_tools,
             ],
             skills=[SKILLS_SOURCE],
             test_manifest_lock=manifest_lock,
+            stage_write_set_lock=stage_write_set_lock,
+            enforce_node_test_domain=self.enforce_stage_domains,
         )
         message = self._green_rejection_message(
             node_id=node_id,
@@ -412,7 +496,11 @@ class TestGenerator:
             status="warning",
             node_id=node_id,
         )
-        raw_payload = await session.invoke(built, message=message)
+        try:
+            raw_payload = await session.invoke(built, message=message)
+        finally:
+            if ownership_registry is not None:
+                ownership_registry.release_node(node_id)
         tests = normalize_test_manifest_payload(raw_payload)
         output_text = json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
         if not payload_declares_test_manifest(raw_payload):
