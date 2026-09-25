@@ -67,6 +67,11 @@ class AppTypeHandler(ABC):
     # stay freely editable.
     template_shared_surfaces: frozenset[str] = frozenset()
 
+    # Workspace-relative runner configuration and template fixture surfaces.
+    # Stage agents may read these files, but the stage-pipeline ownership rail
+    # treats them as coordinator/template-owned and rejects all writes.
+    shared_test_resources: frozenset[str] = frozenset()
+
     def __init__(
         self,
         workspace_path: str,

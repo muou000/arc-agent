@@ -240,6 +240,7 @@ class AndroidAppType(AppTypeHandler):
             f"Unit tests: place under `app/src/test/java/{package_dir}/unit/`.",
             f"Integration tests: place under `app/src/test/java/{package_dir}/integration/`.",
             f"E2E tests: place under `app/src/test/java/{package_dir}/e2e/`.",
+            "When the stage pipeline is active, place node-local tests and fixtures under `generated/<stable-node-id>/<unit|integration|e2e>/` below the package test root; shared runner configuration and fixtures are read-only.",
             "Use Java/Kotlin test filenames supported by the Android app handler.",
         ]
 

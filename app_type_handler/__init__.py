@@ -31,6 +31,12 @@ def template_shared_surfaces(app_type: str) -> frozenset[str]:
     return get_app_type_handler_class(app_type).template_shared_surfaces
 
 
+def shared_test_resources(app_type: str) -> frozenset[str]:
+    """Return runner-owned test configuration and fixture paths."""
+
+    return get_app_type_handler_class(app_type).shared_test_resources
+
+
 def create_app_type_handler(
     app_type: str,
     workspace_path: str,

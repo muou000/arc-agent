@@ -8,7 +8,14 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
-from agents.runtime.capabilities import capability_for, is_test_asset, is_test_file_path, normalize_manifest_path
+from agents.runtime.capabilities import (
+    capability_for,
+    is_node_test_path,
+    is_shared_test_resource,
+    is_test_asset,
+    is_test_file_path,
+    normalize_manifest_path,
+)
 from agents.runtime.import_checks import (
     ImportViolation,
     build_import_block_message,
@@ -289,6 +296,10 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         test_manifest_lock: TestManifestLock | None = None,
         pending_contract_registry: Any | None = None,
         template_shared_surfaces: frozenset[str] | None = None,
+        shared_test_resources: frozenset[str] | None = None,
+        stage_write_set_lock: Any | None = None,
+        node_id: str | None = None,
+        enforce_node_test_domain: bool = False,
         max_design_writes: int | None = None,
         workspace_root: str | None = None,
     ) -> None:
@@ -308,6 +319,14 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # and is deliberately not unlocked by validation failures — a failing
         # test never makes destroying runtime wiring the right repair.
         self._template_shared_surfaces = template_shared_surfaces or frozenset()
+        self._shared_test_resources = frozenset(
+            normalize_manifest_path(path)
+            for path in (shared_test_resources or frozenset())
+            if normalize_manifest_path(path)
+        )
+        self._stage_write_set_lock = stage_write_set_lock
+        self._node_id = str(node_id or "").strip()
+        self._enforce_node_test_domain = bool(enforce_node_test_domain and self._node_id)
         # DESIGN write budget for this pass (interface_design only). Leaf
         # nodes default to 8; a non-leaf shell pass may raise it (see
         # ``InterfaceDesigner._max_design_writes``).
@@ -378,6 +397,13 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         name = str(request.tool_call.get("name", ""))
         args = request.tool_call.get("args", {}) or {}
         path = _discipline_path(args)
+        if name in _FILE_WRITE_TOOLS or name in _ADDITIVE_FILE_WRITE_TOOLS or name == "delete":
+            if blocked := self._validate_shared_test_resource(path):
+                return blocked
+            if blocked := self._validate_node_test_domain(path, operation=name):
+                return blocked
+            if blocked := self._validate_stage_write_set(path, operation=name):
+                return blocked
         # The shared-surface guard runs ahead of the capability table so its
         # remediation message keeps precedence: a TestGenerator writing
         # template wiring (never a test asset) must be told to extend the
@@ -386,7 +412,12 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if name == "write_file" and self._template_shared_surfaces:
             if blocked := self._validate_shared_surface(args):
                 return blocked
-        verdict = capability_for(self._stage, name, path)
+        verdict = capability_for(
+            self._stage,
+            name,
+            path,
+            enforce_node_test_domain=self._enforce_node_test_domain,
+        )
         if not verdict.allowed:
             return verdict.message
         # What remains is runtime state the static table cannot see: the
@@ -399,6 +430,63 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return self._validate_append(args)
         if name in _FILE_WRITE_TOOLS:
             return self._validate_write(args, tool=name, call_id=_tool_call_id(request))
+        return None
+
+    def _validate_shared_test_resource(self, path: str) -> str | None:
+        """Keep runner-owned test infrastructure read-only."""
+
+        normalized = normalize_manifest_path(path)
+        if not normalized:
+            return None
+        if (
+            not self._enforce_node_test_domain
+            and self._stage_write_set_lock is None
+            and not self._shared_test_resources
+        ):
+            return None
+        if normalized not in self._shared_test_resources and not is_shared_test_resource(normalized):
+            return None
+        return (
+            f"Shared test resource blocked: {path} is runner-owned test configuration or fixture "
+            "and is read-only during staged execution. Read it for context, but do not write, "
+            "edit, append, or delete it; place node-specific helpers and fixtures inside the "
+            "current node's generated test namespace."
+        )
+
+    def _validate_node_test_domain(self, path: str, *, operation: str) -> str | None:
+        """Keep test files/assets owned by the current node when enabled."""
+
+        if not self._enforce_node_test_domain or not is_test_asset(path):
+            return None
+        normalized = normalize_manifest_path(path)
+        if is_node_test_path(normalized, self._node_id):
+            return None
+        return (
+            f"Node test domain blocked: {path} is outside node `{self._node_id}`'s stable test "
+            f"namespace, so `{operation}` is not allowed. Use the app-type test root's "
+            "`generated/<stable-node-id>/...` namespace. Shared runner configuration and "
+            "fixtures are read-only."
+        )
+
+    def _validate_stage_write_set(self, path: str, *, operation: str) -> str | None:
+        """Require every stage write to be declared before the first write."""
+
+        lock = self._stage_write_set_lock
+        if lock is None:
+            return None
+        if not path:
+            return f"Stage write set blocked: `{operation}` requires a workspace-relative file path."
+        if not bool(getattr(lock, "locked", False)):
+            return (
+                "Stage write set blocked: declare the complete stage write set with "
+                "`declare_stage_write_set` before the first file write."
+            )
+        if not bool(lock.contains(path)):
+            declared = ", ".join(getattr(lock, "paths", ()) or ()) or "(empty)"
+            return (
+                f"Stage write set blocked: {path} was not declared for this stage; `{operation}` "
+                f"is not allowed. Declared paths: {declared}."
+            )
         return None
 
     def _validate_delete_channel(self, args: dict[str, Any]) -> str | None:
@@ -1215,6 +1303,17 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         """
 
         return list(self._write_events)
+
+    def declared_write_set(self) -> list[str]:
+        """Return the sorted stage write set declared by this pass."""
+
+        lock = self._stage_write_set_lock
+        if lock is None:
+            return []
+        try:
+            return list(getattr(lock, "paths", ()) or ())
+        except Exception:
+            return []
 
     def _annotate_pending_contract(self, request: ToolCallRequest, result: ToolMessage | Any) -> ToolMessage | Any:
         """Re-state the serialization obligation on a successful design write.

@@ -26,6 +26,7 @@ from agents.runtime.stage_discipline import MAX_DESIGN_WRITES, MAX_NON_LEAF_DESI
 from agents.runtime.stage_session import DEFAULT_STAGE_MODEL, StageSession
 from agents.runtime.rebase_gate import cached_rebase_gate
 from agents.skills.selection import SKILLS_SOURCE, interface_design_skills
+from agents.tools.stage_write_set import StageWriteSetLock, build_declare_stage_write_set_tool
 from agents.tools.traceability import build_traceability_tools
 
 
@@ -155,6 +156,7 @@ class InterfaceDesigner:
         app_type: str | None = None,
         context_workspace_root: str | None = None,
         rebase_gate_provider: Callable[[], Any | None] | None = None,
+        enforce_stage_domains: bool = False,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", DEFAULT_STAGE_MODEL)
@@ -169,6 +171,7 @@ class InterfaceDesigner:
         # Optional per-pass mid-phase replay gate (issue #127): called per
         # agent build so the repair flows' rebuilds share the pass's gate.
         self._rebase_gate_provider = rebase_gate_provider
+        self.enforce_stage_domains = bool(enforce_stage_domains)
         # Write budget tier pinned by ``run()`` for the pass it is executing.
         # The repair flows rebuild agents mid-pass and read this instead of
         # re-deriving from anything, so every rebuild within one ``run`` shares
@@ -225,6 +228,10 @@ class InterfaceDesigner:
             workspace_root=session.workspace_root,
             interface_ids_by_file=self._registered_interfaces_by_file(),
         )
+        stage_write_set_lock = (
+            StageWriteSetLock(stage="interface_design", node_id=node_id)
+            if self.enforce_stage_domains else None
+        )
         # Pin the tier once per run: the repair flows below rebuild agents and
         # read this pin, so every rebuild within this pass shares the tier the
         # first agent was built with (no re-derivation, no agent-attribute
@@ -237,6 +244,7 @@ class InterfaceDesigner:
             response_format=InterfaceDesignResponse,
             pending_contract_registry=pending_registry,
             max_design_writes=max_design_writes,
+            stage_write_set_lock=stage_write_set_lock,
         )
         message = get_user_prompt(
             node_id=node_id,
@@ -314,6 +322,7 @@ class InterfaceDesigner:
         response_format: Any,
         pending_contract_registry: PendingContractRegistry | None = None,
         max_design_writes: int | None = None,
+        stage_write_set_lock: StageWriteSetLock | None = None,
     ) -> StageAgentBuild:
         """Build the InterfaceDesigner deep-agent with a given response format.
 
@@ -327,6 +336,15 @@ class InterfaceDesigner:
         shell pass).
         """
 
+        tools = list(build_traceability_tools(node_id=session.node_id, log_cb=self.log_cb))
+        if stage_write_set_lock is not None:
+            tools.insert(
+                0,
+                build_declare_stage_write_set_tool(
+                    stage="interface_design",
+                    lock=stage_write_set_lock,
+                ),
+            )
         return session.build_agent(
             name="interface_designer",
             stage="interface_design",
@@ -334,8 +352,10 @@ class InterfaceDesigner:
                 [get_system_prompt(), stage_skill_activation_policy(required_skill_names)]
             ),
             response_format=response_format,
-            tools=build_traceability_tools(node_id=session.node_id, log_cb=self.log_cb),
+            tools=tools,
             skills=[SKILLS_SOURCE],
+            stage_write_set_lock=stage_write_set_lock,
+            enforce_node_test_domain=self.enforce_stage_domains,
             pending_contract_registry=pending_contract_registry,
             max_design_writes=max_design_writes,
             rebase_gate=self._rebase_gate() if self._rebase_gate_provider else None,
@@ -754,6 +774,7 @@ class InterfaceDesigner:
                 response_format=constrained,
                 pending_contract_registry=pending_contract_registry,
                 max_design_writes=max_design_writes,
+                stage_write_set_lock=getattr(built.stage_discipline, "_stage_write_set_lock", None),
             )
         except Exception:
             return built

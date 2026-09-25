@@ -94,6 +94,14 @@ class StageAgentBuild:
         except Exception:
             return []
 
+    def declared_write_set(self) -> list[str]:
+        """Return the stage's immutable declared write set, when enabled."""
+
+        try:
+            return list(self.stage_discipline.declared_write_set())
+        except Exception:
+            return []
+
 
 class OpenAIGlobSchema(BaseModel):
     """OpenAI-compatible schema for the glob tool.
@@ -406,6 +414,8 @@ def build_stage_agent(
     node_id: str | None = None,
     claims_workspace_root: str | None = None,
     test_manifest_lock: Any | None = None,
+    stage_write_set_lock: Any | None = None,
+    enforce_node_test_domain: bool = False,
     pending_contract_registry: Any | None = None,
     app_type: str | None = None,
     max_design_writes: int | None = None,
@@ -425,6 +435,12 @@ def build_stage_agent(
     it is read-only metadata for write-time import validation: the
     implementation agent may still edit any path its capability table allows,
     but only manifest-locked test paths receive the static import check.
+
+    ``stage_write_set_lock`` and ``enforce_node_test_domain`` are the guarded
+    stage-pipeline ownership rails.  Legacy serial callers omit them and keep
+    the historical path behavior; the stage pipeline supplies them so every
+    file write is declared and node-local test assets stay in their stable
+    namespace.
 
     ``pending_contract_registry`` wires the interface_design stage's
     write-time contract registration (see
@@ -499,8 +515,16 @@ def build_stage_agent(
         stage=stage,
         file_claim_gate=file_claim_gate,
         test_manifest_lock=test_manifest_lock if stage in {"test_generation", "implementation"} else None,
+        stage_write_set_lock=stage_write_set_lock,
+        node_id=node_id,
+        enforce_node_test_domain=enforce_node_test_domain,
         pending_contract_registry=pending_contract_registry if stage == "interface_design" else None,
         template_shared_surfaces=_template_shared_surfaces(app_type),
+        shared_test_resources=(
+            _shared_test_resources(app_type)
+            if enforce_node_test_domain
+            else frozenset()
+        ),
         max_design_writes=max_design_writes if stage == "interface_design" else None,
         # The agent's own filesystem root (the /workspace/ backend route):
         # anchors the write-time test-import validation (issue #156). In
@@ -815,6 +839,16 @@ def _template_shared_surfaces(app_type: str | None) -> frozenset[str]:
     from app_type_handler import template_shared_surfaces
 
     return template_shared_surfaces(app_type)
+
+
+def _shared_test_resources(app_type: str | None) -> frozenset[str]:
+    """Return app-type runner/config/fixture paths that stages may only read."""
+
+    if not app_type:
+        return frozenset()
+    from app_type_handler import shared_test_resources
+
+    return shared_test_resources(app_type)
 
 
 def _normalize_virtual_path(path: str) -> str:

@@ -21,11 +21,17 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from agents.runtime.capabilities import is_test_file_path, normalize_manifest_path
+from agents.runtime.capabilities import (
+    is_node_test_path,
+    is_shared_test_resource,
+    is_test_file_path,
+    normalize_manifest_path,
+)
 from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
@@ -77,6 +83,64 @@ class DeclaredTestFile:
         )
 
 
+class TestManifestOwnershipRegistry:
+    """In-process ownership claims for manifest paths during stage overlap."""
+
+    def __init__(self) -> None:
+        self._owners: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def claim_many(self, *, node_id: str, paths: list[str]) -> str | None:
+        """Atomically claim paths, returning a sibling conflict if present."""
+
+        owner_id = str(node_id or "").strip()
+        normalized = sorted({normalize_manifest_path(path) for path in paths if normalize_manifest_path(path)})
+        if not owner_id or not normalized:
+            return None
+        with self._lock:
+            for path in normalized:
+                owner = self._owners.get(path)
+                if owner and owner != owner_id:
+                    return (
+                        f"Manifest ownership blocked: `{path}` is already claimed by node `{owner}`; "
+                        f"node `{owner_id}` cannot declare or write the same test file. "
+                        "Use the current node's stable test namespace instead."
+                    )
+            for path in normalized:
+                self._owners.setdefault(path, owner_id)
+        return None
+
+    def release_node(self, node_id: str) -> list[str]:
+        owner_id = str(node_id or "").strip()
+        if not owner_id:
+            return []
+        with self._lock:
+            released = [path for path, owner in self._owners.items() if owner == owner_id]
+            for path in released:
+                self._owners.pop(path, None)
+            return released
+
+    def reset(self) -> None:
+        with self._lock:
+            self._owners.clear()
+
+
+_OWNERSHIP_REGISTRIES: dict[str, TestManifestOwnershipRegistry] = {}
+_OWNERSHIP_REGISTRIES_LOCK = threading.Lock()
+
+
+def get_test_manifest_ownership_registry(workspace_root: str) -> TestManifestOwnershipRegistry:
+    """Return the process-local manifest registry for one integration root."""
+
+    key = str(Path(workspace_root).expanduser().resolve())
+    with _OWNERSHIP_REGISTRIES_LOCK:
+        registry = _OWNERSHIP_REGISTRIES.get(key)
+        if registry is None:
+            registry = TestManifestOwnershipRegistry()
+            _OWNERSHIP_REGISTRIES[key] = registry
+        return registry
+
+
 @dataclass
 class TestManifestLock:
     """Locked set of test-file paths the TestGenerator may touch.
@@ -89,6 +153,8 @@ class TestManifestLock:
     """
 
     declared_files: dict[str, DeclaredTestFile] = field(default_factory=dict)
+    node_id: str = ""
+    enforce_node_namespace: bool = False
 
     @property
     def locked(self) -> bool:
@@ -101,6 +167,25 @@ class TestManifestLock:
     def contains(self, file_path: str) -> bool:
         return normalize_manifest_path(file_path) in self.declared_files
 
+    def namespace_error(self, file_path: str) -> str | None:
+        """Return the stable-domain violation for one manifest path, if any."""
+
+        if not self.enforce_node_namespace or not self.node_id:
+            return None
+        normalized = normalize_manifest_path(file_path)
+        if is_shared_test_resource(normalized):
+            return (
+                f"`{normalized}` is shared test infrastructure and is read-only. "
+                "Declare a node-specific helper or fixture inside the current node's generated test namespace."
+            )
+        if not is_node_test_path(normalized, self.node_id):
+            return (
+                f"`{normalized}` is outside node `{self.node_id}`'s stable test namespace. "
+                "Use the app-type test root's `generated/<stable-node-id>/...` namespace; "
+                "shared runner configuration and fixtures are read-only."
+            )
+        return None
+
 
 def build_declare_test_manifest_tool(
     *,
@@ -110,6 +195,8 @@ def build_declare_test_manifest_tool(
     log_cb: LogCallback | None = None,
     current_interface_ids: list[str] | set[str] | None = None,
     require_interface_coverage: bool = False,
+    ownership_registry: TestManifestOwnershipRegistry | None = None,
+    existing_owner_for_path: Callable[[str], str | None] | None = None,
 ):
     """Build the ``declare_test_manifest`` tool for the current stage run.
 
@@ -125,6 +212,12 @@ def build_declare_test_manifest_tool(
     ``require_interface_coverage`` rejects empty coverage rows when the current
     node owns interfaces, preventing a model from using ``[]`` to bypass a
     failed or temporarily unavailable interface lookup.
+
+    ``ownership_registry`` claims every declared path before the lock mutates,
+    so overlapping TestGenerator stages cannot silently declare the same test
+    file. ``existing_owner_for_path`` checks already-published traceability
+    rows, which keeps the in-memory claim registry from being the only source
+    of ownership after a stage has published.
     """
 
     staged_interface_ids = {
@@ -205,6 +298,10 @@ def build_declare_test_manifest_tool(
                     "manifest entry."
                 )
                 continue
+            namespace_error = manifest_lock.namespace_error(file_path)
+            if namespace_error:
+                errors.append(f"Entry {index} (`{file_path}`): {namespace_error}")
+                continue
             if validate_test_path is not None:
                 validation_error = validate_test_path(test_type, file_path)
                 if validation_error:
@@ -247,6 +344,26 @@ def build_declare_test_manifest_tool(
                 + f".{hint} Use ids returned by InterfaceDesigner or the traceability tools."
                 + _MANIFEST_SHAPE_EXAMPLE
             )
+
+        if not errors and existing_owner_for_path is not None:
+            for row in rows:
+                try:
+                    owner = str(existing_owner_for_path(row.file_path) or "").strip()
+                except Exception:
+                    owner = ""
+                if owner and owner != str(node_id or "").strip():
+                    errors.append(
+                        f"Entry `{row.file_path}` is already owned by node `{owner}` in the "
+                        "published test manifest; a sibling node cannot claim it."
+                    )
+
+        if not errors and ownership_registry is not None:
+            ownership_error = ownership_registry.claim_many(
+                node_id=node_id,
+                paths=[row.file_path for row in rows],
+            )
+            if ownership_error:
+                errors.append(ownership_error)
 
         if errors:
             return _tool_error(

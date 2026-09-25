@@ -355,6 +355,7 @@ class ARCWorkflowManager:
             test_generator=self.test_generator,
             test_driven_developer=self.test_driven_developer,
             log_cb=self.log_cb,
+            enforce_stage_domains=self._stage_pipeline,
         )
 
     async def cleanup_workspace(self) -> bool:
@@ -1959,6 +1960,7 @@ class ARCWorkflowManager:
             log_cb=self._log,
             web_port=web_port,
             context_workspace_path=self.workspace_path,
+            enforce_stage_domains=self._stage_pipeline,
         )
 
     async def _integrate_task_workspace(

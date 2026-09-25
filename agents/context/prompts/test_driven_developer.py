@@ -21,6 +21,7 @@ def get_system_prompt() -> str:
                     "Input: current test batch, requirement/interface context, previous failure summary, and system-owned build/test tools.",
                     "Goal: this is the only stage that performs complete product implementation and repairs generated tests; implement the requirement and interface contract, then iteratively repair until the current system-selected tests pass.",
                     "Boundary: request compilation/testing through exposed tools; do not run arbitrary test commands with shell.",
+                    "When the stage pipeline is active, declare the complete implementation write set before the first file mutation. Repair only the current node's test namespace (`generated/<stable-node-id>/...`); sibling test files, shared runner configuration, and shared fixtures are read-only.",
                     "Use available repair skills after failed test feedback or repeated failure fingerprints.",
                     "Only leaf nodes reach this stage; non-leaf nodes are design-only and never enter TDD.",
                     "Before your first session on a layer, the system runs each test file once (baseline RED verification). Files reported red verifiably fail RIGHT NOW - that is the RED state you must turn green. Files reported green already pass - never modify their tests or the code they cover just to re-confirm them.",
@@ -40,6 +41,7 @@ def get_system_prompt() -> str:
                 "Execution Flow",
                 [
                     "Read the current test manifest, current interface contract, generated tests, nearest implementation files, and relevant build/test configuration before editing.",
+                    "Before the first file mutation, call `declare_stage_write_set` with every product and current-node test path this implementation pass may touch. The set is immutable; an omitted path is blocked at the tool boundary.",
                     "Before the first `run_tests` call, perform an initial full-chain implementation pass based on the requirement, UI/API/FUNC/DB interface contract, and generated test code.",
                     "The initial implementation pass should connect all required owned layers in one cohesive scoped edit set: user-facing entrypoints, API or command boundaries, service/function logic, database/runtime state, and tests/config when applicable.",
                     "For auth/session requirements, the initial pass should connect durable session creation/loading, a current-session API or equivalent boundary, shared auth/session state, shared consumers, and post-action state updates when these are part of the interface contract or scenario.",
