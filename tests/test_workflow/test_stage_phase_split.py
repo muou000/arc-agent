@@ -9,16 +9,20 @@ from typing import Any
 from core import sessions
 from core.phases import WorkflowPhaseRunner
 from core.queue_state import (
+    PHASE_DESIGN,
     STAGE_IMPLEMENTATION,
     STAGE_INTERFACE_DESIGN,
     STAGE_PUBLISHED,
     STAGE_TEST_GENERATION,
     STAGE_VISUAL_ANALYSIS,
+    TASK_RUNNING,
     load_or_create_queue,
     stage_status_of,
+    task_status,
 )
 from core.workflow import ARCWorkflowManager
 from tests.helpers.faux import FakeAppHandler, failing_test_output
+from tests.helpers.jsonl import read_jsonl
 from tests.test_agents.conftest import arc_runtime  # noqa: F401
 
 
@@ -132,6 +136,13 @@ def test_interface_and_test_generation_stages_publish_independently(
     assert session["phase_status"]["test"] == "completed"
     assert session["phase_status"]["design"] == "completed"
     assert session["design_baseline"] == {TEST_FILE: "red"}
+    # The test publication must not re-write the contracts its interface
+    # publication already stored: exactly one upsert row event per fact.
+    events = read_jsonl(Path(arc_runtime.paths.runner_events_path))
+    assert [
+        event["interface_id"] for event in events if event.get("type") == "interface_upsert"
+    ] == ["IF-CALC"]
+    assert [event["test_id"] for event in events if event.get("type") == "test_upsert"] == ["T-CALC"]
 
 
 def test_stage_drain_runs_test_generation_before_tdd_and_skips_non_leaf_tests(
@@ -158,6 +169,14 @@ def test_stage_drain_runs_test_generation_before_tdd_and_skips_non_leaf_tests(
     # boundary under test here.
     manager._commit_phase_checkpoint = lambda *_args, **_kwargs: asyncio.sleep(0)
     calls: list[tuple[str, str]] = []
+    queue = load_or_create_queue(
+        str(tmp_project_dir / ".arc" / "processing_queue.json"),
+        tree,
+    )
+    for task in queue["stage_tasks"]:
+        if task["stage"] == STAGE_VISUAL_ANALYSIS:
+            task["status"] = STAGE_PUBLISHED
+    design_task_status: list[str] = []
 
     class _Runner:
         async def run_interface_design_stage(
@@ -170,6 +189,16 @@ def test_stage_drain_runs_test_generation_before_tdd_and_skips_non_leaf_tests(
             self, node_id: str, _requirement: dict[str, Any]
         ) -> bool:
             calls.append((node_id, "tests"))
+            design_task_status.append(
+                task_status(
+                    queue,
+                    next(
+                        item
+                        for item in queue["tasks"]
+                        if item["node_id"] == node_id and item["phase"] == PHASE_DESIGN
+                    ),
+                )
+            )
             return True
 
         async def run_implement_phase(
@@ -179,13 +208,6 @@ def test_stage_drain_runs_test_generation_before_tdd_and_skips_non_leaf_tests(
             return True
 
     manager.phase_runner = _Runner()
-    queue = load_or_create_queue(
-        str(tmp_project_dir / ".arc" / "processing_queue.json"),
-        tree,
-    )
-    for task in queue["stage_tasks"]:
-        if task["stage"] == STAGE_VISUAL_ANALYSIS:
-            task["status"] = STAGE_PUBLISHED
 
     asyncio.run(
         manager._drain_stage_tasks(
@@ -201,6 +223,10 @@ def test_stage_drain_runs_test_generation_before_tdd_and_skips_non_leaf_tests(
         ("LEAF", "tdd"),
         ("ROOT", "tdd"),
     ]
+    # The interface stage's begin already carries the node across the test
+    # publication: the aggregate DESIGN task reads RUNNING (not PENDING)
+    # while TEST_GENERATION executes.
+    assert design_task_status == [TASK_RUNNING]
     assert stage_status_of(queue, "ROOT", STAGE_TEST_GENERATION) == "SKIPPED"
     assert stage_status_of(queue, "LEAF", STAGE_INTERFACE_DESIGN) == STAGE_PUBLISHED
     assert stage_status_of(queue, "LEAF", STAGE_TEST_GENERATION) == STAGE_PUBLISHED

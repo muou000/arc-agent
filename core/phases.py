@@ -821,8 +821,11 @@ class WorkflowPhaseRunner:
             ):
                 return False
 
-        self.traceability.clear_node_design_artifacts(node_id)
-        await self._register_design_observably(node_id, prepared_interfaces, stored_tests)
+        # The interface publication already cleared and re-registered this
+        # node's contracts; clearing again here would drop-then-restore rows a
+        # sibling node may have attached to in the meantime. This store point
+        # adds only the test half.
+        await self._register_design_observably(node_id, [], stored_tests)
         reuse_evidence = baseline.get("coverage_reuse")
         if isinstance(reuse_evidence, dict):
             self.traceability.set_test_pass_statuses(

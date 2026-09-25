@@ -375,3 +375,132 @@ def test_stage_merge_queue_rehydrates_ready_publication_after_coordinator_restar
     assert queue["node_states"]["R"] == "DESIGNED"
     assert (repo / "backend" / "recovered.js").exists()
     assert not Path(handle.path).exists()
+
+
+def test_approved_cross_node_overlap_windows_execute_in_stage_worktrees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A's TEST_GENERATION and B's INTERFACE_DESIGN co-run in real worktrees.
+
+    The ADR 0008 approved window between two sibling leaves has to execute
+    real stage work (not just pass the scheduler policy): each stage runs in
+    its own worktree behind a disjoint declared write set, the two rendezvous
+    inside their runners, and both publications land through the serial merge
+    queue.
+    """
+
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    repo, _stage_manager = _init_repo(tmp_path)
+    tree = {
+        "id": "ROOT",
+        "name": "root",
+        "description": "root",
+        "children": [
+            {"id": "A", "name": "a", "description": "a", "children": []},
+            {"id": "B", "name": "b", "description": "b", "children": []},
+        ],
+    }
+    requirements = {
+        node_id: {"id": node_id, "children_ids": children}
+        for node_id, children in (("ROOT", ["A", "B"]), ("A", []), ("B", []))
+    }
+
+    class _Traceability:
+        def get_requirement(self, node_id: str) -> dict[str, object]:
+            return dict(requirements[node_id])
+
+        def list_interfaces(self, req_id: str) -> list[dict[str, object]]:
+            return []
+
+        def list_tests(self, req_id: str) -> list[dict[str, object]]:
+            return []
+
+        def upsert_node_state(self, _node_id: str, _state: str) -> None:
+            return None
+
+    class _Events:
+        def __getattr__(self, _name: str):
+            return lambda *_args, **_kwargs: None
+
+    window_writes = {
+        ("A", STAGE_INTERFACE_DESIGN): ["backend/a-feature.js"],
+        ("A", STAGE_TEST_GENERATION): ["tests/a.test.js"],
+        ("A", "IMPLEMENTATION"): ["backend/a-impl.js"],
+        ("B", STAGE_INTERFACE_DESIGN): ["backend/b-feature.js"],
+        ("B", STAGE_TEST_GENERATION): ["tests/b.test.js"],
+        ("B", "IMPLEMENTATION"): ["backend/b-impl.js"],
+    }
+    rendezvous_keys = {
+        ("A", STAGE_TEST_GENERATION),
+        ("B", STAGE_INTERFACE_DESIGN),
+    }
+    arrived: set[tuple[str, str]] = set()
+    both_here = asyncio.Event()
+    peak = 0
+
+    class _Runner:
+        def __init__(self, workspace: str) -> None:
+            self.workspace = Path(workspace)
+
+        async def _run(self, node_id: str, stage: str) -> bool:
+            nonlocal peak
+            key = (node_id, stage)
+            arrived.add(key)
+            peak = max(peak, len(arrived))
+            if key in rendezvous_keys:
+                if rendezvous_keys.issubset(arrived):
+                    both_here.set()
+                # The window must co-run; a sequential drain times out here.
+                await asyncio.wait_for(both_here.wait(), timeout=15)
+            for relative in window_writes.get(key, []):
+                path = self.workspace / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"{node_id}:{stage}\n", encoding="utf-8")
+            arrived.discard(key)
+            return True
+
+        async def run_interface_design_stage(
+            self, node_id: str, _requirement: dict[str, object]
+        ) -> bool:
+            return await self._run(node_id, STAGE_INTERFACE_DESIGN)
+
+        async def run_test_generation_stage(
+            self, node_id: str, _requirement: dict[str, object]
+        ) -> bool:
+            return await self._run(node_id, STAGE_TEST_GENERATION)
+
+        async def run_implement_phase(self, node_id: str, _requirement: dict[str, object]) -> bool:
+            return await self._run(node_id, "IMPLEMENTATION")
+
+    runtime = SimpleNamespace(traceability=_Traceability(), events=_Events())
+    manager = ARCWorkflowManager(
+        workspace_path=str(repo),
+        requirement_path="",
+        app_type="cli",
+        web_port=4300,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = runtime
+    manager._save_processing_queue = lambda _queue: None
+    manager._build_task_phase_runner = lambda workspace, _port, handle=None: _Runner(workspace)
+    queue = load_or_create_queue(str(repo / ".arc" / "processing_queue.json"), tree)
+    for task in queue["stage_tasks"]:
+        stage = task["stage"]
+        if stage == STAGE_VISUAL_ANALYSIS:
+            task["status"] = STAGE_PUBLISHED
+        else:
+            task["declared_write_set"] = list(
+                window_writes.get((str(task["node_id"]), stage), [])
+            )
+
+    asyncio.run(manager._drain_stage_tasks(queue, lambda task: manager._execute_stage_task(task, queue)))
+
+    assert both_here.is_set(), "the approved window never co-ran"
+    assert peak == 2
+    for relative in window_writes.values():
+        for path in relative:
+            assert (repo / path).exists(), f"{path} never reached integration"
+    assert not list((repo / ".arc" / "stage-worktrees").iterdir())
+    assert queue["node_states"] == {"ROOT": "PASSED", "A": "PASSED", "B": "PASSED"}

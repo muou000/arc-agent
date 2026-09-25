@@ -11,10 +11,14 @@ calls this module's narrow interface; ``TraceabilityStore`` stays the
 persistence implementation for the seven tables (runtime SDK contract,
 unchanged by design).
 
-The one ordering rule callers must preserve: successful DESIGN stores pass
-through :meth:`DesignArtifactRegistry.register_design` *after* the phase
-runner cleared the node's previous design artifacts — the clear is an
-orchestration decision (which retries and conflict re-queues take), the
+The one ordering rule callers must preserve: a successful DESIGN store point
+passes through :meth:`DesignArtifactRegistry.register_design` *after* the phase
+runner cleared the node's previous design artifacts at that point's owning
+stage. The split DESIGN keeps two store points: the interface publication
+clears and registers the contracts, and the later test publication registers
+tests only — its contracts are already published, and clearing them again
+would drop-then-restore rows other nodes may have attached to since. The clear
+is an orchestration decision (which retries and conflict re-queues take), the
 module never clears on its own.
 """
 
