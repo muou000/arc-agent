@@ -160,6 +160,13 @@ _ROUTE_STATUS_RE = re.compile(
     re.IGNORECASE,
 )
 _ROUTE_RETURN_STATUS_RE = re.compile(r"\breturn\b[\s\S]{0,160}?,\s*(?P<code>[1-5]\d{2})\b")
+_ROUTE_STATUS_COMMENT_RE = re.compile(r"^[ \t]*//[ \t]*(?P<code>[1-5]\d{2})[ \t]*(?:->|=>|:|：)[ \t]*\S", re.MULTILINE)
+_ROUTE_PLACEHOLDER_RE = re.compile(r"\bNOT_IMPLEMENTED\b|\bTODO\s*\(\s*TDD\s*\)", re.IGNORECASE)
+_ROUTE_STATEMENT_RE = re.compile(r"(?:[^;'\"]|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")*;", re.DOTALL)
+_STATUS_CODE_LIST_RE = re.compile(
+    r"\b(?:HTTP\s+)?status\s+codes?\s+(?:fixed|allowed|supported)\s*:\s*(?P<values>[^.\n]*)",
+    re.IGNORECASE,
+)
 _STATUS_TEXT_PATTERNS = (
     re.compile(
         r"\b(?:HTTP\s+)?status(?:\s+code|_code)?\s*(?:is|=|:|->|returns?|returned|为|是)\s*(?P<code>[1-5]\d{2})\b",
@@ -223,6 +230,10 @@ def _parse_status_codes(value: Any) -> list[int]:
 def _extract_status_codes_from_text(value: Any) -> list[int]:
     text = str(value or "")
     codes: list[int] = []
+    for match in _STATUS_CODE_LIST_RE.finditer(text):
+        for code in _parse_status_codes(match.group("values")):
+            if code not in codes:
+                codes.append(code)
     for pattern in _STATUS_TEXT_PATTERNS:
         for match in pattern.finditer(text):
             code = int(match.group("code"))
@@ -242,10 +253,10 @@ def _extract_status_codes_from_value(value: Any, *, key_hint: str = "") -> list[
                 candidates = _parse_status_codes(nested)
                 if not candidates and isinstance(nested, str):
                     candidates = _extract_status_codes_from_text(nested)
-            elif key in {"outputs", "responses", "response", "result", "data"}:
-                candidates = _extract_status_codes_from_value(nested, key_hint=key)
             else:
-                candidates = _extract_status_codes_from_value(nested, key_hint=key)
+                candidates = _extract_status_codes_from_value(
+                    nested, key_hint=key_hint if key_hint in {"outputs", "responses", "response"} else key
+                )
             for code in candidates:
                 if code not in codes:
                     codes.append(code)
@@ -412,15 +423,37 @@ def _extract_route_records(workspace_root: str | Path, interface: dict[str, Any]
         end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
         segment = content[match.start() : end]
         codes: list[int] = []
-        for status_match in _ROUTE_STATUS_RE.finditer(segment):
+        # A leading status-arrow comment is a route-level declaration, unlike a scaffold response.
+        for comment_match in _ROUTE_STATUS_COMMENT_RE.finditer(segment):
+            code = int(comment_match.group("code"))
+            if code not in codes:
+                codes.append(code)
+        # Scaffold responses describe unfinished code, not the intended contract.
+        executable = re.sub(r"/\*[\s\S]*?\*/|^[ \t]*//[^\n]*", "", segment, flags=re.MULTILINE)
+        placeholder_statements = [
+            (statement.start(), statement.end())
+            for statement in _ROUTE_STATEMENT_RE.finditer(executable)
+            if _ROUTE_PLACEHOLDER_RE.search(statement.group())
+        ]
+
+        def is_placeholder(position: int) -> bool:
+            return any(start <= position < stop for start, stop in placeholder_statements)
+
+        for status_match in _ROUTE_STATUS_RE.finditer(executable):
+            if is_placeholder(status_match.start()):
+                continue
             code = int(status_match.group("code"))
             if code not in codes:
                 codes.append(code)
-        for status_match in _ROUTE_RETURN_STATUS_RE.finditer(segment):
+        for status_match in _ROUTE_RETURN_STATUS_RE.finditer(executable):
+            if is_placeholder(status_match.start()):
+                continue
             code = int(status_match.group("code"))
             if code not in codes:
                 codes.append(code)
-        for option_match in re.finditer(r"\bstatus_code\s*=\s*([1-5]\d{2})\b", segment, re.IGNORECASE):
+        for option_match in re.finditer(r"\bstatus_code\s*=\s*([1-5]\d{2})\b", executable, re.IGNORECASE):
+            if is_placeholder(option_match.start()):
+                continue
             code = int(option_match.group(1))
             if code not in codes:
                 codes.append(code)
