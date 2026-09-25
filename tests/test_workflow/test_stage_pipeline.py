@@ -329,3 +329,29 @@ def test_serial_stage_pipeline_compile_uses_the_stage_drain(
 
     assert calls == ["stage"]
     assert result["ok"] is True
+
+
+def test_stage_pipeline_is_the_default_and_falsy_value_opts_out(
+    tmp_project_dir: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("ARC_STAGE_PIPELINE", raising=False)
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_project_dir),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    assert manager._stage_pipeline is True
+    assert manager._stage_worktree_manager is not None
+    assert manager.phase_runner.enforce_stage_domains is True
+
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "0")
+    off = ARCWorkflowManager(
+        workspace_path=str(tmp_project_dir),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    assert off._stage_pipeline is False
+    assert off._stage_worktree_manager is None
+    assert off.phase_runner.enforce_stage_domains is False

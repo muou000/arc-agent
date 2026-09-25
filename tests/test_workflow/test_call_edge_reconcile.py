@@ -79,6 +79,23 @@ async def _no_drain(queue_state: dict[str, Any]) -> None:
     return None
 
 
+async def _no_stage_drain(queue_state: dict[str, Any], execute_stage_task: Any) -> None:
+    return None
+
+
+def _stub_both_drains(manager: ARCWorkflowManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralize the drain regardless of which scheduler mode is the default.
+
+    These tests assert the completion-time call-edge reconcile, not the
+    drain: the queue must stay untouched while the wrap-up sweep runs. The
+    stage pipeline (the default) drains via ``_drain_stage_tasks``; the
+    legacy serial/parallel path uses ``_drain_runnable_tasks``.
+    """
+
+    monkeypatch.setattr(manager, "_drain_runnable_tasks", _no_drain)
+    monkeypatch.setattr(manager, "_drain_stage_tasks", _no_stage_drain)
+
+
 def _edge_reconcile_events(runtime: Any) -> list[dict[str, Any]]:
     events_path = Path(runtime.paths.runner_events_path)
     if not events_path.exists():
@@ -109,7 +126,7 @@ def test_fresh_compile_completion_backfills_forward_reference(
     _seed_forward_reference(runtime)
     logs: list[tuple] = []
     manager = _make_manager(tmp_project_dir, runtime, logs)
-    monkeypatch.setattr(manager, "_drain_runnable_tasks", _no_drain)
+    _stub_both_drains(manager, monkeypatch)
 
     result = asyncio.run(manager.compile_requirement_tree(dict(_TREE)))
 
@@ -148,7 +165,7 @@ def test_resume_completion_backfills_edges_a_crashed_run_left_behind(
     # What the previous (crashed) run persisted: a compatible queue file.
     queue_state = manager._load_or_create_processing_queue(dict(_TREE))
     manager._save_processing_queue(queue_state)
-    monkeypatch.setattr(manager, "_drain_runnable_tasks", _no_drain)
+    _stub_both_drains(manager, monkeypatch)
 
     asyncio.run(manager.compile_requirement_tree(dict(_TREE), resume_from_queue=True))
 

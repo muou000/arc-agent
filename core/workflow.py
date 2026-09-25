@@ -208,7 +208,9 @@ def _worktrees_enabled() -> bool:
 
 def _stage_pipeline_enabled() -> bool:
     raw = os.environ.get(ARC_STAGE_PIPELINE, "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # The stage pipeline is the default (post-rollout, ADR 0008); an explicit
+    # falsy value restores the pre-pipeline strict serial path.
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _affinity_depth() -> int:
@@ -298,9 +300,10 @@ class ARCWorkflowManager:
         # Per-node worktree parallelism (default off; ARC_NODE_WORKTREES=1
         # opts in) instead of the shared-workspace serial mode.
         self._parallel_mode = _worktrees_enabled()
-        # The stage pipeline is deliberately opt-in. Keeping the decision at
-        # manager construction makes one compile run internally consistent if
-        # the host environment changes while a run is in flight.
+        # The stage pipeline is the default; ARC_STAGE_PIPELINE=0/false/no/off
+        # restores the pre-pipeline strict serial path. Keeping the decision
+        # at manager construction makes one compile run internally consistent
+        # if the host environment changes while a run is in flight.
         self._stage_pipeline = _stage_pipeline_enabled()
         # Captured once per process like ARC_NODE_WORKTREES: one CLI run, one
         # grouping; a mid-run flip would put queued tasks in two groups' files.
@@ -308,9 +311,9 @@ class ARCWorkflowManager:
         self._worktree_manager = (
             NodeWorktreeManager(self.workspace_path) if self._parallel_mode else None
         )
-        # Stage worktrees are a separate opt-in rail. They are used only by
-        # the stage pipeline's serial-integration mode; the older node-worktree
-        # mode keeps its established lifecycle unchanged.
+        # Stage worktrees serve only the stage pipeline's serial-integration
+        # mode; the older node-worktree mode keeps its established lifecycle
+        # unchanged.
         self._stage_worktree_manager = (
             StageWorktreeManager(self.workspace_path) if self._stage_pipeline else None
         )
