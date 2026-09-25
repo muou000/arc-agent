@@ -233,7 +233,7 @@ def build_declare_test_manifest_tool(
     async def declare_test_manifest(files: list[dict[str, Any]]) -> str:
         """Declare and lock the test-file manifest for this stage run.
 
-        Call this before writing any test file, with one entry
+        Call ``declare_test_manifest`` before writing any test file, with one entry
         per test file you intend to create or update. ``coverage_scope`` is
         ``owned`` for behavior introduced by this node, ``dependency`` for a
         dependency regression, and ``shared`` for a shared-contract check:
@@ -247,8 +247,11 @@ def build_declare_test_manifest_tool(
         `test-e2e` directory. Include every planned test file in the first
         call; if the declaration is rejected, fix the reported issues and
         re-declare — the lock merges, adding only paths whose earlier
-        declaration failed. Test helpers and runner configs do not belong in
-        the manifest and stay writable without being declared.
+        declaration failed. Node-local helpers and fixtures do not belong in
+        the manifest. When the stage pipeline is active, they must be in the
+        current node's test namespace and declared with
+        ``declare_stage_write_set`` before writing; shared runner configuration
+        and fixtures are read-only in that mode.
         """
 
         if not isinstance(files, list) or not files:
@@ -304,8 +307,9 @@ def build_declare_test_manifest_tool(
                 errors.append(
                     f"Entry {index}: `{file_path}` does not look like a test file. "
                     "Manifest entries must be test files (`.test.`/`.spec.` in the "
-                    "name); helpers and runner configs are written without a "
-                    "manifest entry."
+                    "name); node-local helpers do not belong in the test-file manifest. "
+                    "In pipeline mode they need `declare_stage_write_set`; shared runner "
+                    "configuration is read-only in that mode."
                 )
                 continue
             namespace_error = manifest_lock.namespace_error(file_path)
