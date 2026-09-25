@@ -16,8 +16,10 @@ from agents.runtime.capabilities import (
     is_node_test_path,
     is_shared_test_resource,
     is_test_asset,
+    node_test_namespace_hint,
     normalize_manifest_path,
 )
+from agents.tools.declaration_budget import ConsecutiveRejectionBudget, rejected_message
 
 
 def normalize_write_set_path(value: object) -> str:
@@ -80,8 +82,9 @@ class StageWriteSetLock:
                 return f"Shared test resource `{path}` is read-only and cannot be declared for a stage write."
             if self.node_id and is_test_asset(path) and not is_node_test_path(path, self.node_id):
                 return (
-                    f"Test asset `{path}` is outside node `{self.node_id}`'s stable test namespace; "
-                    "sibling test paths cannot be declared for this stage."
+                    f"Test asset `{path}` is outside node `{self.node_id}`'s stable test namespace. "
+                    f"{node_test_namespace_hint(self.node_id)} "
+                    "Sibling test paths cannot be declared for this stage."
                 )
         proposed = set(normalized)
         if self._locked:
@@ -103,6 +106,8 @@ class StageWriteSetLock:
 def build_declare_stage_write_set_tool(*, stage: str, lock: StageWriteSetLock):
     """Build the model-facing declaration tool for one stage pass."""
 
+    rejection_budget = ConsecutiveRejectionBudget()
+
     async def declare_stage_write_set(paths: list[str]) -> str:
         """Declare every workspace-relative path this stage may write.
 
@@ -113,10 +118,19 @@ def build_declare_stage_write_set_tool(*, stage: str, lock: StageWriteSetLock):
         """
 
         if not isinstance(paths, list):
-            return _tool_error("The stage write set must be a JSON array of workspace-relative paths.")
+            return _tool_error(
+                rejected_message(
+                    rejection_budget,
+                    "declare_stage_write_set",
+                    "The stage write set must be a JSON array of workspace-relative paths.",
+                )
+            )
         error = lock.declare(paths)
         if error:
-            return _tool_error(error)
+            return _tool_error(
+                rejected_message(rejection_budget, "declare_stage_write_set", error)
+            )
+        rejection_budget.record_acceptance()
         return json.dumps(
             {
                 "status": "locked",
@@ -131,6 +145,13 @@ def build_declare_stage_write_set_tool(*, stage: str, lock: StageWriteSetLock):
             indent=2,
         )
 
+    if lock.node_id:
+        # The stable segment is a sha256 digest of the node id — unguessable
+        # for the model, so the tool description carries the concrete value
+        # from the first turn instead of leaving it to a rejection.
+        declare_stage_write_set.__doc__ = (declare_stage_write_set.__doc__ or "") + (
+            " " + node_test_namespace_hint(lock.node_id)
+        )
     declare_stage_write_set.__name__ = "declare_stage_write_set"
     return declare_stage_write_set
 
