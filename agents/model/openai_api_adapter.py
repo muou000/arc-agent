@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
+from urllib.parse import urlparse
 
 import httpx
 from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, OpenAIError
@@ -232,6 +233,7 @@ class ARCModelAPIError(RuntimeError):
         model: str,
         status_code: int | None = None,
         error_type: str = "",
+        base_url: str = "",
         original: BaseException | None = None,
     ) -> None:
         super().__init__(message)
@@ -239,6 +241,7 @@ class ARCModelAPIError(RuntimeError):
         self.model = model
         self.status_code = status_code
         self.error_type = error_type
+        self.base_url = str(base_url or "").strip()
         self.original = original
 
 
@@ -1107,14 +1110,26 @@ def reset_structured_output_support_cache_for_tests() -> None:
         _STRUCTURED_OUTPUT_SUPPORT_LOCKS.clear()
 
 
-def normalize_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model: str) -> Exception:
+def normalize_model_api_exception(
+    exc: Exception,
+    *,
+    api_mode: OpenAIAPIMode,
+    model: str,
+    base_url: str = "",
+) -> Exception:
     """Return ARC's normalized API exception when `exc` is model-provider related."""
 
-    return _wrap_model_api_exception(exc, api_mode=api_mode, model=model)
+    return _wrap_model_api_exception(exc, api_mode=api_mode, model=model, base_url=base_url)
 
 
-def _raise_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model: str) -> NoReturn:
-    wrapped = _wrap_model_api_exception(exc, api_mode=api_mode, model=model)
+def _raise_model_api_exception(
+    exc: Exception,
+    *,
+    api_mode: OpenAIAPIMode,
+    model: str,
+    base_url: str = "",
+) -> NoReturn:
+    wrapped = _wrap_model_api_exception(exc, api_mode=api_mode, model=model, base_url=base_url)
     if wrapped is exc:
         raise exc
     raise wrapped from exc
@@ -1273,7 +1288,9 @@ async def acall_model_with_retries(
                 failed_attempts += 1
                 _record_model_failure(endpoint_key, exc=exc)
                 if failed_attempts > policy.max_retries:
-                    _raise_model_api_exception(exc, api_mode=api_mode, model=model)
+                    _raise_model_api_exception(
+                        exc, api_mode=api_mode, model=model, base_url=base_url
+                    )
                 _log_model_retry(
                     exc,
                     failed_attempts=failed_attempts,
@@ -1285,9 +1302,12 @@ async def acall_model_with_retries(
                     stream_retry = not stream_retry
                 continue
             failed_attempts += 1
-            _record_model_failure(endpoint_key, exc=exc)
+            if _is_connection_failure(exc):
+                _record_model_failure(endpoint_key, exc=exc)
             if not _should_retry_model_exception(exc, failed_attempts=failed_attempts, policy=policy):
-                _raise_model_api_exception(exc, api_mode=api_mode, model=model)
+                _raise_model_api_exception(
+                    exc, api_mode=api_mode, model=model, base_url=base_url
+                )
             delay = _compute_retry_delay(policy, exc)
             next_stream = (
                 _is_connection_failure(exc)
@@ -1584,7 +1604,13 @@ def _raise_endpoint_unreachable(
         "The endpoint stopped answering; retrying would only burn more time. "
         "Check network connectivity or the provider status, then rerun with --resume."
     )
-    raise ARCModelAPIError(message, api_mode=api_mode, model=model, error_type="EndpointUnreachable")
+    raise ARCModelAPIError(
+        message,
+        api_mode=api_mode,
+        model=model,
+        error_type="EndpointUnreachable",
+        base_url=base_url,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1595,7 +1621,7 @@ def _raise_endpoint_unreachable(
 def _is_connection_failure(exc: Exception) -> bool:
     """Whether the failure suggests the endpoint itself stopped answering."""
 
-    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+    if isinstance(exc, (APIConnectionError, APITimeoutError, httpx.TransportError)):
         return True
     return isinstance(getattr(exc, "__cause__", None), httpx.TransportError) or isinstance(
         getattr(exc, "__cause__", None), (APIConnectionError, APITimeoutError)
@@ -1710,7 +1736,13 @@ async def _asleep(seconds: float) -> None:
         await asyncio.sleep(seconds)
 
 
-def _wrap_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model: str) -> Exception:
+def _wrap_model_api_exception(
+    exc: Exception,
+    *,
+    api_mode: OpenAIAPIMode,
+    model: str,
+    base_url: str = "",
+) -> Exception:
     if isinstance(exc, ARCModelAPIError):
         return exc
     if not _is_model_api_exception(exc):
@@ -1730,6 +1762,7 @@ def _wrap_model_api_exception(exc: Exception, *, api_mode: OpenAIAPIMode, model:
         model=model,
         status_code=status_code if isinstance(status_code, int) else None,
         error_type=error_type,
+        base_url=base_url,
         original=exc,
     )
 
@@ -1800,6 +1833,95 @@ def _short_error_text(exc: Exception, limit: int = 800) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "... [truncated]"
+
+
+MODEL_ERROR_PROVIDER_OUTAGE = "provider_outage"
+MODEL_ERROR_AUTHENTICATION = "authentication"
+MODEL_ERROR_RATE_LIMIT = "rate_limit"
+MODEL_ERROR_MODEL = "model_error"
+MODEL_ERROR_PROVIDER = "provider_error"
+MODEL_ERROR_PROMPT_OR_TOOL = "prompt_or_tool"
+
+
+def model_api_error_category(exc: BaseException) -> str:
+    """Classify a model failure without treating every API error as outage."""
+
+    if not isinstance(exc, ARCModelAPIError):
+        return MODEL_ERROR_PROMPT_OR_TOOL
+    raw_status_code = getattr(exc, "status_code", None)
+    try:
+        status_code = int(raw_status_code) if raw_status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    if status_code in {401, 403}:
+        return MODEL_ERROR_AUTHENTICATION
+    if status_code == 429:
+        return MODEL_ERROR_RATE_LIMIT
+    if isinstance(status_code, int) and status_code >= 500:
+        return MODEL_ERROR_PROVIDER
+    if isinstance(status_code, int) and 400 <= status_code < 500:
+        return MODEL_ERROR_MODEL
+    error_type = str(getattr(exc, "error_type", "") or "").strip().lower()
+    message = str(exc).lower()
+    if "endpointunreachable" in error_type or "endpoint unreachable" in message:
+        return MODEL_ERROR_PROVIDER_OUTAGE
+    if any(token in error_type for token in ("ratelimit", "rate_limit", "throttl")):
+        return MODEL_ERROR_RATE_LIMIT
+    return MODEL_ERROR_MODEL
+
+
+def is_provider_outage_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is the adapter's explicit endpoint-unreachable signal."""
+
+    return model_api_error_category(exc) == MODEL_ERROR_PROVIDER_OUTAGE
+
+
+def model_api_error_details(exc: BaseException) -> dict[str, Any]:
+    """Return secret-free provider metadata for the run-level outage gate."""
+
+    if not isinstance(exc, ARCModelAPIError):
+        return {
+            "fingerprint": "",
+            "provider": "",
+            "base_url": "",
+            "model": "",
+            "api_mode": "",
+            "error_category": MODEL_ERROR_PROMPT_OR_TOOL,
+            "error_type": type(exc).__name__,
+            "status_code": None,
+            "message": _short_error_text(exc, limit=500),
+        }
+    category = model_api_error_category(exc)
+    base_url = str(
+        getattr(exc, "base_url", "") or _get_openai_base_url() or "https://api.openai.com/v1"
+    ).strip().rstrip("/")
+    provider = _provider_name(base_url)
+    fingerprint_source = f"{provider}|{base_url}|{category}"
+    fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:24]
+    return {
+        "fingerprint": fingerprint,
+        "provider": provider,
+        "base_url": base_url,
+        "model": str(getattr(exc, "model", "") or "").strip(),
+        "api_mode": str(getattr(exc, "api_mode", "") or "").strip(),
+        "error_category": category,
+        "error_type": str(getattr(exc, "error_type", "") or type(exc).__name__).strip(),
+        "status_code": getattr(exc, "status_code", None),
+        "message": _redact_sensitive_text(_short_error_text(exc, limit=500)),
+    }
+
+
+def _provider_name(base_url: str) -> str:
+    if not base_url:
+        return "openai"
+    try:
+        return str(urlparse(base_url).hostname or base_url).strip().lower()
+    except ValueError:
+        return base_url
+
+
+def _redact_sensitive_text(value: str) -> str:
+    return re.sub(r"(?i)(bearer\s+|sk-[A-Za-z0-9_-]{8,})\S*", "[redacted]", value)
 
 
 def _one_line(value: Any) -> str:

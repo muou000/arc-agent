@@ -641,8 +641,15 @@ def next_runnable_task(
     """
 
     busy_nodes = {str(task.get("node_id", "")) for task in in_flight}
+    deferred_task_ids = {
+        str(task_id).strip()
+        for task_id in (queue_state.get("provider_outage_deferred_task_ids") or [])
+        if str(task_id).strip()
+    }
     for task in queue_state["tasks"]:
         if task_status(queue_state, task) != TASK_PENDING:
+            continue
+        if str(task.get("task_id", "")) in deferred_task_ids:
             continue
         if str(task.get("node_id", "")) in busy_nodes:
             continue
@@ -675,10 +682,17 @@ def next_affinity_task(
     in_flight_tasks = list(in_flight)
     busy_nodes = {str(task.get("node_id", "")) for task in in_flight_tasks}
     busy_groups = {affinity.get(node, node) for node in busy_nodes}
+    deferred_task_ids = {
+        str(task_id).strip()
+        for task_id in (queue_state.get("provider_outage_deferred_task_ids") or [])
+        if str(task_id).strip()
+    }
 
     pending_weight: dict[str, int] = {}
     for other in queue_state["tasks"]:
         if task_status(queue_state, other) != TASK_PENDING:
+            continue
+        if str(other.get("task_id", "")) in deferred_task_ids:
             continue
         node_id = str(other.get("node_id", ""))
         if node_id in busy_nodes:
@@ -698,6 +712,8 @@ def next_affinity_task(
     best_weight = -1
     for task in queue_state["tasks"]:
         if task_status(queue_state, task) != TASK_PENDING:
+            continue
+        if str(task.get("task_id", "")) in deferred_task_ids:
             continue
         node_id = str(task.get("node_id", ""))
         if node_id in busy_nodes:
