@@ -284,6 +284,15 @@ def test_tool_description_documents_redeclaration_merge() -> None:
     assert "the lock merges, adding only paths whose earlier declaration failed" in doc
 
 
+def test_tool_description_uses_a_namespace_safe_path_example() -> None:
+    tool = build_declare_test_manifest_tool(node_id="REQ-X", manifest_lock=TestManifestLock())
+
+    doc = " ".join((tool.__doc__ or "").split())
+    assert "backend/tests/unit/auth_service.test.js" not in doc
+    assert "stable segment in the exact path under the current node's generated namespace" in doc
+    assert "backend/tests/generated/<stable-segment>/unit/auth_service.test.js" in doc
+
+
 def test_declaration_rejects_empty_list() -> None:
     payload = _parse(_declare([]))
     assert payload["status"] == "error"
