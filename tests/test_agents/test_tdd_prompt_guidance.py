@@ -9,9 +9,14 @@ skill wording that guards each mode.
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+import yaml
+
 from agents.context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
+from agents.test_driven_developer import TestDrivenDeveloper
+from tests.helpers.faux import FauxChatModel, faux_tool_call, faux_text
 
 SKILL_ROOT = Path(__file__).resolve().parents[2] / "skills"
 
@@ -83,6 +88,101 @@ def test_repair_skill_read_only_forbidden_zones_pinned() -> None:
     # gate cannot drift apart silently.
     assert "The only valid verification of an environment repair is `run_tests`" in skill
     assert "If the layer is already closed (`ARC_TDD_HARD_STOP`)" in skill
+
+
+def test_arc_tdd_skill_description_targets_implement_stage() -> None:
+    """The optional TDD catalog entry must not invite an unsupported workflow."""
+
+    skill = (SKILL_ROOT / "test-driven-development" / "SKILL.md").read_text(encoding="utf-8")
+    frontmatter = yaml.safe_load(skill.split("---", 2)[1])
+    description = str(frontmatter["description"])
+
+    assert "TestDrivenDeveloper" in description
+    assert "IMPLEMENT" in description
+    assert "run_tests" in description
+    assert "any feature or bugfix" not in description
+    assert "before writing implementation code" not in description
+
+
+def test_arc_tdd_skill_obeys_arc_baseline_and_tool_contract() -> None:
+    """The full optional skill must align with staged RED evidence and tools."""
+
+    skill = (SKILL_ROOT / "test-driven-development" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "Baseline RED Evidence" in skill
+    assert "TestGenerator" in skill
+    assert "run_tests" in skill
+    assert "run_build" in skill
+    assert "execute" not in skill
+    assert "npm test" not in skill
+    assert "delete product" not in skill.lower()
+    assert "registered test" in skill.lower()
+
+
+def test_arc_tdd_catalog_is_safe_on_the_real_implement_surface(
+    tmp_project_dir: Path,
+    arc_runtime,
+) -> None:
+    """Faux model sees the rewritten catalog on the real TDD adapter surface."""
+
+    arc_runtime.traceability.store_requirement_tree(
+        {"id": "REQ-TDD-CATALOG", "name": "Counter", "description": "Add two numbers"}
+    )
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "read_file",
+                {"file_path": "/skills/test-driven-development/SKILL.md"},
+            ),
+            faux_text("DONE"),
+        ]
+    )
+    developer = TestDrivenDeveloper(
+        model=model,
+        workspace_root=str(tmp_project_dir),
+        requirement_path=str(tmp_project_dir / "requirements" / "req.md"),
+        app_type="web",
+    )
+
+    asyncio.run(
+        developer.run(
+            node_id="REQ-TDD-CATALOG",
+            test_files=["tests/test_counter.py"],
+            test_type="Unit",
+            node_tests=[],
+        )
+    )
+
+    assert model.bound_tool_name_sets
+    bound = set(model.bound_tool_name_sets[0])
+    assert {"run_tests", "run_build", "install_dependencies"} <= bound
+    assert "execute" not in bound
+
+    system_messages = [
+        message
+        for turn in model.calls
+        for message in turn
+        if getattr(message, "type", "") == "system"
+    ]
+    assert system_messages
+    system_prompt = "\n".join(str(message.content) for message in system_messages)
+    assert "test-driven-development" in system_prompt
+    assert "TestDrivenDeveloper" in system_prompt
+    assert "npm test" not in system_prompt
+
+    skill_results = [
+        message
+        for turn in model.calls
+        for message in turn
+        if getattr(message, "type", "") == "tool"
+        and getattr(message, "tool_call_id", "")
+    ]
+    assert skill_results
+    skill_content = "\n".join(str(message.content) for message in skill_results)
+    assert "Baseline RED Evidence" in skill_content
+    assert "run_tests" in skill_content
+    assert "npm test" not in skill_content
+    assert "never remove product files" in skill_content.lower()
 
 
 def test_harness_skill_strictmode_section_pinned() -> None:
