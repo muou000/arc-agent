@@ -116,7 +116,7 @@ make clean       # 清理 pytest 缓存与 __pycache__
 - 测试生成契约：`declare_test_manifest` 声明即锁、test 契约交接、E2E 场景隔离。
 - 阶段纪律与工具边界：`stage_discipline` 拦截与出路、阶段能力表、模板共享面写入
   门禁、工具参数清洗与截断守卫、permission denied 提示、delete/glob 路径边界、
-  write 回执指纹。
+  write 回执指纹、glob read-deny 扣留命中披露。
 - agent 基础设施：faux harness 本身、结构化输出支持探测、checkpointer 序列化、
   上下文缓存、会话复用、阶段会话接口、step 预算、skill 目录注入与选择、tool
   usage 事件、Windows 路径兼容。

@@ -46,6 +46,13 @@ no-match regex hint (whose "run a separate search per alternative" advice
 coached the per-keyword call loop the expansion removes) with text that
 matches the actual semantics, and injects a strategy-change prompt once one
 search scope accumulates consecutive no-match results.
+
+A sixth behavior (issue #296): the ``glob`` tool is rebuilt on its upstream
+factory seam so a receipt that would read as the bare ``No files found``
+while the search actually matched read-denied files (``node_modules``,
+``dist``, ...) instead discloses the withheld count and the denied-subtree
+segment names — never the full matching paths. Genuinely empty searches
+keep the bare sentinel; see ``ARCFilesystemMiddleware._with_withheld_note``.
 """
 
 from __future__ import annotations
@@ -65,6 +72,7 @@ from deepagents.middleware.filesystem import (
     DeleteSchema,
     EditFileSchema,
     FilesystemMiddleware,
+    GlobSchema,
     WriteFileSchema,
 )
 from langchain.agents.middleware.types import AgentMiddleware
@@ -202,6 +210,101 @@ def _delete_deny_pattern_resolver() -> "Callable[..., list[str]] | None":
         )
         return None
     return helper
+
+
+# Upstream renders an empty glob as exactly this sentinel line
+# (deepagents.middleware.filesystem._format_file_paths). The withheld-match
+# disclosure keys off the bare form: truncated receipts and receipts with
+# notes appended after the sentinel already carry their own explanation.
+_GLOB_NO_FILES_SENTINEL = "No files found"
+
+
+def _glob_permission_filter_resolver() -> "Callable[..., list[str]] | None":
+    """Resolve upstream's glob permission filter, or ``None`` if renamed.
+
+    Same posture as the delete deny-pattern helper above: a deepagents
+    upgrade that renames or removes it degrades to the bare upstream glob
+    receipt (the silent-empty behavior issue #296 fixes) instead of crashing
+    ``build_stage_agent``.
+    """
+
+    import deepagents.middleware.filesystem as filesystem_middleware
+
+    helper = getattr(filesystem_middleware, "_apply_permissions_to_glob_results", None)
+    if not callable(helper):
+        logging.getLogger(__name__).warning(
+            "deepagents %s no longer exposes the glob permission filter; "
+            "keeping upstream glob receipts",
+            _deepagents_version,
+        )
+        return None
+    return helper
+
+
+# Wildcard characters that make a deny-pattern segment non-literal. Only
+# literal segments (node_modules, dist, package-lock.json, ...) are nameable
+# in the withheld-match disclosure; wildcard-only segments are not.
+_GLOB_WILDCARD_SEGMENT_CHARS = "*?[]{}"
+
+
+def _deny_literal_segments(permissions: Any) -> "set[str]":
+    """Literal path segments of the read-deny rules.
+
+    The disclosure names denied subtrees, and only segments the deny rules
+    themselves name can be disclosed without leaking per-file detail. The
+    leading segment of an absolute pattern is the workspace anchor every
+    path shares (`/workspace/...`), so it is dropped as pure noise.
+    """
+
+    segments: set[str] = set()
+    for rule in permissions or []:
+        if getattr(rule, "mode", None) != "deny":
+            continue
+        if "read" not in (getattr(rule, "operations", None) or []):
+            continue
+        for pattern in getattr(rule, "paths", None) or []:
+            parts = [part for part in str(pattern).split("/") if part]
+            if str(pattern).startswith("/") and parts:
+                parts = parts[1:]
+            for part in parts:
+                if part and not any(char in part for char in _GLOB_WILDCARD_SEGMENT_CHARS):
+                    segments.add(part)
+    return segments
+
+
+def _denied_subtree_names(withheld_paths: "list[str]", literal_segments: "set[str]") -> "list[str]":
+    """Denied-subtree segment names the withheld paths actually sit under.
+
+    A path denied by ``/workspace/**/node_modules/**`` necessarily contains
+    the ``node_modules`` segment, so intersecting the withheld paths'
+    segments with the deny rules' literal segments yields truthful names
+    without echoing any full path.
+    """
+
+    names: set[str] = set()
+    for path in withheld_paths:
+        for segment in str(path).split("/"):
+            if segment in literal_segments:
+                names.add(segment)
+    return sorted(names)
+
+
+def _withheld_glob_note(count: int, names: "list[str]", *, truncated: bool) -> str:
+    """The disclosure that a bare-empty glob receipt actually had matches.
+
+    State the fact the model cannot infer from the scene (#281/#282
+    lesson): the search matched, but read-deny rules hide every match, so
+    pattern variants cannot succeed either.
+    """
+
+    quantifier = "at least " if truncated else ""
+    noun = "match" if count == 1 else "matches"
+    scope = f" ({', '.join(names)})" if names else ""
+    return (
+        f"Note: {quantifier}{count} {noun} withheld by read-deny{scope}. Matches "
+        "under denied subtrees are hidden from every pattern; retrying "
+        "pattern variants cannot list them."
+    )
 
 
 # Ground truth appended to successful write_file/edit_file receipts. Models
@@ -436,6 +539,21 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
     and post-edit disk reads, plus a capped excerpt) so the post-edit
     confirmation never motivates a whole-file re-read, which the post-write
     budget would block anyway (issue #247).
+
+    The glob tool is rebuilt on its upstream factory seam
+    (``_create_glob_tool``) with one receipt rewrite: upstream filters backend
+    matches by read permission and renders the filtered-empty list with the
+    same bare ``No files found`` a genuinely empty search produces, so a
+    pattern aimed at a denied subtree (``node_modules``, ``dist``, ...) reads
+    as "successful, nothing there" and invites endless pattern-variant
+    retries — the loop that consumed the last 15 minutes of the
+    easy-ticketbooking 2026-09-25 run (issue #296). When the receipt would be
+    the bare sentinel, the wrapper re-runs the search at the backend level
+    and discloses matches the read filter withheld: the count plus the
+    denied-subtree segment names, never the full matching paths (the
+    delete-tool rule that receipts cannot probe protected existence).
+    Genuinely empty searches, denied ``path`` arguments and traversal keep
+    upstream's receipts unchanged.
     """
 
     # Matches the stock core-stack entry so ``create_deep_agent`` replaces it
@@ -719,6 +837,139 @@ class ARCFilesystemMiddleware(FilesystemMiddleware):
             *_changed_region_lines(before_body, after_body),
             _WRITE_RECEIPT_NOTE,
         ]
+
+    # ------------------------------------------------------------------
+    # glob receipts that disclose matches withheld by the read-deny filter
+    # (issue #296). The upstream tool keeps doing the work; this wrapper only
+    # rewrites the bare-empty receipt when the search actually matched
+    # read-denied files (see _disclose_withheld_glob).
+    # ------------------------------------------------------------------
+
+    def _create_glob_tool(self) -> "BaseTool":
+        upstream_glob = super()._create_glob_tool()
+        resolve_visible = _glob_permission_filter_resolver()
+        if resolve_visible is None:
+            return upstream_glob
+        return StructuredTool.from_function(
+            name="glob",
+            description=upstream_glob.description,
+            func=self._glob_with_withheld_disclosure(upstream_glob.func, resolve_visible),
+            coroutine=self._aglob_with_withheld_disclosure(upstream_glob.coroutine, resolve_visible),
+            infer_schema=False,
+            args_schema=GlobSchema,
+        )
+
+    def _glob_with_withheld_disclosure(
+        self,
+        upstream_glob: "Callable[..., Any]",
+        resolve_visible: "Callable[..., list[str]]",
+    ) -> "Callable[..., ToolMessage]":
+        def sync_glob(pattern: str, runtime: ToolRuntime, path: "str | None" = None) -> ToolMessage:
+            result = upstream_glob(pattern=pattern, runtime=runtime, path=path)
+            if getattr(result, "content", None) != _GLOB_NO_FILES_SENTINEL:
+                return result
+            probe_result = self._safe_probe(self._glob_probe, pattern, path)
+            return self._with_withheld_note(result, probe_result, resolve_visible)
+
+        return sync_glob
+
+    def _aglob_with_withheld_disclosure(
+        self,
+        upstream_glob: "Callable[..., Any]",
+        resolve_visible: "Callable[..., list[str]]",
+    ) -> "Callable[..., Any]":
+        async def async_glob(pattern: str, runtime: ToolRuntime, path: "str | None" = None) -> ToolMessage:
+            result = await upstream_glob(pattern=pattern, runtime=runtime, path=path)
+            if getattr(result, "content", None) != _GLOB_NO_FILES_SENTINEL:
+                return result
+            probe_result = await self._safe_aprobe(self._aglob_probe, pattern, path)
+            return self._with_withheld_note(result, probe_result, resolve_visible)
+
+        return async_glob
+
+    def _glob_probe(self, pattern: str, path: "str | None") -> Any:
+        return self.backend.glob(pattern, path=path)
+
+    async def _aglob_probe(self, pattern: str, path: "str | None") -> Any:
+        return await self.backend.aglob(pattern, path=path)
+
+    def _safe_probe(self, probe: "Callable[..., Any]", pattern: str, path: "str | None") -> Any:
+        """The backend-level re-search, or ``None`` on any surprise.
+
+        Runs only after the upstream tool answered the bare sentinel, so it
+        repeats a walk that just completed; a failing probe keeps upstream's
+        receipt instead of corrupting it.
+        """
+
+        try:
+            return probe(pattern, validate_path(path) if path is not None else None)
+        except Exception:
+            logging.getLogger(__name__).debug("glob disclosure probe failed", exc_info=True)
+            return None
+
+    async def _safe_aprobe(self, probe: "Callable[..., Any]", pattern: str, path: "str | None") -> Any:
+        try:
+            return await probe(pattern, validate_path(path) if path is not None else None)
+        except Exception:
+            logging.getLogger(__name__).debug("glob disclosure probe failed", exc_info=True)
+            return None
+
+    def _with_withheld_note(
+        self,
+        result: Any,
+        probe_result: Any,
+        resolve_visible: "Callable[..., list[str]]",
+    ) -> Any:
+        """Rewrite a bare-empty glob receipt that actually had matches.
+
+        Upstream filters backend glob matches by read permission and renders
+        the filtered-empty list with the same bare ``No files found`` a
+        genuinely empty search produces — a "successful" empty that reads as
+        "the file is not there" and drove the easy-ticketbooking run's
+        pattern-variant loop against ``node_modules`` (issue #296). When the
+        receipt is the bare sentinel and the probe shows matches the read
+        filter withheld, the receipt discloses the count and the
+        denied-subtree segment names — never the full matching paths, so the
+        receipt cannot be used to probe which protected files exist (the
+        delete-tool precedent). Genuinely empty searches and every surprise
+        (probe error, nothing withheld) keep upstream's receipt untouched.
+        """
+
+        try:
+            content = getattr(result, "content", None)
+            if content != _GLOB_NO_FILES_SENTINEL or probe_result is None:
+                return result
+            if getattr(probe_result, "error", None):
+                return result
+            raw_matches = list(getattr(probe_result, "matches", None) or [])
+            if not raw_matches:
+                return result
+            visible_paths = set(resolve_visible(self._permissions, raw_matches))
+            withheld_paths = [
+                str(match.get("path", ""))
+                for match in raw_matches
+                if str(match.get("path", "")) not in visible_paths
+            ]
+            if not withheld_paths:
+                return result
+            result.content = "\n\n".join(
+                (
+                    content,
+                    _withheld_glob_note(
+                        len(withheld_paths),
+                        _denied_subtree_names(
+                            withheld_paths, _deny_literal_segments(self._permissions)
+                        ),
+                        truncated=bool(getattr(probe_result, "truncated", False)),
+                    ),
+                )
+            )
+            return result
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "glob withheld disclosure failed", exc_info=True
+            )
+            return result
 
 
 class WindowsCompatFilesystemBackend(FilesystemBackend):
