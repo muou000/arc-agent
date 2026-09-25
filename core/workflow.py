@@ -1574,24 +1574,30 @@ class ARCWorkflowManager:
         queue_state: dict[str, Any],
         node_id: str,
         stage: str,
-    ) -> None:
-        """Project a landed stage back onto the legacy aggregate state."""
+    ) -> str | None:
+        """Project a landed stage back onto the legacy aggregate state.
+
+        Returns the aggregate phase this publication completed
+        (``PHASE_DESIGN`` or ``PHASE_IMPLEMENT``), or ``None`` when the
+        aggregate stays in flight: a leaf's interface publication waits for
+        the same node's test publication before DESIGN completes.
+        """
 
         if stage == STAGE_INTERFACE_DESIGN:
             test_task = stage_task_of(queue_state, node_id, STAGE_TEST_GENERATION)
             if test_task is not None and bool(test_task.get("applicable", True)):
-                return
+                return None
             complete_task(queue_state, node_id, PHASE_DESIGN, on_state_change=self._upsert_node_state)
             marker = getattr(self.runtime.events, "mark_design_done", None)
             if callable(marker):
                 marker(node_id)
-            return
+            return PHASE_DESIGN
         if stage == STAGE_TEST_GENERATION:
             complete_task(queue_state, node_id, PHASE_DESIGN, on_state_change=self._upsert_node_state)
             marker = getattr(self.runtime.events, "mark_design_done", None)
             if callable(marker):
                 marker(node_id)
-            return
+            return PHASE_DESIGN
         if stage == STAGE_IMPLEMENTATION:
             complete_task(queue_state, node_id, PHASE_IMPLEMENT, on_state_change=self._upsert_node_state)
             marker = getattr(self.runtime.events, "mark_implementation_done", None)
@@ -1600,6 +1606,8 @@ class ARCWorkflowManager:
             marker = getattr(self.runtime.events, "mark_test_passed", None)
             if callable(marker):
                 marker(node_id)
+            return PHASE_IMPLEMENT
+        return None
 
     def _max_concurrent_tasks(self) -> int:
         if not self._parallel_mode:
@@ -3044,20 +3052,13 @@ class ARCWorkflowManager:
         if self._stage_worktrees_enabled():
             return await self._execute_stage_task_in_worktree(stage_task, queue_state, requirement_data)
 
-        if stage == STAGE_TEST_GENERATION:
-            # The current aggregate DESIGN runner already generated and
-            # published this stage. This branch only repairs a restored queue
-            # whose aggregate state is complete but whose stage projection is
-            # still pending.
-            if design_status_of(queue_state, node_id) == TASK_COMPLETED:
-                return {"status": STAGE_PUBLISHED}
-            return {
-                "status": STAGE_FAILED,
-                "error_category": "test_generation",
-                "error": "TEST_GENERATION is not independently runnable until the phase runner split",
-            }
+        if stage == STAGE_TEST_GENERATION and design_status_of(queue_state, node_id) == TASK_COMPLETED:
+            # Pre-split queue repair: the aggregate DESIGN runner already
+            # generated and published this stage; only the stage projection
+            # is still pending.
+            return {"status": STAGE_PUBLISHED}
 
-        if stage == STAGE_INTERFACE_DESIGN:
+        if stage in {STAGE_INTERFACE_DESIGN, STAGE_TEST_GENERATION}:
             phase = PHASE_DESIGN
         elif stage == STAGE_IMPLEMENTATION:
             phase = PHASE_IMPLEMENT
@@ -3084,20 +3085,72 @@ class ARCWorkflowManager:
                 "error": f"aggregate {phase} task is missing",
             }
 
-        self._begin_task(aggregate_task, queue_state)
-        await self._execute_task(aggregate_task, queue_state)
-        status = stage_status_of(queue_state, node_id, stage)
-        if status in {STAGE_PUBLISHED, STAGE_SKIPPED}:
-            return {"status": STAGE_PUBLISHED}
-        return {
-            "status": STAGE_FAILED,
-            "error_category": "aggregate_phase",
-            "error": str(
-                (stage_task_of(queue_state, node_id, stage) or {}).get(
-                    "error", f"{stage} did not publish"
+        task_ok = False
+        try:
+            if stage == STAGE_TEST_GENERATION:
+                # The interface stage's begin already moved the node into
+                # DESIGNING; re-beginning would re-emit design_started and try
+                # to flip the already-published interface stage to RUNNING.
+                task_ok = await self.phase_runner.run_test_generation_stage(
+                    node_id, requirement_data
                 )
-            ),
-        }
+            else:
+                self._begin_task(aggregate_task, queue_state)
+                if stage == STAGE_INTERFACE_DESIGN:
+                    task_ok = await self.phase_runner.run_interface_design_stage(
+                        node_id, requirement_data
+                    )
+                else:
+                    task_ok = await self.phase_runner.run_implement_phase(
+                        node_id, requirement_data
+                    )
+        except Exception as exc:
+            if provider_outage_threshold() > 0 and is_provider_outage_error(exc):
+                await self._handle_provider_outage_task(aggregate_task, queue_state, None, exc)
+                return {
+                    "status": STAGE_FAILED,
+                    "error_category": "provider_outage",
+                    "error": f"{stage} interrupted by provider outage: {exc}",
+                }
+            await self._log(
+                "Compiler",
+                f"{stage} stage task for node {node_id} crashed: {type(exc).__name__}: {exc}",
+                "error",
+                node_id=node_id,
+            )
+            task_ok = False
+
+        if not task_ok:
+            fail_task(queue_state, node_id, on_state_change=self._upsert_node_state)
+            self._save_processing_queue(queue_state)
+            if phase == PHASE_DESIGN:
+                self.runtime.events.mark_design_failed(node_id)
+                # Audit trail for the parent-serial gate: a failed parent
+                # unblocks its children, so record that they will design
+                # against the integration state without this shell.
+                descendants = queue_state.get("descendants", {}).get(node_id) or []
+                if descendants:
+                    await self._log(
+                        "Compiler",
+                        f"DESIGN failed for node {node_id}; {len(descendants)} descendant node(s) "
+                        f"({', '.join(descendants)}) will design against the integration state "
+                        "without this node's shell.",
+                        status="warning",
+                        node_id=node_id,
+                    )
+            else:
+                self.runtime.events.mark_implementation_failed(node_id)
+            return {
+                "status": STAGE_FAILED,
+                "error_category": "stage_execution",
+                "error": f"{stage} stage execution failed",
+            }
+
+        completed_phase = self._finalize_stage_publication(queue_state, node_id, stage)
+        if completed_phase is not None:
+            sessions.merge_node_session(node_id, {"resume_context": {}})
+            await self._commit_phase_checkpoint(node_id, completed_phase, requirement_data)
+        return {"status": STAGE_PUBLISHED}
 
     async def _execute_stage_task_in_worktree(
         self,
@@ -3219,10 +3272,10 @@ class ARCWorkflowManager:
         node_id = str(stage_task.get("node_id", "") or "")
         stage = str(stage_task.get("stage", "") or "").strip().upper()
         if stage == STAGE_TEST_GENERATION:
-            # The bundled runner still performs TestGenerator during DESIGN;
-            # the split runner in #255 will replace this no-op with the real
-            # independent stage without changing the worktree seam.
-            return stage_status_of(queue_state, node_id, STAGE_INTERFACE_DESIGN) == STAGE_PUBLISHED
+            # The interface stage's begin already moved the node into
+            # DESIGNING; re-beginning would try to flip the already-published
+            # interface stage back to RUNNING.
+            return bool(await runner.run_test_generation_stage(node_id, requirement_data))
 
         if stage == STAGE_INTERFACE_DESIGN:
             phase = PHASE_DESIGN
@@ -3242,8 +3295,8 @@ class ARCWorkflowManager:
         if aggregate_task is None:
             return False
         self._begin_task(aggregate_task, queue_state)
-        if phase == PHASE_DESIGN:
-            return bool(await runner.run_design_phase(node_id, requirement_data))
+        if stage == STAGE_INTERFACE_DESIGN:
+            return bool(await runner.run_interface_design_stage(node_id, requirement_data))
         return bool(await runner.run_implement_phase(node_id, requirement_data))
 
     def _stage_traceability_rows(self, node_id: str, method_name: str) -> list[dict[str, Any]]:

@@ -385,13 +385,51 @@ class WorkflowPhaseRunner:
     def events(self):
         return get_runtime().events
 
+    async def run_interface_design_stage(
+        self, node_id: str, requirement_data: dict[str, Any]
+    ) -> bool:
+        """Run and publish only the InterfaceDesigner stage.
+
+        Visual analysis is a coordinator-owned predecessor in the staged
+        pipeline.  This entry point therefore consumes the requirement row as
+        already published and never performs a second visual analysis pass.
+        Leaf nodes register their interface contracts here; the node's test
+        contract stays unpublished until :meth:`run_test_generation_stage`.
+        """
+
+        return await self._run_interface_design_stage(node_id, requirement_data)
+
+    async def run_test_generation_stage(
+        self, node_id: str, requirement_data: dict[str, Any]
+    ) -> bool:
+        """Run TestGenerator, its RED baseline, and publish the test contract.
+
+        Requires this node's published interface stage: the prepared
+        contracts and materialized files are read from the node session the
+        interface stage wrote, so the standalone stage and the bundled
+        ``run_design_phase`` path cannot drift apart.
+        """
+
+        return await self._run_test_generation_stage_from_session(node_id, requirement_data)
+
     async def run_design_phase(self, node_id: str, requirement_data: dict[str, Any]) -> bool:
+        """Run the bundled DESIGN flow: interface design, then test generation."""
+
         requirement_data = await analyze_and_attach_visual_references(
             workspace_path=self.context_workspace_path,
             requirements_dir=str(Path(self.requirement_path).expanduser().resolve().parent),
             requirement_data=requirement_data,
             log_cb=self._log,
         )
+        if not await self._run_interface_design_stage(node_id, requirement_data):
+            return False
+        return await self._run_test_generation_stage_from_session(node_id, requirement_data)
+
+    async def _run_interface_design_stage(
+        self, node_id: str, requirement_data: dict[str, Any]
+    ) -> bool:
+        """Run the InterfaceDesigner half of DESIGN and publish its contract."""
+
         requirement_data = self.traceability.get_requirement(node_id) or requirement_data
         # The leaf/non-leaf split must use the traceability record's
         # children_ids, not a caller's possibly-partial requirement snapshot.
@@ -553,7 +591,6 @@ class WorkflowPhaseRunner:
         )
         context_pipeline.cache.invalidate_db_layers(node_id)
 
-        stored_tests: list[dict[str, Any]] = []
         if is_non_leaf:
             self.traceability.clear_node_design_artifacts(node_id)
             await self._register_design_observably(node_id, prepared_interfaces, [])
@@ -595,6 +632,45 @@ class WorkflowPhaseRunner:
             f"Interface artifact summary: {json.dumps(summarize_interface_artifacts(prepared_interfaces), ensure_ascii=False)}",
             node_id=node_id,
         )
+        # The leaf's interface contract is this stage's publication; the test
+        # contract publishes only in _run_test_generation_stage_from_session,
+        # which re-clears and re-registers both halves after its RED baseline.
+        self.traceability.clear_node_design_artifacts(node_id)
+        await self._register_design_observably(node_id, prepared_interfaces, [])
+        context_pipeline.cache.invalidate_file_layers(node_id)
+        context_pipeline.cache.invalidate_db_layers(node_id)
+        await self._log(
+            "InterfaceDesigner",
+            f"Stored {len(prepared_interfaces)} interface definition(s) into traceability DB.",
+            node_id=node_id,
+        )
+        return True
+
+    async def _run_test_generation_stage_from_session(
+        self, node_id: str, requirement_data: dict[str, Any]
+    ) -> bool:
+        """Run the TestGenerator half of DESIGN from the interface publication."""
+
+        requirement_data = self.traceability.get_requirement(node_id) or requirement_data
+        is_non_leaf = bool(requirement_data.get("children_ids"))
+        if is_non_leaf:
+            # The interface stage already published the composition contract
+            # and logged the skip; a non-leaf node has no test work.
+            return True
+        node_session = sessions.load_node_session(node_id)
+        phase_status = node_session.get("phase_status") or {}
+        if str(phase_status.get("design", "") or "").strip().lower() != "prepared":
+            await self._log(
+                "TestGenerator",
+                "TEST_GENERATION requires this node's published INTERFACE_DESIGN stage first "
+                "(session phase_status.design is not 'prepared'); run interface design before "
+                "generating tests.",
+                status="error",
+                node_id=node_id,
+            )
+            return False
+        prepared_interfaces = list(node_session.get("interfaces") or [])
+        files_written = list(node_session.get("materialized_files") or [])
 
         await self._log("TestGenerator", "Generating tests from agent-selected coverage strategy.", node_id=node_id)
         tests, testgen_output = await self.test_generator.run(
@@ -733,8 +809,8 @@ class WorkflowPhaseRunner:
         await self.app_handler.shutdown_e2e_runtime()
         if baseline is None:
             # The gate hard-failed (green files survived every rejection
-            # round, or the repair pass broke the manifest); run_design_phase
-            # must not store the rejected artifacts.
+            # round, or the repair pass broke the manifest); the test
+            # publication must not store the rejected artifacts.
             return False
         if baseline.get("revised_tests") is not None:
             stored_tests = baseline["revised_tests"]

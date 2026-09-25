@@ -266,8 +266,15 @@ def test_stage_drain_runs_real_stage_worktrees_and_serial_merge_queue(
         def __init__(self, workspace: str) -> None:
             self.workspace = Path(workspace)
 
-        async def run_design_phase(self, _node_id: str, _requirement: dict[str, object]) -> bool:
+        async def run_interface_design_stage(
+            self, _node_id: str, _requirement: dict[str, object]
+        ) -> bool:
             (self.workspace / "backend" / "stage-feature.js").write_text("feature;\n", encoding="utf-8")
+            return True
+
+        async def run_test_generation_stage(
+            self, _node_id: str, _requirement: dict[str, object]
+        ) -> bool:
             return True
 
         async def run_implement_phase(self, _node_id: str, _requirement: dict[str, object]) -> bool:
