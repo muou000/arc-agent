@@ -28,6 +28,7 @@ sibling ``.arc`` state.
 
 from __future__ import annotations
 
+import copy
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -416,7 +417,15 @@ def transition_stage_task(
     if retry_at is not None or (next_status != STAGE_RETRY_WAIT and next_status != current):
         task["retry_at"] = retry_at
     if publication is not None:
-        task["publication"] = dict(publication)
+        incoming_publication = copy.deepcopy(dict(publication))
+        existing_publication = task.get("publication")
+        if (
+            current in {STAGE_READY_TO_MERGE, STAGE_PUBLISHED}
+            and existing_publication is not None
+            and incoming_publication != existing_publication
+        ):
+            raise ValueError(f"Publication for {node_id}:{stage} is immutable after publication")
+        task["publication"] = incoming_publication
     if error is not None:
         task["error"] = error
     elif next_status not in {STAGE_FAILED, STAGE_RETRY_WAIT}:
