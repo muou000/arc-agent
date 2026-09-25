@@ -3301,6 +3301,7 @@ class ARCWorkflowManager:
                 node_id,
                 stage,
                 declared_write_set=stage_task.get("declared_write_set"),
+                restart_failed_attempt=int(stage_task.get("attempt_count", 0) or 0) > 1,
             )
         except Exception:
             self._release_port_slot(slot)
