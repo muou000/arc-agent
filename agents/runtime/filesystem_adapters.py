@@ -53,6 +53,11 @@ while the search actually matched read-denied files (``node_modules``,
 ``dist``, ...) instead discloses the withheld count and the denied-subtree
 segment names — never the full matching paths. Genuinely empty searches
 keep the bare sentinel; see ``ARCFilesystemMiddleware._with_withheld_note``.
+``GlobGuidanceMiddleware`` (issue #298) gives glob the symmetric protection:
+consecutive no-hit globs on one scope get an escalating strategy-change note
+riding on the receipt, on the same ladder and reset semantics as the grep
+budget (the ``_NoHitStreaks`` counter class is shared; each middleware keeps
+its own instance, so the two budgets stay independent).
 """
 
 from __future__ import annotations
@@ -1315,6 +1320,30 @@ def _strip_upstream_regex_note(content: str, pattern: str) -> str:
     return content
 
 
+class _NoHitStreaks:
+    """Per-scope consecutive no-hit counter behind the grep and glob budgets.
+
+    The grep (#218) and glob (#298) budgets share one ladder design — hint
+    after ``_GREP_NO_MATCH_HINT_AFTER``, escalate at double that, reset on a
+    hit — so the counting lives here, single-source. A no-hit advances its
+    scope's count; a hit resets it to zero. Callers skip error results before
+    recording, so errors neither advance nor reset. The state lives on one
+    middleware instance per built stage agent — a session's conversation
+    scope.
+    """
+
+    def __init__(self) -> None:
+        self._streaks: dict[str, int] = {}
+
+    def record(self, scope: str, *, no_hit: bool) -> int:
+        if no_hit:
+            streak = self._streaks.get(scope, 0) + 1
+            self._streaks[scope] = streak
+            return streak
+        self._streaks[scope] = 0
+        return 0
+
+
 class GrepGuidanceMiddleware(AgentMiddleware[Any, Any, Any]):
     """Keep grep results honest about their semantics and bound no-match loops.
 
@@ -1339,7 +1368,7 @@ class GrepGuidanceMiddleware(AgentMiddleware[Any, Any, Any]):
     """
 
     def __init__(self) -> None:
-        self._no_match_streaks: dict[str, int] = {}
+        self._no_match_streaks = _NoHitStreaks()
 
     def wrap_tool_call(self, request: "ToolCallRequest", handler: Any) -> Any:
         return self._with_guidance(request, handler(request))
@@ -1364,12 +1393,7 @@ class GrepGuidanceMiddleware(AgentMiddleware[Any, Any, Any]):
             scope = str(args.get("path") or "").strip().rstrip("/") or "(default root)"
             expansion = alternation_expansion(pattern)
             no_match = content.split("\n\n", 1)[0] == _GREP_NO_MATCH_SENTINEL
-            if no_match:
-                streak = self._no_match_streaks.get(scope, 0) + 1
-                self._no_match_streaks[scope] = streak
-            else:
-                streak = 0
-                self._no_match_streaks[scope] = 0
+            streak = self._no_match_streaks.record(scope, no_hit=no_match)
 
             notes: list[str] = []
             if no_match:
@@ -1385,4 +1409,89 @@ class GrepGuidanceMiddleware(AgentMiddleware[Any, Any, Any]):
             return result
         except Exception:
             logger.debug("grep guidance rewrite failed", exc_info=True)
+            return result
+
+
+#: The glob ladder is the grep no-match ladder by design (issue #298: same
+#: hint-after-3, escalate-at-6, reset-on-hit semantics, shared ``_NoHitStreaks``
+#: counter) — do not start a second ladder.
+_GLOB_NO_HIT_HINT_AFTER = _GREP_NO_MATCH_HINT_AFTER
+_GLOB_NO_HIT_ESCALATE_AFTER = _GREP_NO_MATCH_ESCALATE_AFTER
+
+
+def _glob_budget_note(streak: int, scope: str, *, withheld: bool = False) -> str:
+    """The strategy-change prompt for a scope accumulating no-hit globs."""
+
+    if withheld:
+        return (
+            f"Glob budget: {streak} consecutive no-hit globs on {scope}. "
+            "Matches in read-denied subtrees were withheld; stop probing "
+            "those subtrees and change strategy."
+        )
+    if streak >= _GLOB_NO_HIT_ESCALATE_AFTER:
+        return (
+            f"Glob budget: {streak} consecutive no-hit globs on {scope}. "
+            "The file you keep guessing for is very likely absent from this "
+            "scope — stop searching it; change strategy."
+        )
+    return (
+        f"Glob budget: {streak} consecutive no-hit globs on {scope}. "
+        "Stop enumerating pattern variants — read the candidate file "
+        "(`read_file` with offset/limit) or the code that imports it instead. "
+        "A no-hit glob does not prove a file is absent: matches under "
+        "read-denied subtrees (node_modules, dist, build, coverage, lockfiles) "
+        "are withheld, not listed."
+    )
+
+
+class GlobGuidanceMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Bound no-hit glob loops with an escalating budget note (issue #298).
+
+    Symmetric to the grep no-match budget. The 2026-09-25 easy-ticketbooking
+    run burned ~110 no-hit globs in its final 15 minutes — pattern variants
+    over ``node_modules`` returning bare ``No files found`` with no signal to
+    change strategy — and the run died in that loop. The streak is tracked
+    per scope (the call's ``path`` argument) through the shared
+    ``_NoHitStreaks`` counter class (this middleware owns its own instance,
+    so grep and glob budgets stay independent), keeping the ladder and reset
+    semantics single-source with the grep side; error results (denied paths)
+    are skipped before recording and thus neither count nor reset.
+
+    Best-effort like the grep guidance: any failure leaves the tool result
+    untouched rather than breaking the call.
+    """
+
+    def __init__(self) -> None:
+        self._no_hit_streaks = _NoHitStreaks()
+
+    def wrap_tool_call(self, request: "ToolCallRequest", handler: Any) -> Any:
+        return self._with_guidance(request, handler(request))
+
+    async def awrap_tool_call(self, request: "ToolCallRequest", handler: Any) -> Any:
+        return self._with_guidance(request, await handler(request))
+
+    def _with_guidance(self, request: "ToolCallRequest", result: Any) -> Any:
+        try:
+            call = getattr(request, "tool_call", None) or {}
+            if str(call.get("name") or "") != "glob":
+                return result
+            content = getattr(result, "content", None)
+            if not isinstance(content, str):
+                return result
+            if str(getattr(result, "status", "") or "") == "error":
+                # Errors (denied paths, refused globs) are not no-hits:
+                # they must neither advance nor reset the budget streak.
+                return result
+            args = call.get("args") or {}
+            scope = str(args.get("path") or "").strip().rstrip("/") or "(default root)"
+            no_hit = content.split("\n\n", 1)[0] == _GLOB_NO_FILES_SENTINEL
+            streak = self._no_hit_streaks.record(scope, no_hit=no_hit)
+            if not no_hit or streak < _GLOB_NO_HIT_HINT_AFTER:
+                return result
+            first_note = content.split("\n\n", 2)[1] if "\n\n" in content else ""
+            withheld = first_note.startswith("Note: ") and " withheld by read-deny" in first_note
+            result.content = content + "\n\n" + _glob_budget_note(streak, scope, withheld=withheld)
+            return result
+        except Exception:
+            logger.debug("glob guidance rewrite failed", exc_info=True)
             return result

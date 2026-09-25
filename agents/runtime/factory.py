@@ -19,6 +19,7 @@ from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.filesystem_adapters import (
     ARCFilesystemMiddleware,
     ArcCompositeBackend,
+    GlobGuidanceMiddleware,
     GrepGuidanceMiddleware,
     MAX_GREP_ALTERNATIVES,
     PermissionDeniedHintMiddleware,
@@ -564,8 +565,10 @@ def build_stage_agent(
             PermissionDeniedHintMiddleware(),
             # Innermost result shaper: strips upstream's loop-coaching grep
             # note, states the alternation semantics, and enforces the
-            # no-match budget (issue #218).
+            # no-match budget (issue #218). The glob middleware is its
+            # symmetric no-hit stop-loss (issue #298).
             GrepGuidanceMiddleware(),
+            GlobGuidanceMiddleware(),
         ]
     )
     # Mount-time capability filter: the same table the middleware enforces

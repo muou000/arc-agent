@@ -62,6 +62,29 @@ def test_repair_skill_rules_pinned() -> None:
     assert "22. When a React test asserts an exact count" in skill
 
 
+def test_repair_skill_read_only_forbidden_zones_pinned() -> None:
+    """The 2026-09-25 easy-ticketbooking run burned its last 15 minutes
+    probing ``node_modules`` (110 no-hit globs) because no model-facing
+    surface said the dependency/build subtrees are off-limits and that an
+    empty/denied result is not proof of absence (issue #298). Rule 10b is
+    the canonical statement; a weaker rewording must fail this pin."""
+    skill = (SKILL_ROOT / "tdd-test-failure-repair" / "SKILL.md").read_text(encoding="utf-8")
+    assert "10b. Read-only forbidden zones:" in skill
+    # The zone enumeration follows the mechanical deny list, lockfiles included.
+    assert "`node_modules`, `dist`, `dist-ssr`, `build`, `coverage`, `.vite`" in skill
+    assert "`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`" in skill
+    assert "`.arc` (except `.arc/tdd_runs`)" in skill
+    # Empty/denied is not absence — the load-bearing fact the run lacked.
+    assert "does not mean the file does not exist" in skill
+    assert "matches under denied subtrees are withheld, not listed" in skill
+    # run_tests is the only verification channel, and the gate vocabulary is
+    # quoted verbatim: the executor's ARC_TDD_HARD_STOP copy is pinned on the
+    # other side (tests/test_workflow/test_tdd_executor.py), so skill and
+    # gate cannot drift apart silently.
+    assert "The only valid verification of an environment repair is `run_tests`" in skill
+    assert "If the layer is already closed (`ARC_TDD_HARD_STOP`)" in skill
+
+
 def test_harness_skill_strictmode_section_pinned() -> None:
     skill = (SKILL_ROOT / "web-test-harness-skill" / "SKILL.md").read_text(encoding="utf-8")
     assert "## StrictMode and exact-call-count assertions" in skill

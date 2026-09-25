@@ -427,7 +427,13 @@ def _declared_stage_write_set(task: Mapping[str, Any]) -> set[str] | None:
 
 
 def stage_write_sets_disjoint(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    """Return whether two declared stage write sets are provably disjoint."""
+    """Return whether two declared stage write sets are provably disjoint.
+
+    Pure declaration-level predicate: a missing declaration on either side is
+    *not* disjoint here. The overlap gate (:func:`stage_overlap_allowed`)
+    additionally proves disjointness structurally for the approved pairs, so
+    a first-pass pair without visible declarations is not fail-closed.
+    """
 
     left_set = _declared_stage_write_set(left)
     right_set = _declared_stage_write_set(right)
@@ -436,12 +442,57 @@ def stage_write_sets_disjoint(left: Mapping[str, Any], right: Mapping[str, Any])
     return left_set.isdisjoint(right_set)
 
 
+def _approved_pair_structurally_disjoint(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+    left_set: set[str] | None,
+    right_set: set[str] | None,
+) -> bool:
+    """Structural disjointness proof for one approved pair (issue #295).
+
+    The stage pipeline disciplines every formal stage with the capability
+    predicates this module already imports: TestGenerator may only write
+    test assets, and every stage's test-asset writes are confined to its own
+    node's stable test namespace (product writes are never test assets). For
+    a cross-node approved pair those confinements alone prove the actual
+    write sets disjoint, so a first-pass pair whose declarations are not
+    visible to the scheduler yet can overlap instead of fail-closing on
+    queue metadata no production path populates before dispatch.
+
+    Explicit declarations stay authoritative and only tighten the proof: a
+    generator declaring a path outside its own namespace voids it (the
+    discipline would block the write, but the declared intent departs from
+    the confinement the proof relies on), and a declared path on the other
+    side that lands inside the generator's namespace keeps the pair refused.
+    """
+
+    if _stage_name(left) == STAGE_TEST_GENERATION:
+        test_gen, other, test_gen_set, other_set = left, right, left_set, right_set
+    else:
+        test_gen, other, test_gen_set, other_set = right, left, right_set, left_set
+    if _stage_name(test_gen) != STAGE_TEST_GENERATION:
+        return False
+    test_gen_node = _stage_node_id(test_gen)
+    other_node = _stage_node_id(other)
+    if not test_gen_node or not other_node or test_gen_node == other_node:
+        return False
+    if test_gen_set and any(
+        not is_node_test_path(path, test_gen_node) for path in test_gen_set
+    ):
+        return False
+    if other_set is None:
+        return True
+    return not any(is_node_test_path(path, test_gen_node) for path in other_set)
+
+
 def stage_overlap_allowed(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     """Return whether two stage worktrees may execute at the same time.
 
     Visual analysis does not write a product worktree, so it is independent of
     every formal stage. All other overlap is limited to the two ADR-approved
-    adjacent windows and requires explicit, disjoint write sets.
+    adjacent windows and requires provably disjoint writes: explicit
+    declarations when both sides are visible, otherwise the pipeline's
+    structural write confinement for the approved cross-node pairs.
     """
 
     left_stage = _stage_name(left)
@@ -454,7 +505,11 @@ def stage_overlap_allowed(left: Mapping[str, Any], right: Mapping[str, Any]) -> 
         return False
     if frozenset({left_stage, right_stage}) not in _APPROVED_STAGE_OVERLAPS:
         return False
-    return stage_write_sets_disjoint(left, right)
+    left_set = _declared_stage_write_set(left)
+    right_set = _declared_stage_write_set(right)
+    if left_set is not None and right_set is not None:
+        return left_set.isdisjoint(right_set)
+    return _approved_pair_structurally_disjoint(left, right, left_set, right_set)
 
 
 def _stage_node_order(task: Mapping[str, Any]) -> int | None:

@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from agents.runtime.capabilities import node_test_namespace_prefixes
 from core.queue_state import (
     STAGE_INTERFACE_DESIGN,
     STAGE_IMPLEMENTATION,
@@ -156,12 +157,54 @@ def test_only_approved_disjoint_stage_windows_can_overlap() -> None:
     assert not stage_overlap_allowed(test_generation, conflicting_design)
 
 
-def test_missing_write_set_fails_closed_before_overlap() -> None:
+def test_generator_declaration_outside_its_namespace_fails_closed() -> None:
+    # The generator declared a path its own node test domain would never
+    # admit ("tests/n.test.ts" is a test asset outside node N's namespace):
+    # the intent departs from the structural confinement the overlap proof
+    # relies on, so the pair stays refused even though the sibling stage has
+    # not declared anything yet.
     test_generation = _stage("N", STAGE_TEST_GENERATION, 0, writes=["tests/n.test.ts"])
     interface_design = _stage("N+1", STAGE_INTERFACE_DESIGN, 1)
 
     assert not stage_write_sets_disjoint(test_generation, interface_design)
     assert not stage_overlap_allowed(test_generation, interface_design)
+
+
+def test_first_pass_approved_pairs_overlap_without_declared_write_sets() -> None:
+    # Issue #295: a fresh queue never populates declared_write_set before
+    # dispatch, so fail-closing on the missing metadata made the two ADR
+    # windows unreachable on a first pass. The pipeline disciplines every
+    # formal stage (TestGenerator writes only its node's test namespace;
+    # the other stages' test-asset writes stay in their own namespace), so
+    # the approved cross-node pairs are provably disjoint without any
+    # declaration.
+    test_generation = _stage("N", STAGE_TEST_GENERATION, 0)
+    interface_design = _stage("N+1", STAGE_INTERFACE_DESIGN, 1)
+    implementation = _stage("N", STAGE_IMPLEMENTATION, 2)
+    next_test_generation = _stage("N+1", STAGE_TEST_GENERATION, 3)
+
+    assert stage_overlap_allowed(test_generation, interface_design)
+    assert stage_overlap_allowed(implementation, next_test_generation)
+    # The structural proof licenses only the approved cross-node windows.
+    assert not stage_overlap_allowed(interface_design, _stage("N+1", STAGE_IMPLEMENTATION, 4))
+    assert not stage_overlap_allowed(test_generation, _stage("N", STAGE_INTERFACE_DESIGN, 5))
+    assert not stage_overlap_allowed(interface_design, _stage("N", STAGE_INTERFACE_DESIGN, 6))
+
+
+def test_generator_namespace_declaration_keeps_the_window_open() -> None:
+    prefix = node_test_namespace_prefixes("N")[1]
+    test_generation = _stage("N", STAGE_TEST_GENERATION, 0, writes=[f"{prefix}/api.test.js"])
+    interface_design = _stage("N+1", STAGE_INTERFACE_DESIGN, 1)
+
+    assert stage_overlap_allowed(test_generation, interface_design)
+
+
+def test_sibling_declaration_inside_the_generator_namespace_stays_refused() -> None:
+    prefix = node_test_namespace_prefixes("N")[1]
+    test_generation = _stage("N", STAGE_TEST_GENERATION, 0)
+    sibling_design = _stage("N+1", STAGE_INTERFACE_DESIGN, 1, writes=[f"{prefix}/helper.ts"])
+
+    assert not stage_overlap_allowed(test_generation, sibling_design)
 
 
 def test_published_write_set_is_used_when_the_task_field_is_not_registered_yet() -> None:
@@ -219,6 +262,43 @@ def test_stage_selector_rejects_non_adjacent_overlap_even_when_writes_are_disjoi
     )
 
     assert next_runnable_stage_task(queue, [active_design], max_in_flight=2) is None
+
+
+def test_stage_selector_opens_the_first_pass_test_generation_window() -> None:
+    # Issue #295 at the selector level: the running generator carries no
+    # declared_write_set (fresh first pass) and the adjacent candidate has
+    # none either; the pick must still happen through the structural proof.
+    running_generation = _stage("A", STAGE_TEST_GENERATION, 2, "RUNNING", node_order=0)
+    candidate_design = _stage("B", STAGE_INTERFACE_DESIGN, 4, node_order=1)
+    queue = _queue(
+        _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_PUBLISHED, node_order=0),
+        running_generation,
+        _stage("B", STAGE_VISUAL_ANALYSIS, 3, STAGE_PUBLISHED, node_order=1),
+        candidate_design,
+    )
+
+    pick = next_runnable_stage_task(queue, [running_generation], max_in_flight=2)
+
+    assert pick is candidate_design
+
+
+def test_stage_selector_opens_the_first_pass_implementation_window() -> None:
+    running_implementation = _stage("A", STAGE_IMPLEMENTATION, 3, "RUNNING", node_order=0)
+    candidate_generation = _stage("B", STAGE_TEST_GENERATION, 5, node_order=1)
+    queue = _queue(
+        _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_TEST_GENERATION, 2, STAGE_PUBLISHED, node_order=0),
+        running_implementation,
+        _stage("B", STAGE_VISUAL_ANALYSIS, 4, STAGE_PUBLISHED, node_order=1),
+        _stage("B", STAGE_INTERFACE_DESIGN, 6, STAGE_PUBLISHED, node_order=1),
+        candidate_generation,
+    )
+
+    pick = next_runnable_stage_task(queue, [running_implementation], max_in_flight=2)
+
+    assert pick is candidate_generation
 
 
 def test_stage_backpressure_stops_new_work_when_publications_are_queued() -> None:
@@ -282,6 +362,48 @@ def test_stage_drain_uses_bounded_slots_and_the_approved_overlap_window(
     asyncio.run(manager._drain_stage_tasks(queue, execute))
 
     assert peak == 2
+    assert all(task["status"] == STAGE_PUBLISHED for task in queue["stage_tasks"])
+
+
+def test_stage_drain_opens_the_first_pass_window_without_declared_write_sets(
+    tmp_project_dir: Path, runtime, monkeypatch
+) -> None:
+    # Issue #295 end to end: the same adjacent pair as the bounded-slot test
+    # but with no hand-fed declared_write_set on either side - exactly the
+    # queue shape every fresh compile produces. The drain must still run the
+    # approved pair concurrently instead of serializing the whole pipeline.
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_project_dir),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = runtime
+    manager._save_processing_queue = lambda _queue: None
+    queue = _queue(
+        _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_TEST_GENERATION, 2, node_order=0),
+        _stage("B", STAGE_VISUAL_ANALYSIS, 3, STAGE_PUBLISHED, node_order=1),
+        _stage("B", STAGE_INTERFACE_DESIGN, 4, node_order=1),
+        _stage("B", STAGE_TEST_GENERATION, 5, node_order=1),
+    )
+    active: set[str] = set()
+    peak = 0
+
+    async def execute(stage_task: dict[str, Any]) -> dict[str, Any]:
+        nonlocal peak
+        active.add(stage_task["stage_task_id"])
+        peak = max(peak, len(active))
+        await asyncio.sleep(0)
+        active.remove(stage_task["stage_task_id"])
+        return {"status": STAGE_PUBLISHED}
+
+    asyncio.run(manager._drain_stage_tasks(queue, execute))
+
+    assert peak == 2, "the first-pass overlap window must open without declared write sets"
     assert all(task["status"] == STAGE_PUBLISHED for task in queue["stage_tasks"])
 
 
