@@ -234,7 +234,10 @@ class FakeAppHandler:
         return (
             "Exit Code: 0\n"
             f"Installed '{package}' into {target}/node_modules (no-save; package.json and "
-            "lockfile untouched). Re-run run_tests to validate the repair.\n"
+            "lockfile untouched). If the TDD layer is still open, re-run run_tests "
+            "to validate the repair. If ARC_TDD_HARD_STOP has closed it, do not retry; "
+            "record the installation as unverified in the failure report for a fresh "
+            "TDD pass. Do not inspect node_modules or dist to verify the installation.\n"
         )
 
     def validate_test_path(self, test_type: str, file_path: str) -> str:
