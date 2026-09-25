@@ -109,3 +109,13 @@ _避免_：拆块续写、分块绕过
 **回填阶梯（Backfill Ladder）**：
 字段级校验判负之前的确定性补全顺序：条目自身字段 → 已存储的追溯行 → 机械推导（interface_id 的类型段、节点前缀机械 test_id、词汇表默认值）。全部来源穷尽才允许一次 repair，repair 穷尽才判负；没有回填来源且无法登记的条目丢弃但必须可观察。`coverage_scope` 缺失按 `owned` 处理——保守默认：错误地按 owned 处理会在基线 RED 门与 owned-覆盖检查中响亮失败，按 dependency/shared 默认则会静默豁免 witness（ADR 0007）。既有实现复用只有在接口状态、历史 implement checkpoint、完整覆盖映射和当前绿测结果同时成立时才记录为 `reused/converged`；任一证据缺失仍要求当前节点的 owned RED witness。
 _避免_：校验即终判、静默丢弃
+
+### 门禁与校验
+
+**状态契约门禁（Status Contract Gate）**：
+TestGenerator 产物中 HTTP 状态断言的静态契约校验：状态码按需求文本 → 接口卡 → 路由源码的顺序解析，无隐式 200 回退；契约提不出状态码时报 needs-info 诊断，断言与契约冲突时报 conflict 诊断。needs-info 的本意是把契约缺口交回设计侧补齐，不是拒绝与契约一致的断言。
+_避免_：状态码校验器、HTTP 断言检查
+
+**测试契约预检（Test Contract Preflight）**：
+TDD session 启动前对生成测试的 fail-closed 静态检查（文件物化、模块语法、runner 入口与全局、runner 依赖、配置契约）。deterministic 诊断阻止 TDD 启动；只有运行时才能判定的问题（动态导入、bundler 别名）一律 fail-open 留给 runner。预检拦的是可静态证明的破损，真实 runner 仍是运行时权威——与机械现实原则同源（ADR 0006）。
+_避免_：测试静态分析、TDD 门禁（泛称）
