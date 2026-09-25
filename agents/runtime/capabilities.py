@@ -140,6 +140,28 @@ def node_test_namespace_prefixes(node_id: object) -> tuple[str, ...]:
     )
 
 
+def node_test_namespace_hint(node_id: object) -> str:
+    """Render the concrete accepted test namespaces for one node.
+
+    The stable segment is a digest of the node id, so no prompt or error that
+    states the rule as a placeholder (`generated/<stable-node-id>/...`) is
+    actionable: the model cannot derive ``sha256`` itself, and the
+    easy-ticketbooking run of 2026-09-25 burned 60+ byte-identical
+    ``declare_test_manifest`` calls guessing the segment (`REQ-1`, `req-1`,
+    ...). Errors and tool descriptions render the accepted prefixes through
+    this one helper so the text cannot drift from
+    :func:`node_test_namespace_prefixes`.
+    """
+
+    segment = stable_node_path_segment(node_id)
+    accepted = ", ".join(f"`{prefix}/...`" for prefix in node_test_namespace_prefixes(node_id))
+    return (
+        f"The stable test namespace segment for node `{node_id}` is `{segment}` "
+        "(a digest derived from the node id, not the raw id): test files must be "
+        f"declared and written under {accepted}."
+    )
+
+
 def is_node_test_path(path: str, node_id: object) -> bool:
     """Whether a test asset belongs to the current node's stable namespace."""
 

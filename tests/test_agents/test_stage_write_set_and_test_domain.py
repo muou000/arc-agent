@@ -13,9 +13,11 @@ from agents.runtime.capabilities import (
     capability_for,
     is_node_test_path,
     node_test_namespace,
+    node_test_namespace_hint,
     stable_node_path_segment,
 )
 from agents.runtime.stage_discipline import StageDisciplineMiddleware
+from agents.tools.declaration_budget import ESCALATION_THRESHOLD
 from agents.tools.stage_write_set import StageWriteSetLock, build_declare_stage_write_set_tool
 from agents.tools.test_manifest import (
     DeclaredTestFile,
@@ -225,3 +227,100 @@ def test_stage_prompts_name_the_write_set_and_node_domain_contract() -> None:
     assert "declare_stage_write_set" in interface_designer.get_system_prompt()
     assert "stable app-type namespace" in test_generator.get_system_prompt()
     assert "current node's test namespace" in test_driven_developer.get_system_prompt()
+
+
+def test_namespace_hint_discloses_concrete_segment() -> None:
+    hint = node_test_namespace_hint("REQ-1")
+    segment = stable_node_path_segment("REQ-1")
+    assert segment in hint
+    assert "not the raw id" in hint
+    for prefix in (
+        "tests/generated",
+        "frontend/tests/generated",
+        "backend/tests/generated",
+        "backend/test-e2e/generated",
+    ):
+        assert f"`{prefix}/{segment}/...`" in hint
+    # The placeholder is exactly what the 2026-09-25 run's model guessed
+    # around for 60+ calls; no model-facing surface may render it again.
+    assert "<stable-node-id>" not in hint
+
+
+def test_manifest_rejection_and_description_disclose_concrete_namespace() -> None:
+    lock = TestManifestLock(node_id="REQ-1", enforce_node_namespace=True)
+    tool = build_declare_test_manifest_tool(node_id="REQ-1", manifest_lock=lock)
+    segment = stable_node_path_segment("REQ-1")
+    assert segment in (tool.__doc__ or "")
+
+    rejected = asyncio.run(
+        tool(files=[{"file_path": "backend/tests/generated/req-1/probe.test.js", "type": "Unit"}])
+    )
+    assert '"status": "error"' in rejected
+    assert "outside node `REQ-1`'s stable test namespace" in rejected
+    assert segment in rejected
+    assert "<stable-node-id>" not in rejected
+
+
+def test_manifest_tool_description_omits_namespace_when_not_enforced() -> None:
+    lock = TestManifestLock(node_id="REQ-1")
+    tool = build_declare_test_manifest_tool(node_id="REQ-1", manifest_lock=lock)
+    assert "stable test namespace segment" not in (tool.__doc__ or "")
+
+
+def test_write_set_rejection_and_description_disclose_concrete_namespace() -> None:
+    lock = StageWriteSetLock(stage="test_generation", node_id="REQ-1")
+    tool = build_declare_stage_write_set_tool(stage="test_generation", lock=lock)
+    segment = stable_node_path_segment("REQ-1")
+    assert segment in (tool.__doc__ or "")
+
+    rejected = lock.declare(["backend/tests/generated/req-1/probe.test.js"])
+    assert rejected is not None
+    assert "outside node `REQ-1`'s stable test namespace" in rejected
+    assert segment in rejected
+    assert "<stable-node-id>" not in rejected
+
+
+def test_manifest_rejection_budget_escalates_then_resets_on_success() -> None:
+    lock = TestManifestLock(node_id="REQ-1", enforce_node_namespace=True)
+    tool = build_declare_test_manifest_tool(node_id="REQ-1", manifest_lock=lock)
+    bad = [{"file_path": "backend/tests/generated/req-1/probe.test.js", "type": "Unit"}]
+
+    pre_threshold = asyncio.run(tool(files=bad))
+    assert "consecutive declarations" not in pre_threshold
+    last = pre_threshold
+    for _ in range(ESCALATION_THRESHOLD - 1):
+        last = asyncio.run(tool(files=bad))
+    assert "consecutive declarations" in last
+    assert "declare_test_manifest" in last
+
+    good = [
+        {
+            "file_path": f"backend/tests/generated/{stable_node_path_segment('REQ-1')}/probe.test.js",
+            "type": "Unit",
+            "coverage_scope": "owned",
+        }
+    ]
+    assert '"status": "locked"' in asyncio.run(tool(files=good))
+
+    again = asyncio.run(tool(files=bad))
+    assert '"status": "error"' in again
+    assert "consecutive declarations" not in again
+
+
+def test_write_set_rejection_budget_escalates_then_resets_on_success() -> None:
+    lock = StageWriteSetLock(stage="test_generation", node_id="REQ-1")
+    tool = build_declare_stage_write_set_tool(stage="test_generation", lock=lock)
+    bad = ["backend/tests/generated/req-1/probe.test.js"]
+
+    payload = ""
+    for _ in range(ESCALATION_THRESHOLD - 1):
+        payload = asyncio.run(tool(paths=bad))
+    assert '"status": "error"' in payload
+    assert "consecutive declarations" not in payload
+    payload = asyncio.run(tool(paths=bad))
+    assert "consecutive declarations" in payload
+
+    assert '"status": "locked"' in asyncio.run(tool(paths=["src/app.py"]))
+    payload = asyncio.run(tool(paths=bad))
+    assert '"status": "error"' in payload
+    assert "consecutive declarations" not in payload

@@ -30,7 +30,12 @@ from agents.runtime.capabilities import (
     is_node_test_path,
     is_shared_test_resource,
     is_test_file_path,
+    node_test_namespace_hint,
     normalize_manifest_path,
+)
+from agents.tools.declaration_budget import (
+    ConsecutiveRejectionBudget,
+    rejected_message as _rejection,
 )
 from core.test_types import CANONICAL_TEST_TYPES, canonical_test_type
 
@@ -181,8 +186,8 @@ class TestManifestLock:
         if not is_node_test_path(normalized, self.node_id):
             return (
                 f"`{normalized}` is outside node `{self.node_id}`'s stable test namespace. "
-                "Use the app-type test root's `generated/<stable-node-id>/...` namespace; "
-                "shared runner configuration and fixtures are read-only."
+                f"{node_test_namespace_hint(self.node_id)} "
+                "Shared runner configuration and fixtures are read-only."
             )
         return None
 
@@ -223,6 +228,7 @@ def build_declare_test_manifest_tool(
     staged_interface_ids = {
         str(value).strip() for value in current_interface_ids or [] if str(value or "").strip()
     }
+    rejection_budget = ConsecutiveRejectionBudget()
 
     async def declare_test_manifest(files: list[dict[str, Any]]) -> str:
         """Declare and lock the test-file manifest for this stage run.
@@ -247,10 +253,14 @@ def build_declare_test_manifest_tool(
 
         if not isinstance(files, list) or not files:
             return _tool_error(
-                "The manifest declaration must be a non-empty list of "
-                "{file_path, type, coverage_scope, interface_ids} entries. If this node should "
-                "own no local tests, skip declaring and return an empty `tests` "
-                "manifest instead."
+                _rejection(
+                    rejection_budget,
+                    _TOOL_NAME,
+                    "The manifest declaration must be a non-empty list of "
+                    "{file_path, type, coverage_scope, interface_ids} entries. If this node should "
+                    "own no local tests, skip declaring and return an empty `tests` "
+                    "manifest instead.",
+                )
             )
 
         rows: list[DeclaredTestFile] = []
@@ -367,10 +377,15 @@ def build_declare_test_manifest_tool(
 
         if errors:
             return _tool_error(
-                "The manifest declaration was rejected. Fix every issue and "
-                "re-declare the complete manifest:\n- " + "\n- ".join(errors)
+                _rejection(
+                    rejection_budget,
+                    _TOOL_NAME,
+                    "The manifest declaration was rejected. Fix every issue and "
+                    "re-declare the complete manifest:\n- " + "\n- ".join(errors),
+                )
             )
 
+        rejection_budget.record_acceptance()
         first_declaration = not manifest_lock.locked
         manifest_lock.declare(rows)
         await _emit_log(
@@ -410,6 +425,13 @@ def build_declare_test_manifest_tool(
             indent=2,
         )
 
+    if manifest_lock.enforce_node_namespace:
+        # The stable segment is a sha256 digest of the node id — unguessable
+        # for the model, so the tool description carries the concrete value
+        # from the first turn instead of leaving it to a rejection.
+        declare_test_manifest.__doc__ = (declare_test_manifest.__doc__ or "") + (
+            " " + node_test_namespace_hint(node_id)
+        )
     declare_test_manifest.__name__ = _TOOL_NAME
     return declare_test_manifest
 
