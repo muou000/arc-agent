@@ -27,6 +27,7 @@ from core.stage_worktree import (
     StageWorktreeManager,
 )
 from core.worktree import MergeConflictError
+from tests.helpers.jsonl import read_jsonl
 
 
 def _git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -626,15 +627,13 @@ def test_replayed_stage_publication_does_not_duplicate_completion_events(
 
     def _completed_events() -> int:
         events_path = repo / ".arc" / "runner-events.jsonl"
-        if not events_path.exists():
-            return 0
         return sum(
             1
-            for line in events_path.read_text(encoding="utf-8").splitlines()
-            if '"type": "requirement_state"' in line
-            and '"node_id": "R"' in line
-            and '"phase": "design"' in line
-            and '"status": "completed"' in line
+            for event in read_jsonl(events_path)
+            if event.get("type") == "requirement_state"
+            and event.get("node_id") == "R"
+            and event.get("phase") == "design"
+            and event.get("status") == "completed"
         )
 
     asyncio.run(manager._rehydrate_stage_merge_queue(queue))
@@ -652,3 +651,13 @@ def test_replayed_stage_publication_does_not_duplicate_completion_events(
 
     assert root_interface["status"] == STAGE_PUBLISHED, root_interface.get("error")
     assert _completed_events() == 1
+
+    # A fresh attempt re-arms the emission: its design/running event makes
+    # the completion marker novel again even though one was recorded before.
+    manager.runtime.events.mark_design_started("R")
+    root_interface["status"] = STAGE_READY_TO_MERGE
+    asyncio.run(manager._rehydrate_stage_merge_queue(queue))
+    asyncio.run(manager._drain_stage_merge_queue(queue))
+
+    assert root_interface["status"] == STAGE_PUBLISHED, root_interface.get("error")
+    assert _completed_events() == 2

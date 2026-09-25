@@ -121,12 +121,14 @@ class EventClient:
     def mark_test_failed(self, node_id: str, message: str | None = None) -> None:
         self._emit_requirement_state(node_id, "test", "failed", message)
 
-    def has_requirement_state(self, node_id: str, phase: str, status: str) -> bool:
-        """Whether the runner event log already records this aggregate state.
+    def is_latest_requirement_state(self, node_id: str, phase: str, status: str) -> bool:
+        """Whether this state is already the node's latest recorded state for the phase.
 
-        Resume replays re-run publication finalization after a crash; the
-        append-only log is the durable ledger, so a replayed finalization
-        checks here instead of appending a second completion event.
+        Publication finalization must be exactly-once across resume replays:
+        the append-only log is the durable ledger, so a completion marker is
+        re-emitted only when the ledger's newest event for the node and phase
+        is a different state (a fresh attempt's ``running``, a failure, or no
+        record at all).
         """
 
         normalized_node_id = str(node_id or "").strip()
@@ -141,6 +143,7 @@ class EventClient:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return False
+        latest: str | None = None
         for line in lines:
             try:
                 event = json.loads(line)
@@ -148,13 +151,14 @@ class EventClient:
                 continue
             if not isinstance(event, dict) or event.get("type") != "requirement_state":
                 continue
-            if (
-                str(event.get("node_id") or "").strip() == normalized_node_id
-                and str(event.get("phase") or "").strip() == wanted_phase
-                and str(event.get("status") or "").strip() == wanted_status
-            ):
-                return True
-        return False
+            if str(event.get("node_id") or "").strip() != normalized_node_id:
+                continue
+            if str(event.get("phase") or "").strip() != wanted_phase:
+                continue
+            state = str(event.get("status") or "").strip()
+            if state:
+                latest = state
+        return latest == wanted_status
 
     def record_visual_analysis(
         self,

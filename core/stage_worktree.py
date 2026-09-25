@@ -273,7 +273,7 @@ class StageWorktreeManager(NodeWorktreeManager):
                     if (path := _normalize_repo_path(raw))
                 )
             )
-            protected = [path for path in staged if _is_coordinator_path(path)]
+            protected = _coordinator_conflicts(staged_result.stdout)
             if protected:
                 raise StagePublicationError(
                     "stage worktree attempted to publish coordinator files: " + ", ".join(protected)
@@ -407,13 +407,7 @@ class StageWorktreeManager(NodeWorktreeManager):
                 ["diff", "--cached", "--name-only"],
                 cwd=self.main_workspace,
             )
-            coordinator = sorted(
-                {
-                    path
-                    for raw in staged_result.stdout.splitlines()
-                    if (path := _normalize_repo_path(raw)) and _is_coordinator_path(path)
-                }
-            )
+            coordinator = _coordinator_conflicts(staged_result.stdout)
             if coordinator:
                 self._git(["merge", "--abort"], cwd=self.main_workspace, check=False)
                 self._quarantined.add(str(Path(handle.path)))
@@ -533,6 +527,23 @@ def _is_coordinator_path(path: str) -> bool:
     normalized = path.casefold()
     return normalized == ".arc" or normalized.startswith(".arc/") or normalized.endswith(
         "/processing_queue.json"
+    )
+
+
+def _coordinator_conflicts(staged_output: str) -> list[str]:
+    """Coordinator paths within ``git diff --cached --name-only`` output.
+
+    Shared by the publish-time and merge-time guards: runtime state under
+    ``.arc`` belongs to the coordinator and must neither be published from
+    a stage worktree nor merged out of one.
+    """
+
+    return sorted(
+        {
+            path
+            for raw in staged_output.splitlines()
+            if (path := _normalize_repo_path(raw)) and _is_coordinator_path(path)
+        }
     )
 
 

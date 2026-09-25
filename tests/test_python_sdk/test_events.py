@@ -1024,32 +1024,49 @@ class TestMergeArbitrationEvents:
         }
 
 
-class TestHasRequirementState:
-    """Resume replays re-run publication finalization; the append-only
-    runner event log is the ledger that keeps aggregate completion markers
-    exactly-once across a crash between the merge commit and the queue save."""
+class TestIsLatestRequirementState:
+    """Publication finalization must be exactly-once across resume replays;
+    the append-only log is the ledger, and a completion marker is only
+    skipped while it is still the node's latest recorded state."""
 
-    def test_true_after_the_matching_state_was_emitted(
+    def test_true_while_the_state_is_the_latest_recording(
         self, events: EventClient, event_paths: RuntimePaths
     ) -> None:
-        assert events.has_requirement_state("REQ-1", "design", "completed") is False
+        assert events.is_latest_requirement_state("REQ-1", "design", "completed") is False
         events.mark_design_done("REQ-1")
-        assert events.has_requirement_state("REQ-1", "design", "completed") is True
+        assert events.is_latest_requirement_state("REQ-1", "design", "completed") is True
         events.mark_test_passed("REQ-1")
-        assert events.has_requirement_state("REQ-1", "test", "passed") is True
+        assert events.is_latest_requirement_state("REQ-1", "test", "passed") is True
 
-    def test_false_for_a_different_node_phase_or_status(
+    def test_a_fresh_running_event_re_arms_the_completion_marker(
+        self, events: EventClient
+    ) -> None:
+        events.mark_design_started("REQ-1")
+        events.mark_design_done("REQ-1")
+        assert events.is_latest_requirement_state("REQ-1", "design", "completed") is True
+        events.mark_design_started("REQ-1")
+        assert events.is_latest_requirement_state("REQ-1", "design", "completed") is False
+        assert events.is_latest_requirement_state("REQ-1", "design", "running") is True
+
+    def test_a_failure_re_arms_the_completion_marker(
         self, events: EventClient
     ) -> None:
         events.mark_design_done("REQ-1")
-        assert events.has_requirement_state("REQ-2", "design", "completed") is False
-        assert events.has_requirement_state("REQ-1", "implement", "completed") is False
-        assert events.has_requirement_state("REQ-1", "design", "failed") is False
+        events.mark_design_failed("REQ-1")
+        assert events.is_latest_requirement_state("REQ-1", "design", "completed") is False
+        assert events.is_latest_requirement_state("REQ-1", "design", "failed") is True
+
+    def test_false_for_a_different_node_or_phase(
+        self, events: EventClient
+    ) -> None:
+        events.mark_design_done("REQ-1")
+        assert events.is_latest_requirement_state("REQ-2", "design", "completed") is False
+        assert events.is_latest_requirement_state("REQ-1", "implement", "completed") is False
 
     def test_false_when_the_event_log_does_not_exist_yet(
         self, events: EventClient
     ) -> None:
-        assert events.has_requirement_state("REQ-1", "design", "completed") is False
+        assert events.is_latest_requirement_state("REQ-1", "design", "completed") is False
 
     def test_tolerates_malformed_and_foreign_lines(
         self, events: EventClient, event_paths: RuntimePaths
@@ -1058,13 +1075,12 @@ class TestHasRequirementState:
         with event_paths.runner_events_path.open("a", encoding="utf-8") as output:
             output.write("not-json\n")
             output.write('{"type": "requirement_state"}\n')
-        assert events.has_requirement_state("REQ-1", "design", "completed") is True
-        assert events.has_requirement_state("REQ-1", "implement", "completed") is False
+        assert events.is_latest_requirement_state("REQ-1", "design", "completed") is True
 
     def test_blank_arguments_never_match(
         self, events: EventClient
     ) -> None:
         events.mark_design_done("REQ-1")
-        assert events.has_requirement_state("", "design", "completed") is False
-        assert events.has_requirement_state("REQ-1", "", "completed") is False
-        assert events.has_requirement_state("REQ-1", "design", "") is False
+        assert events.is_latest_requirement_state("", "design", "completed") is False
+        assert events.is_latest_requirement_state("REQ-1", "", "completed") is False
+        assert events.is_latest_requirement_state("REQ-1", "design", "") is False
