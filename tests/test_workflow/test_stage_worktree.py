@@ -14,6 +14,7 @@ from arcbench_agent_runtime.context import RuntimePaths
 from arcbench_agent_runtime.events import EventClient
 from core import sessions
 from core.queue_state import (
+    STAGE_BLOCKED,
     STAGE_FAILED,
     STAGE_INTERFACE_DESIGN,
     STAGE_PUBLISHED,
@@ -21,8 +22,11 @@ from core.queue_state import (
     STAGE_RUNNING,
     STAGE_TEST_GENERATION,
     STAGE_VISUAL_ANALYSIS,
+    TASK_FAILED,
+    fail_stage_task,
     load_or_create_queue,
     reset_node_for_retry,
+    task_status,
     transition_stage_task,
 )
 from core.stage_merge_queue import StageMergeQueue
@@ -537,6 +541,108 @@ def test_stage_merge_queue_rehydrates_ready_publication_after_coordinator_restar
     assert queue["node_states"]["R"] == "DESIGNED"
     assert (repo / "backend" / "recovered.js").exists()
     assert not Path(handle.path).exists()
+
+
+def test_failed_stage_does_not_publish_a_late_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
+    repo, _stage_manager = _init_repo(tmp_path)
+    queue = load_or_create_queue(
+        str(repo / ".arc" / "processing_queue.json"),
+        {"id": "L", "name": "leaf", "description": "leaf", "children": []},
+    )
+    for task in queue["stage_tasks"]:
+        if task["stage"] in {STAGE_VISUAL_ANALYSIS, STAGE_INTERFACE_DESIGN}:
+            task["status"] = STAGE_PUBLISHED
+        elif task["stage"] == STAGE_TEST_GENERATION:
+            task["declared_write_set"] = ["tests/test_l.py"]
+    queue["node_states"]["L"] = "DESIGNING"
+    stage_task = next(task for task in queue["stage_tasks"] if task["stage_task_id"] == "L:TEST_GENERATION")
+    transition_stage_task(queue, "L", STAGE_TEST_GENERATION, STAGE_RUNNING)
+
+    manager = ARCWorkflowManager(
+        workspace_path=str(repo), requirement_path="", app_type="cli", web_port=4200,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = SimpleNamespace(traceability=SimpleNamespace(list_interfaces=lambda **_: [], list_tests=lambda **_: []))
+    manager._save_processing_queue = lambda _queue: None
+
+    async def _run_and_fail(_stage, current_queue, _requirement, runner) -> bool:
+        path = Path(runner.workspace_path) / "tests" / "test_l.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("def test_l(): assert False\n", encoding="utf-8")
+        fail_stage_task(
+            current_queue, "L", STAGE_TEST_GENERATION,
+            error="no registered tests", error_category="test_generation",
+        )
+        return True
+
+    manager._run_stage_phase_in_worktree = _run_and_fail
+    before = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    result = asyncio.run(manager._execute_stage_task_in_worktree(stage_task, queue, {"id": "L"}))
+    asyncio.run(manager._drain_stage_merge_queue(queue))
+
+    assert result["status"] == STAGE_FAILED
+    assert stage_task["status"] == STAGE_FAILED
+    assert stage_task["error"] == "no registered tests"
+    assert queue["node_states"]["L"] == "FAILED"
+    assert next(t for t in queue["stage_tasks"] if t["stage_task_id"] == "L:IMPLEMENTATION")["status"] == STAGE_BLOCKED
+    assert _git(["rev-parse", "HEAD"], repo).stdout.strip() == before
+    assert not (repo / "tests" / "test_l.py").exists()
+    assert len(manager._stage_merge_queue) == 0
+
+
+def test_failed_queued_publication_is_discarded_before_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
+    repo, stage_manager = _init_repo(tmp_path)
+    handle = stage_manager.prepare_stage("L", STAGE_TEST_GENERATION, declared_write_set=["tests/test_l.py"])
+    path = Path(handle.path) / "tests" / "test_l.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("def test_l(): assert False\n", encoding="utf-8")
+    publication = _publish(stage_manager, handle, writes=["tests/test_l.py"])
+    queue = load_or_create_queue(
+        str(repo / ".arc" / "processing_queue.json"),
+        {"id": "L", "name": "leaf", "description": "leaf", "children": []},
+    )
+    for task in queue["stage_tasks"]:
+        if task["stage"] in {STAGE_VISUAL_ANALYSIS, STAGE_INTERFACE_DESIGN}:
+            task["status"] = STAGE_PUBLISHED
+    stage_task = next(task for task in queue["stage_tasks"] if task["stage_task_id"] == "L:TEST_GENERATION")
+    transition_stage_task(queue, "L", STAGE_TEST_GENERATION, STAGE_RUNNING)
+    transition_stage_task(queue, "L", STAGE_TEST_GENERATION, STAGE_READY_TO_MERGE, publication=publication.to_dict())
+
+    manager = ARCWorkflowManager(
+        workspace_path=str(repo), requirement_path="", app_type="cli", web_port=4200,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager._save_processing_queue = lambda _queue: None
+    manager._stage_merge_queue.enqueue(stage_task, publication, handle=handle)
+    fail_stage_task(queue, "L", STAGE_TEST_GENERATION, error="no registered tests")
+    before = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+
+    assert asyncio.run(manager._drain_stage_merge_queue(queue)) is False
+    assert _git(["rev-parse", "HEAD"], repo).stdout.strip() == before
+    assert not (repo / "tests" / "test_l.py").exists()
+    assert stage_task["status"] == STAGE_FAILED
+    assert len(manager._stage_merge_queue) == 0
+
+
+def test_failed_stage_reports_blocked_successors_in_compile_result(tmp_path: Path) -> None:
+    queue = load_or_create_queue(
+        str(tmp_path / ".arc" / "processing_queue.json"),
+        {"id": "L", "name": "leaf", "description": "leaf", "children": []},
+    )
+    fail_stage_task(queue, "L", STAGE_TEST_GENERATION, error="no registered tests")
+
+    result = ARCWorkflowManager._build_compile_result(queue)
+
+    assert result["failed_nodes"] == ["L"]
+    assert result["blocked_stages"] == ["L:IMPLEMENTATION (blocked by failed TEST_GENERATION stage)"]
+    assert result["unvalidated_tasks"] == []
+    assert task_status(queue, next(t for t in queue["tasks"] if t["task_id"] == "L:IMPLEMENT")) == TASK_FAILED
 
 
 def test_approved_cross_node_overlap_windows_execute_in_stage_worktrees(

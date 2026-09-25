@@ -79,6 +79,23 @@ class StageMergeQueue:
     def discard(self, stage_task_id: str) -> None:
         self._entries.pop(str(stage_task_id), None)
 
+    def discard_inactive(self, queue_state: Mapping[str, Any]) -> list[StageMergeEntry]:
+        """Drop queued publications whose persisted stage is no longer ready."""
+
+        statuses = {
+            str(task.get("stage_task_id") or f"{task.get('node_id', '')}:{task.get('stage', '')}"):
+            str(task.get("status") or "").strip().upper()
+            for task in queue_state.get("stage_tasks", []) or []
+            if isinstance(task, Mapping)
+        }
+        discarded = [
+            entry for entry in self._entries.values()
+            if statuses.get(entry.stage_task_id) != "READY_TO_MERGE"
+        ]
+        for entry in discarded:
+            self.discard(entry.stage_task_id)
+        return discarded
+
     def contains(self, stage_task_id: str) -> bool:
         """Whether a publication is already represented in the in-memory queue."""
 

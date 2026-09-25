@@ -512,10 +512,13 @@ class ARCWorkflowManager:
             self.runtime.events.mark_run_failed("ARC compilation finished with failures.")
             failed_nodes = result.get("failed_nodes", [])
             blocked_nodes = result.get("blocked_nodes", [])
+            blocked_stages = result.get("blocked_stages", [])
             unvalidated_tasks = result.get("unvalidated_tasks", [])
             details = [f"failed: {', '.join(failed_nodes)}"] if failed_nodes else []
             if blocked_nodes:
                 details.append(f"blocked: {', '.join(blocked_nodes)}")
+            if blocked_stages:
+                details.append(f"blocked stages: {', '.join(blocked_stages)}")
             if unvalidated_tasks:
                 details.append(f"unvalidated tasks: {', '.join(unvalidated_tasks)}")
             await self._log(
@@ -1265,6 +1268,16 @@ class ARCWorkflowManager:
                             ),
                         }
 
+                    if stage_status_of(queue_state, node_id, stage) == STAGE_FAILED:
+                        # A validation gate may have failed this stage while its
+                        # worker was still finishing. Never revive its publication.
+                        context = self._stage_workspaces.get(str(stage_task.get("stage_task_id") or ""))
+                        if context is not None:
+                            await self._discard_stage_workspace(context)
+                        self._stage_merge_queue.discard(str(stage_task.get("stage_task_id") or ""))
+                        self._save_processing_queue(queue_state)
+                        continue
+
                     if result is False or (
                         isinstance(result, dict)
                         and str(result.get("status", "")).strip().upper() == STAGE_FAILED
@@ -1476,6 +1489,12 @@ class ARCWorkflowManager:
         manager = self._stage_worktree_manager
         if not self._stage_worktrees_enabled() or manager is None:
             return False
+        for stale in self._stage_merge_queue.discard_inactive(queue_state):
+            context = self._stage_workspaces.pop(stale.stage_task_id, None)
+            if context is not None:
+                self._release_port_slot(context.slot)
+            if isinstance(stale.handle, StageWorktreeHandle):
+                await asyncio.to_thread(manager.settle_stage, stale.handle, published=False)
         integrated_any = False
         while True:
             entry = self._stage_merge_queue.pop_ready(queue_state)
@@ -3218,6 +3237,15 @@ class ARCWorkflowManager:
                     "error": f"{stage} stage execution failed",
                 }
 
+            if stage_status_of(queue_state, node_id, stage) == STAGE_FAILED:
+                await self._discard_stage_workspace(context)
+                failed_task = stage_task_of(queue_state, node_id, stage) or {}
+                return {
+                    "status": STAGE_FAILED,
+                    "error": str(failed_task.get("error") or f"{stage} stage failed"),
+                    "error_category": str(failed_task.get("error_category") or "stage_execution"),
+                }
+
             declared = stage_task.get("declared_write_set")
             if declared is None:
                 declared = await asyncio.to_thread(manager.changed_files, context.handle)
@@ -3379,6 +3407,14 @@ class ARCWorkflowManager:
             for node_id, state in queue_state["node_states"].items()
             if state == NODE_BLOCKED_BY_DEPENDENCY
         )
+        blocked_stages = sorted(
+            f"{task['stage_task_id']} ({task['error']})"
+            for task in queue_state.get("stage_tasks", [])
+            if task.get("error_category") == "blocked_by_stage"
+            and stage_status_of(queue_state, str(task.get("node_id", "")), str(task.get("stage", "")))
+            in {STAGE_BLOCKED, STAGE_FAILED}
+            and task.get("error")
+        )
         completed_tasks = [
             task["task_id"] for task in queue_state["tasks"] if task_status(queue_state, task) == TASK_COMPLETED
         ]
@@ -3398,6 +3434,7 @@ class ARCWorkflowManager:
             "run_status": run_status,
             "failed_nodes": failed_nodes,
             "blocked_nodes": blocked_nodes,
+            "blocked_stages": blocked_stages,
             "unvalidated_tasks": pending_tasks,
             "visit_order": completed_tasks,
             "states": dict(queue_state["node_states"]),
