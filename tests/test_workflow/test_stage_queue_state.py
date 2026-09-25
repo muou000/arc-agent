@@ -269,6 +269,37 @@ def test_save_queue_persists_stage_publication_metadata(tmp_path: Path) -> None:
     assert published["publication"]["artifact_commit"] == "artifact"
 
 
+def test_stage_publication_is_deep_copied_and_immutable_after_ready_to_merge(tmp_path: Path) -> None:
+    queue = _queue(tmp_path)
+    transition_stage_task(queue, "L", STAGE_INTERFACE_DESIGN, STAGE_RUNNING)
+    publication = {
+        "base_commit": "base",
+        "artifact_commit": "artifact",
+        "declared_write_set": ["frontend/App.tsx"],
+        "validation_evidence": {"checks": ["build"]},
+    }
+    transition_stage_task(
+        queue,
+        "L",
+        STAGE_INTERFACE_DESIGN,
+        STAGE_READY_TO_MERGE,
+        publication=publication,
+    )
+    publication["validation_evidence"]["checks"].append("health")
+
+    stored = next(item for item in queue["stage_tasks"] if item["stage_task_id"] == "L:INTERFACE_DESIGN")
+    assert stored["publication"]["validation_evidence"] == {"checks": ["build"]}
+
+    with pytest.raises(ValueError, match="immutable"):
+        transition_stage_task(
+            queue,
+            "L",
+            STAGE_INTERFACE_DESIGN,
+            STAGE_READY_TO_MERGE,
+            publication={**publication, "artifact_commit": "different"},
+        )
+
+
 def test_implement_retry_preserves_design_publications_and_resets_implementation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

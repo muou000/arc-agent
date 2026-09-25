@@ -92,6 +92,14 @@ from core.scheduling import (
     next_runnable_task,
     stage_backpressure_state,
 )
+from core.stage_merge_queue import StageMergeQueue
+from core.stage_worktree import (
+    StagePublication,
+    StagePublicationError,
+    StageWorktreeHandle,
+    StageWorktreeManager,
+    stable_payload_hash,
+)
 from core.scheduling_switches import (
     ARC_AFFINITY_DEPTH,
     ARC_AUTO_TDD_RETRY,
@@ -229,6 +237,17 @@ class _TaskWorkspace:
     phase_runner: WorkflowPhaseRunner
 
 
+@dataclass
+class _StageTaskWorkspace:
+    """An isolated formal-stage workspace and its coordinator resources."""
+
+    stage_task_id: str
+    handle: StageWorktreeHandle
+    slot: int
+    web_port: int | None
+    phase_runner: WorkflowPhaseRunner
+
+
 class ARCWorkflowManager:
     """Manage the ARC requirement-tree compilation queue."""
 
@@ -264,6 +283,14 @@ class ARCWorkflowManager:
         self._worktree_manager = (
             NodeWorktreeManager(self.workspace_path) if self._parallel_mode else None
         )
+        # Stage worktrees are a separate opt-in rail. They are used only by
+        # the stage pipeline's serial-integration mode; the older node-worktree
+        # mode keeps its established lifecycle unchanged.
+        self._stage_worktree_manager = (
+            StageWorktreeManager(self.workspace_path) if self._stage_pipeline else None
+        )
+        self._stage_merge_queue = StageMergeQueue()
+        self._stage_workspaces: dict[str, _StageTaskWorkspace] = {}
         # Nothing is in flight when a compile starts (fresh or resumed), so
         # any claims left by a previous process are stale by definition:
         # landed files are tracked in git and un-landed work re-runs.
@@ -1077,23 +1104,32 @@ class ARCWorkflowManager:
         queue_state: dict[str, Any],
         execute_stage_task: Callable[[dict[str, Any]], Awaitable[Any]],
     ) -> None:
-        """Drain stage tasks through the bounded scheduling seam.
+        """Drain formal stages and serialize their ready publications.
 
-        Stage worktree creation and publication merging are intentionally
-        supplied by the later stage-runner/merge-queue slices. This method
-        owns only the coordinator-side scheduling contract: it marks a task
-        RUNNING before execution, applies the same slot/backpressure limits to
-        every pick, and leaves successful work at READY_TO_MERGE unless the
-        executor explicitly returns a terminal publication status.
+        A stage executor never edits the integration checkout. In the stage
+        worktree mode it returns an immutable publication envelope, which is
+        persisted as ``READY_TO_MERGE`` before the coordinator's merge queue
+        attempts integration. The legacy executor seam remains available for
+        direct tests and for queues without a usable Git repository.
         """
 
         self._inflight.clear()
-        max_concurrency = self._max_concurrent_tasks()
+        stage_worktrees = self._stage_worktrees_enabled()
+        max_concurrency = (
+            self._max_stage_concurrent_tasks(queue_state)
+            if stage_worktrees
+            else self._max_concurrent_tasks()
+        )
+        if stage_worktrees:
+            self._port_slot_count = max_concurrency
         in_flight: dict[asyncio.Task[Any], dict[str, Any]] = {}
         self._ensure_background_visual_stage_tasks(queue_state)
+        if stage_worktrees:
+            await self._rehydrate_stage_merge_queue(queue_state)
         try:
             while True:
                 while len(in_flight) < max_concurrency:
+                    await self._drain_stage_merge_queue(queue_state)
                     stage_task = next_runnable_stage_task(
                         queue_state,
                         in_flight.values(),
@@ -1105,6 +1141,8 @@ class ARCWorkflowManager:
                     )
                     if stage_task is None:
                         if not in_flight:
+                            if await self._drain_stage_merge_queue(queue_state):
+                                continue
                             pending_formal = any(
                                 str(item.get("stage", "")).strip().upper()
                                 in {
@@ -1206,20 +1244,64 @@ class ARCWorkflowManager:
                             if isinstance(result, dict)
                             else STAGE_READY_TO_MERGE
                         )
-                        transition_stage_task(
-                            queue_state,
-                            node_id,
-                            stage,
-                            status,
-                            publication=publication if isinstance(publication, dict) else None,
-                        )
+                        if stage_worktrees and status == STAGE_READY_TO_MERGE:
+                            if not isinstance(publication, dict):
+                                fail_stage_task(
+                                    queue_state,
+                                    node_id,
+                                    stage,
+                                    error="stage completed without a publication envelope",
+                                    error_category="stage_publication",
+                                    on_state_change=self._upsert_node_state,
+                                )
+                            else:
+                                transition_stage_task(
+                                    queue_state,
+                                    node_id,
+                                    stage,
+                                    STAGE_READY_TO_MERGE,
+                                    publication=publication,
+                                )
+                                handle = result.get("_stage_workspace")
+                                try:
+                                    decoded = StagePublication.from_dict(
+                                        publication,
+                                        node_id=node_id,
+                                        stage=stage,
+                                    )
+                                    self._stage_merge_queue.enqueue(
+                                        stage_task,
+                                        decoded,
+                                        handle=(handle.handle if isinstance(handle, _StageTaskWorkspace) else handle),
+                                    )
+                                except (StagePublicationError, ValueError) as exc:
+                                    fail_stage_task(
+                                        queue_state,
+                                        node_id,
+                                        stage,
+                                        error=str(exc),
+                                        error_category="stage_publication",
+                                        on_state_change=self._upsert_node_state,
+                                    )
+                                    if isinstance(handle, _StageTaskWorkspace):
+                                        await self._discard_stage_workspace(handle)
+                        else:
+                            transition_stage_task(
+                                queue_state,
+                                node_id,
+                                stage,
+                                status,
+                                publication=publication if isinstance(publication, dict) else None,
+                            )
                     self._save_processing_queue(queue_state)
+                await self._drain_stage_merge_queue(queue_state)
         finally:
             for pending in in_flight:
                 if not pending.done():
                     pending.cancel()
             if in_flight:
                 await asyncio.gather(*in_flight, return_exceptions=True)
+        await self._drain_stage_merge_queue(queue_state)
 
     def _ensure_background_visual_stage_tasks(
         self,
@@ -1256,6 +1338,230 @@ class ARCWorkflowManager:
                 "Compiler",
                 f"Removed {len(removed)} reusable worktree(s) after the drain.",
             )
+
+    def _stage_worktrees_enabled(self) -> bool:
+        """Whether this run can use the stage-specific Git merge rail."""
+
+        manager = self._stage_worktree_manager
+        if self._parallel_mode or manager is None:
+            return False
+        try:
+            return manager.is_available()
+        except Exception:  # noqa: BLE001 - a legacy/faux workspace falls back safely
+            return False
+
+    def _max_stage_concurrent_tasks(self, queue_state: dict[str, Any]) -> int:
+        """Resolve stage worktree capacity independently of node worktrees."""
+
+        configured = queue_state.get("stage_max_in_flight")
+        if configured is None:
+            configured = os.environ.get(ARC_MAX_CONCURRENT_TASKS, "")
+        try:
+            value = int(configured)
+        except (TypeError, ValueError):
+            value = PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS
+        return min(max(1, value), MAX_PARALLEL_TASKS)
+
+    async def _rehydrate_stage_merge_queue(self, queue_state: dict[str, Any]) -> None:
+        """Rebuild in-memory merge entries from persisted READY_TO_MERGE tasks."""
+
+        manager = self._stage_worktree_manager
+        if not self._stage_worktrees_enabled() or manager is None:
+            return
+        changed = False
+        for task in queue_state.get("stage_tasks", []) or []:
+            if str(task.get("status") or "").strip().upper() != STAGE_READY_TO_MERGE:
+                continue
+            stage_task_id = str(
+                task.get("stage_task_id")
+                or f"{task.get('node_id', '')}:{task.get('stage', '')}"
+            )
+            if self._stage_merge_queue.contains(stage_task_id):
+                continue
+            try:
+                publication = StagePublication.from_dict(
+                    task.get("publication") or {},
+                    node_id=str(task.get("node_id") or ""),
+                    stage=str(task.get("stage") or ""),
+                )
+                handle = await asyncio.to_thread(
+                    manager.prepare_stage,
+                    publication.node_id,
+                    publication.stage,
+                    declared_write_set=publication.declared_write_set,
+                    base_commit=publication.base_commit,
+                )
+                self._stage_merge_queue.enqueue(task, publication, handle=handle)
+            except (StagePublicationError, WorktreeError, ValueError) as exc:
+                fail_stage_task(
+                    queue_state,
+                    str(task.get("node_id") or ""),
+                    str(task.get("stage") or "").strip().upper(),
+                    error=f"cannot restore stage publication: {exc}",
+                    error_category="stage_recovery",
+                    on_state_change=self._upsert_node_state,
+                )
+                changed = True
+                await self._log(
+                    "Compiler",
+                    f"Could not restore stage publication {stage_task_id}: {exc}",
+                    "error",
+                    str(task.get("node_id") or ""),
+                )
+        if changed:
+            self._save_processing_queue(queue_state)
+
+    async def _discard_stage_workspace(self, context: _StageTaskWorkspace) -> None:
+        manager = self._stage_worktree_manager
+        try:
+            if manager is not None:
+                await asyncio.to_thread(manager.settle_stage, context.handle, published=False)
+        finally:
+            self._stage_workspaces.pop(context.stage_task_id, None)
+            self._release_port_slot(context.slot)
+
+    async def _drain_stage_merge_queue(self, queue_state: dict[str, Any]) -> bool:
+        """Integrate every currently eligible stage publication in order."""
+
+        manager = self._stage_worktree_manager
+        if not self._stage_worktrees_enabled() or manager is None:
+            return False
+        integrated_any = False
+        while True:
+            entry = self._stage_merge_queue.pop_ready(queue_state)
+            if entry is None:
+                break
+            handle = entry.handle
+            publication = entry.publication
+            if not isinstance(handle, StageWorktreeHandle) or not isinstance(publication, StagePublication):
+                error = "stage merge queue entry is missing its worktree publication"
+                fail_stage_task(
+                    queue_state,
+                    entry.node_id,
+                    entry.stage,
+                    error=error,
+                    error_category="stage_merge_queue",
+                    on_state_change=self._upsert_node_state,
+                )
+                self._save_processing_queue(queue_state)
+                continue
+
+            verify = self._build_merge_health_gate() if self.app_type == "web" else None
+            try:
+                self._validate_stage_publication(entry.node_id, entry.stage, publication)
+                committed, detail = await asyncio.to_thread(
+                    manager.integrate_stage,
+                    handle,
+                    publication,
+                    f"merge {entry.node_id}:{entry.stage} stage publication",
+                    verify=verify,
+                )
+            except (MergeConflictError, WorktreeError, StagePublicationError) as exc:
+                fail_stage_task(
+                    queue_state,
+                    entry.node_id,
+                    entry.stage,
+                    error=str(exc),
+                    error_category="stage_merge",
+                    on_state_change=self._upsert_node_state,
+                )
+                self._save_processing_queue(queue_state)
+                with suppress(Exception):
+                    await asyncio.to_thread(manager.settle_stage, handle, published=False)
+                context = self._stage_workspaces.pop(entry.stage_task_id, None)
+                if context is not None:
+                    self._release_port_slot(context.slot)
+                await self._log(
+                    "Compiler",
+                    f"Stage publication {entry.node_id}:{entry.stage} was not integrated: {exc}",
+                    "error",
+                    entry.node_id,
+                )
+                continue
+
+            transition_stage_task(
+                queue_state,
+                entry.node_id,
+                entry.stage,
+                STAGE_PUBLISHED,
+            )
+            self._finalize_stage_publication(queue_state, entry.node_id, entry.stage)
+            self._save_processing_queue(queue_state)
+            try:
+                await asyncio.to_thread(manager.settle_stage, handle, published=True)
+            except Exception as exc:  # noqa: BLE001 - preserve a landed branch for inspection
+                await self._log(
+                    "Compiler",
+                    f"Stage worktree cleanup for {entry.node_id}:{entry.stage} failed: {type(exc).__name__}: {exc}",
+                    "warning",
+                    entry.node_id,
+                )
+            context = self._stage_workspaces.pop(entry.stage_task_id, None)
+            if context is not None:
+                self._release_port_slot(context.slot)
+            await self._log(
+                "Compiler",
+                f"Integrated stage {entry.node_id}:{entry.stage}: {detail}.",
+                node_id=entry.node_id,
+            )
+            integrated_any = True
+        return integrated_any
+
+    def _validate_stage_publication(
+        self,
+        node_id: str,
+        stage: str,
+        publication: StagePublication,
+    ) -> None:
+        """Recheck coordinator-visible publication hashes before integration."""
+
+        if not set(publication.changed_files).issubset(publication.declared_write_set):
+            raise StagePublicationError(
+                f"publication {node_id}:{stage} changed files outside its declared write set"
+            )
+        store = getattr(self.runtime, "traceability", None)
+        interfaces_reader = getattr(store, "list_interfaces", None)
+        tests_reader = getattr(store, "list_tests", None)
+        if not callable(interfaces_reader) or not callable(tests_reader):
+            return
+        expected_contract = stable_payload_hash(self._stage_traceability_rows(node_id, "list_interfaces"))
+        expected_manifest = stable_payload_hash(self._stage_traceability_rows(node_id, "list_tests"))
+        if publication.contract_hash != expected_contract:
+            raise StagePublicationError(f"contract hash drift for stage {node_id}:{stage}")
+        if publication.test_manifest_hash != expected_manifest:
+            raise StagePublicationError(f"test manifest hash drift for stage {node_id}:{stage}")
+
+    def _finalize_stage_publication(
+        self,
+        queue_state: dict[str, Any],
+        node_id: str,
+        stage: str,
+    ) -> None:
+        """Project a landed stage back onto the legacy aggregate state."""
+
+        if stage == STAGE_INTERFACE_DESIGN:
+            test_task = stage_task_of(queue_state, node_id, STAGE_TEST_GENERATION)
+            if test_task is not None and bool(test_task.get("applicable", True)):
+                return
+            complete_task(queue_state, node_id, PHASE_DESIGN, on_state_change=self._upsert_node_state)
+            marker = getattr(self.runtime.events, "mark_design_done", None)
+            if callable(marker):
+                marker(node_id)
+            return
+        if stage == STAGE_TEST_GENERATION:
+            complete_task(queue_state, node_id, PHASE_DESIGN, on_state_change=self._upsert_node_state)
+            marker = getattr(self.runtime.events, "mark_design_done", None)
+            if callable(marker):
+                marker(node_id)
+            return
+        if stage == STAGE_IMPLEMENTATION:
+            complete_task(queue_state, node_id, PHASE_IMPLEMENT, on_state_change=self._upsert_node_state)
+            marker = getattr(self.runtime.events, "mark_implementation_done", None)
+            if callable(marker):
+                marker(node_id)
+            marker = getattr(self.runtime.events, "mark_test_passed", None)
+            if callable(marker):
+                marker(node_id)
 
     def _max_concurrent_tasks(self) -> int:
         if not self._parallel_mode:
@@ -2568,13 +2874,7 @@ class ARCWorkflowManager:
         stage_task: dict[str, Any],
         queue_state: dict[str, Any],
     ) -> dict[str, Any] | bool:
-        """Run a stage through the currently available phase-runner seam.
-
-        DESIGN is still a bundled InterfaceDesigner + TestGenerator pass in
-        this slice. Running it behind INTERFACE_DESIGN publishes both design
-        stages through the existing aggregate transition; the later runner
-        split can replace this adapter without changing the scheduler.
-        """
+        """Run one stage, returning a coordinator-owned publication envelope."""
 
         node_id = str(stage_task.get("node_id", "") or "")
         stage = str(stage_task.get("stage", "") or "").strip().upper()
@@ -2594,6 +2894,9 @@ class ARCWorkflowManager:
                     ),
                 }
             return {"status": STAGE_SKIPPED if status == STAGE_SKIPPED else STAGE_PUBLISHED}
+
+        if self._stage_worktrees_enabled():
+            return await self._execute_stage_task_in_worktree(stage_task, queue_state, requirement_data)
 
         if stage == STAGE_TEST_GENERATION:
             # The current aggregate DESIGN runner already generated and
@@ -2649,6 +2952,168 @@ class ARCWorkflowManager:
                 )
             ),
         }
+
+    async def _execute_stage_task_in_worktree(
+        self,
+        stage_task: dict[str, Any],
+        queue_state: dict[str, Any],
+        requirement_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute and publish a formal stage without touching integration."""
+
+        manager = self._stage_worktree_manager
+        if manager is None:
+            return {
+                "status": STAGE_FAILED,
+                "error_category": "stage_worktree",
+                "error": "stage worktree manager is unavailable",
+            }
+        node_id = str(stage_task.get("node_id", "") or "")
+        stage = str(stage_task.get("stage", "") or "").strip().upper()
+        context: _StageTaskWorkspace | None = None
+        try:
+            context = await self._open_stage_task_workspace(stage_task, queue_state)
+            self._stage_workspaces[context.stage_task_id] = context
+            ok = await self._run_stage_phase_in_worktree(
+                stage_task,
+                queue_state,
+                requirement_data,
+                context.phase_runner,
+            )
+            if not ok:
+                await self._discard_stage_workspace(context)
+                return {
+                    "status": STAGE_FAILED,
+                    "error_category": "stage_execution",
+                    "error": f"{stage} stage execution failed",
+                }
+
+            declared = stage_task.get("declared_write_set")
+            if declared is None:
+                declared = await asyncio.to_thread(manager.changed_files, context.handle)
+            interfaces = self._stage_traceability_rows(node_id, "list_interfaces")
+            tests = self._stage_traceability_rows(node_id, "list_tests")
+            publication = await asyncio.to_thread(
+                manager.publish,
+                context.handle,
+                f"publish {node_id}:{stage} stage",
+                declared_write_set=declared,
+                contract_hash=stable_payload_hash(interfaces),
+                test_manifest_hash=stable_payload_hash(tests),
+                validation_evidence={
+                    "status": "passed",
+                    "stage": stage,
+                    "node_id": node_id,
+                    "base_commit": context.handle.base_commit,
+                },
+            )
+            return {
+                "status": STAGE_READY_TO_MERGE,
+                "publication": publication.to_dict(),
+                "_stage_workspace": context,
+            }
+        except Exception as exc:  # noqa: BLE001 - the drain converts it into a stage failure
+            if context is not None:
+                with suppress(Exception):
+                    await self._discard_stage_workspace(context)
+            return {
+                "status": STAGE_FAILED,
+                "error_category": "stage_worktree",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    async def _open_stage_task_workspace(
+        self,
+        stage_task: dict[str, Any],
+        queue_state: dict[str, Any],
+    ) -> _StageTaskWorkspace:
+        manager = self._stage_worktree_manager
+        if manager is None:
+            raise StagePublicationError("stage worktree manager is unavailable")
+        stage_task_id = str(
+            stage_task.get("stage_task_id")
+            or f"{stage_task.get('node_id', '')}:{stage_task.get('stage', '')}"
+        )
+        node_id = str(stage_task.get("node_id", "") or "")
+        stage = str(stage_task.get("stage", "") or "").strip().upper()
+        slot = self._acquire_port_slot(stage_task_id)
+        try:
+            handle = await asyncio.to_thread(
+                manager.prepare_stage,
+                node_id,
+                stage,
+                declared_write_set=stage_task.get("declared_write_set"),
+            )
+        except Exception:
+            self._release_port_slot(slot)
+            raise
+        web_port = self._slot_port(slot)
+        runner = self._build_task_phase_runner(handle.path, web_port, handle=None)
+        await self._log(
+            "Compiler",
+            f"Stage workspace for {stage_task_id}: {handle.path}"
+            + (f" (web port {web_port})" if web_port is not None else ""),
+            node_id=node_id,
+        )
+        return _StageTaskWorkspace(
+            stage_task_id=stage_task_id,
+            handle=handle,
+            slot=slot,
+            web_port=web_port,
+            phase_runner=runner,
+        )
+
+    async def _run_stage_phase_in_worktree(
+        self,
+        stage_task: dict[str, Any],
+        queue_state: dict[str, Any],
+        requirement_data: dict[str, Any],
+        runner: WorkflowPhaseRunner,
+    ) -> bool:
+        node_id = str(stage_task.get("node_id", "") or "")
+        stage = str(stage_task.get("stage", "") or "").strip().upper()
+        if stage == STAGE_TEST_GENERATION:
+            # The bundled runner still performs TestGenerator during DESIGN;
+            # the split runner in #255 will replace this no-op with the real
+            # independent stage without changing the worktree seam.
+            return stage_status_of(queue_state, node_id, STAGE_INTERFACE_DESIGN) == STAGE_PUBLISHED
+
+        if stage == STAGE_INTERFACE_DESIGN:
+            phase = PHASE_DESIGN
+        elif stage == STAGE_IMPLEMENTATION:
+            phase = PHASE_IMPLEMENT
+        else:
+            return False
+        aggregate_task = next(
+            (
+                task
+                for task in queue_state.get("tasks", [])
+                if str(task.get("node_id", "")) == node_id
+                and str(task.get("phase", "")) == phase
+            ),
+            None,
+        )
+        if aggregate_task is None:
+            return False
+        self._begin_task(aggregate_task, queue_state)
+        if phase == PHASE_DESIGN:
+            return bool(await runner.run_design_phase(node_id, requirement_data))
+        return bool(await runner.run_implement_phase(node_id, requirement_data))
+
+    def _stage_traceability_rows(self, node_id: str, method_name: str) -> list[dict[str, Any]]:
+        store = getattr(self.runtime, "traceability", None)
+        method = getattr(store, method_name, None)
+        if not callable(method):
+            return []
+        try:
+            rows = method(req_id=node_id)
+        except TypeError:
+            rows = method(node_id)
+        except Exception as exc:  # noqa: BLE001 - publication evidence must fail closed
+            raise StagePublicationError(
+                f"traceability {method_name} read failed for {node_id}: {type(exc).__name__}: {exc}"
+            ) from exc
+        return [dict(row) for row in rows or [] if isinstance(row, dict)]
 
     async def _run_task(self, task: dict[str, Any], ctx: "_TaskWorkspace | None" = None) -> bool:
         node_id = task["node_id"]

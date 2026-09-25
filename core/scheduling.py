@@ -322,6 +322,38 @@ def stage_task_dependencies_met(
     if _stage_status(queue_state, stage_task) != STAGE_PENDING:
         return False
 
+    return _stage_prerequisites_met(queue_state, stage_task)
+
+
+def stage_publication_dependencies_met(
+    queue_state: dict[str, Any], stage_task: dict[str, Any]
+) -> bool:
+    """Return whether a ready publication may enter integration.
+
+    A stage can finish before an earlier publication lands.  The merge queue
+    uses this query instead of treating ``READY_TO_MERGE`` as permission to
+    bypass the same-node predecessor or the existing parent/dependency gates.
+    """
+
+    stage = _stage_name(stage_task)
+    node_id = _stage_node_id(stage_task)
+    if not node_id or stage not in STAGE_PIPELINE:
+        return False
+    if not bool(stage_task.get("applicable", True)):
+        return False
+    if _stage_status(queue_state, stage_task) != STAGE_READY_TO_MERGE:
+        return False
+    return _stage_prerequisites_met(queue_state, stage_task)
+
+
+def _stage_prerequisites_met(
+    queue_state: dict[str, Any], stage_task: Mapping[str, Any]
+) -> bool:
+    """Shared predecessor logic for starting and publishing formal stages."""
+
+    stage = _stage_name(stage_task)
+    node_id = _stage_node_id(stage_task)
+
     if stage == STAGE_VISUAL_ANALYSIS:
         return True
 
