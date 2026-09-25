@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -119,6 +120,41 @@ class EventClient:
 
     def mark_test_failed(self, node_id: str, message: str | None = None) -> None:
         self._emit_requirement_state(node_id, "test", "failed", message)
+
+    def has_requirement_state(self, node_id: str, phase: str, status: str) -> bool:
+        """Whether the runner event log already records this aggregate state.
+
+        Resume replays re-run publication finalization after a crash; the
+        append-only log is the durable ledger, so a replayed finalization
+        checks here instead of appending a second completion event.
+        """
+
+        normalized_node_id = str(node_id or "").strip()
+        wanted_phase = str(phase or "").strip()
+        wanted_status = str(status or "").strip()
+        if not normalized_node_id or not wanted_phase or not wanted_status:
+            return False
+        path = self.paths.runner_events_path
+        if not path.exists():
+            return False
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return False
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "requirement_state":
+                continue
+            if (
+                str(event.get("node_id") or "").strip() == normalized_node_id
+                and str(event.get("phase") or "").strip() == wanted_phase
+                and str(event.get("status") or "").strip() == wanted_status
+            ):
+                return True
+        return False
 
     def record_visual_analysis(
         self,

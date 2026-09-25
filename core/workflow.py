@@ -1523,7 +1523,15 @@ class ARCWorkflowManager:
                 entry.stage,
                 STAGE_PUBLISHED,
             )
-            self._finalize_stage_publication(queue_state, entry.node_id, entry.stage)
+            # A crash between the merge commit and the queue save replays an
+            # already-integrated publication on resume; its finalization must
+            # not append the aggregate completion markers a second time.
+            self._finalize_stage_publication(
+                queue_state,
+                entry.node_id,
+                entry.stage,
+                replay=not committed,
+            )
             self._save_processing_queue(queue_state)
             try:
                 await asyncio.to_thread(manager.settle_stage, handle, published=True)
@@ -1574,6 +1582,8 @@ class ARCWorkflowManager:
         queue_state: dict[str, Any],
         node_id: str,
         stage: str,
+        *,
+        replay: bool = False,
     ) -> str | None:
         """Project a landed stage back onto the legacy aggregate state.
 
@@ -1581,6 +1591,9 @@ class ARCWorkflowManager:
         (``PHASE_DESIGN`` or ``PHASE_IMPLEMENT``), or ``None`` when the
         aggregate stays in flight: a leaf's interface publication waits for
         the same node's test publication before DESIGN completes.
+        ``replay`` marks the resume of an already-integrated publication;
+        the completion markers are then deduped against the runner event
+        log instead of being appended a second time.
         """
 
         if stage == STAGE_INTERFACE_DESIGN:
@@ -1588,26 +1601,67 @@ class ARCWorkflowManager:
             if test_task is not None and bool(test_task.get("applicable", True)):
                 return None
             complete_task(queue_state, node_id, PHASE_DESIGN, on_state_change=self._upsert_node_state)
-            marker = getattr(self.runtime.events, "mark_design_done", None)
-            if callable(marker):
-                marker(node_id)
+            self._emit_stage_aggregate_event(
+                node_id,
+                "mark_design_done",
+                phase="design",
+                status="completed",
+                replay=replay,
+            )
             return PHASE_DESIGN
         if stage == STAGE_TEST_GENERATION:
             complete_task(queue_state, node_id, PHASE_DESIGN, on_state_change=self._upsert_node_state)
-            marker = getattr(self.runtime.events, "mark_design_done", None)
-            if callable(marker):
-                marker(node_id)
+            self._emit_stage_aggregate_event(
+                node_id,
+                "mark_design_done",
+                phase="design",
+                status="completed",
+                replay=replay,
+            )
             return PHASE_DESIGN
         if stage == STAGE_IMPLEMENTATION:
             complete_task(queue_state, node_id, PHASE_IMPLEMENT, on_state_change=self._upsert_node_state)
-            marker = getattr(self.runtime.events, "mark_implementation_done", None)
-            if callable(marker):
-                marker(node_id)
-            marker = getattr(self.runtime.events, "mark_test_passed", None)
-            if callable(marker):
-                marker(node_id)
+            self._emit_stage_aggregate_event(
+                node_id,
+                "mark_implementation_done",
+                phase="implement",
+                status="completed",
+                replay=replay,
+            )
+            self._emit_stage_aggregate_event(
+                node_id,
+                "mark_test_passed",
+                phase="test",
+                status="passed",
+                replay=replay,
+            )
             return PHASE_IMPLEMENT
         return None
+
+    def _emit_stage_aggregate_event(
+        self,
+        node_id: str,
+        marker_name: str,
+        *,
+        phase: str,
+        status: str,
+        replay: bool,
+    ) -> None:
+        """Emit one aggregate completion marker, deduped on resume replays.
+
+        The append-only runner event log is the durable ledger: the queue
+        save happens after the markers, so a crash in between leaves a
+        READY_TO_MERGE task whose completion events already exist.
+        """
+
+        events = getattr(self.runtime, "events", None)
+        marker = getattr(events, marker_name, None)
+        if not callable(marker):
+            return
+        dedupe = getattr(events, "has_requirement_state", None)
+        if replay and callable(dedupe) and dedupe(node_id, phase, status):
+            return
+        marker(node_id)
 
     def _max_concurrent_tasks(self) -> int:
         if not self._parallel_mode:

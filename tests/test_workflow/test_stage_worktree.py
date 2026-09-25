@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from arcbench_agent_runtime.context import RuntimePaths
+from arcbench_agent_runtime.events import EventClient
 from core.queue_state import (
     STAGE_INTERFACE_DESIGN,
     STAGE_PUBLISHED,
@@ -20,6 +22,7 @@ from core.queue_state import (
 from core.workflow import ARCWorkflowManager
 from core.stage_merge_queue import StageMergeQueue
 from core.stage_worktree import (
+    StagePublication,
     StagePublicationError,
     StageWorktreeManager,
 )
@@ -504,3 +507,148 @@ def test_approved_cross_node_overlap_windows_execute_in_stage_worktrees(
             assert (repo / path).exists(), f"{path} never reached integration"
     assert not list((repo / ".arc" / "stage-worktrees").iterdir())
     assert queue["node_states"] == {"ROOT": "PASSED", "A": "PASSED", "B": "PASSED"}
+
+
+def test_stage_merge_never_lands_coordinator_files(tmp_path: Path) -> None:
+    """The merge boundary is the last line of defense for ``.arc`` state.
+
+    A publish-time guard blocks coordinator paths, but a stage branch that
+    carries them anyway (stale branch state, a bypassed path) must fail the
+    integration instead of writing ``.arc`` JSON into the shared workspace -
+    otherwise concurrent stage worktrees could merge runtime state (ADR 0008).
+    """
+
+    repo, manager = _init_repo(tmp_path)
+    traceability_file = repo / ".arc" / "traceability" / "requirements.json"
+    traceability_file.parent.mkdir(parents=True)
+    traceability_file.write_text('{"requirements": []}\n', encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "track coordinator traceability"], repo)
+
+    handle = manager.prepare_stage(
+        "REQ-1",
+        STAGE_INTERFACE_DESIGN,
+        declared_write_set=["backend/feature.js", ".arc/traceability/requirements.json"],
+    )
+    stage_tree = Path(handle.path)
+    (stage_tree / "backend" / "feature.js").write_text("feature;\n", encoding="utf-8")
+    (stage_tree / ".arc" / "traceability" / "requirements.json").write_text(
+        '{"hijacked": true}\n', encoding="utf-8"
+    )
+    _git(["add", "-A"], stage_tree)
+    _git(["commit", "-q", "-m", "stage carries coordinator state"], stage_tree)
+    artifact = _git(["rev-parse", "HEAD"], stage_tree).stdout.strip()
+    publication = StagePublication(
+        node_id="REQ-1",
+        stage=STAGE_INTERFACE_DESIGN,
+        base_commit=handle.base_commit,
+        artifact_commit=artifact,
+        declared_write_set=(".arc/traceability/requirements.json", "backend/feature.js"),
+        contract_hash="contract-hash",
+        test_manifest_hash="manifest-hash",
+        validation_evidence={"status": "passed"},
+        changed_files=(".arc/traceability/requirements.json", "backend/feature.js"),
+        branch=handle.branch,
+        worktree_path=handle.path,
+    )
+
+    head_before = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    with pytest.raises(StagePublicationError, match="coordinator files"):
+        manager.integrate_stage(handle, publication, "merge hijacked stage")
+
+    assert _git(["rev-parse", "HEAD"], repo).stdout.strip() == head_before
+    assert traceability_file.read_text(encoding="utf-8") == '{"requirements": []}\n'
+    assert Path(handle.path).exists()
+
+
+def _recording_event_client(repo: Path) -> EventClient:
+    return EventClient(RuntimePaths.from_env(project_dir=str(repo)))
+
+
+def test_replayed_stage_publication_does_not_duplicate_completion_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash between the merge commit and the queue save leaves a
+    READY_TO_MERGE publication whose merge already landed; the resume
+    replay must finalize it exactly once, driven by the runner event log
+    instead of re-appending the aggregate completion markers."""
+
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
+    repo, stage_manager = _init_repo(tmp_path)
+    handle = stage_manager.prepare_stage(
+        "R",
+        STAGE_INTERFACE_DESIGN,
+        declared_write_set=["backend/recovered.js"],
+    )
+    (Path(handle.path) / "backend" / "recovered.js").write_text("recovered;\n", encoding="utf-8")
+    publication = _publish(stage_manager, handle, writes=["backend/recovered.js"])
+    # The merge already landed, but the queue still records READY_TO_MERGE:
+    # the exact on-disk state after a crash before the PUBLISHED save.
+    committed, _detail = stage_manager.integrate_stage(handle, publication, "merge R design")
+    assert committed is True
+
+    class _Traceability:
+        def get_requirement(self, node_id: str) -> dict[str, object]:
+            return {"id": node_id, "children_ids": []}
+
+        def upsert_node_state(self, _node_id: str, _state: str) -> None:
+            return None
+
+    manager = ARCWorkflowManager(
+        workspace_path=str(repo),
+        requirement_path="",
+        app_type="cli",
+        web_port=4300,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = SimpleNamespace(
+        traceability=_Traceability(),
+        events=_recording_event_client(repo),
+    )
+    manager._save_processing_queue = lambda _queue: None
+    queue = load_or_create_queue(
+        str(repo / ".arc" / "processing_queue.json"),
+        {
+            "id": "R",
+            "name": "root",
+            "description": "root",
+            "children": [{"id": "L", "name": "leaf", "description": "leaf", "children": []}],
+        },
+    )
+    root_visual = next(item for item in queue["stage_tasks"] if item["stage_task_id"] == "R:VISUAL_ANALYSIS")
+    root_visual["status"] = STAGE_PUBLISHED
+    root_interface = next(item for item in queue["stage_tasks"] if item["stage_task_id"] == "R:INTERFACE_DESIGN")
+    root_interface["status"] = STAGE_READY_TO_MERGE
+    root_interface["publication"] = publication.to_dict()
+    root_test = next(item for item in queue["stage_tasks"] if item["stage_task_id"] == "R:TEST_GENERATION")
+    root_test["status"] = "SKIPPED"
+
+    def _completed_events() -> int:
+        events_path = repo / ".arc" / "runner-events.jsonl"
+        if not events_path.exists():
+            return 0
+        return sum(
+            1
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+            if '"type": "requirement_state"' in line
+            and '"node_id": "R"' in line
+            and '"phase": "design"' in line
+            and '"status": "completed"' in line
+        )
+
+    asyncio.run(manager._rehydrate_stage_merge_queue(queue))
+    asyncio.run(manager._drain_stage_merge_queue(queue))
+
+    assert root_interface["status"] == STAGE_PUBLISHED, root_interface.get("error")
+    assert queue["node_states"]["R"] == "DESIGNED"
+    assert _completed_events() == 1
+
+    # Replay the same crash window once more: the event log is the ledger,
+    # so the second finalization must not append a second completion event.
+    root_interface["status"] = STAGE_READY_TO_MERGE
+    asyncio.run(manager._rehydrate_stage_merge_queue(queue))
+    asyncio.run(manager._drain_stage_merge_queue(queue))
+
+    assert root_interface["status"] == STAGE_PUBLISHED, root_interface.get("error")
+    assert _completed_events() == 1

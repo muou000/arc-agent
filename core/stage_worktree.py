@@ -343,8 +343,16 @@ class StageWorktreeManager(NodeWorktreeManager):
                 self._git(["rev-parse", integration_branch], cwd=self.main_workspace),
                 f"rev-parse {integration_branch}",
             )
+            # An already-integrated branch has nothing to replay, so it must
+            # not be rebased: a fast-forward would move the branch head away
+            # from the publication's artifact commit and break resume replays.
+            already_integrated = self._git(
+                ["merge-base", "--is-ancestor", handle.branch, current_head],
+                cwd=self.main_workspace,
+                check=False,
+            ).returncode == 0
             rebased = False
-            if current_head != publication.base_commit:
+            if not already_integrated and current_head != publication.base_commit:
                 rebased = self._rebase_stage(handle, integration_branch)
 
             branch_head_after_rebase = _git_text(
@@ -391,6 +399,28 @@ class StageWorktreeManager(NodeWorktreeManager):
                         files=conflict_paths,
                     )
                 resolved = additions
+
+            # Last line of defense before coordinator state lands: publish
+            # rejects ``.arc`` writes, but a stage branch that carries them
+            # anyway must never merge them into the shared workspace.
+            staged_result = self._git(
+                ["diff", "--cached", "--name-only"],
+                cwd=self.main_workspace,
+            )
+            coordinator = sorted(
+                {
+                    path
+                    for raw in staged_result.stdout.splitlines()
+                    if (path := _normalize_repo_path(raw)) and _is_coordinator_path(path)
+                }
+            )
+            if coordinator:
+                self._git(["merge", "--abort"], cwd=self.main_workspace, check=False)
+                self._quarantined.add(str(Path(handle.path)))
+                raise StagePublicationError(
+                    f"stage {handle.node_id}:{handle.stage} attempted to merge "
+                    "coordinator files into integration: " + ", ".join(coordinator)
+                )
 
             failure: str | None = None
             if verify is not None:
