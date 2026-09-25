@@ -663,6 +663,16 @@ def complete_task(
     """
 
     if phase == PHASE_DESIGN:
+        stages = (STAGE_INTERFACE_DESIGN, STAGE_TEST_GENERATION)
+    elif phase == PHASE_IMPLEMENT:
+        stages = (STAGE_IMPLEMENTATION,)
+    else:
+        raise ValueError(f"Unknown aggregate phase: {phase}")
+    for stage in stages:
+        if stage_status_of(queue_state, node_id, stage) == STAGE_FAILED:
+            raise ValueError(f"Cannot complete {phase} for {node_id}: failed {stage} stage")
+
+    if phase == PHASE_DESIGN:
         new_state = NODE_DESIGNED
         queue_state.setdefault("node_design_done", {})[node_id] = True
         _set_stage_status_if_present(queue_state, node_id, STAGE_VISUAL_ANALYSIS, STAGE_PUBLISHED)

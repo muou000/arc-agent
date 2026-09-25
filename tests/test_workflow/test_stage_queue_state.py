@@ -129,6 +129,37 @@ def test_published_stage_cannot_reenter_running_without_explicit_retry(tmp_path:
         transition_stage_task(queue, "L", STAGE_INTERFACE_DESIGN, STAGE_RUNNING)
 
 
+@pytest.mark.parametrize("status", [STAGE_READY_TO_MERGE, STAGE_PUBLISHED])
+def test_failed_stage_cannot_publish_or_erase_its_failure(tmp_path: Path, status: str) -> None:
+    queue = _queue(tmp_path)
+    transition_stage_task(queue, "L", STAGE_INTERFACE_DESIGN, STAGE_RUNNING)
+    fail_stage_task(queue, "L", STAGE_INTERFACE_DESIGN, error="invalid tests", error_category="gate")
+
+    with pytest.raises(ValueError, match="Invalid stage transition"):
+        transition_stage_task(queue, "L", STAGE_INTERFACE_DESIGN, status)
+
+    stage = next(item for item in queue["stage_tasks"] if item["stage_task_id"] == "L:INTERFACE_DESIGN")
+    assert stage["status"] == STAGE_FAILED
+    assert stage["error"] == "invalid tests"
+    assert stage["error_category"] == "gate"
+    assert queue["node_states"]["L"] == "FAILED"
+    assert stage_status_of(queue, "L", STAGE_TEST_GENERATION) == STAGE_BLOCKED
+
+
+def test_failed_test_generation_is_not_marked_designed_by_late_completion(tmp_path: Path) -> None:
+    queue = _queue(tmp_path)
+    transition_stage_task(queue, "L", STAGE_INTERFACE_DESIGN, STAGE_PUBLISHED)
+    transition_stage_task(queue, "L", STAGE_TEST_GENERATION, STAGE_RUNNING)
+    fail_stage_task(queue, "L", STAGE_TEST_GENERATION, error="no registered tests")
+
+    with pytest.raises(ValueError, match="failed TEST_GENERATION"):
+        complete_task(queue, "L", PHASE_DESIGN)
+
+    assert queue["node_states"]["L"] == "FAILED"
+    assert queue["node_design_done"]["L"] is False
+    assert stage_status_of(queue, "L", STAGE_TEST_GENERATION) == STAGE_FAILED
+
+
 def test_repeating_running_transition_does_not_consume_an_attempt(tmp_path: Path) -> None:
     queue = _queue(tmp_path)
 
