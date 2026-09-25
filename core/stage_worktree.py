@@ -273,7 +273,7 @@ class StageWorktreeManager(NodeWorktreeManager):
                     if (path := _normalize_repo_path(raw))
                 )
             )
-            protected = [path for path in staged if _is_coordinator_path(path)]
+            protected = _coordinator_conflicts(staged_result.stdout)
             if protected:
                 raise StagePublicationError(
                     "stage worktree attempted to publish coordinator files: " + ", ".join(protected)
@@ -343,8 +343,16 @@ class StageWorktreeManager(NodeWorktreeManager):
                 self._git(["rev-parse", integration_branch], cwd=self.main_workspace),
                 f"rev-parse {integration_branch}",
             )
+            # An already-integrated branch has nothing to replay, so it must
+            # not be rebased: a fast-forward would move the branch head away
+            # from the publication's artifact commit and break resume replays.
+            already_integrated = self._git(
+                ["merge-base", "--is-ancestor", handle.branch, current_head],
+                cwd=self.main_workspace,
+                check=False,
+            ).returncode == 0
             rebased = False
-            if current_head != publication.base_commit:
+            if not already_integrated and current_head != publication.base_commit:
                 rebased = self._rebase_stage(handle, integration_branch)
 
             branch_head_after_rebase = _git_text(
@@ -391,6 +399,22 @@ class StageWorktreeManager(NodeWorktreeManager):
                         files=conflict_paths,
                     )
                 resolved = additions
+
+            # Last line of defense before coordinator state lands: publish
+            # rejects ``.arc`` writes, but a stage branch that carries them
+            # anyway must never merge them into the shared workspace.
+            staged_result = self._git(
+                ["diff", "--cached", "--name-only"],
+                cwd=self.main_workspace,
+            )
+            coordinator = _coordinator_conflicts(staged_result.stdout)
+            if coordinator:
+                self._git(["merge", "--abort"], cwd=self.main_workspace, check=False)
+                self._quarantined.add(str(Path(handle.path)))
+                raise StagePublicationError(
+                    f"stage {handle.node_id}:{handle.stage} attempted to merge "
+                    "coordinator files into integration: " + ", ".join(coordinator)
+                )
 
             failure: str | None = None
             if verify is not None:
@@ -503,6 +527,23 @@ def _is_coordinator_path(path: str) -> bool:
     normalized = path.casefold()
     return normalized == ".arc" or normalized.startswith(".arc/") or normalized.endswith(
         "/processing_queue.json"
+    )
+
+
+def _coordinator_conflicts(staged_output: str) -> list[str]:
+    """Coordinator paths within ``git diff --cached --name-only`` output.
+
+    Shared by the publish-time and merge-time guards: runtime state under
+    ``.arc`` belongs to the coordinator and must neither be published from
+    a stage worktree nor merged out of one.
+    """
+
+    return sorted(
+        {
+            path
+            for raw in staged_output.splitlines()
+            if (path := _normalize_repo_path(raw)) and _is_coordinator_path(path)
+        }
     )
 
 
