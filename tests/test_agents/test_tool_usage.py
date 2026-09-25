@@ -314,3 +314,28 @@ def test_async_wrap_records_usage() -> None:
     assert isinstance(result, ToolMessage)
     assert len(records) == 1
     assert records[0].limit == 50
+
+
+def test_glob_sentinel_receipt_carries_result_text_for_telemetry() -> None:
+    """The raw receipt text travels with the record so the SDK's
+    ``result_empty`` classification can recognize the upstream empty-result
+    sentinel texts (a bare ``result_chars`` count cannot)."""
+
+    records: list[Any] = []
+    set_tool_usage_sink(records.append)
+    middleware = ToolUsageMiddleware()
+    receipt = ToolMessage(
+        content="No files found\n\nNote: 1 match withheld by read-deny (node_modules).",
+        name="glob",
+        tool_call_id="call-glob-1",
+    )
+
+    def glob_tool(request: ToolCallRequest) -> ToolMessage:
+        return receipt
+
+    middleware.wrap_tool_call(make_request("glob", {"pattern": "**/cli*", "path": "/workspace"}), glob_tool)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.result_chars == len(receipt.content)
+    assert record.result_text == receipt.content

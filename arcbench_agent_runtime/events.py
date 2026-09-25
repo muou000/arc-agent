@@ -31,6 +31,24 @@ def _nullable_nonneg_int(value: Any) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+# The upstream filesystem tools render empty results as fixed sentinel texts:
+# glob as ``No files found``, grep as ``No matches found``. Both are real
+# characters, so the historical ``result_chars == 0`` emptiness check read
+# every ineffective glob or grep as a non-empty result (issue #296: 109
+# permission-withheld globs answered by the sentinel were invisible to the
+# ``empty_results`` telemetry). A result whose first paragraph is a known
+# sentinel counts as empty; notes appended after the sentinel (withheld
+# matches, grep guidance) keep the classification. Matched on the first
+# paragraph only, so content that merely mentions a sentinel stays non-empty.
+_KNOWN_EMPTY_RESULT_SENTINELS = ("No files found", "No matches found")
+
+
+def _is_known_empty_result_text(result_text: str | None) -> bool:
+    if not result_text:
+        return False
+    return result_text.split("\n\n", 1)[0] in _KNOWN_EMPTY_RESULT_SENTINELS
+
+
 def _nonneg_float(value: Any) -> float | None:
     """Normalize an optional duration: absent or invalid means "not reported"."""
 
@@ -268,6 +286,7 @@ class EventClient:
         offset: int | None = None,
         limit: int | None = None,
         result_chars: int = 0,
+        result_text: str | None = None,
         requested_path: str | None = None,
         path_classification: str = "",
         execution_path: str | None = None,
@@ -280,7 +299,12 @@ class EventClient:
         wasteful round-trips: file reads record their ``offset``/``limit``
         (``limit=None`` means the model asked for an unpaged, whole-file read)
         and every event records the result size so empty grep/read results are
-        visible. An empty ``node_id`` attributes the call to the run as a whole.
+        visible. ``result_text`` — the raw receipt the producing middleware
+        saw — lets known empty-result sentinel texts (``No files found``,
+        ``No matches found``) count as empty even though they carry real
+        characters; direct SDK callers that omit it keep the historical
+        char-count-only classification. An empty ``node_id`` attributes the
+        call to the run as a whole.
         """
         normalized_chars = _nonneg_int(result_chars)
         detail = {
@@ -288,7 +312,7 @@ class EventClient:
             "offset": _nullable_nonneg_int(offset),
             "limit": _nullable_nonneg_int(limit),
             "result_chars": normalized_chars,
-            "result_empty": normalized_chars == 0,
+            "result_empty": normalized_chars == 0 or _is_known_empty_result_text(result_text),
         }
         normalized_requested = str(requested_path or "").strip() or None
         normalized_classification = str(path_classification or "").strip()
