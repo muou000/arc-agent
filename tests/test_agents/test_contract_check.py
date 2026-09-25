@@ -365,6 +365,181 @@ def test_validate_http_status_contract_uses_interface_output_without_defaulting_
     assert diagnostics == []
 
 
+@pytest.mark.parametrize("response_field", ["outputs", "responses"])
+def test_validate_http_status_contract_accepts_arc_output2_auth_shapes(
+    tmp_project_dir: Path, response_field: str,
+) -> None:
+    route_path = tmp_project_dir / "backend" / "src" / "routes" / "auth.routes.js"
+    route_path.parent.mkdir(parents=True)
+    route_path.write_text(
+        "const router = express.Router();\n"
+        "router.post('/register', (req, res) => {\n"
+        "  // 201 -> { user }\n"
+        "  // 400 -> validation error\n"
+        "  // 409 -> duplicate email\n"
+        "  return res.status(500).json({ code: 'NOT_IMPLEMENTED', message: 'TODO(TDD)' });\n"
+        "});\n"
+        "router.get('/me', (req, res) => {\n"
+        "  // 200 -> { user }\n"
+        "  return res.status(500).json({ code: 'NOT_IMPLEMENTED', message: 'TODO(TDD)' });\n"
+        "});\n"
+        "router.post('/logout', (req, res) => {\n"
+        "  // 200 -> { ok: true }\n"
+        "  return res.status(500).json({ code: 'NOT_IMPLEMENTED', message: 'TODO(TDD)' });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_project_dir / "integration" / "auth.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const register = await request.post('/api/auth/register');\n"
+        "expect(register.status).toBe(201);\n"
+        "expect(register.status).toBe(400);\n"
+        "expect(register.status).toBe(409);\n"
+        "const me = await request.get('/api/auth/me');\n"
+        "expect(me.status).toBe(200);\n"
+        "const logout = await request.post('/api/auth/logout');\n"
+        "expect(logout.status).toBe(200);\n",
+        encoding="utf-8",
+    )
+    interface = {
+        "interface_id": "IF-AUTH",
+        "type": "API",
+        "specification": "POST /api/auth/register, GET /api/auth/me, POST /api/auth/logout. "
+        "Status codes fixed: register 201 success, 400 field validation, "
+        "409 duplicates; me/logout always 200.",
+        response_field: {
+            "register": "201 { user }; 400 { errors }; 409 { error }",
+            "me": "200 { user }",
+            "logout": "200 { ok: true }",
+        },
+        "file_path": "backend/src/routes/auth.routes.js",
+    }
+    manifest = [{"type": "Integration", "file_path": "integration/auth.test.js"}]
+
+    assert validate_http_status_contracts(
+        tmp_project_dir, {"description": "Authentication."}, [interface], manifest
+    ) == []
+
+    for field in (response_field, "specification"):
+        partial = {**interface}
+        partial.pop(field)
+        partial["file_path"] = "backend/src/routes/missing.js"
+        assert validate_http_status_contracts(
+            tmp_project_dir, {"description": "Authentication."}, [partial], manifest
+        ) == []
+
+
+def test_validate_http_status_contract_route_comments_are_scoped_and_placeholder_is_not_a_contract(
+    tmp_project_dir: Path,
+) -> None:
+    route_path = tmp_project_dir / "backend" / "src" / "routes" / "notes.js"
+    route_path.parent.mkdir(parents=True)
+    route_path.write_text(
+        "router.post('/notes', (req, res) => {\n"
+        "  // 201 -> created\n"
+        "  return res.status(500).json({\n"
+        "    code: 'NOT_IMPLEMENTED', message: 'TODO(TDD)'\n"
+        "  });\n"
+        "});\n"
+        "router.get('/users', (req, res) => {\n"
+        "  // 200 -> users\n"
+        "  return res.status(500).json({ code: 'NOT_IMPLEMENTED' });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_project_dir / "integration" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status).toBe(201);\n",
+        encoding="utf-8",
+    )
+    interface = {
+        "interface_id": "IF-NOTES",
+        "type": "API",
+        "specification": "POST /api/notes creates a note.",
+        "file_path": "backend/src/routes/notes.js",
+    }
+    manifest = [{"type": "Integration", "file_path": "integration/notes.test.js"}]
+
+    assert validate_http_status_contracts(tmp_project_dir, {"description": "Create a note."}, [interface], manifest) == []
+
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status).toBe(500);\n",
+        encoding="utf-8",
+    )
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir, {"description": "Create a note."}, [interface], manifest
+    )
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_conflict"
+    assert diagnostics[0]["contract_status_codes"] == [201]
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    ["code: 'NOT_IMPLEMENTED'", "message: 'TODO(TDD)'", "message: 'TODO(TDD); work pending'"],
+)
+def test_validate_http_status_contract_placeholder_only_requires_status_declaration(
+    tmp_project_dir: Path, placeholder: str,
+) -> None:
+    route_path = tmp_project_dir / "backend" / "src" / "routes" / "notes.js"
+    route_path.parent.mkdir(parents=True)
+    route_path.write_text(
+        "router.post('/notes', (req, res) => {\n"
+        f"  return res.status(500).json({{ {placeholder} }});\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_project_dir / "integration" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status).toBe(500);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [{"interface_id": "IF-NOTES", "type": "API", "file_path": "backend/src/routes/notes.js"}],
+        [{"type": "Integration", "file_path": "integration/notes.test.js"}],
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_needs_info"
+
+
+def test_validate_http_status_contract_preserves_real_status_next_to_placeholder(tmp_project_dir: Path) -> None:
+    route_path = tmp_project_dir / "backend" / "src" / "routes" / "notes.js"
+    route_path.parent.mkdir(parents=True)
+    route_path.write_text(
+        "router.post('/notes', (req, res) => {\n"
+        "  if (req.invalid) return res.status(400).json({ error: 'invalid' });\n"
+        "  return res.status(500).json({ code: 'NOT_IMPLEMENTED' });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_project_dir / "integration" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status).toBe(400);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [{"interface_id": "IF-NOTES", "type": "API", "file_path": "backend/src/routes/notes.js"}],
+        [{"type": "Integration", "file_path": "integration/notes.test.js"}],
+    )
+
+    assert diagnostics == []
+
+
 def test_validate_http_status_contract_reads_top_level_status_field(tmp_project_dir: Path) -> None:
     test_path = tmp_project_dir / "tests" / "notes.test.js"
     test_path.parent.mkdir(parents=True)
