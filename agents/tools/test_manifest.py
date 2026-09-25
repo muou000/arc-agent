@@ -236,8 +236,15 @@ def build_declare_test_manifest_tool(
         Call this before writing any test file, with one entry
         per test file you intend to create or update. ``coverage_scope`` is
         ``owned`` for behavior introduced by this node, ``dependency`` for a
-        dependency regression, and ``shared`` for a shared-contract check:
-        [{"file_path": "backend/tests/unit/auth_service.test.js", "type": "Unit", "coverage_scope": "owned", "interface_ids": ["IF-AUTH-SERVICE"]}].
+        dependency regression, and ``shared`` for a shared-contract check.
+        When the stage pipeline enforces node domains, replace the supplied
+        stable segment in the exact path under the current node's generated
+        namespace before calling this tool, for example:
+        [{"file_path": "backend/tests/generated/<stable-segment>/unit/auth_service.test.js", "type": "Unit", "coverage_scope": "owned", "interface_ids": ["IF-AUTH-SERVICE"]}].
+        The literal ``<stable-segment>`` is a prompt placeholder, not a path
+        to submit. With namespace enforcement disabled, the legacy
+        ``backend/tests/...``, ``frontend/tests/...`` and
+        ``backend/test-e2e/...`` roots remain valid.
 
         The declaration is validated (placement rules, interface ids, type)
         and then LOCKED for the rest of this stage run: write_file, edit_file

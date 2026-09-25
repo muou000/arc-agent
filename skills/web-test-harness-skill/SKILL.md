@@ -19,12 +19,23 @@ The template ships the complete test infrastructure. Treat these as fixed contra
 
 These files are injected into your context as `<scaffold_files>`. The bullets above are starting anchors, not the contract itself: the durable contract is the usage pattern (setup -> operate -> cleanup lifecycle, import ordering, placement rules below). When a recipe references a path, export, or option that does not match the actual scaffold file contents, trust the file and adapt the recipe to it — never invent the missing piece, and never rebuild infrastructure to match the recipe.
 
+## Test paths and relative imports
+
+When the stage pipeline is active, `<stable-segment>` below means the concrete stable segment for the current node supplied by the stage prompt or tool description. Replace the placeholder before declaring or writing a file; never send the literal `<stable-segment>` string. Node-local Web tests use these roots:
+
+- Backend Unit: `backend/tests/generated/<stable-segment>/...`
+- Backend Integration: `backend/tests/generated/<stable-segment>/integration/...`
+- Frontend Unit or component: `frontend/tests/generated/<stable-segment>/...`
+- Web E2E: `backend/test-e2e/generated/<stable-segment>/...`
+
+Compute every relative import from the test file's actual directory. For example, a backend Unit file directly below `backend/tests/generated/<stable-segment>/` reaches `backend/src/` with `../../../src/...`, while a backend Integration file one level deeper reaches it with `../../../../src/...`. A frontend file directly below `frontend/tests/generated/<stable-segment>/` reaches `frontend/src/` with `../../../src/...`. The disabled-namespace compatibility mode still accepts the legacy `backend/tests/...`, `frontend/tests/...`, and `backend/test-e2e/...` roots, but those roots must not be used when the stage pipeline says the node domain is enforced.
+
 Rules:
 
 1. Never create or edit a test config, setup file, harness module, or test-related `package.json` entry (test scripts, test `devDependencies`) to "set up" testing, and never install dependencies for it. This boundary covers test infrastructure only: when the application source under test genuinely needs a new runtime dependency, adding it to `dependencies` is the implementer's call in the later TDD stage, not a harness concern. If a recipe below works against the files listed above, the test infrastructure is sufficient.
 2. Do not rely on runner globals. Load Vitest with ESM `import { describe, it, expect, vi } from 'vitest'` even in the CommonJS backend package; load Playwright with `const { test, expect } = require('@playwright/test')`.
 3. Lock the final test file list (path, type, covered interface ids) before the first write; every subsequent write must land on one of those paths. Never rename, re-create, or delete-then-rewrite a test file mid-pass — pick the final name once and fix content in place.
-4. Name files after the module under test, not after requirement ids or scenario prose: `backend/tests/<domain>Repository.test.js` mirrors `backend/src/repositories/<domain>Repository.js`; a frontend file containing JSX ends in `.test.tsx`/`.spec.tsx`, one without JSX in `.test.ts`; Playwright files end in `.e2e.spec.js`. Use `.test.<ext>` consistently for Vitest files.
+4. Name files after the module under test, not after requirement ids or scenario prose: `backend/tests/generated/<stable-segment>/domainRepository.test.js` mirrors `backend/src/repositories/domainRepository.js`; a frontend file containing JSX ends in `.test.tsx`/`.spec.tsx`, one without JSX in `.test.ts`; Playwright files end in `.e2e.spec.js`. Use `.test.<ext>` consistently for Vitest files.
 5. One Vitest file per owned executable capability per layer; do not split a capability into many files or reorganize by renaming. Open each `describe` with `'<Module> (<interface-ids>)'` so tests stay traceable to the interface contract.
 6. Centralize valid input construction in one factory per file — `function valid<X>(overrides = {}) { return { ...all required fields..., ...overrides }; }` — and let each test override only the field it varies. Never copy a ten-field payload into every `it`.
 7. Pick the recipe by the interface type under test, not by the domain: repository/service → backend unit; route/boundary wiring → backend API integration; page/component → frontend component; pure logic → frontend unit; user-visible scenario → E2E.
@@ -33,8 +44,9 @@ Rules:
 
 ```js
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createTestDatabaseHarness } from '../src/database/test_harness.js';
-import * as domainRepository from '../src/repositories/domainRepository.js';
+// File: backend/tests/generated/<stable-segment>/domainRepository.test.js
+import { createTestDatabaseHarness } from '../../../src/database/test_harness.js';
+import * as domainRepository from '../../../src/repositories/domainRepository.js';
 
 describe('DomainRepository (<interface-ids>)', () => {
   let harness;
@@ -59,7 +71,8 @@ describe('DomainRepository (<interface-ids>)', () => {
 ```js
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
-import { createTestDatabaseHarness } from '../src/database/test_harness.js';
+// File: backend/tests/generated/<stable-segment>/integration/domainApi.test.js
+import { createTestDatabaseHarness } from '../../../../src/database/test_harness.js';
 
 let harness;
 let app;
@@ -70,7 +83,7 @@ beforeAll(async () => {
   // Order contract: harness.setup() must redirect the database path BEFORE
   // anything imports code that initializes the database. Dynamic import is
   // the mechanism that guarantees this ordering.
-  app = (await import('../src/app.js')).default;
+  app = (await import('../../../../src/app.js')).default;
 });
 
 afterAll(async () => {
@@ -78,7 +91,7 @@ afterAll(async () => {
 });
 ```
 
-11. The ordering contract is `harness.setup()` before any import or call that can trigger database initialization. In the current template that means a dynamic `await import('../src/app.js')`, because `backend/src/app.js` initializes the database at module load; if initialization ever becomes explicit or lazy, the contract still applies and only the mechanism changes. A static top-level import is the canonical failure — the app binds to the wrong database file and tests silently write outside the isolated database.
+11. The ordering contract is `harness.setup()` before any import or call that can trigger database initialization. In the Integration recipe above that means a dynamic `await import('../../../../src/app.js')`, because the example file is under `backend/tests/generated/<stable-segment>/integration/` and `backend/src/app.js` initializes the database at module load. Recalculate that relative path for any other directory. If initialization ever becomes explicit or lazy, the contract still applies and only the mechanism changes. A static top-level import is the canonical failure — the app binds to the wrong database file and tests silently write outside the isolated database.
 12. Assert `response.status`, the response envelope, and user-visible messages in the requirement's language (for Chinese requirements match `/中文关键词/`), never raw error stack text.
 13. For cookie flows, extract once and replay it: `const cookie = res.headers['set-cookie'].find((c) => c.includes('<cookie-name>=')).split(';')[0];` then `.set('Cookie', cookie)`.
 
@@ -89,7 +102,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import * as domainApi from '../src/api/domain.js';
+// File: frontend/tests/generated/<stable-segment>/DomainPage.test.tsx
+import * as domainApi from '../../../src/api/domain.js';
 
 function renderPage() {
   return render(
@@ -122,6 +136,7 @@ The template's production entry (`frontend/src/main.tsx`) renders inside `React.
 ```js
 const { test, expect } = require('@playwright/test');
 
+// File: backend/test-e2e/generated/<stable-segment>/login.e2e.spec.js
 function uniqueSuffix() {
   return crypto.randomUUID().slice(0, 8);
 }
@@ -143,4 +158,4 @@ function uniqueSuffix() {
 - Static `import app` before the database harness redirected the path; sharing one database file across tests in a suite.
 - Mocking the database or service layer to avoid the harness, or mocking fetch internals instead of spying the app's own API module.
 - Fixed identifiers in E2E; asserting error text in a language the requirement does not use.
-- Relative ESM imports without their explicit extension (`'../src/database/test_harness'` instead of `'../src/database/test_harness.js'`), or a relative depth that does not match this file's own directory (from `backend/tests/integration/` the app lives at `'../../src/app.js'`, not `'../src/app'`). Test-file writes are statically validated against the workspace and an import that resolves to no existing file is rejected with the exact correction.
+- Relative ESM imports without their explicit extension (for example, `'../../../src/database/test_harness'` instead of `'../../../src/database/test_harness.js'`), or a relative depth that does not match this file's own directory. Test-file writes are statically validated against the workspace and an import that resolves to no existing file is rejected with the exact correction. Recalculate the `../` depth whenever the test moves between the root generated directory and a deeper layer such as `integration/`; do not reuse a fixed `../src` template.
