@@ -26,6 +26,8 @@ PreflightClassification = Literal["deterministic", "environment", "runtime"]
 PreflightStatus = Literal["passed", "warning", "blocked", "environment", "skipped"]
 
 _RUNNER_GLOBALS = ("describe", "it", "beforeAll", "afterAll", "beforeEach", "afterEach", "expect", "test")
+_ESM_ENTRY_SUFFIXES = frozenset({".mjs", ".mts"})
+_CJS_ENTRY_SUFFIXES = frozenset({".cjs", ".cts"})
 _JS_CONFIG_EXTENSIONS = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts")
 _VITEST_CONFIG_NAMES = tuple(f"vitest.config{ext}" for ext in _JS_CONFIG_EXTENSIONS) + tuple(
     f"vite.config{ext}" for ext in _JS_CONFIG_EXTENSIONS
@@ -182,7 +184,6 @@ def run_test_contract_preflight(
     report.checked_files = [asset.manifest_path for asset in assets]
     issues: list[PreflightIssue] = []
     packages: dict[Path, _PackageInfo] = {}
-    configs: dict[Path, tuple[Path | None, str]] = {}
     contents: dict[Path, str] = {}
 
     for asset in assets:
@@ -210,9 +211,7 @@ def run_test_contract_preflight(
             continue
 
         package = packages.setdefault(asset.package_root, _load_package(asset.package_root))
-        config_path, config_kind = configs.setdefault(
-            asset.package_root, _find_config(asset.package_root, asset.test_type)
-        )
+        config_path, config_kind = _find_config(asset.package_root, asset.test_type)
         if package.payload is None:
             issues.extend(_package_issues(package, web_marker, asset))
         try:
@@ -231,7 +230,7 @@ def run_test_contract_preflight(
 
         package_type = _package_type(package.payload)
         issues.extend(_check_module_syntax(asset, content, package_type, config=False))
-        issues.extend(_check_runner_entry(asset, content))
+        issues.extend(_check_runner_entry(asset, content, package_type))
         issues.extend(_check_static_modules(root, asset, content))
         issues.extend(_check_dynamic_resolution(asset, content))
         issues.extend(_check_runner_globals(asset, content, config_path, config_kind))
@@ -438,9 +437,9 @@ def _check_module_syntax(
 
     suffix = Path(asset.manifest_path).suffix.lower()
     strict_kind: str | None = None
-    if suffix in {".mjs", ".mts"}:
+    if suffix in _ESM_ENTRY_SUFFIXES:
         strict_kind = "esm"
-    elif suffix in {".cjs", ".cts"}:
+    elif suffix in _CJS_ENTRY_SUFFIXES:
         strict_kind = "cjs"
     elif config:
         strict_kind = "esm" if package_type == "module" else "cjs"
@@ -478,7 +477,7 @@ def _check_module_syntax(
     return []
 
 
-def _check_runner_entry(asset: _TestAsset, content: str) -> list[PreflightIssue]:
+def _check_runner_entry(asset: _TestAsset, content: str, package_type: str) -> list[PreflightIssue]:
     code = strip_js_comments(content)
     expected = "@playwright/test" if asset.test_type.strip().lower() == "e2e" else "vitest"
     issues: list[PreflightIssue] = []
@@ -496,16 +495,38 @@ def _check_runner_entry(asset: _TestAsset, content: str) -> list[PreflightIssue]
                 )
             )
         elif import_style == "commonjs":
+            esm_reason = _esm_context_reason(asset, package_type)
+            if esm_reason is None:
+                continue
             issues.append(
                 PreflightIssue(
                     "deterministic",
                     "commonjs_runner_entry",
-                    f"The test loads `{module}` through CommonJS require; the configured runner entry is ESM-oriented.",
+                    f"The test loads `{module}` through CommonJS require, but {esm_reason}, so require() is not available.",
                     asset.manifest_path,
                     f"Use a named ESM import from `{module}` instead of require().",
                 )
             )
     return issues
+
+
+def _esm_context_reason(asset: _TestAsset, package_type: str) -> str | None:
+    """Decide whether CommonJS require is provably unavailable for this entry.
+
+    Shares the entry-extension vocabulary with `_check_module_syntax`'s
+    strict_kind (`.mjs`/`.mts` are ESM, `.cjs`/`.cts` are CommonJS) but, for
+    an ambiguous `.js`/`.ts` entry, also treats a `type: module` package as
+    ESM; a CommonJS package may load its runner through require.
+    """
+
+    suffix = Path(asset.manifest_path).suffix.lower()
+    if suffix in _ESM_ENTRY_SUFFIXES:
+        return f"the `{suffix}` entry is ESM"
+    if suffix in _CJS_ENTRY_SUFFIXES:
+        return None
+    if package_type == "module":
+        return "the package is configured as ESM (`type: module`)"
+    return None
 
 
 def _runner_modules(code: str) -> list[tuple[str, Literal["esm", "commonjs"]]]:
