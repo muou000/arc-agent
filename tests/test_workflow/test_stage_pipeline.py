@@ -300,7 +300,14 @@ def test_serial_stage_pipeline_compile_uses_the_stage_drain(
     manager.runtime = runtime
 
     class _Runner:
-        async def run_design_phase(self, _node_id: str, _requirement: dict[str, Any]) -> bool:
+        async def run_interface_design_stage(
+            self, _node_id: str, _requirement: dict[str, Any]
+        ) -> bool:
+            return True
+
+        async def run_test_generation_stage(
+            self, _node_id: str, _requirement: dict[str, Any]
+        ) -> bool:
             return True
 
         async def run_implement_phase(self, _node_id: str, _requirement: dict[str, Any]) -> bool:
