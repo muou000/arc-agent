@@ -145,6 +145,24 @@ def test_empty_result_with_trailing_note_still_counts_as_no_hit() -> None:
     assert "Glob budget" in result.content
 
 
+def test_withheld_result_does_not_claim_the_file_is_absent() -> None:
+    middleware = GlobGuidanceMiddleware()
+    withheld = _handler_returning(
+        _tool_message(
+            _BARE_EMPTY
+            + "\n\nNote: 1 match withheld by read-deny (node_modules). "
+            "Matches under denied subtrees are hidden from every pattern."
+        )
+    )
+    for _ in range(_GLOB_NO_HIT_ESCALATE_AFTER):
+        result = middleware.wrap_tool_call(_glob_request(), withheld)
+
+    assert f"{_GLOB_NO_HIT_ESCALATE_AFTER} consecutive no-hit globs" in result.content
+    assert "stop probing those subtrees" in result.content
+    assert "very likely absent" not in result.content
+    assert "read the candidate file" not in result.content
+
+
 def test_non_glob_tools_pass_through_untouched() -> None:
     from langgraph.prebuilt.tool_node import ToolCallRequest
 
@@ -204,6 +222,26 @@ def test_build_path_budget_hint_on_third_consecutive_miss(tmp_project_dir: Path)
     assert "Glob budget" not in contents[0]
     assert "Glob budget" not in contents[1]
     assert "3 consecutive no-hit globs on /workspace" in contents[2]
+
+
+def test_build_path_withheld_disclosure_keeps_budget_truthful(tmp_project_dir: Path) -> None:
+    cli = tmp_project_dir / "backend" / "node_modules" / "vitest" / "dist" / "cli.js"
+    cli.parent.mkdir(parents=True, exist_ok=True)
+    cli.write_text("// hidden\n", encoding="utf-8")
+    args = {"pattern": "**/vitest/dist/**/cli*", "path": "/workspace"}
+
+    contents = [
+        turn[0]
+        for turn in drive_scripted_tool_turns(tmp_project_dir, [[("glob", args)]] * 3)
+    ]
+
+    assert all("1 match withheld by read-deny" in content for content in contents)
+    assert all("node_modules" in content and "dist" in content for content in contents)
+    assert all("cli.js" not in content for content in contents)
+    assert "Glob budget" not in contents[0]
+    assert "Glob budget" not in contents[1]
+    assert "3 consecutive no-hit globs on /workspace" in contents[2]
+    assert "stop probing those subtrees" in contents[2]
 
 
 def test_build_path_hit_resets_the_budget(tmp_project_dir: Path) -> None:
