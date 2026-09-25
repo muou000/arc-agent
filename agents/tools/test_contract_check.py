@@ -160,7 +160,12 @@ _ROUTE_STATUS_RE = re.compile(
     re.IGNORECASE,
 )
 _ROUTE_RETURN_STATUS_RE = re.compile(r"\breturn\b[\s\S]{0,160}?,\s*(?P<code>[1-5]\d{2})\b")
-_ROUTE_STATUS_COMMENT_RE = re.compile(r"^[ \t]*//[ \t]*(?P<code>[1-5]\d{2})[ \t]*(?:->|=>|:|：)[ \t]*\S", re.MULTILINE)
+_ROUTE_STATUS_COMMENT_RE = re.compile(r"^[ \t]*//[ \t]*(?P<code>[1-5]\d{2})[ \t]*(?:->|=>|:|：|\{)[ \t]*\S", re.MULTILINE)
+# Route-table comment with the status after the path: `// POST /api/auth/register -> 201`.
+_ROUTE_STATUS_ARROW_COMMENT_RE = re.compile(
+    rf"^[ \t]*//[ \t]*(?:{_HTTP_METHODS})?[ \t]*(?P<path>/[^\s]*)[ \t]*(?:->|=>|→)[ \t]*(?P<code>[1-5]\d{{2}})\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 _ROUTE_PLACEHOLDER_RE = re.compile(r"\bNOT_IMPLEMENTED\b|\bTODO\s*\(\s*TDD\s*\)", re.IGNORECASE)
 _ROUTE_STATEMENT_RE = re.compile(r"(?:[^;'\"]|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")*;", re.DOTALL)
 _STATUS_CODE_LIST_RE = re.compile(
@@ -184,6 +189,16 @@ _STATUS_TEXT_PATTERNS = (
         r"(?P<code>[1-5]\d{2})\b"
     ),
     re.compile(r"状态码\s*(?:为|是|[:：])?\s*(?P<code>[1-5]\d{2})\b"),
+    # Route-table arrow notation: `POST /api/auth/register -> 201`. The
+    # leading path token anchors the arrow so prose arrows stay ignored.
+    re.compile(
+        r"(?P<path>/[A-Za-z0-9_./:{}?=&%-]+)[ \t]*(?:->|=>|→)[ \t]*(?P<code>[1-5]\d{2})\b",
+        re.IGNORECASE,
+    ),
+    # Status-body continuation: `; 400 { errors: ... }` (also line start /
+    # text start). A clause boundary plus a bare status-sized number with an
+    # opening body brace is the shape DESIGN writes after the primary arrow.
+    re.compile(r"(?:^|[;\n])[ \t]*(?P<code>[1-5]\d{2})[ \t]*\{"),
 )
 _STATUS_FIELD_NAMES = {
     "status",
@@ -410,6 +425,22 @@ def collect_manifest_http_status_assertions(
     return assertions
 
 
+def _leading_comment_block(content: str, position: int) -> str:
+    """Return the contiguous ``//`` comment block ending directly above ``position``.
+
+    Design skeletons state each route's contract in a comment table placed
+    above the route declarations; per-declaration segments start at the
+    declaration itself, so without this the comment table belongs to no
+    segment. A blank or code line stops the block.
+    """
+
+    lines = content[:position].splitlines(keepends=True)
+    index = len(lines)
+    while index > 0 and lines[index - 1].lstrip().startswith("//"):
+        index -= 1
+    return "".join(lines[index:])
+
+
 def _extract_route_records(workspace_root: str | Path, interface: dict[str, Any]) -> list[dict[str, Any]]:
     file_path = str(interface.get("file_path") or "").strip()
     content = _read_workspace_text(workspace_root, file_path)
@@ -421,10 +452,14 @@ def _extract_route_records(workspace_root: str | Path, interface: dict[str, Any]
     routes: list[dict[str, Any]] = []
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
-        segment = content[match.start() : end]
+        segment = _leading_comment_block(content, match.start()) + content[match.start() : end]
         codes: list[int] = []
         # A leading status-arrow comment is a route-level declaration, unlike a scaffold response.
         for comment_match in _ROUTE_STATUS_COMMENT_RE.finditer(segment):
+            code = int(comment_match.group("code"))
+            if code not in codes:
+                codes.append(code)
+        for comment_match in _ROUTE_STATUS_ARROW_COMMENT_RE.finditer(segment):
             code = int(comment_match.group("code"))
             if code not in codes:
                 codes.append(code)

@@ -840,3 +840,140 @@ def test_validate_http_status_contract_rejects_unbounded_2xx_matcher(tmp_project
     assert len(diagnostics) == 1
     assert diagnostics[0]["code"] == "status_code_needs_info"
     assert "specific status code" in diagnostics[0]["message"]
+
+
+def test_validate_http_status_contract_accepts_route_table_arrow_spec(tmp_project_dir: Path) -> None:
+    """The 2026-09-25 easy-ticketbooking run died on exactly this shape.
+
+    DESIGN recorded statuses in `specification` prose as route-table arrows
+    (`POST /api/auth/register -> 201 ; 400 { errors }`), which the gate's
+    text patterns could not read, so every status assertion became
+    needs-info and the whole compile was rejected with no repair round.
+    """
+
+    test_path = tmp_project_dir / "tests" / "auth.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const register = await request.post('/api/auth/register');\n"
+        "expect(register.status).toBe(201);\n"
+        "expect(register.status).toBe(400);\n"
+        "expect(register.status).toBe(409);\n"
+        "const session = await request.get('/api/auth/session');\n"
+        "expect(session.status).toBe(200);\n"
+        "const logout = await request.post('/api/auth/logout');\n"
+        "expect(logout.status).toBe(200);\n",
+        encoding="utf-8",
+    )
+    interface = {
+        "interface_id": "REQ-1-API-Auth",
+        "type": "API",
+        "specification": (
+            "POST /api/auth/register -> 201 { user:{id,username} } on success; "
+            "400 { errors:{field:code} } for REQUIRED/FORMAT; 409 { errors:{username:'DUPLICATE_USERNAME'} }. "
+            "GET /api/auth/session -> 200 { user:{id,username}|null }. "
+            "POST /api/auth/logout -> 200 { ok:true }."
+        ),
+        "file_path": "backend/src/routes/auth.js",
+    }
+
+    assert validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Register a traveler account."},
+        [interface],
+        [{"type": "Integration", "file_path": "tests/auth.test.js"}],
+    ) == []
+
+
+def test_validate_http_status_contract_reads_leading_route_table_comment(tmp_project_dir: Path) -> None:
+    """Skeleton route tables put the contract comment ABOVE each declaration.
+
+    Per-declaration segments start at the declaration, so a leading comment
+    table belonged to no segment and its declared statuses were invisible;
+    only the TODO(TDD) scaffold responses (correctly ignored) remained.
+    """
+
+    route_path = tmp_project_dir / "backend" / "src" / "routes" / "auth.js"
+    route_path.parent.mkdir(parents=True)
+    route_path.write_text(
+        "const router = express.Router();\n"
+        "\n"
+        "// POST /api/auth/register -> 201 { user: { id, username } };\n"
+        "//   400 { errors: { <field>: <code> } } for REQUIRED/FORMAT;\n"
+        "//   409 { errors: { username: 'DUPLICATE_USERNAME' } }.\n"
+        "router.post('/register', (req, res) => {\n"
+        "  void req; void res;\n"
+        "  res.status(501).json({ message: 'TODO(TDD)' });\n"
+        "});\n"
+        "\n"
+        "// GET /api/auth/session -> 200 { user: { id, username } | null }.\n"
+        "router.get('/session', (req, res) => {\n"
+        "  res.status(501).json({ message: 'TODO(TDD)' });\n"
+        "});\n"
+        "\n"
+        "// POST /api/auth/logout -> 200 { ok: true }.\n"
+        "router.post('/logout', (req, res) => {\n"
+        "  res.status(501).json({ message: 'TODO(TDD)' });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_project_dir / "tests" / "auth.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const register = await request.post('/api/auth/register');\n"
+        "expect(register.status).toBe(201);\n"
+        "expect(register.status).toBe(400);\n"
+        "expect(register.status).toBe(409);\n"
+        "const session = await request.get('/api/auth/session');\n"
+        "expect(session.status).toBe(200);\n"
+        "const logout = await request.post('/api/auth/logout');\n"
+        "expect(logout.status).toBe(200);\n",
+        encoding="utf-8",
+    )
+    interface = {
+        "interface_id": "REQ-1-API-Auth",
+        "type": "API",
+        # Deliberately status-free prose: the route source must be the
+        # only recognized declaration source in this test.
+        "specification": "Auth route boundary for register, session and logout.",
+        "file_path": "backend/src/routes/auth.js",
+    }
+
+    assert validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Register a traveler account."},
+        [interface],
+        [{"type": "Integration", "file_path": "tests/auth.test.js"}],
+    ) == []
+
+
+def test_validate_http_status_contract_ignores_arrow_without_route_path(tmp_project_dir: Path) -> None:
+    """The arrow notation is anchored on a `/`-leading path token.
+
+    A prose arrow after a plain word or number must not register a status
+    code, otherwise guessed assertions would pass without any contract.
+    """
+
+    test_path = tmp_project_dir / "tests" / "notes.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await request.post('/api/notes');\n"
+        "expect(response.status).toBe(201);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a note."},
+        [
+            {
+                "interface_id": "IF-NOTES",
+                "type": "API",
+                "specification": "See step 2 -> 201 in the flow diagram; latency budget 128 { ms } per call.",
+                "file_path": "backend/src/routes/notes.js",
+            }
+        ],
+        [{"type": "Integration", "file_path": "tests/notes.test.js"}],
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_needs_info"
