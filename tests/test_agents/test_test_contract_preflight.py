@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
+import pytest
+
 from agents.runtime.test_contract_preflight import run_test_contract_preflight
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SKILL_PATH = _REPO_ROOT / "skills" / "web-test-harness-skill" / "SKILL.md"
+_SKILL_VITEST_FORM = re.compile(r"`(import\s*\{[^}]+\}\s*from\s*'vitest')`")
+_SKILL_PLAYWRIGHT_FORM = re.compile(r"`(const\s*\{[^}]+\}\s*=\s*require\('@playwright/test'\))`")
 
 
 def _workspace(
@@ -50,10 +58,55 @@ def _run(root: Path, test_path: str, test_type: str = "Unit"):
     )
 
 
-def test_commonjs_runner_entry_is_blocked_with_an_actionable_fix(tmp_path: Path) -> None:
+def _write_test_file(root: Path, test_path: str, content: str) -> None:
+    path = root / test_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _dual_config_backend(tmp_path: Path) -> Path:
+    """Mirror the web template: one CommonJS backend package with both runner configs."""
+
+    root = tmp_path / "workspace"
+    backend = root / "backend"
+    backend.mkdir(parents=True)
+    (backend / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "backend",
+                "devDependencies": {"vitest": "^4.0.0", "@playwright/test": "^1.0.0"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (backend / "vitest.config.js").write_text(
+        """const { defineConfig } = require('vitest/config');
+module.exports = defineConfig({
+  test: {
+    include: ['tests/**/*.{test,spec}.{js,jsx,ts,tsx}'],
+    exclude: ['test-e2e/**/*'],
+  },
+});
+""",
+        encoding="utf-8",
+    )
+    (backend / "playwright.config.js").write_text(
+        """const { defineConfig } = require('@playwright/test');
+module.exports = defineConfig({ testDir: './test-e2e', testMatch: /.*\\.(js|jsx|ts|tsx)$/ });
+""",
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_commonjs_runner_entry_is_blocked_in_esm_package(tmp_path: Path) -> None:
     root, test_path = _workspace(
         tmp_path,
+        config="""import { defineConfig } from 'vitest/config';
+export default defineConfig({ test: { include: ['tests/**/*.test.js'] } });
+""",
         test_content="const { describe, it, expect } = require('vitest');\nit('works', () => expect(1).toBe(1));\n",
+        package={"name": "backend", "type": "module", "devDependencies": {"vitest": "^4.0.0"}},
     )
 
     report = _run(root, test_path)
@@ -61,8 +114,85 @@ def test_commonjs_runner_entry_is_blocked_with_an_actionable_fix(tmp_path: Path)
     assert report.status == "blocked"
     issue = next(issue for issue in report.issues if issue.kind == "commonjs_runner_entry")
     assert issue.classification == "deterministic"
+    assert "type: module" in issue.message
     assert "ESM import" in issue.suggestion
     assert not report.can_start_tdd
+
+
+def test_cjs_package_accepts_commonjs_playwright_entry(tmp_path: Path) -> None:
+    root = _dual_config_backend(tmp_path)
+    _write_test_file(
+        root,
+        "backend/test-e2e/login.e2e.spec.js",
+        "const { test, expect } = require('@playwright/test');\ntest('works', async () => expect(true).toBeTruthy());\n",
+    )
+
+    report = _run(root, "backend/test-e2e/login.e2e.spec.js", "E2E")
+
+    assert not report.deterministic_errors
+    assert report.can_start_tdd
+
+
+@pytest.mark.parametrize("e2e_first", [True, False], ids=["e2e-first", "vitest-first"])
+def test_backend_dual_config_is_not_poisoned_by_manifest_order(tmp_path: Path, e2e_first: bool) -> None:
+    root = _dual_config_backend(tmp_path)
+    _write_test_file(
+        root,
+        "backend/test-e2e/register.e2e.spec.js",
+        "const { test, expect } = require('@playwright/test');\ntest('works', async () => expect(true).toBeTruthy());\n",
+    )
+    _write_test_file(
+        root,
+        "backend/tests/authApi.test.js",
+        "import { describe, it, expect } from 'vitest';\ndescribe('auth', () => { it('works', () => expect(1).toBe(1)); });\n",
+    )
+    _write_test_file(
+        root,
+        "backend/tests/authService.test.js",
+        "import { describe, it, expect } from 'vitest';\ndescribe('service', () => { it('works', () => expect(1).toBe(1)); });\n",
+    )
+    e2e_entry = {"test_id": "T-E2E", "type": "E2E", "file_path": "backend/test-e2e/register.e2e.spec.js"}
+    vitest_entries = [
+        {"test_id": "T-1", "type": "Integration", "file_path": "backend/tests/authApi.test.js"},
+        {"test_id": "T-2", "type": "Unit", "file_path": "backend/tests/authService.test.js"},
+    ]
+    tests = [e2e_entry, *vitest_entries] if e2e_first else [*vitest_entries, e2e_entry]
+
+    report = run_test_contract_preflight(root, app_type="web", tests=tests)
+
+    assert report.deterministic_errors == []
+    assert report.can_start_tdd
+
+
+def test_skill_canonical_runner_forms_pass_preflight(tmp_path: Path) -> None:
+    skill_text = _SKILL_PATH.read_text(encoding="utf-8")
+    vitest_form = _SKILL_VITEST_FORM.search(skill_text)
+    playwright_form = _SKILL_PLAYWRIGHT_FORM.search(skill_text)
+    assert vitest_form is not None, "web-test-harness-skill no longer teaches a canonical Vitest ESM import"
+    assert playwright_form is not None, "web-test-harness-skill no longer teaches a canonical Playwright CJS require"
+
+    root = _dual_config_backend(tmp_path)
+    _write_test_file(
+        root,
+        "backend/tests/canonical.test.js",
+        f"{vitest_form.group(1)};\nit('works', () => expect(1).toBe(1));\n",
+    )
+    _write_test_file(
+        root,
+        "backend/test-e2e/canonical.e2e.spec.js",
+        f"{playwright_form.group(1)};\ntest('works', async () => expect(true).toBeTruthy());\n",
+    )
+    report = run_test_contract_preflight(
+        root,
+        app_type="web",
+        tests=[
+            {"test_id": "T-E2E", "type": "E2E", "file_path": "backend/test-e2e/canonical.e2e.spec.js"},
+            {"test_id": "T-UNIT", "type": "Unit", "file_path": "backend/tests/canonical.test.js"},
+        ],
+    )
+
+    assert report.deterministic_errors == []
+    assert report.can_start_tdd
 
 
 def test_esm_test_entry_rejects_commonjs_syntax(tmp_path: Path) -> None:
