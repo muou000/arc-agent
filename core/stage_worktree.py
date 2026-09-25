@@ -157,8 +157,14 @@ class StageWorktreeManager(NodeWorktreeManager):
         *,
         declared_write_set: Iterable[str] | None = None,
         base_commit: str | None = None,
+        restart_failed_attempt: bool = False,
     ) -> StageWorktreeHandle:
-        """Create or resume a stage branch from the current integration HEAD."""
+        """Create or resume a stage; restart only a newly scheduled failed attempt.
+
+        Recovery of a READY_TO_MERGE publication must retain its committed
+        branch and workspace. A new attempt instead starts at integration
+        HEAD without inheriting uncommitted test files from the failed run.
+        """
 
         normalized_stage = str(stage or "").strip().upper()
         if not normalized_stage or normalized_stage == STAGE_VISUAL_ANALYSIS:
@@ -179,7 +185,24 @@ class StageWorktreeManager(NodeWorktreeManager):
                 self._git(["rev-parse", integration_branch], cwd=self.main_workspace),
                 f"rev-parse {integration_branch}",
             )
-            if self._is_registered(worktree_path):
+            if restart_failed_attempt:
+                if self._is_registered(worktree_path):
+                    # The existing removal helper unlinks shared node_modules
+                    # before Git recurses through the worktree on Windows.
+                    handle = StageWorktreeHandle(
+                        node_id=str(node_id), stage=normalized_stage, branch=branch,
+                        path=str(worktree_path), main_workspace=self.main_workspace,
+                        base_commit=integration_head,
+                    )
+                    self._unlink_node_modules(handle)  # type: ignore[arg-type]
+                    self._git(["worktree", "remove", "--force", str(worktree_path)], cwd=self.main_workspace)
+                self._detach_branch_elsewhere(branch, keep_path=worktree_path)
+                self._git(
+                    ["worktree", "add", "-B", branch, str(worktree_path), integration_branch],
+                    cwd=self.main_workspace,
+                )
+                base_commit = integration_head
+            elif self._is_registered(worktree_path):
                 if self._branch_exists(branch):
                     self._git(["checkout", branch], cwd=str(worktree_path))
                 else:

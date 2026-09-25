@@ -9,17 +9,22 @@ from pathlib import Path
 
 import pytest
 
+from agents.runtime.capabilities import stable_node_path_segment
 from arcbench_agent_runtime.context import RuntimePaths
 from arcbench_agent_runtime.events import EventClient
+from core import sessions
 from core.queue_state import (
+    STAGE_FAILED,
     STAGE_INTERFACE_DESIGN,
     STAGE_PUBLISHED,
     STAGE_READY_TO_MERGE,
+    STAGE_RUNNING,
     STAGE_TEST_GENERATION,
     STAGE_VISUAL_ANALYSIS,
     load_or_create_queue,
+    reset_node_for_retry,
+    transition_stage_task,
 )
-from core.workflow import ARCWorkflowManager
 from core.stage_merge_queue import StageMergeQueue
 from core.stage_worktree import (
     StagePublication,
@@ -27,7 +32,10 @@ from core.stage_worktree import (
     StageWorktreeManager,
 )
 from core.worktree import MergeConflictError
+from core.workflow import ARCWorkflowManager
+from tests.helpers.faux import FauxChatModel, faux_tool_call
 from tests.helpers.jsonl import read_jsonl
+from tests.test_agents.conftest import arc_runtime  # noqa: F401
 
 
 def _git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -88,6 +96,156 @@ def test_prepare_stage_records_integration_base_and_uses_stage_namespace(tmp_pat
     assert handle.branch == "arc-stage/REQ-1/INTERFACE_DESIGN"
     assert Path(handle.path).parent.name == "stage-worktrees"
     assert manager._is_registered(Path(handle.path))
+
+
+def test_failed_test_stage_retry_starts_without_previous_uncommitted_files(tmp_path: Path) -> None:
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare_stage("REQ-1", STAGE_TEST_GENERATION)
+    root = Path(handle.path)
+    test_path = root / "backend" / "tests" / "generated" / "REQ-1" / "auth.test.js"
+    helper_path = test_path.with_name("helper.js")
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text("previous attempt\n", encoding="utf-8")
+    helper_path.write_text("old helper\n", encoding="utf-8")
+    tracked = root / "backend" / "app.js"
+    tracked.write_text("failed edit\n", encoding="utf-8")
+    _git(["add", "backend/app.js"], root)
+
+    assert manager.prepare_stage("REQ-1", STAGE_TEST_GENERATION).path == handle.path
+    assert test_path.read_text(encoding="utf-8") == "previous attempt\n"
+
+    for attempt in range(2):
+        restarted = manager.prepare_stage("REQ-1", STAGE_TEST_GENERATION, restart_failed_attempt=True)
+        assert restarted.path == handle.path
+        assert not test_path.exists()
+        assert not helper_path.exists()
+        assert tracked.read_text(encoding="utf-8") == "v1;\n"
+        assert _git(["status", "--porcelain"], root).stdout == ""
+        if attempt == 0:
+            test_path.parent.mkdir(parents=True)
+            test_path.write_text("second failed attempt\n", encoding="utf-8")
+
+    assert (repo / "backend" / "app.js").read_text(encoding="utf-8") == "v1;\n"
+
+
+def test_test_generation_two_failed_attempts_then_resume_registers_written_tests(
+    tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The faux model must rewrite after a failed stage; a leftover on disk
+    cannot turn the next pass into an unwritten, zero-row manifest.
+    """
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
+    repo = tmp_project_dir
+    _git(["init", "-q"], repo)
+    _git(["config", "user.email", "test@example.com"], repo)
+    _git(["config", "user.name", "test"], repo)
+    (repo / ".gitignore").write_text(".arc/\n", encoding="utf-8")
+    (repo / "backend").mkdir()
+    (repo / "backend" / "app.js").write_text("v1;\n", encoding="utf-8")
+    _git(["add", ".gitignore", "backend/app.js"], repo)
+    _git(["commit", "-q", "-m", "init"], repo)
+
+    node_id = "REQ-1"
+    path = f"backend/tests/generated/{stable_node_path_segment(node_id)}/auth.test.js"
+    test_code = "test('auth', () => { expect(login()).toBe(true); });\n"
+    arc_runtime.traceability.store_requirement_tree(
+        {"id": node_id, "name": "Auth", "description": "Login", "children": []}
+    )
+    interface = {"interface_id": "REQ-1-FUNC-login", "type": "FUNC", "file_path": "backend/app.js"}
+    arc_runtime.traceability.upsert_interface(
+        interface_id=interface["interface_id"], req_ids=[node_id], type="FUNC",
+        content="{}", file_path="backend/app.js",
+    )
+    queue = load_or_create_queue(
+        str(repo / ".arc" / "processing_queue.json"), {"id": node_id, "children": []}
+    )
+    interface_task = next(task for task in queue["stage_tasks"] if task["stage"] == STAGE_INTERFACE_DESIGN)
+    test_task = next(task for task in queue["stage_tasks"] if task["stage"] == STAGE_TEST_GENERATION)
+    interface_task["status"] = STAGE_PUBLISHED
+    manager = ARCWorkflowManager(
+        workspace_path=str(repo), requirement_path="", app_type="web", web_port=4400,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = arc_runtime
+    manager._save_processing_queue = lambda _queue: None
+    real_build = manager._build_task_phase_runner
+    produced: list[list[dict[str, object]] | None] = []
+    runner_saw_existing: list[bool] = []
+
+    def build_runner(workspace: str, port: int | None, handle=None):
+        runner = real_build(workspace, port, handle)
+        existing = (Path(workspace) / path).exists()
+        runner_saw_existing.append(existing)
+        responses = [faux_tool_call("declare_stage_write_set", {"paths": [path]}, call_id="s1")]
+        if existing:
+            # This is the toxic resume: the model reads the old test and
+            # declares that it will preserve it, without a new write receipt.
+            responses.append(
+                faux_tool_call("read_file", {"file_path": f"/workspace/{path}"}, call_id="s-read")
+            )
+        responses.append(faux_tool_call("declare_test_manifest", {"files": [
+            {"file_path": path, "type": "Unit", "interface_ids": [interface["interface_id"]]}
+        ]}, call_id="s2"))
+        if not existing:
+            responses.append(faux_tool_call(
+                "write_file", {"file_path": f"/workspace/{path}", "content": test_code}, call_id="s3"
+            ))
+        responses.append(faux_tool_call("TestGenerationResponse", {
+                "summary": "Auth behavior", "tests": [{
+                    "test_id": "REQ-1-T-AUTH", "req_id": node_id,
+                    "interface_ids": [interface["interface_id"]], "type": "Unit",
+                    "file_path": path, "first_line": test_code.strip(),
+                }], "files_written": [] if existing else [path],
+            }, call_id="s4"))
+        model = FauxChatModel(responses=responses)
+        runner.test_generator.model = model
+        original_run = runner.test_generator.run
+
+        async def record_generation(*args, **kwargs):
+            rows, text = await original_run(*args, **kwargs)
+            produced.append(rows)
+            return rows, text
+
+        runner.test_generator.run = record_generation
+
+        async def baseline(**_kwargs):
+            if len(produced) <= 2:
+                return None  # Failure after the faux model wrote its test.
+            return {"file_state": {path: "red"}, "revised_tests": None}
+
+        runner._enforce_design_baseline_red = baseline
+        return runner
+
+    manager._build_task_phase_runner = build_runner
+    for attempt in range(3):
+        sessions.merge_node_session(node_id, {
+            "phase_status": {"design": "prepared"}, "interfaces": [interface],
+            "materialized_files": [],
+        })
+        transition_stage_task(queue, node_id, STAGE_TEST_GENERATION, STAGE_RUNNING)
+        result = asyncio.run(manager._execute_stage_task(test_task, queue))
+        assert produced[-1] is not None and len(produced[-1]) == 1
+        assert runner_saw_existing[-1] is False
+        assert test_task["attempt_count"] == attempt + 1
+        assert (repo / path).exists() is False  # Stage writes never reach integration before publication.
+        stage_file = Path(manager._stage_worktree_manager.worktrees_root) / "REQ-1--TEST_GENERATION" / path
+        assert stage_file.read_text(encoding="utf-8") == test_code
+        if attempt < 2:
+            assert result["status"] == STAGE_FAILED
+            assert arc_runtime.traceability.list_tests(req_id=node_id) == []
+            transition_stage_task(queue, node_id, STAGE_TEST_GENERATION, STAGE_FAILED)
+            reset_node_for_retry(queue, node_id)
+            transition_stage_task(queue, node_id, STAGE_INTERFACE_DESIGN, STAGE_PUBLISHED)
+        else:
+            assert result["status"] == STAGE_READY_TO_MERGE
+            rows = arc_runtime.traceability.list_tests(req_id=node_id)
+            assert len(rows) == 1
+            assert rows[0]["file_path"] == path
+            publication = StagePublication.from_dict(result["publication"])
+            context = result["_stage_workspace"]
+            manager._stage_worktree_manager.integrate_stage(context.handle, publication, "merge tests")
+            assert (repo / path).read_text(encoding="utf-8") == test_code
+            assert rows[0]["first_line"] == test_code.strip()
 
 
 def test_publish_requires_complete_metadata_and_declared_write_set(tmp_path: Path) -> None:
