@@ -57,6 +57,8 @@ TestGenerator 必须在 manifest、测试文件和 DESIGN RED baseline 完成后
 
 现有父子和 declared dependency 门禁保持不变。阶段流水线不是 `ARC_DESIGN_GATE_PIPELINE` 的替代品，也不自动放宽依赖方 DESIGN。
 
+**写入集合不相交的证明语义（2026-09-25 补记，issue #295）**：首轮编译的 PENDING 任务在 dispatch 前没有任何持久化写集声明（agent 侧的 `declare_stage_write_set` 只存内存锁，真实写集在阶段发布时才落进 publication），按"双方显式声明不相交才放行"的 fail-closed 读法，两个批准窗口在首轮永远打不开。补记裁定：不相交证明以阶段纪律的结构写域为默认依据——TestGenerator 只可写测试资产、所有阶段的测试资产写入都被限制在本节点稳定测试命名空间内（`agents/runtime/capabilities.py` 单源），因此批准的跨节点窗口按结构即不相交；显式声明只做收紧（生成方声明越出自身命名空间、或对侧声明落在生成方命名空间内，均判相交拒绝）。`core/scheduling.py` 的 `stage_overlap_allowed` 按此实现，`tests/test_workflow/test_stage_pipeline.py` 以无手工注入写集的判定级、选择器级、drain 级三层测试钉住。
+
 ### Stage worktree 与发布物
 
 每个正式 stage 使用独立 worktree，从同节点前置阶段已经发布后的最新 integration HEAD 创建。stage 完成后不直接修改 integration，而是提交产品代码或节点测试文件，并返回不可变的阶段发布物。发布物至少包含：
