@@ -58,6 +58,11 @@ NPM_INSTALL_TIMEOUT_SECONDS = 900.0
 # the full budget before trying the fallback wastes minutes on every install.
 NPM_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 240.0
 LEGACY_PEER_DEPS_FLAG = "--legacy-peer-deps"
+_NPM_PEER_RESOLUTION_FAILURE = re.compile(
+    r"\bERESOLVE\b|unable to resolve dependency tree|"
+    r"Cannot read properties of null \(reading ['\"]edgesOut['\"]\)",
+    re.IGNORECASE,
+)
 
 # Node release lines where unflagged require(esm) is available (the template's
 # jsdom dependency chain needs it). Line 21 never received the backport.
@@ -72,6 +77,20 @@ def _node_supports_require_esm(version_text: str) -> bool:
     if major > 23:
         return True
     return any(major == line_major and minor >= line_minor for line_major, line_minor in _REQUIRE_ESM_MINIMUMS)
+
+
+def _format_npm_attempt_failure(
+    command: str,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+) -> str:
+    return (
+        f"{command} exited {returncode}\n"
+        f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    )
+
+
 # Generous because a cold machine downloads ~150 MB of browser binaries. Once
 # the machine-wide Playwright cache is warm the command exits in seconds.
 PLAYWRIGHT_BROWSER_INSTALL_TIMEOUT_SECONDS = 900.0
@@ -239,24 +258,26 @@ async def run_npm_install(
 ) -> bool:
     """Install dependencies in ``target_dir`` and verify the outcome.
 
-    Tries a plain ``npm install`` first, then falls back to
-    ``--legacy-peer-deps``. The fallback is required on npm 10.x, where the
-    optional-peer resolution for vitest makes arborist crash with
-    ``Cannot read properties of null (reading 'edgesOut')``.
+    Tries a plain ``npm install`` first. The ``--legacy-peer-deps`` fallback
+    is reserved for npm peer-resolution errors and the known Arborist null
+    ``edgesOut`` crash; unrelated install failures are reported unchanged.
 
     Returns True only when npm succeeded *and* ``node_modules`` is non-empty.
     """
     failures: list[str] = []
-    attempts = (
+    attempts = [
         ("npm install", NPM_PRIMARY_ATTEMPT_TIMEOUT_SECONDS),
-        (f"npm install {LEGACY_PEER_DEPS_FLAG}", NPM_INSTALL_TIMEOUT_SECONDS),
-    )
+    ]
     for command, timeout in attempts:
         try:
-            returncode, stdout, stderr = await _run_npm_command(command, target_dir, timeout)
+            returncode, stdout, stderr = await _run_npm_command(
+                command,
+                target_dir,
+                timeout,
+            )
         except Exception as exc:
-            failures.append(f"{command} raised {type(exc).__name__}: {exc}")
-            continue
+            failures.append(f"{command} could not run: {type(exc).__name__}: {exc}")
+            break
 
         if returncode == 0 and node_modules_ready(target_dir):
             await _emit_log(log_cb, "System", f"NPM install success in {target_dir}")
@@ -265,10 +286,20 @@ async def run_npm_install(
         if returncode == 0:
             failures.append(
                 f"{command} exited 0 but node_modules is empty "
-                "(nothing was installed; check the template and package.json)"
+                "(nothing was installed; check the template and package.json)\n"
+                f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
             )
-        else:
-            failures.append(f"{command} exited {returncode}: {_tail(stderr) or _tail(stdout)}")
+            break
+
+        failures.append(
+            _format_npm_attempt_failure(command, returncode, stdout, stderr)
+        )
+        if command == "npm install" and _NPM_PEER_RESOLUTION_FAILURE.search(
+            f"{stdout}\n{stderr}"
+        ):
+            attempts.append(
+                (f"npm install {LEGACY_PEER_DEPS_FLAG}", NPM_INSTALL_TIMEOUT_SECONDS)
+            )
 
     await _emit_log(
         log_cb,
