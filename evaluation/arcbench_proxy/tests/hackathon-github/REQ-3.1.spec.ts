@@ -1,20 +1,33 @@
 import { test, expect } from '@playwright/test';
-import { signIn } from './helpers';
+import { FIXTURES, openHome, openRepository } from './helpers';
 
-// covers: REQ-3-2-1
-test('REQ-3-2-1: create a private initialized repository and preserve it', async ({ page }) => {
-  await signIn(page);
-  await page.getByRole('link', { name: 'New repository', exact: true }).click();
-  const name = 'proxy-repository-' + String(Date.now());
-  await page.getByLabel('Repository name', { exact: true }).fill(name);
-  await page.getByLabel('Description', { exact: true }).fill('Repository created by Playwright');
-  await page.getByRole('radio', { name: 'Private', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Add a README file', exact: true }).check();
-  await page.getByRole('button', { name: 'Create repository', exact: true }).click();
-  await expect(page.getByRole('heading', { name: new RegExp(name, 'i') })).toBeVisible();
-  await expect(page.getByText('Private', { exact: true })).toBeVisible();
-  await expect(page.getByRole('link', { name: 'README.md', exact: true })).toBeVisible();
+// covers: REQ-3-1
+test('REQ-3-1: searching for a repository opens it directly and survives reload', async ({ page }) => {
+  await openRepository(page, FIXTURES.publicRepository);
+  await expect(page.getByRole('heading', { name: new RegExp(FIXTURES.publicRepository, 'i') })).toBeVisible();
   await page.reload();
-  await expect(page.getByRole('heading', { name: new RegExp(name, 'i') })).toBeVisible();
-  await expect(page.getByRole('link', { name: 'README.md', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: new RegExp(FIXTURES.publicRepository, 'i') })).toBeVisible();
+});
+
+// covers: REQ-3-1
+test('REQ-3-1: a query without matches shows No results consistently', async ({ page }) => {
+  await openHome(page);
+  const search = page.getByRole('searchbox', { name: 'Search', exact: true });
+  await search.fill('no-such-repository-xyz');
+  await search.press('Enter');
+  await expect(page.getByText('No results', { exact: true })).toBeVisible();
+  await openHome(page);
+  const repeat = page.getByRole('searchbox', { name: 'Search', exact: true });
+  await repeat.fill('no-such-repository-xyz');
+  await repeat.press('Enter');
+  await expect(page.getByText('No results', { exact: true })).toBeVisible();
+});
+
+// covers: REQ-3-1
+test('REQ-3-1: a private repository name exposes no result link to a visitor', async ({ page }) => {
+  await openHome(page);
+  const search = page.getByRole('searchbox', { name: 'Search', exact: true });
+  await search.fill(FIXTURES.privateRepository);
+  await search.press('Enter');
+  await expect(page.getByRole('link', { name: FIXTURES.privateRepository, exact: true })).toHaveCount(0);
 });

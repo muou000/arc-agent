@@ -60,5 +60,7 @@ the proxy tests. Run it with the requirements directory and matching test direct
 
     python evaluation\\arcbench_proxy\\coverage_report.py --requirements-dir D:\\code\\arc-agent\\arc-bench-test\\hackathon-sheet\\requirements --tests-dir evaluation\\arcbench_proxy\\tests\\hackathon-sheet
 
-The initial suite is intentionally small. Expand it by adding a black-box test and
-a covers comment, then keep a separate frozen subset for regression comparison.
+The suite covers every atomic requirement of both tasks with black-box tests
+grouped by requirement; the `covers:` comment maps each test to the atomic IDs it
+exercises. Expand it by adding a black-box test and a covers comment, then keep
+a separate frozen subset for regression comparison.
