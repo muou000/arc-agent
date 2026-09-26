@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from core import phases as phases_module
 from agents.test_driven_developer import TestDrivenDeveloper
 from core import sessions
 from core.phases import TDD_RUN_TESTS_BUDGET, TDD_STALL_THRESHOLD, WorkflowPhaseRunner
@@ -563,6 +564,50 @@ module.exports = defineConfig({
     assert len(events) == 1
     assert events[0]["node_id"] == node_id
     assert events[0]["classification"] == "deterministic"
+
+
+def test_test_contract_preflight_internal_failure_blocks_and_persists(
+    tmp_project_dir: Path, arc_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node_id = "REQ-TDD-CONTRACT-PREFLIGHT-INTERNAL"
+    test_path = "backend/tests/login.test.js"
+    seed_node(arc_runtime, node_id, [{"test_id": "T1", "type": "Unit", "file_path": test_path}])
+
+    model = FauxChatModel(responses=[faux_text("BLOCKED")] * 10)
+    fake = FakeAppHandler([failing_test_output()] * 10)
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    def exploding_preflight(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("preflight boom")
+
+    monkeypatch.setattr(phases_module, "run_test_contract_preflight", exploding_preflight)
+
+    final_ok = asyncio.run(
+        runner._run_tdd_for_node(
+            node_id=node_id,
+            tests=[{"test_id": "T1", "type": "Unit", "file_path": test_path}],
+        )
+    )
+
+    assert final_ok is False
+    assert model.call_count == 0
+    assert fake.calls == []
+    session = sessions.load_node_session(node_id)
+    diagnostic = session["test_contract_preflight"]
+    assert diagnostic["status"] == "failed"
+    assert diagnostic["classification"] == "internal"
+    assert diagnostic["can_start_tdd"] is False
+    assert diagnostic["issues"][0]["kind"] == "internal_error"
+    assert "preflight boom" in session["recent_failure_summary"]
+    events = [
+        event
+        for event in read_jsonl(arc_runtime.paths.runner_events_path)
+        if event["type"] == "test_contract_preflight"
+    ]
+    assert len(events) == 1
+    assert events[0]["node_id"] == node_id
+    assert events[0]["status"] == "failed"
+    assert events[0]["classification"] == "internal"
 
 
 # ---------------------------------------------------------------------------

@@ -22,8 +22,8 @@ from agents.runtime.import_checks import (
     strip_js_comments,
 )
 
-PreflightClassification = Literal["deterministic", "environment", "runtime"]
-PreflightStatus = Literal["passed", "warning", "blocked", "environment", "skipped"]
+PreflightClassification = Literal["deterministic", "environment", "runtime", "internal"]
+PreflightStatus = Literal["passed", "warning", "blocked", "environment", "failed", "skipped"]
 
 _RUNNER_GLOBALS = ("describe", "it", "beforeAll", "afterAll", "beforeEach", "afterEach", "expect", "test")
 _ESM_ENTRY_SUFFIXES = frozenset({".mjs", ".mts"})
@@ -139,11 +139,17 @@ class TestContractPreflightReport:
         return [issue for issue in self.issues if issue.classification == "runtime"]
 
     @property
+    def internal_errors(self) -> list[PreflightIssue]:
+        return [issue for issue in self.issues if issue.classification == "internal"]
+
+    @property
     def primary_classification(self) -> str:
         if self.deterministic_errors:
             return "deterministic"
         if self.environment_errors:
             return "environment"
+        if self.internal_errors:
+            return "internal"
         if self.runtime_warnings:
             return "runtime"
         return ""
@@ -156,11 +162,17 @@ class TestContractPreflightReport:
             return "blocked"
         if self.environment_errors:
             return "environment"
+        if self.internal_errors:
+            return "failed"
         return "warning" if self.runtime_warnings else "passed"
 
     @property
     def can_start_tdd(self) -> bool:
-        return not self.applicable or (not self.deterministic_errors and not self.environment_errors)
+        return not self.applicable or (
+            not self.deterministic_errors
+            and not self.environment_errors
+            and not self.internal_errors
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,6 +185,7 @@ class TestContractPreflightReport:
             "deterministic_error_count": len(self.deterministic_errors),
             "environment_error_count": len(self.environment_errors),
             "runtime_warning_count": len(self.runtime_warnings),
+            "internal_error_count": len(self.internal_errors),
         }
 
     def render(self) -> str:
@@ -184,6 +197,8 @@ class TestContractPreflightReport:
             headline = "Test contract preflight blocked TDD. No TestDrivenDeveloper session or run_tests budget was started."
         elif self.environment_errors:
             headline = "Test contract preflight found an environment failure. No TestDrivenDeveloper session or run_tests budget was started."
+        elif self.internal_errors:
+            headline = "Test contract preflight failed internally. No TestDrivenDeveloper session or run_tests budget was started."
         else:
             headline = "Test contract preflight passed with runtime-only warnings; the runner remains authoritative."
         lines = [headline]
