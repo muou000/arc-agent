@@ -1435,3 +1435,100 @@ def test_validate_http_status_contract_accepts_hackathon_sheet_create_shape(
         interfaces,
         manifest,
     ) == []
+
+
+def test_workbook_routes_keep_comma_statuses_and_template_get_separate(
+    tmp_project_dir: Path,
+) -> None:
+    test_path = tmp_project_dir / "tests" / "workbooks.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const created = await request.post('/api/workbooks');\n"
+        "expect(created.status).toBe(201);\n"
+        "expect(created.status).toBe(400);\n"
+        "expect(created.status).toBe(500);\n"
+        "const id = 'missing';\n"
+        "const found = await request.get(`/api/workbooks/${id}`);\n"
+        "expect(found.status).toBe(200);\n"
+        "expect(found.status).toBe(404);\n"
+        "const updated = await request.patch(`/api/workbooks/${id}`);\n"
+        "expect(updated.status).toBe(200);\n"
+        "expect(updated.status).toBe(400);\n"
+        "expect(updated.status).toBe(404);\n"
+        "expect(updated.status).toBe(409);\n",
+        encoding="utf-8",
+    )
+    card = {
+        "interface_id": "REQ-1-1-1-API-Workbooks",
+        "type": "API",
+        "specification": (
+            "GET /api/workbooks/:id returns 200 {workbook}, 404 {notFound}. "
+            "PATCH /api/workbooks/:id returns 200 {workbook}, 400 {invalid}, "
+            "404 {missing}, 409 {conflict}. "
+            "POST /api/workbooks returns 201 {created}, 400 {invalid}, 500 {failure}."
+        ),
+        "file_path": "backend/src/routes/workbooks.js",
+    }
+    tests = [{"type": "Integration", "file_path": "tests/workbooks.test.js",
+              "interface_ids": [card["interface_id"]]}]
+    assertions = extract_http_status_assertions("tests/workbooks.test.js", test_path.read_text())
+    assert {(item["method"], item["path"]) for item in assertions} == {
+        ("POST", "/api/workbooks"),
+        ("GET", "/api/workbooks/${id}"),
+        ("PATCH", "/api/workbooks/${id}"),
+    }
+    assert validate_http_status_contracts(tmp_project_dir, {}, [card], tests) == []
+
+    test_path.write_text(
+        "const id = 'missing';\n"
+        "const found = await request.get(`/api/workbooks/${id}`);\n"
+        "expect(found.status).toBe(201);\n", encoding="utf-8",
+    )
+    diagnostics = validate_http_status_contracts(tmp_project_dir, {}, [card], tests)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_conflict"
+    assert diagnostics[0]["contract_status_codes"] == [200, 404]
+
+    tests[0]["interface_ids"] = ["IF-IMPORT-UI"]
+    test_path.write_text(
+        "const found = await request.get(`/api/workbooks/${id}`);\n"
+        "expect(found.status).toBe(200);\n", encoding="utf-8",
+    )
+    diagnostics = validate_http_status_contracts(tmp_project_dir, {}, [card], tests)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_needs_info"
+    assert card["interface_id"] in diagnostics[0]["message"]
+
+
+def test_import_route_comment_supplies_only_its_own_declared_statuses(tmp_project_dir: Path) -> None:
+    route = tmp_project_dir / "backend/src/routes/workbooks.js"
+    route.parent.mkdir(parents=True)
+    route.write_text(
+        "const router = require('express').Router();\n"
+        "// GET /api/workbooks -> 200 {workbooks}\n"
+        "router.get('/', (req, res) => res.status(501).json({code: 'NOT_IMPLEMENTED'}));\n"
+        "// POST /api/workbooks/import -> 201 {workbook}, 400 {errors}\n"
+        "router.post('/import', (req, res) => res.status(501).json({code: 'NOT_IMPLEMENTED'}));\n",
+        encoding="utf-8",
+    )
+    test = tmp_project_dir / "tests/import.test.js"
+    test.parent.mkdir(parents=True)
+    test.write_text(
+        "const response = await request.post('/api/workbooks/import');\n"
+        "expect(response.status).toBe(201);\n"
+        "expect(response.status).toBe(400);\n", encoding="utf-8",
+    )
+    card = {"interface_id": "IF-IMPORT", "type": "API",
+            "file_path": "backend/src/routes/workbooks.js",
+            "specification": "POST /api/workbooks/import accepts CSV."}
+    manifest = [{"type": "Integration", "file_path": "tests/import.test.js",
+                 "interface_ids": ["IF-IMPORT"]}]
+    assert validate_http_status_contracts(tmp_project_dir, {}, [card], manifest) == []
+    test.write_text(
+        "const response = await request.post('/api/workbooks/import');\n"
+        "expect(response.status).toBe(200);\n", encoding="utf-8",
+    )
+    diagnostics = validate_http_status_contracts(tmp_project_dir, {}, [card], manifest)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_conflict"
+    assert diagnostics[0]["contract_status_codes"] == [201, 400]

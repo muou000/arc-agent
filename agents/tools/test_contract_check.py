@@ -76,7 +76,7 @@ _TEST_ID = re.compile(r"(?:getByTestId\(\s*|\[data-testid\s*=\s*)(['\"])([\w.-]+
 #: Integration/API calls: ``fetch('/api/auth/register'...)``,
 #: ``request.get('/api/auth/me')``, supertest ``agent.post('/api/auth/register')``.
 _API_HOOK = re.compile(
-    r"\.(?:get|post|put|patch|delete)\(\s*(['\"])(/[^'\"]+)\1",
+    r"\.(?:get|post|put|patch|delete)\(\s*(['\"`])(/[^'\"`]+)\1",
 )
 
 _ROLE_NAMES = {"link", "button", "checkbox", "textbox", "combobox", "heading", "banner", "navigation", "img", "radio", "option", "listbox", "dialog"}
@@ -110,7 +110,7 @@ _REQUEST_CALL_RE = re.compile(
     rf"(?:(?:const|let|var)\s+(?P<variable>{_IDENTIFIER})\s*=\s*)?"
     rf"(?:await\s+)?(?:(?:{_IDENTIFIER})\s*\.\s*)+"
     rf"(?P<method>{_HTTP_METHODS})\s*\(\s*"
-    rf"(?P<quote>['\"])(?P<path>/[^'\"\n]*)",
+    rf"(?P<quote>['\"`])(?P<path>/[^'\"`\n]*)",
     re.IGNORECASE,
 )
 _STATUS_PROPERTY_ASSERTION_RE = re.compile(
@@ -127,7 +127,7 @@ _REVERSED_STATUS_CONTAINS_RE = re.compile(
 )
 _REQUEST_EXPECT_RE = re.compile(
     rf"(?P<full>(?:await\s+)?(?:{_IDENTIFIER}(?:\([^\n)]*\))?\s*\.\s*)+"
-    rf"(?P<method>{_HTTP_METHODS})\s*\(\s*(?P<quote>['\"])(?P<path>/[^'\"\n]*)"
+    rf"(?P<method>{_HTTP_METHODS})\s*\(\s*(?P<quote>['\"`])(?P<path>/[^'\"`\n]*)"
     rf"[^\n;]*?\)\s*\.\s*expect\(\s*(?P<expected>[^)\n]+)\))",
     re.IGNORECASE,
 )
@@ -135,7 +135,7 @@ _CHAIN_REQUEST_CALL_RE = re.compile(
     rf"(?:(?:const|let|var)\s+(?P<variable>{_IDENTIFIER})\s*=\s*)?"
     rf"(?:await\s+)?{_IDENTIFIER}\s*\([^)]*\)\s*\.\s*"
     rf"(?P<method>{_HTTP_METHODS})\s*\(\s*"
-    rf"(?P<quote>['\"])(?P<path>/[^'\"\n]*)",
+    rf"(?P<quote>['\"`])(?P<path>/[^'\"`\n]*)",
     re.IGNORECASE,
 )
 _FETCH_CALL_RE = re.compile(
@@ -145,7 +145,7 @@ _FETCH_CALL_RE = re.compile(
 )
 _ROUTE_DECLARATION_RE = re.compile(
     rf"\b(?:router|app|server|api)\s*\.\s*(?P<method>{_HTTP_METHODS})\s*\(\s*"
-    rf"(?P<quote>['\"])(?P<path>/[^'\"\n]*)",
+    rf"(?P<quote>['\"`])(?P<path>/[^'\"`\n]*)",
     re.IGNORECASE,
 )
 _ROUTE_DECORATOR_RE = re.compile(
@@ -199,7 +199,7 @@ _STATUS_TEXT_PATTERNS = (
     # text start). A clause boundary plus a bare status-sized number with an
     # opening body brace is the shape DESIGN writes after the primary arrow.
     re.compile(
-        r"(?:^|[;\n]|\b(?:or|and)\b|(?:或|或者))[ \t]*"
+        r"(?:^|[;,\n]|\b(?:or|and)\b|(?:或|或者))[ \t]*"
         r"(?P<code>[1-5]\d{2})[ \t]*\{",
         re.IGNORECASE,
     ),
@@ -259,6 +259,63 @@ def _extract_status_codes_from_text(value: Any) -> list[int]:
             if code not in codes:
                 codes.append(code)
     return codes
+
+
+_METHOD_PATH_RE = re.compile(
+    rf"\b(?P<method>{_HTTP_METHODS})\s+(?P<path>/[A-Za-z0-9_./:{{}}?=&%-]+)",
+    re.IGNORECASE,
+)
+
+
+def _route_status_declarations(value: Any) -> list[dict[str, Any]]:
+    """Extract only statuses in each method/path clause of an interface."""
+
+    text = str(value or "")
+    matches = list(_METHOD_PATH_RE.finditer(text))
+    declarations = []
+    for index, match in enumerate(matches):
+        clause = text[match.start(): matches[index + 1].start() if index + 1 < len(matches) else len(text)]
+        # A free-form summary after a route list does not belong only to
+        # the final listed route. Structured outputs can still supply it.
+        clause = _STATUS_CODE_LIST_RE.split(clause, maxsplit=1)[0]
+        codes = _extract_status_codes_from_text(clause)
+        for arrow in re.finditer(r"(?:->|=>|→)\s*([1-5]\d{2})\b", clause):
+            code = int(arrow.group(1))
+            if code not in codes:
+                codes.append(code)
+        for comment_match in _ROUTE_STATUS_COMMENT_RE.finditer(clause):
+            code = int(comment_match.group("code"))
+            if code not in codes:
+                codes.append(code)
+        if codes:
+            declarations.append({
+                "method": match.group("method").upper(),
+                "path": _normalize_api_path(match.group("path").rstrip(".,;")),
+                "status_codes": codes,
+            })
+    return declarations
+
+
+def preserve_prior_api_route_clauses(previous: str, updated: str) -> str:
+    """Retain statuses of old routes absent from a reused card's update."""
+
+    prior = _route_status_declarations(previous)
+    current = _route_status_declarations(updated)
+    matches = list(_METHOD_PATH_RE.finditer(previous))
+    retained = []
+    for index, match in enumerate(matches):
+        method = match.group("method").upper()
+        path = _normalize_api_path(match.group("path").rstrip(".,;"))
+        if not any(route["method"] == method and route["path"] == path for route in prior):
+            continue
+        if any(
+            route["method"] == method and _path_matches(route["path"], path)
+            for route in current
+        ):
+            continue
+        clause = previous[match.start(): matches[index + 1].start() if index + 1 < len(matches) else len(previous)]
+        retained.append(clause.strip())
+    return " ".join([updated.strip(), *retained]).strip()
 
 
 def _extract_status_codes_from_value(value: Any, *, key_hint: str = "") -> list[int]:
@@ -385,7 +442,7 @@ def extract_http_status_assertions(file_path: str, content: str) -> list[dict[st
                 item
                 for item in reversed(requests)
                 if int(item["start"]) <= match.start()
-                and (not receiver or not item["variable"] or item["variable"] == receiver)
+                and (not receiver or item["variable"] == receiver)
             ),
             None,
         )
@@ -456,14 +513,26 @@ def _extract_route_records(workspace_root: str | Path, interface: dict[str, Any]
     routes: list[dict[str, Any]] = []
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
-        segment = _leading_comment_block(content, match.start()) + content[match.start() : end]
+        leading = _leading_comment_block(content, match.start())
+        segment = leading + content[match.start() : end]
         codes: list[int] = []
-        # A leading status-arrow comment is a route-level declaration, unlike a scaffold response.
-        for comment_match in _ROUTE_STATUS_COMMENT_RE.finditer(segment):
-            code = int(comment_match.group("code"))
-            if code not in codes:
-                codes.append(code)
-        for comment_match in _ROUTE_STATUS_ARROW_COMMENT_RE.finditer(segment):
+        comment_routes = _route_status_declarations(leading)
+        same_method = [
+            route for route in comment_routes
+            if route["method"] == match.group("method").upper()
+        ]
+        declared = [
+            route for route in same_method
+            if (
+                _path_matches(match.group("path"), route["path"])
+                or (match.group("path") == "/" and len(same_method) == 1)
+            )
+        ]
+        for route in declared:
+            for code in route["status_codes"]:
+                if code not in codes:
+                    codes.append(code)
+        for comment_match in _ROUTE_STATUS_COMMENT_RE.finditer(content[match.start() : end]):
             code = int(comment_match.group("code"))
             if code not in codes:
                 codes.append(code)
@@ -535,6 +604,57 @@ def _extract_interface_route_paths(interface: dict[str, Any]) -> list[dict[str, 
             if path and not any(item["path"] == path for item in paths):
                 paths.append({"method": "", "path": path})
     return paths
+
+
+def find_unregistered_api_routes(
+    workspace_root: str | Path,
+    materialized_paths: list[str],
+    interfaces: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Find materialized API routes lacking a method/path contract card."""
+
+    contracts = [
+        route
+        for interface in interfaces
+        if str(interface.get("type") or "").upper() == "API"
+        for route in _extract_interface_route_paths(interface)
+        if route["method"]
+    ]
+    missing: list[dict[str, str]] = []
+    for file_path in dict.fromkeys(materialized_paths):
+        content = _read_workspace_text(workspace_root, file_path)
+        if not content:
+            continue
+        for match in _ROUTE_DECLARATION_RE.finditer(content):
+            line = content[content.rfind("\n", 0, match.start()) + 1:match.start()].strip()
+            if line.startswith(("//", "/*", "*")):
+                continue
+            method = match.group("method").upper()
+            relative_path = _normalize_api_path(match.group("path"))
+            # A router-relative '/' cannot identify its mount without the
+            # app's wiring; a specific path or a route-table comment can.
+            declared = [
+                route for route in _route_status_declarations(_leading_comment_block(content, match.start()))
+                if route["method"] == method
+                and _path_matches(relative_path, route["path"])
+            ]
+            path = declared[-1]["path"] if declared else relative_path
+            if path == "/":
+                continue
+            if any(
+                route["method"] == method and _path_matches(relative_path, route["path"])
+                for route in contracts
+            ) or (
+                declared and any(
+                    route["method"] == method and _path_matches(route["path"], path)
+                    for route in contracts
+                )
+            ):
+                continue
+            entry = {"file_path": str(file_path), "method": method, "path": path}
+            if entry not in missing:
+                missing.append(entry)
+    return missing
 
 
 def _interface_status_sources(workspace_root: str | Path, interface: dict[str, Any]) -> list[dict[str, Any]]:
@@ -631,7 +751,18 @@ def _assertion_status_codes(
             if code not in matched_route_codes:
                 matched_route_codes.append(code)
     route_codes = matched_route_codes if item["routes"] else item["route_codes"]
-    registered_codes = list(item["interface_codes"] or route_codes)
+    declared = [
+        route for route in item["declared_routes"]
+        if (not path or _path_matches(route["path"], path))
+        and (not method or route["method"] == method)
+    ]
+    declared_codes = list(dict.fromkeys(
+        code for route in declared for code in route["status_codes"]
+    ))
+    registered_codes = (
+        declared_codes if item["declared_routes"]
+        else list(item["interface_codes"] or route_codes)
+    )
     return route_codes, registered_codes
 
 
@@ -709,6 +840,7 @@ def validate_http_status_contracts(
         if isinstance(scenario, dict):
             requirement_text += "\n" + "\n".join(str(scenario.get(key) or "") for key in ("name", "given", "when", "then"))
     requirement_codes = _extract_status_codes_from_text(requirement_text)
+    requirement_routes = _route_status_declarations(requirement_text)
     requirement_paths = [
         _normalize_api_path(path.rstrip(".,;"))
         for path in re.findall(r"['\"](/[^'\"\s)]+)", requirement_text)
@@ -737,6 +869,12 @@ def validate_http_status_contracts(
                 "interface_id": str(interface.get("interface_id") or "").strip(),
                 "paths": paths,
                 "interface_codes": interface_codes,
+                "declared_routes": [
+                    route
+                    for field in ("specification", "responsibility", "first_line", "test_focus")
+                    for route in _route_status_declarations(interface.get(field))
+                    if route["status_codes"]
+                ],
                 "route_codes": route_codes,
                 "routes": [
                     source["route"]
@@ -767,7 +905,7 @@ def validate_http_status_contracts(
             path_candidates = [item for item in candidates if item["paths"]]
             if path_candidates:
                 candidates = path_candidates
-        if not candidates and len(prepared) == 1:
+        if not candidates and len(prepared) == 1 and not prepared[0]["paths"]:
             candidates = prepared
         if not candidates:
             diagnostics.append(
@@ -839,8 +977,33 @@ def validate_http_status_contracts(
 
         candidate_paths = [route.get("path", "") for route in candidate["paths"]]
         route_codes, registered_codes = _assertion_status_codes(candidate, path, method)
+        named_ids = manifest_interface_ids.get(str(assertion.get("file_path") or ""), set())
+        if named_ids and candidate["interface_id"] not in named_ids:
+            diagnostics.append(
+                _status_contract_diagnostic(
+                    code="status_code_needs_info",
+                    assertion=assertion,
+                    interface_id=candidate["interface_id"],
+                    message=(
+                        f"needs-info: this test's manifest must name API interface "
+                        f"{candidate['interface_id']} for {method} {path}, not only "
+                        f"{', '.join(sorted(named_ids))}. Use coverage_scope=dependency or shared "
+                        "for a foreign regression contract."
+                    ),
+                )
+            )
+            continue
+        matched_requirement = [
+            route for route in requirement_routes
+            if (not path or _path_matches(route["path"], path))
+            and (not method or route["method"] == method)
+        ]
+        relevant_requirement_codes = (
+            list(dict.fromkeys(code for route in matched_requirement for code in route["status_codes"]))
+            if requirement_routes else requirement_codes
+        )
         requirement_applies = bool(
-            requirement_codes
+            relevant_requirement_codes
             and (
                 not requirement_paths
                 or not path
@@ -848,7 +1011,7 @@ def validate_http_status_contracts(
                 or len(prepared) == 1
             )
         )
-        if candidate["interface_codes"] and route_codes and set(candidate["interface_codes"]).isdisjoint(route_codes):
+        if registered_codes and route_codes and set(registered_codes).isdisjoint(route_codes):
             diagnostics.append(
                 _status_contract_diagnostic(
                     code="status_code_conflict",
@@ -857,13 +1020,13 @@ def validate_http_status_contracts(
                     contract_status_codes=registered_codes,
                     message=(
                         f"HTTP status sources for {candidate['interface_id'] or 'API interface'} "
-                        f"conflict: interface declares {', '.join(str(code) for code in candidate['interface_codes'])}, "
+                        f"conflict: interface declares {', '.join(str(code) for code in registered_codes)}, "
                         f"but the matched route declares {', '.join(str(code) for code in route_codes)}."
                     ),
                 )
             )
             continue
-        if requirement_applies and registered_codes and set(requirement_codes).isdisjoint(registered_codes):
+        if requirement_applies and registered_codes and set(relevant_requirement_codes).isdisjoint(registered_codes):
             diagnostics.append(
                 _status_contract_diagnostic(
                     code="status_code_conflict",
@@ -871,7 +1034,7 @@ def validate_http_status_contracts(
                     interface_id=candidate["interface_id"],
                     contract_status_codes=registered_codes,
                     message=(
-                        f"Requirement declares HTTP status {', '.join(str(code) for code in requirement_codes)}, "
+                        f"Requirement declares HTTP status {', '.join(str(code) for code in relevant_requirement_codes)}, "
                         f"but registered contract {candidate['interface_id'] or 'API interface'} declares "
                         f"{', '.join(str(code) for code in registered_codes)}."
                     ),
@@ -879,7 +1042,7 @@ def validate_http_status_contracts(
             )
             continue
         contract_codes = (
-            list(requirement_codes)
+            list(relevant_requirement_codes)
             if requirement_applies
             else registered_codes
         )

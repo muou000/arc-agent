@@ -88,6 +88,27 @@ def test_prepare_interfaces_merges_existing_content_under_new_pass(tmp_project_d
     assert row["file_path"] == "src/other.py"
 
 
+def test_reused_api_card_keeps_unchanged_routes_when_post_is_added(tmp_project_dir, arc_runtime) -> None:
+    registry = _make_registry(tmp_project_dir, arc_runtime)
+    old = _iface(
+        "REQ-1-API-Workbooks", type="API", file_path="backend/src/routes/workbooks.js",
+        specification=(
+            "GET /api/workbooks/:id returns 200 {workbook}, 404 {missing}. "
+            "PATCH /api/workbooks/:id returns 200 {workbook}, 400 {bad}, "
+            "404 {missing}, 409 {conflict}."
+        ),
+    )
+    registry.register_design("REQ-1", registry.prepare_interfaces("REQ-1", [old]), [])
+    reused = registry.prepare_interfaces("REQ-2", [{
+        "interface_id": old["interface_id"],
+        "type": "API", "file_path": old["file_path"],
+        "specification": "POST /api/workbooks returns 201 {created}, 400 {invalid}, 500 {failure}.",
+    }])[0]
+    assert "POST /api/workbooks returns 201" in reused["specification"]
+    assert "GET /api/workbooks/:id returns 200 {workbook}, 404 {missing}" in reused["specification"]
+    assert "PATCH /api/workbooks/:id returns 200 {workbook}, 400 {bad}, 404 {missing}, 409 {conflict}" in reused["specification"]
+
+
 def test_prepare_interfaces_rejects_invalid_type(tmp_project_dir, arc_runtime) -> None:
     registry = _make_registry(tmp_project_dir, arc_runtime)
     with pytest.raises(ValueError, match="invalid `type`"):

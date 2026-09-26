@@ -222,6 +222,16 @@ class DesignArtifactRegistry:
                 except json.JSONDecodeError:
                     existing_content = {}
                 if isinstance(existing_content, dict):
+                    if (
+                        str(existing.get("type") or "").upper() == "API"
+                        and str(interface.get("specification") or "").strip()
+                    ):
+                        from agents.tools.test_contract_check import preserve_prior_api_route_clauses
+
+                        interface = {**interface, "specification": preserve_prior_api_route_clauses(
+                            str(existing_content.get("specification") or ""),
+                            str(interface["specification"]),
+                        )}
                     interface = {**existing_content, **interface}
             interface_type = resolve_interface_type(interface, stored_row=existing)
             if not interface_type:
