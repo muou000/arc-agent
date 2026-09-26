@@ -224,6 +224,85 @@ def test_copy_template_accepts_a_complete_template(tmp_path, monkeypatch) -> Non
 # --------------------------------------------------------------------------
 
 
+def test_install_package_rejects_an_already_installed_package(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    backend = workspace / "backend"
+    package = backend / "node_modules" / "@scope" / "pkg"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "@scope/pkg", "version": "1.2.3"}), encoding="utf-8"
+    )
+    handler = _make_handler(workspace)
+    npm_commands: list[list[str]] = []
+
+    async def fake_run_npm_command(command, target_dir, timeout=0.0):
+        npm_commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run_npm_command)
+
+    receipt = asyncio.run(handler.install_package("@scope/pkg", "backend"))
+
+    assert receipt.startswith("Exit Code: 1")
+    assert "\u5df2\u5b89\u88c5 @scope/pkg@1.2.3" in receipt
+    assert "\u672c\u6b21\u5931\u8d25\u7684\u539f\u56e0\u4e0d\u5728\u7f3a\u5305" in receipt
+    assert npm_commands == []
+
+
+def test_install_package_uses_the_locked_version_when_package_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    backend = workspace / "backend"
+    backend.mkdir(parents=True)
+    (backend / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {"node_modules/pkg": {"version": "1.2.3"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    handler = _make_handler(workspace)
+    npm_commands: list[list[str]] = []
+
+    async def fake_run_npm_command(command, target_dir, timeout=0.0):
+        npm_commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run_npm_command)
+
+    receipt = asyncio.run(handler.install_package("pkg", "backend"))
+
+    assert npm_commands[0][-1] == "pkg@1.2.3"
+    assert receipt.startswith("Exit Code: 0")
+
+
+def test_install_package_keeps_a_bare_name_without_a_lockfile_entry(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    backend = workspace / "backend"
+    backend.mkdir(parents=True)
+    (backend / "package-lock.json").write_text(
+        json.dumps({"lockfileVersion": 3, "packages": {}}), encoding="utf-8"
+    )
+    handler = _make_handler(workspace)
+    npm_commands: list[list[str]] = []
+
+    async def fake_run_npm_command(command, target_dir, timeout=0.0):
+        npm_commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run_npm_command)
+
+    receipt = asyncio.run(handler.install_package("pkg", "backend"))
+
+    assert npm_commands[0][-1] == "pkg"
+    assert receipt.startswith("Exit Code: 0")
+
+
 def test_install_dependencies_installs_the_missing_dom_peer(tmp_path, monkeypatch) -> None:
     """`@testing-library/react` 16 needs the `@testing-library/dom` peer, the
     provided template does not declare it, and the `--legacy-peer-deps`

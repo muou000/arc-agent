@@ -171,6 +171,48 @@ def node_modules_ready(target_dir: str) -> bool:
         return False
 
 
+def _read_package_version(manifest_path: str) -> str | None:
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as file:
+            package = json.load(file)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(package, dict):
+        return None
+    version = package.get("version")
+    if not isinstance(version, str) or not version.strip():
+        return None
+    return version.strip()
+
+
+def _installed_package_version(target_dir: str, package_name: str) -> str | None:
+    manifest_path = os.path.join(
+        target_dir, "node_modules", *package_name.split("/"), "package.json"
+    )
+    return _read_package_version(manifest_path)
+
+
+def _locked_package_version(target_dir: str, package_name: str) -> str | None:
+    lockfile_path = os.path.join(target_dir, "package-lock.json")
+    try:
+        with open(lockfile_path, "r", encoding="utf-8") as file:
+            lockfile = json.load(file)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(lockfile, dict):
+        return None
+    packages = lockfile.get("packages")
+    if not isinstance(packages, dict):
+        return None
+    entry = packages.get(f"node_modules/{package_name}")
+    if not isinstance(entry, dict):
+        return None
+    version = entry.get("version")
+    if not isinstance(version, str) or not version.strip():
+        return None
+    return version.strip()
+
+
 def _resolve_executable(program: str) -> str:
     """Resolve ``program`` to a real file ``create_subprocess_exec`` can spawn.
 
@@ -1183,10 +1225,11 @@ class WebAppType(AppTypeHandler):
         Used by the TDD-stage ``install_dependencies`` tool when ``run_tests``
         reports a missing package (``Cannot find module 'x'``). The package is
         installed with ``--no-save --no-package-lock`` so the provided
-        template's ``package.json`` and lockfile stay untouched — the install
-        only fixes the runtime ``node_modules`` tree of this workspace. The
-        agent is still free to declare the dependency in ``package.json`` by
-        editing it (the file is writable), but nothing forces that edit.
+        template's ``package.json`` and lockfile stay untouched. Already
+        installed packages are rejected instead of being reinstalled. When a
+        missing package is recorded in ``package-lock.json``, the locked
+        version is installed; only packages absent from the lockfile use a
+        bare package name.
 
         ``--legacy-peer-deps`` matches the fallback posture of the primary
         install: on npm 10.x a plain resolution can crash arborist on vitest's
@@ -1214,9 +1257,27 @@ class WebAppType(AppTypeHandler):
                 "STDERR:\n"
                 f"Install target directory does not exist: {label}/\n"
             )
+        installed_version = _installed_package_version(target_dir, name)
+        if installed_version:
+            await self._log(
+                "System",
+                f"Refusing to reinstall already installed package '{name}@{installed_version}' "
+                "because this failure is not caused by a missing package.",
+                "warning",
+            )
+            return (
+                "Exit Code: 1\n"
+                "STDERR:\n"
+                f"Package '{name}@{installed_version}' is already installed; this failure is not "
+                "caused by a missing package.\n"
+                f"\u5df2\u5b89\u88c5 {name}@{installed_version}\uff1b\u672c\u6b21\u5931\u8d25\u7684\u539f\u56e0\u4e0d\u5728\u7f3a\u5305\u3002 "
+                "Continue with failure attribution elsewhere instead of reinstalling it.\n"
+            )
+        locked_version = _locked_package_version(target_dir, name)
+        package_spec = f"{name}@{locked_version}" if locked_version else name
         await self._log(
             "System",
-            f"Installing npm package '{name}' into {label}/ (no-save)...",
+            f"Installing npm package '{package_spec}' into {label}/ (no-save)...",
         )
         # LEGACY_PEER_DEPS_FLAG is a single-token npm flag; split() keeps the
         # argv form honest if it ever grows, and a multi-token value would be
@@ -1234,7 +1295,7 @@ class WebAppType(AppTypeHandler):
                     "--no-save",
                     "--no-package-lock",
                     *LEGACY_PEER_DEPS_FLAG.split(),
-                    name,
+                    package_spec,
                 ],
                 target_dir,
                 NPM_INSTALL_TIMEOUT_SECONDS,
@@ -1242,33 +1303,33 @@ class WebAppType(AppTypeHandler):
         except Exception as exc:
             await self._log(
                 "System",
-                f"npm install of '{name}' into {label}/ could not run: {type(exc).__name__}: {exc}",
+                f"npm install of '{package_spec}' into {label}/ could not run: {type(exc).__name__}: {exc}",
                 "warning",
             )
             return (
                 "Exit Code: 1\n"
                 "STDERR:\n"
-                f"npm install of '{name}' into {label}/ could not run: "
+                f"npm install of '{package_spec}' into {label}/ could not run: "
                 f"{type(exc).__name__}: {exc}\n"
                 "Fall back to a standard-library or local implementation.\n"
             )
         if returncode != 0:
             await self._log(
                 "System",
-                f"npm install of '{name}' into {label}/ failed: {_tail(stderr)}",
+                f"npm install of '{package_spec}' into {label}/ failed: {_tail(stderr)}",
                 "warning",
             )
             return (
                 "Exit Code: 1\n"
                 "STDERR:\n"
-                f"npm install of '{name}' into {label}/ failed:\n{_tail(stderr)}\n"
+                f"npm install of '{package_spec}' into {label}/ failed:\n{_tail(stderr)}\n"
                 "If the package name is wrong or the registry is unreachable, fall back to "
                 "a standard-library or local implementation.\n"
             )
-        await self._log("System", f"npm install of '{name}' into {label}/ succeeded.")
+        await self._log("System", f"npm install of '{package_spec}' into {label}/ succeeded.")
         return (
             f"Exit Code: 0\n"
-            f"Installed '{name}' into {label}/node_modules (no-save; package.json and "
+            f"Installed '{package_spec}' into {label}/node_modules (no-save; package.json and "
             "lockfile untouched). If the TDD layer is still open, re-run run_tests "
             "to validate the repair. If ARC_TDD_HARD_STOP has closed it, do not retry; "
             "record the installation as unverified in the failure report for a fresh "
