@@ -195,6 +195,10 @@ _STATUS_TEXT_PATTERNS = (
         r"(?P<path>/[A-Za-z0-9_./:{}?=&%-]+)[ \t]*(?:->|=>|→)[ \t]*(?P<code>[1-5]\d{2})\b",
         re.IGNORECASE,
     ),
+    # Pipe-separated status alternatives: `-> 200 detail | 404 NOT_FOUND` or
+    # `-> 200 { ok } | 404 { error } | 400 { error }`. DESIGN writes `|` as
+    # the clause boundary between a route's alternative response statuses.
+    re.compile(r"\|[ \t]*(?P<code>[1-5]\d{2})\b", re.IGNORECASE),
     # Status-body continuation: `; 400 { errors: ... }` (also line start /
     # text start). A clause boundary plus a bare status-sized number with an
     # opening body brace is the shape DESIGN writes after the primary arrow.
@@ -742,6 +746,12 @@ def _parameterized_path_matches(candidate: str, requested: str) -> bool:
     never hit those contracts. Segments keep the suffix semantics of the
     literal match: a shorter candidate aligns to the tail of the requested
     path, which covers router-relative declarations under a mount prefix.
+    A single-segment relative parameter route (``/:id``) needs at least two
+    swallowed segments: with one it would reinterpret the resource segment
+    of a sibling static route (``/:id`` vs ``/api/workbooks``) as the
+    parameter value. Routers in this system mount at multi-segment prefixes
+    (``app.use('/api/workbooks', router)``), so the mount a relative route
+    swallows is never a single segment.
     """
 
     pattern = candidate.strip("/").split("/")
@@ -750,7 +760,10 @@ def _parameterized_path_matches(candidate: str, requested: str) -> bool:
     concrete = requested.strip("/").split("/")
     if len(pattern) > len(concrete):
         return False
-    aligned = concrete[len(concrete) - len(pattern) :]
+    swallow = len(concrete) - len(pattern)
+    if swallow and swallow < (2 if len(pattern) == 1 else 1):
+        return False
+    aligned = concrete[swallow:]
     for expected, actual in zip(pattern, aligned):
         if expected.startswith(":") or expected.startswith("*"):
             if not actual:
@@ -758,6 +771,27 @@ def _parameterized_path_matches(candidate: str, requested: str) -> bool:
         elif expected != actual:
             return False
     return True
+
+
+def _static_path_matches(candidate: str, requested: str) -> bool:
+    """Match without parameter reinterpretation: literal equality or suffix.
+
+    Route precedence rule: when an assertion path statically matches a
+    declared route, sibling parameterized records that reach it only by
+    reinterpreting a static segment as a parameter value describe different
+    endpoints (``/:id`` vs ``/api/auth/register``) and must not contribute
+    their statuses to that assertion's verdict.
+    """
+
+    left = _normalize_api_path(candidate)
+    right = _normalize_api_path(requested)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if left == "/":
+        return right == "/"
+    return right.endswith(left)
 
 
 def _assertion_status_codes(
@@ -781,6 +815,21 @@ def _assertion_status_codes(
             and (not method or not route.get("method") or route.get("method") == method)
         )
     ]
+    if path and any(
+        _static_path_matches(route.get("path", ""), path)
+        and (not method or not route.get("method") or route.get("method") == method)
+        for route in item["paths"]
+    ):
+        # The assertion path statically matches a declared path of this
+        # candidate: route records that reach it only through parameter
+        # reinterpretation (``/:id`` vs the list route ``/api/workbooks`` or
+        # the sibling ``/api/auth/register``) describe different endpoints,
+        # and their codes must not enter this assertion's verdict.
+        matching_routes = [
+            route
+            for route in matching_routes
+            if _static_path_matches(route.get("path", ""), path)
+        ]
     matched_route_codes: list[int] = []
     for route in matching_routes:
         for code in route.get("status_codes") or []:
@@ -882,6 +931,12 @@ def validate_http_status_contracts(
         for path in re.findall(r"['\"](/[^'\"\s)]+)", requirement_text)
     ]
     manifest_interface_ids = _manifest_interface_ids(tests)
+    interface_types = {
+        str(interface.get("interface_id") or "").strip():
+            str(interface.get("type") or "").strip().upper()
+        for interface in interfaces or []
+        if isinstance(interface, dict)
+    }
 
     prepared: list[dict[str, Any]] = []
     for interface in api_interfaces:
@@ -944,6 +999,21 @@ def validate_http_status_contracts(
         if not candidates and len(prepared) == 1 and not prepared[0]["paths"]:
             candidates = prepared
         if not candidates:
+            if path == "/":
+                # The bare root path is the SPA/static surface the backend
+                # serves, not an API route. When this test file's manifest
+                # binds it to a non-API interface (FUNC/UI), the root
+                # assertion belongs to that contract, which the API status
+                # gate does not police; unknown or API-only owners keep the
+                # needs-info diagnostic.
+                named_ids = manifest_interface_ids.get(
+                    str(assertion.get("file_path") or ""), set()
+                )
+                if any(
+                    interface_types.get(named_id, "") not in ("", "API")
+                    for named_id in named_ids
+                ):
+                    continue
             diagnostics.append(
                 _status_contract_diagnostic(
                     code="status_code_needs_info",
