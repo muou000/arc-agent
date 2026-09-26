@@ -152,3 +152,79 @@ def test_normal_read_write_rhythm_never_trips_the_nudge(tmp_project_dir: Path) -
     _invoke(built, tmp_project_dir, "REQ-PROBE-STALL:rhythm")
 
     assert all("PROBE STALL" not in result for result in _tool_results(model))
+
+
+def test_identical_grep_replays_cached_result_through_the_real_chain(
+    tmp_project_dir: Path,
+) -> None:
+    """The third identical grep is answered from cache with the directive.
+
+    End-to-end through ``build_stage_agent``'s middleware chain: the first
+    two greps execute the real search, the third returns the model's own
+    earlier evidence plus the ARC REPEATED PROBE directive - the session
+    stays alive, only the wasted re-execution disappears.
+    """
+
+    _seed_probe_log(tmp_project_dir)
+    responses = [
+        faux_tool_call(
+            "grep",
+            {"pattern": "line 3:", "path": PROBE_LOG_VIRTUAL, "output_mode": "content"},
+            call_id=f"same-{index}",
+        )
+        for index in range(3)
+    ] + [faux_text("done")]
+    model, built = _build(tmp_project_dir, responses)
+
+    _invoke(built, tmp_project_dir, "REQ-PROBE-STALL:mirror")
+
+    results = _tool_results(model)
+    assert len(results) == 3
+    assert "ARC REPEATED PROBE" not in results[0]
+    assert "ARC REPEATED PROBE" not in results[1]
+    assert results[2].startswith("/workspace")
+    assert "ARC REPEATED PROBE" in results[2]
+    assert "never produces new information" in results[2]
+
+
+def test_identical_no_match_greps_replay_with_directive_and_ladder_silent(
+    tmp_project_dir: Path,
+) -> None:
+    """Identical no-match repeats: the mirror answers, the #218 ladder waits.
+
+    The repeated probe and the #218 no-match budget share the identical-miss
+    domain, so their cooperation needs a pin of its own: the first two
+    identical misses execute (each advancing the ladder's streak to 2), the
+    third is replayed from cache with the directive. A replay never reaches
+    the grep backend, so the ladder's streak stays below its hint threshold
+    and its own wording stays silent - the mirror's directive is the
+    steering for this shape. Keyword enumeration (varied misses) stays the
+    ladder's domain and keeps its own e2e pins.
+    """
+
+    _seed_probe_log(tmp_project_dir)
+    responses = [
+        faux_tool_call(
+            "grep",
+            {"pattern": "definitely-not-present", "path": PROBE_LOG_VIRTUAL, "output_mode": "content"},
+            call_id=f"miss-{index}",
+        )
+        for index in range(3)
+    ] + [faux_text("done")]
+    model, built = _build(tmp_project_dir, responses)
+
+    _invoke(built, tmp_project_dir, "REQ-PROBE-STALL:miss-mirror")
+
+    results = _tool_results(model)
+    assert len(results) == 3
+    for result in results[:2]:
+        assert result.startswith("No matches found")
+        assert "ARC REPEATED PROBE" not in result
+        # The per-miss literal-text note still rides every real execution.
+        assert "grep matches literal text" in result
+    # The replay carries the cached no-match evidence plus the directive.
+    assert results[2].startswith("No matches found")
+    assert "ARC REPEATED PROBE" in results[2]
+    # The ladder never fired: two real misses stay below its threshold of
+    # three, and the replayed round trip does not reach the grep backend.
+    assert all("No-match budget" not in result for result in results)
