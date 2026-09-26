@@ -727,18 +727,23 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             f"{_MAX_EDITS_PER_PATH} repair attempts (targeted edits and "
             "delete-rewrite cycles share one budget)"
         )
+        timing = (
+            " Same-pass repair is limited to evidence-backed mechanical defects; semantic or behavioral "
+            "redesign and edits without new evidence belong to a later validation or green-baseline "
+            "repair pass."
+        )
         fully_written = self._manifest_fully_written()
         if fully_written is not None:
             declared = ", ".join(fully_written)
             return (
                 f"{prefix} blocked: {path} has already used {attempts} in this pass, and every "
                 f"declared manifest file is written ({declared}). The current files are final for "
-                "this stage: stop editing and return your manifest response now."
+                f"this stage: stop editing and return your manifest response now.{timing}"
             )
         return (
             f"{prefix} blocked: {path} has already used {attempts} in this pass; the version on "
             "disk stands and the content you wrote is in your context. Continue with your "
-            "remaining declared files and return the manifest instead of polishing this one."
+            f"remaining declared files and return the manifest instead of polishing this one.{timing}"
         )
 
     def _validate_test_asset_edit(self, path: str) -> str | None:

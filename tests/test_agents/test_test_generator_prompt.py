@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from agents.context.prompts import common as common_prompts
 from agents.context.prompts.test_generator import get_system_prompt, get_user_prompt
 from agents.tools.test_manifest import TestManifestLock, build_declare_test_manifest_tool
 
@@ -100,3 +101,22 @@ def test_generator_prompts_and_manifest_tool_explain_helper_declarations() -> No
         assert "declared nowhere and stay writable" not in normalized
 
     assert "When the stage pipeline is active, shared runner configuration" in system_prompt
+
+
+def test_repair_timing_policy_is_consistent_across_test_generator_prompts_and_tools() -> None:
+    system_prompt = get_system_prompt()
+    user_prompt = get_user_prompt(
+        node_id="REQ-X",
+        requirement_data={"name": "Example", "description": "Example requirement"},
+        dynamic_context="",
+    )
+    policy = common_prompts.test_generator_repair_policy()
+
+    assert policy in system_prompt
+    assert system_prompt.count(policy) == 1
+    assert policy in user_prompt
+    assert policy in common_prompts.workspace_tool_policy()
+    assert "repair generated tests in the same pass" not in system_prompt
+    assert "Do not run, reread, or self-repair files written in this pass" not in user_prompt
+    assert "separate later repair pass" in system_prompt
+    assert "separate later repair pass" in user_prompt

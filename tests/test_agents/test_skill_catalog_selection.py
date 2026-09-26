@@ -509,6 +509,8 @@ def test_generator_repair_message_carries_requirement_snapshot(
     # #211: the repair snapshot is the same compact block the first pass
     # embeds (repair/first-pass parity), not a pretty-printed variant.
     assert_compact_requirement_snapshot(message, requirement_data)
+    assert "separate later repair pass requested by the system" in message
+    assert "ordinary same-pass mechanical-fix channel" in message
 
 
 # -- planner removal ------------------------------------------------------------

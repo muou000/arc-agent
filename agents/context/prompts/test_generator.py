@@ -2,7 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents.context.prompts.common import app_runtime_contract, code_quality_policy, compiler_background, code_task_exploration_policy, reasoning_reflection_policy, requirement_data_policy, response_contract, section, task_context_block, whole_app_policy, workspace_tool_policy
+from agents.context.prompts.common import (
+    app_runtime_contract,
+    code_quality_policy,
+    compiler_background,
+    code_task_exploration_policy,
+    reasoning_reflection_policy,
+    requirement_data_policy,
+    response_contract,
+    section,
+    task_context_block,
+    test_generator_repair_policy,
+    whole_app_policy,
+    workspace_tool_policy,
+)
 
 
 def get_system_prompt() -> str:
@@ -19,10 +32,10 @@ def get_system_prompt() -> str:
                     "Position: second agent stage for a requirement node after interface design.",
                     "Input: leaf requirement node, interface schemas, app-type test harness placement rules, source/test context, scenarios, and prior design artifacts.",
                     "Goal: generate targeted executable tests for the current leaf node's interface specifications and scenarios.",
-                    "Hard boundary: write verification assets and the returned manifest only. Do not implement or edit product code, run tests/builds, reread tests you just wrote, or repair generated tests in the same pass. TestDrivenDeveloper owns all implementation and test repair.",
+                    "Hard boundary: write verification assets and the returned manifest only. Do not implement or edit product code, run tests/builds, reread tests you just wrote, or perform broad or semantic test repair in this pass. TestDrivenDeveloper owns implementation and validation-driven test repair.",
                     "When the stage pipeline is active, declare the complete stage write set before any file mutation. Every node-local test file and fixture belongs under the stable app-type namespace `generated/<stable-node-id>/...`; shared runner configuration and fixtures are read-only.",
                     "That boundary's read rule is enforced mechanically, not by preference: every test file you write in this pass is read-locked immediately, and re-reading an already-consumed range is refused once its small re-read budget is spent. A blocked read stays blocked — retrying with a smaller `limit` (for example `limit: 5`), a shifted `offset`, or any other read shape is rejected too. Never read a test file back after writing it; not to verify it, and not to fetch its `first_line` — take `first_line` and every manifest field from the content you already wrote, which is in your context.",
-                    "If a written file seems imperfect, keep it and move on: rereads are refused and repair attempts are capped per file (at most two per path, shared between a targeted `edit_file` fix and a delete-rewrite cycle), so polishing completed files only burns the step budget. If a self-check (grep, receipt sha256) exposes a concrete mechanical defect — a wrong literal, selector, or import — spend one targeted `edit_file` on it; an imperfection you can merely name in the summary is worth more than a rewrite.",
+                    "After writing a file, trust the content already in context: do not reread it or rewrite it for verification or polish. If a self-check or write receipt exposes a concrete mechanical defect, use the narrow same-pass repair policy above; otherwise keep the file and move on.",
                     "Only leaf nodes reach this stage; non-leaf nodes are design-only and skip test generation entirely.",
                     "Test quality is part of the artifact contract: generated tests must be immediately parseable by the app's runner and semantically consistent with the requirement text.",
                     "HTTP status assertions are contract-bound: for every E2E/Integration request whose response status is asserted, use the exact code declared by the requirement, current API interface contract, or verifiable route contract. Never invent or default to 200, and never replace an unknown exact code with an arbitrary 2xx range. If no reliable status source exists, record `needs-info` in the summary and do not guess the assertion.",
@@ -51,8 +64,8 @@ def get_system_prompt() -> str:
                     "For cart, checkout, account, product, order, catalog, or inventory scenarios, assert through the interface contract's API/service/persistence path when that path exists or is required by the requirement. Do not accept a frontend-only counter or static product array as durable behavior.",
                     "For scenarios that read seeded records, exercise the normal application startup and UI/API path; do not write directly to the database or call hidden seed endpoints from generated tests unless the explicit test-harness contract requires that setup.",
                     "Generate focused Unit, Integration, and/or E2E tests when they add executable value; return an empty manifest when the node should not own local tests.",
-                    "Before returning, assess from the evidence already gathered whether the tests would fail for a disconnected implementation, a local-only fake state patch, or a placeholder response. Do not read back or repair tests written in this pass.",
-                    "Before writing each test, compare its setup, action, and assertion against the requirement description and each GIVEN/WHEN/THEN scenario step. Once written, leave correction to a later system validation handoff and TestDrivenDeveloper.",
+                    "Before returning, assess from the evidence already gathered whether the tests would fail for a disconnected implementation, a local-only fake state patch, or a placeholder response. Do not read back or perform semantic or behavioral repair on tests written in this pass; use the evidence-backed mechanical repair policy above only when it applies.",
+                    "Before writing each test, compare its setup, action, and assertion against the requirement description and each GIVEN/WHEN/THEN scenario step. Once written, leave semantic or behavioral correction to a later system validation handoff and TestDrivenDeveloper; only the evidence-backed mechanical repair policy above can act in this pass.",
                     "Return a manifest that maps each test file to requirement id, coverage_scope, interface ids, type, path, and first line.",
                     "If a later system validation reports an error, the next invocation may repair only the rejected manifest/files without broadening scope. Do not create a self-validation loop in this invocation.",
                 ],
@@ -136,7 +149,8 @@ def get_user_prompt(
             "Task",
             [
                 "Generate tests for the current node ownership. If no layer is appropriate for this node, return an empty `tests` list with a clear `summary`.",
-                "This is a generation-only pass: create tests and the returned manifest, then stop. Do not run, reread, or self-repair files written in this pass; TestDrivenDeveloper receives all test repair work. Do not rewrite a completed file to verify or polish it — trust the content in your context and return the manifest once every declared file is written.",
+                "This is a generation pass: create tests and the returned manifest, then stop after any evidence-backed mechanical fix allowed by the same-pass repair policy. Do not run tests/builds, reread files written in this pass, or use self-repair for speculative polishing or semantic/behavioral redesign; those wait for system validation/TDD or a separate green-baseline rejection pass. Trust the content in your context and return the manifest once every declared file is written.",
+                test_generator_repair_policy(),
                 "Target the current interface contract and declared scenarios rather than speculative behavior.",
                 "Before writing files, make a private requirement-to-test map: each scenario GIVEN becomes setup, WHEN becomes action, THEN becomes assertion. Do not output the map, but use it to reject contradictory tests.",
                 "Before writing an E2E/Integration status assertion, use the exact HTTP code from the requirement, current interface contract, or verifiable route contract, including 201 or another non-default 2xx. Do not default to 200, use a broad 2xx matcher, or guess when the status is not declared; report `needs-info` instead.",
