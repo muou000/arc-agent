@@ -189,6 +189,10 @@ _STAGE_PRODUCT_WORK = frozenset(
 )
 _APPROVED_STAGE_OVERLAPS = frozenset(
     {
+        # Adjacent nodes own disjoint stable test namespaces, so two
+        # TestGenerator stages may run together as long as the queue proves
+        # their node-order adjacency.
+        frozenset({STAGE_TEST_GENERATION}),
         frozenset({STAGE_INTERFACE_DESIGN, STAGE_TEST_GENERATION}),
         frozenset({STAGE_TEST_GENERATION, STAGE_IMPLEMENTATION}),
     }
@@ -466,6 +470,24 @@ def _approved_pair_structurally_disjoint(
     side that lands inside the generator's namespace keeps the pair refused.
     """
 
+    if _stage_name(left) == STAGE_TEST_GENERATION and _stage_name(right) == STAGE_TEST_GENERATION:
+        left_node = _stage_node_id(left)
+        right_node = _stage_node_id(right)
+        if not left_node or not right_node or left_node == right_node:
+            return False
+        if left_set is not None and any(
+            not is_node_test_path(path, left_node) for path in left_set
+        ):
+            return False
+        if right_set is not None and any(
+            not is_node_test_path(path, right_node) for path in right_set
+        ):
+            return False
+        # Stable namespace segments are node-specific, so two valid explicit
+        # declarations are disjoint by construction. Missing declarations use
+        # the same capability-level confinement as the first pass proof.
+        return True
+
     if _stage_name(left) == STAGE_TEST_GENERATION:
         test_gen, other, test_gen_set, other_set = left, right, left_set, right_set
     else:
@@ -489,17 +511,18 @@ def stage_overlap_allowed(left: Mapping[str, Any], right: Mapping[str, Any]) -> 
     """Return whether two stage worktrees may execute at the same time.
 
     Visual analysis does not write a product worktree, so it is independent of
-    every formal stage. All other overlap is limited to the two ADR-approved
-    adjacent windows and requires provably disjoint writes: explicit
-    declarations when both sides are visible, otherwise the pipeline's
-    structural write confinement for the approved cross-node pairs.
+    every formal stage. All other overlap is limited to the ADR-approved
+    adjacent windows, including adjacent TestGenerator stages, and requires
+    provably disjoint writes: explicit declarations when both sides are
+    visible, otherwise the pipeline's structural write confinement for the
+    approved cross-node pairs.
     """
 
     left_stage = _stage_name(left)
     right_stage = _stage_name(right)
     if left_stage == STAGE_VISUAL_ANALYSIS or right_stage == STAGE_VISUAL_ANALYSIS:
         return True
-    if not left_stage or not right_stage or left_stage == right_stage:
+    if not left_stage or not right_stage:
         return False
     if _stage_node_id(left) == _stage_node_id(right):
         return False
@@ -542,6 +565,7 @@ def _approved_stage_overlap_for_queue(
     return abs(candidate_order - blocker_order) == 1 and (
         (_stage_name(first), _stage_name(second))
         in {
+            (STAGE_TEST_GENERATION, STAGE_TEST_GENERATION),
             (STAGE_TEST_GENERATION, STAGE_INTERFACE_DESIGN),
             (STAGE_IMPLEMENTATION, STAGE_TEST_GENERATION),
         }
