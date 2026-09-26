@@ -1008,6 +1008,157 @@ def test_test_generator_writes_test_asset_and_returns_manifest(
     assert (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").read_text(encoding="utf-8") == test_code
 
 
+def test_test_generator_can_target_fix_a_concrete_mechanical_defect_same_pass(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A receipt-visible mechanical defect may use the narrow same-pass edit channel."""
+    node_id = "REQ-GEN-MECHANICAL-FIX"
+    seed_requirement(arc_runtime, node_id)
+    original = "test('add', () => { expect(add(1, 1)).toBe(3); });\n"
+    repaired = "test('add', () => { expect(add(1, 1)).toBe(2); });\n"
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "type": "Unit",
+                            "interface_ids": [],
+                        }
+                    ]
+                },
+                call_id="m0",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": original},
+                call_id="m1",
+            ),
+            faux_tool_call(
+                "edit_file",
+                {
+                    "file_path": "/workspace/backend/tests/unit/calc.test.js",
+                    "old_string": "toBe(3)",
+                    "new_string": "toBe(2)",
+                },
+                call_id="m2",
+            ),
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "Corrected the concrete expected literal.",
+                    "tests": [
+                        {
+                            "test_id": "T-MECHANICAL-FIX",
+                            "req_id": node_id,
+                            "interface_ids": [],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "first_line": "test('add', () => {",
+                        }
+                    ],
+                    "files_written": ["backend/tests/unit/calc.test.js"],
+                },
+                call_id="m3",
+            ),
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    assert model.call_count == 4
+    assert tests is not None and tests[0]["test_id"] == "T-MECHANICAL-FIX"
+    assert (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").read_text(encoding="utf-8") == repaired
+
+
+def test_test_generator_repeated_same_pass_edits_stop_at_shared_budget(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A same-pass edit loop is bounded and returns the manifest after the block."""
+    node_id = "REQ-GEN-MECHANICAL-BUDGET"
+    seed_requirement(arc_runtime, node_id)
+    model = FauxChatModel(
+        responses=[
+            faux_tool_call(
+                "declare_test_manifest",
+                {
+                    "files": [
+                        {
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "type": "Unit",
+                            "interface_ids": [],
+                        }
+                    ]
+                },
+                call_id="b0",
+            ),
+            faux_tool_call(
+                "write_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "content": "v1\n"},
+                call_id="b1",
+            ),
+            faux_tool_call(
+                "edit_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "old_string": "v1", "new_string": "v2"},
+                call_id="b2",
+            ),
+            faux_tool_call(
+                "edit_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "old_string": "v2", "new_string": "v3"},
+                call_id="b3",
+            ),
+            faux_tool_call(
+                "edit_file",
+                {"file_path": "/workspace/backend/tests/unit/calc.test.js", "old_string": "v3", "new_string": "v4"},
+                call_id="b4",
+            ),
+            faux_tool_call(
+                "TestGenerationResponse",
+                {
+                    "summary": "Stopped after the repair budget blocked another edit.",
+                    "tests": [
+                        {
+                            "test_id": "T-MECHANICAL-BUDGET",
+                            "req_id": node_id,
+                            "interface_ids": [],
+                            "type": "Unit",
+                            "file_path": "backend/tests/unit/calc.test.js",
+                            "first_line": "v3",
+                        }
+                    ],
+                    "files_written": ["backend/tests/unit/calc.test.js"],
+                },
+                call_id="b5",
+            ),
+        ]
+    )
+
+    tests, _output = asyncio.run(
+        make_generator(tmp_project_dir, model).run(
+            node_id,
+            {"name": "Calculator", "description": "Add two numbers"},
+        )
+    )
+
+    assert model.call_count == 6
+    assert tests is not None and tests[0]["test_id"] == "T-MECHANICAL-BUDGET"
+    assert (tmp_project_dir / "backend" / "tests" / "unit" / "calc.test.js").read_text(encoding="utf-8") == "v3\n"
+    blocked_messages = [
+        str(message.content)
+        for turn in model.calls
+        for message in turn
+        if getattr(message, "type", "") == "tool" and getattr(message, "tool_call_id", "") == "b4"
+    ]
+    assert blocked_messages and "Repair budget blocked" in blocked_messages[-1]
+
+
 def test_test_generator_uses_staged_current_interfaces_before_db_commit(
     tmp_project_dir: Path, arc_runtime
 ) -> None:
@@ -1657,6 +1808,9 @@ def test_test_generator_repair_pass_cannot_introduce_new_test_paths(
     assert tests[0]["file_path"] == "backend/tests/unit/green.test.js"
     assert not (tmp_project_dir / "backend" / "tests" / "unit" / "greenV2.test.js").exists()
     assert current_interface_id_calls == 1
+    first_turn_text = "\n".join(str(message.content) for message in model.calls[0])
+    assert "separate later repair pass requested by the system" in first_turn_text
+    assert "ordinary same-pass mechanical-fix channel" in first_turn_text
 
 
 def test_test_generator_repair_prose_answer_is_none_not_empty_manifest(

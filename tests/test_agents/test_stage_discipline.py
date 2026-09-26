@@ -687,6 +687,8 @@ def test_test_generator_same_path_edit_repairs_within_budget() -> None:
     assert blocked.status == "error"
     assert "Repair budget blocked" in blocked.content
     assert "return the manifest" in blocked.content
+    assert "evidence-backed mechanical defects" in blocked.content
+    assert "later validation or green-baseline repair pass" in blocked.content
 
 
 def test_edit_and_delete_rewrite_share_one_repair_budget_per_path() -> None:
