@@ -94,6 +94,11 @@ MAX_PROBES_PER_TARGET = _MAX_PROBES_PER_TARGET
 # fail -> edit -> verify rhythm never replays a stale result.
 _PROBE_MIRROR_TOOLS = frozenset({"grep", "glob", "ls"})
 #: Identical executions answered from cache afterwards (occurrence 3+).
+#: Two real executions are deliberate slack: a healthy pass rarely repeats
+#: one exact probe between writes (see the #217 calibration above), so the
+#: first repeat stays a legitimate re-check; the storm case is capped at two
+#: executions per fingerprint per zero-write window. The #217 nudge keeps
+#: counting replayed round trips toward its own per-target threshold.
 _PROBE_REPEAT_EXECUTIONS = 2
 #: Cached result texts kept per session; evicted least-recently-cached first.
 #: Oversized search outputs are already bounded upstream (evicted to
@@ -399,9 +404,11 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         self._probe_counts: dict[str, int] = {}
         self._probe_nudge_fired = False
         # Repeated-probe mirror ledger (see _PROBE_MIRROR_TOOLS): per-
-        # fingerprint execution counts since the last successful write, and
-        # the result content each fingerprint last returned for replays.
-        self._probe_executions: dict[str, int] = {}
+        # fingerprint occurrence counts since the last successful write (a
+        # replayed round trip counts like an executed one - the threshold
+        # cares about the model repeating, not the tool running), and the
+        # result content each fingerprint last returned for replays.
+        self._probe_occurrences: dict[str, int] = {}
         self._probe_replay_cache: dict[str, str] = {}
         self._probe_replay_order: deque[str] = deque()
 
@@ -1243,17 +1250,17 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         fingerprint = self._probe_fingerprint(request)
         if not fingerprint:
             return None
-        executions = self._probe_executions.get(fingerprint, 0)
-        self._probe_executions[fingerprint] = executions + 1
-        if executions < _PROBE_REPEAT_EXECUTIONS:
+        occurrences = self._probe_occurrences.get(fingerprint, 0)
+        self._probe_occurrences[fingerprint] = occurrences + 1
+        if occurrences < _PROBE_REPEAT_EXECUTIONS:
             return None
         cached = self._probe_replay_cache.get(fingerprint)
         if cached is None:
             return None
-        directive = self._replay_directive(executions + 1)
+        directive = self._replay_directive(occurrences + 1)
         logging.getLogger(__name__).info(
             "probe mirror replay: identical search repeated %d time(s): %s",
-            executions + 1,
+            occurrences + 1,
             fingerprint,
         )
         return ToolMessage(
@@ -1339,7 +1346,7 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
 
         self._probe_counts.clear()
         self._probe_nudge_fired = False
-        self._probe_executions.clear()
+        self._probe_occurrences.clear()
         self._probe_replay_cache.clear()
         self._probe_replay_order.clear()
 
