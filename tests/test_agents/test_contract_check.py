@@ -1235,6 +1235,67 @@ def test_validate_http_status_contract_inconsistent_candidate_status_sets_stay_a
     assert "more than one API interface" in diagnostics[0]["message"]
 
 
+def test_validate_http_status_contract_prefers_full_path_over_mislabeled_func_card(
+    tmp_project_dir: Path,
+) -> None:
+    """A relative path on a mis-typed FUNC card must not shadow the API card.
+
+    The 2026-09-26 hackathon-sheet REQ-1-2-1 replay contained a service
+    boundary card marked ``type=API`` with ``POST /workbooks``.  Its suffix
+    match competed with the real ``POST /api/workbooks`` card and produced a
+    needs-info diagnostic even though the API card declared both statuses.
+    The full mounted path is the more specific ownership candidate.
+    """
+
+    test_path = tmp_project_dir / "integration" / "workbooks-create.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const created = await request.post('/api/workbooks');\n"
+        "expect(created.status).toBe(201);\n"
+        "const invalid = await request.post('/api/workbooks');\n"
+        "expect(invalid.status).toBe(400);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Create a blank workbook."},
+        [
+            {
+                "interface_id": "REQ-1-1-1-API-Workbooks",
+                "type": "API",
+                "specification": (
+                    "POST /api/workbooks -> 201 { id, name } | "
+                    "400 { error: 'WORKBOOK_NAME_REQUIRED' }."
+                ),
+                "outputs": {"status_codes": [201, 400]},
+                "file_path": "backend/src/routes/workbooks.js",
+            },
+            {
+                "interface_id": "REQ-1-1-1-FUNC-Workbooks",
+                # This is the production failure shape: a FUNC service card
+                # was incorrectly persisted as API and therefore entered the
+                # HTTP status candidate pool.
+                "type": "API",
+                "specification": (
+                    "createWorkbook(name): POST /workbooks { name } -> 201; "
+                    "errors are raised through the shared apiClient."
+                ),
+                "file_path": "backend/src/services/workbooks.js",
+            },
+        ],
+        [
+            {
+                "type": "Integration",
+                "file_path": "integration/workbooks-create.test.js",
+                "interface_ids": ["REQ-1-1-1-API-Workbooks"],
+            }
+        ],
+    )
+
+    assert diagnostics == []
+
+
 def test_validate_http_status_contract_accepts_hackathon_sheet_workbooks_shape(
     tmp_project_dir: Path,
 ) -> None:
