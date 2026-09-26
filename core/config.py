@@ -228,11 +228,21 @@ def check_config() -> dict[str, Any]:
     else:
         info.append(f"Python version: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
 
-    # Check agent runtime availability
+    # Check agent runtime availability. Reading package metadata instead of
+    # importing keeps ``doctor`` off the multi-second deepagents import chain
+    # (the version line is informational; compilation loads the runtime).
     try:
-        import deepagents as _agent_runtime
-        version = getattr(_agent_runtime, '__version__', 'installed')
-        info.append(f"Agent runtime: {version}")
+        from importlib.metadata import version as _runtime_version
+        from importlib.util import find_spec as _find_runtime_spec
+
+        if _find_runtime_spec("deepagents") is not None:
+            try:
+                version = _runtime_version("deepagents")
+            except Exception:  # noqa: BLE001 - metadata missing: still installed
+                version = "installed"
+            info.append(f"Agent runtime: {version}")
+        else:
+            errors.append("Agent runtime not installed (reinstall ARC or check dependencies)")
     except ImportError:
         errors.append("Agent runtime not installed (reinstall ARC or check dependencies)")
 

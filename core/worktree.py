@@ -413,6 +413,16 @@ class NodeWorktreeManager:
         # excludes them. The workflow's asyncio merge lock keeps running for
         # its own bookkeeping on top of this gate.
         self.integration_gate = _IntegrationGate()
+        # Probe caches: every prepare/publish/integrate used to re-spawn
+        # ``worktree list --porcelain`` and ``rev-parse --abbrev-ref HEAD``,
+        # which dominates serial scheduling latency on Windows (hundreds of
+        # ~50ms process spawns per run). The registered-path set is
+        # invalidated whenever a mutating ``git worktree`` command passes
+        # through ``_git``; the integration branch name is stable for the
+        # manager's lifetime (nothing in the compile flow switches the
+        # integration workspace's branch mid-run).
+        self._registered_paths: set[str] | None = None
+        self._integration_branch_name: str | None = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -443,12 +453,20 @@ class NodeWorktreeManager:
             worktree_path = self._select_worktree_path(safe_id, branch, group_key)
             reusable = worktree_path != self.worktrees_root / safe_id
 
-            if worktree_path.exists() and not self._is_registered(worktree_path):
+            registered = self._is_registered(worktree_path)
+            if worktree_path.exists() and not registered:
                 # Leftover directory from an unregistered worktree (crash between
                 # directory creation and registration): start clean.
                 shutil.rmtree(worktree_path, ignore_errors=True)
+            elif registered and not worktree_path.exists():
+                # Stale registration: the directory is already gone, and a
+                # plain ``worktree add`` refuses "missing but already
+                # registered" paths. Prune clears the residue so the add
+                # below can run.
+                self._git(["worktree", "prune"], cwd=self.main_workspace, check=False)
+                registered = False
 
-            if self._is_registered(worktree_path):
+            if registered:
                 if self._branch_exists(branch):
                     # Reuse after an interrupted run so the agent keeps its
                     # artifacts and committed work.
@@ -1477,8 +1495,10 @@ class NodeWorktreeManager:
     # ------------------------------------------------------------------
 
     def _integration_branch(self) -> str:
-        result = self._git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=self.main_workspace)
-        return result.stdout.strip() or "HEAD"
+        if self._integration_branch_name is None:
+            result = self._git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=self.main_workspace)
+            self._integration_branch_name = result.stdout.strip() or "HEAD"
+        return self._integration_branch_name
 
     def _branch_exists(self, branch: str) -> bool:
         result = self._git(["rev-parse", "--verify", "--quiet", branch], cwd=self.main_workspace, check=False)
@@ -1527,14 +1547,17 @@ class NodeWorktreeManager:
         return normalize(left) == normalize(right)
 
     def _is_registered(self, worktree_path: Path) -> bool:
-        result = self._git(["worktree", "list", "--porcelain"], cwd=self.main_workspace, check=False)
         normalized = str(worktree_path).replace("\\", "/").lower()
-        for line in result.stdout.splitlines():
-            if line.startswith("worktree "):
-                registered = line[len("worktree "):].strip().replace("\\", "/").lower()
-                if registered == normalized:
-                    return True
-        return False
+        if self._registered_paths is None:
+            result = self._git(
+                ["worktree", "list", "--porcelain"], cwd=self.main_workspace, check=False
+            )
+            paths: set[str] = set()
+            for line in result.stdout.splitlines():
+                if line.startswith("worktree "):
+                    paths.add(line[len("worktree "):].strip().replace("\\", "/").lower())
+            self._registered_paths = paths
+        return normalized in self._registered_paths
 
     # ------------------------------------------------------------------
     # workspace conveniences
@@ -1633,6 +1656,16 @@ class NodeWorktreeManager:
             encoding=None if binary else "utf-8",
             errors=None if binary else "replace",
         )
+        if len(args) >= 2 and args[0] == "worktree" and args[1] in (
+            "add",
+            "remove",
+            "prune",
+            "move",
+            "repair",
+        ):
+            # Registration may have changed (even for a failed remove); the
+            # next probe re-lists instead of trusting a stale set.
+            self._registered_paths = None
         if check and completed.returncode != 0:
             stderr = completed.stderr
             if isinstance(stderr, bytes):
