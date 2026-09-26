@@ -24,6 +24,11 @@ from core.cli import (
 from core.config import set_web_port
 from core.logging import configure_process_stdio
 from core.path_safety import validate_clean_target
+from core.runtime_config import (
+    resolve_runtime_config,
+    runtime_config_warnings,
+    validate_compile_config,
+)
 
 
 @dataclass(slots=True)
@@ -150,6 +155,16 @@ async def cmd_compile(args: argparse.Namespace) -> int:
     except FileNotFoundError as exc:
         print(f"Error: {exc}")
         return 2
+
+    config_errors = validate_compile_config(app_type=args.app_type, web_port=args.port)
+    if config_errors:
+        print("Error: invalid runtime configuration:")
+        for error in config_errors:
+            print(f"  - {error}")
+        return 2
+    for warning in runtime_config_warnings():
+        print(f"Warning: {warning}")
+
     from core.workflow import ARCWorkflowManager
     
     # Validate mutual exclusivity
@@ -186,7 +201,7 @@ async def cmd_compile(args: argparse.Namespace) -> int:
     set_web_port(args.port)
     
     # Model API mode
-    model_api_mode = os.environ.get("ARC_OPENAI_API_MODE", "").strip() or None
+    model_api_mode = resolve_runtime_config().get("ARC_OPENAI_API_MODE")
     
     config = CompilationConfig(
         output_dir=output_dir,

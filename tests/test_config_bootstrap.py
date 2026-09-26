@@ -85,6 +85,40 @@ def test_missing_explicit_env_file_fails_with_a_clean_cli_error(tmp_path: Path) 
     assert "Traceback" not in result.stderr
 
 
+def test_compile_rejects_invalid_runtime_config_before_cleaning_output(tmp_path: Path) -> None:
+    custom_env = tmp_path / "invalid.env"
+    custom_env.write_text("ARC_MODEL_MAX_RETRIES=banana\n", encoding="utf-8")
+    output = tmp_path / "existing-output"
+    output.mkdir()
+    sentinel = output / "keep.txt"
+    sentinel.write_text("preserve", encoding="utf-8")
+    child_env = os.environ.copy()
+    child_env["ARC_ENV_FILE"] = str(custom_env)
+    child_env.pop("ARC_MODEL_MAX_RETRIES", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "arc_main.py",
+            "compile",
+            str(tmp_path / "missing-requirements.yaml"),
+            "-o",
+            str(output),
+            "--clean",
+        ],
+        cwd=REPO_ROOT,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "ARC_MODEL_MAX_RETRIES" in result.stdout
+    assert "banana" in result.stdout
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+
+
 def test_check_config_flags_bad_model_retry_env_values(monkeypatch) -> None:
     monkeypatch.setenv("ARC_MODEL_TIMEOUT", "banana")
     monkeypatch.setenv("ARC_MODEL_MAX_RETRIES", "99")
@@ -94,10 +128,10 @@ def test_check_config_flags_bad_model_retry_env_values(monkeypatch) -> None:
 
     result = check_config()
 
-    warnings = "\n".join(result["warnings"])
-    assert "ARC_MODEL_TIMEOUT must be a number, got: banana" in warnings
-    assert "ARC_MODEL_MAX_RETRIES=99 is outside the sane range 0-10" in warnings
-    assert "ARC_MODEL_RETRY_DELAY" not in warnings
+    errors = "\n".join(result["errors"])
+    assert "ARC_MODEL_TIMEOUT" in errors and "banana" in errors
+    assert "ARC_MODEL_MAX_RETRIES" in errors and "99" in errors
+    assert "ARC_MODEL_RETRY_DELAY" not in errors
 
 
 def test_check_config_accepts_valid_model_retry_env_values(monkeypatch) -> None:
@@ -122,8 +156,9 @@ def test_check_config_flags_bad_stream_transport_env_value(monkeypatch) -> None:
 
     result = check_config()
 
-    warnings = "\n".join(result["warnings"])
-    assert "ARC_MODEL_STREAM_TRANSPORT has unexpected value: streaming" in warnings
+    errors = "\n".join(result["errors"])
+    assert "ARC_MODEL_STREAM_TRANSPORT" in errors
+    assert "streaming" in errors
 
 
 def test_check_config_accepts_all_stream_transport_modes(monkeypatch) -> None:
