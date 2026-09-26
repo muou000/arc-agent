@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from agents.context.prompts.common import workspace_tool_policy
@@ -178,6 +179,24 @@ def _handler_returning(message: Any) -> Any:
     """A tool-call handler that always returns the given (pre-built) result."""
 
     return lambda request: message
+
+
+class _ExplodingArgs:
+    def get(self, key: str) -> Any:
+        raise RuntimeError(f"malformed tool-call args: {key}")
+
+
+def test_malformed_grep_args_fail_open() -> None:
+    middleware = GrepGuidanceMiddleware()
+    result = _tool_message("No matches found")
+    request = SimpleNamespace(
+        tool_call={"name": "grep", "args": _ExplodingArgs(), "id": "call-1"}
+    )
+
+    returned = middleware.wrap_tool_call(request, _handler_returning(result))
+
+    assert returned is result
+    assert returned.content == "No matches found"
 
 
 def test_expansion_note_on_matching_alternation_result() -> None:

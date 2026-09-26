@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from agents.context.prompts import common as common_prompts
 from agents.context.prompts.test_generator import get_system_prompt, get_user_prompt
+from agents.tools.test_manifest import TestManifestLock, build_declare_test_manifest_tool
 
 
 def test_system_prompt_forbids_empty_interface_coverage_fallback() -> None:
@@ -70,3 +72,48 @@ def test_prompts_require_contract_http_statuses_without_a_200_default() -> None:
     assert "Never invent or default to 200" in system_prompt
     assert "including 201 or another non-default 2xx" in user_prompt
     assert "report `needs-info` instead" in user_prompt
+
+
+def test_generator_prompts_and_manifest_tool_explain_helper_declarations() -> None:
+    system_prompt = get_system_prompt()
+    user_prompt = get_user_prompt(
+        node_id="REQ-X",
+        requirement_data={"name": "Example", "description": "Example requirement"},
+        dynamic_context="",
+    )
+    manifest_tool = build_declare_test_manifest_tool(
+        node_id="REQ-X",
+        manifest_lock=TestManifestLock(node_id="REQ-X", enforce_node_namespace=True),
+    )
+
+    for visible_text in (system_prompt, user_prompt, manifest_tool.__doc__ or ""):
+        normalized = " ".join(visible_text.split())
+        assert "stage pipeline is active" in normalized
+        assert "declare_stage_write_set" in normalized
+        assert "declare_test_manifest" in normalized
+        assert "node" in normalized.lower()
+        assert "shared runner configuration" in normalized.lower()
+        assert "read-only" in normalized
+        assert "stay writable without a declaration" not in normalized
+        assert "declared nowhere and stay writable" not in normalized
+
+    assert "When the stage pipeline is active, shared runner configuration" in system_prompt
+
+
+def test_repair_timing_policy_is_consistent_across_test_generator_prompts_and_tools() -> None:
+    system_prompt = get_system_prompt()
+    user_prompt = get_user_prompt(
+        node_id="REQ-X",
+        requirement_data={"name": "Example", "description": "Example requirement"},
+        dynamic_context="",
+    )
+    policy = common_prompts.test_generator_repair_policy()
+
+    assert policy in system_prompt
+    assert system_prompt.count(policy) == 1
+    assert policy in user_prompt
+    assert policy in common_prompts.workspace_tool_policy()
+    assert "repair generated tests in the same pass" not in system_prompt
+    assert "Do not run, reread, or self-repair files written in this pass" not in user_prompt
+    assert "separate later repair pass" in system_prompt
+    assert "separate later repair pass" in user_prompt

@@ -550,6 +550,9 @@ class TestGenerator:
             "The following test files PASSED the baseline run and are REJECTED:\n"
             + "\n".join(evidence_lines)
             + "\n\n### Required Repair\n"
+            "This is a separate later repair pass requested by the system after the generation pass. "
+            "Use the baseline evidence below as the reason for each change; the ordinary same-pass "
+            "mechanical-fix channel does not authorize speculative polishing or repairs to unrelated files.\n\n"
             "For each rejected file, choose exactly one:\n"
             "1. **Delete** the test file (`delete` tool) if its coverage duplicates another "
             "current-node test or the scenario should not be node-local, and drop its manifest "

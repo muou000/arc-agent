@@ -2403,17 +2403,43 @@ def test_missing_package_failure_grants_install_cycle(
         ("Integration", [INTEGRATION_TEST_FILE]),
     ]
     all_tool_results = tool_results_text(model)
-    # The install result must name the package/target and tell the agent to
-    # re-run run_tests to validate the repair.
+    # The install result must name the package/target and preserve the
+    # re-validation route while the layer remains open.
     assert "cookie-parser" in all_tool_results
     assert "backend/node_modules" in all_tool_results
-    assert "Re-run run_tests" in all_tool_results
+    assert "If the TDD layer is still open, re-run run_tests" in all_tool_results
     # The report delivered after the install grant (second env failure) is
     # the same first-report contract: it must still offer the
     # install_dependencies path, not end the turn (#174).
     install_grant_report = tool_messages_in_call(model, 2)
     assert "install_dependencies" in install_grant_report
     assert "you cannot fix it" not in install_grant_report
+
+
+def test_install_after_hard_stop_reports_unverified_repair(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    """A late environment repair cannot re-open a stalled TDD layer."""
+
+    node_id = "REQ-TDD-LATE-INSTALL"
+    tests = [{"test_id": "T1", "type": "Unit", "file_path": UNIT_TEST_FILE}]
+    seed_node(arc_runtime, node_id, tests)
+    model = FauxChatModel(responses=[
+        *(faux_tool_call("run_tests", {}, call_id=f"r{i}") for i in range(TDD_STALL_THRESHOLD)),
+        faux_tool_call("install_dependencies", {"package": "bcrypt", "target": "backend"}, call_id="install"),
+        faux_text("Failed: installed bcrypt after the layer closed; verification is pending a fresh pass."),
+    ])
+    fake = FakeAppHandler([failing_test_output(detail="AssertionError: bcrypt missing") for _ in range(TDD_STALL_THRESHOLD + 1)])
+    runner = make_runner(tmp_project_dir, make_tdd(tmp_project_dir, model, fake), fake)
+
+    assert asyncio.run(runner._run_tdd_for_node(node_id=node_id, tests=tests)) is False
+    assert fake.calls == [("Unit", [UNIT_TEST_FILE])] * (TDD_STALL_THRESHOLD + 1)
+    assert fake.install_calls == [("bcrypt", "backend")]
+    receipts = tool_results_text(model)
+    assert "ARC_TDD_HARD_STOP" in receipts or "Deterministic TDD Stop" in receipts
+    assert "If the TDD layer is still open, re-run run_tests" in receipts
+    assert "If ARC_TDD_HARD_STOP has closed it, do not retry" in receipts
+    assert "unverified in the failure report" in receipts
 
 
 def test_missing_package_install_fails_closes_layer(
@@ -2576,3 +2602,29 @@ def test_install_package_converts_spawn_failure_into_failed_install(
     assert result.startswith("Exit Code: 1")
     assert "could not run" in result
     assert "FileNotFoundError" in result
+
+
+def test_install_package_success_receipt_respects_closed_layer(tmp_path, monkeypatch) -> None:
+    """The real web handler's receipt must agree with the TDD gate."""
+
+    from app_type_handler import web as web_mod
+    from app_type_handler.web import WebAppType
+
+    async def successful_run(command, target_dir, timeout=None):
+        return 0, "", ""
+
+    async def noop_log(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(web_mod, "_run_npm_command", successful_run)
+    handler = WebAppType.__new__(WebAppType)
+    handler.workspace_path = str(tmp_path)
+    handler.log_cb = noop_log
+    (tmp_path / "backend").mkdir()
+
+    receipt = asyncio.run(handler.install_package("bcrypt", "backend"))
+
+    assert receipt.startswith("Exit Code: 0")
+    assert "If the TDD layer is still open, re-run run_tests" in receipt
+    assert "If ARC_TDD_HARD_STOP has closed it, do not retry" in receipt
+    assert "unverified in the failure report" in receipt

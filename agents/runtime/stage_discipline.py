@@ -632,8 +632,9 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         every subsequent touch must stay on a declared path. This removes the
         rename/duplicate-file churn class at write time: an undeclared path
         cannot be created at all, so "try another name" and "write the same
-        coverage twice" become hard errors. Helpers and runner configs are
-        exempt — they carry no manifest entry and stay freely writable.
+        coverage twice" become hard errors. Node-local helpers carry no
+        manifest entry but still require a stage write-set declaration;
+        shared runner configs remain read-only.
 
         A failed declaration deliberately does NOT unlock the gate: the model
         may retry the declaration until it validates; the stage can always end
@@ -649,12 +650,17 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         if self._test_manifest_lock.contains(relative):
             return None
         if not self._test_manifest_lock.locked:
+            helper_guidance = (
+                " Node-local helpers need a stage write-set declaration but no test-file "
+                "manifest entry; shared runner configuration and fixtures are read-only."
+                if self._stage_write_set_lock is not None
+                else " Helpers and runner configuration are not test-file manifest entries."
+            )
             return (
                 f"Manifest-first blocked: {path} is a test file, but the test-file "
                 "manifest has not been declared yet. Call `declare_test_manifest` "
                 "first with every planned test file (path + type + interface ids), "
-                "then write the files. Test helpers and runner configs do not need "
-                "a declaration."
+                "then write the files." + helper_guidance
             )
         declared = ", ".join(sorted(self._test_manifest_lock.declared_files))
         return (
@@ -721,18 +727,23 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             f"{_MAX_EDITS_PER_PATH} repair attempts (targeted edits and "
             "delete-rewrite cycles share one budget)"
         )
+        timing = (
+            " Same-pass repair is limited to evidence-backed mechanical defects; semantic or behavioral "
+            "redesign and edits without new evidence belong to a later validation or green-baseline "
+            "repair pass."
+        )
         fully_written = self._manifest_fully_written()
         if fully_written is not None:
             declared = ", ".join(fully_written)
             return (
                 f"{prefix} blocked: {path} has already used {attempts} in this pass, and every "
                 f"declared manifest file is written ({declared}). The current files are final for "
-                "this stage: stop editing and return your manifest response now."
+                f"this stage: stop editing and return your manifest response now.{timing}"
             )
         return (
             f"{prefix} blocked: {path} has already used {attempts} in this pass; the version on "
             "disk stands and the content you wrote is in your context. Continue with your "
-            "remaining declared files and return the manifest instead of polishing this one."
+            f"remaining declared files and return the manifest instead of polishing this one.{timing}"
         )
 
     def _validate_test_asset_edit(self, path: str) -> str | None:

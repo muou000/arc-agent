@@ -263,11 +263,18 @@ def build_declare_test_manifest_tool(
     async def declare_test_manifest(files: list[dict[str, Any]]) -> str:
         """Declare and lock the test-file manifest for this stage run.
 
-        Call this before writing any test file, with one entry
+        Call ``declare_test_manifest`` before writing any test file, with one entry
         per test file you intend to create or update. ``coverage_scope`` is
         ``owned`` for behavior introduced by this node, ``dependency`` for a
-        dependency regression, and ``shared`` for a shared-contract check:
-        [{"file_path": "backend/tests/unit/auth_service.test.js", "type": "Unit", "coverage_scope": "owned", "interface_ids": ["IF-AUTH-SERVICE"]}].
+        dependency regression, and ``shared`` for a shared-contract check.
+        When the stage pipeline enforces node domains, replace the supplied
+        stable segment in the exact path under the current node's generated
+        namespace before calling this tool, for example:
+        [{"file_path": "backend/tests/generated/<stable-segment>/unit/auth_service.test.js", "type": "Unit", "coverage_scope": "owned", "interface_ids": ["IF-AUTH-SERVICE"]}].
+        The literal ``<stable-segment>`` is a prompt placeholder, not a path
+        to submit. With namespace enforcement disabled, the legacy
+        ``backend/tests/...``, ``frontend/tests/...`` and
+        ``backend/test-e2e/...`` roots remain valid.
 
         The declaration is validated (placement rules, interface ids, type)
         and then LOCKED for the rest of this stage run: write_file, edit_file
@@ -281,9 +288,11 @@ def build_declare_test_manifest_tool(
         after a successful manifest declaration, only exact re-declarations of
         existing rows are accepted; a fresh path is rejected even when it was
         omitted from the manifest by mistake. Calls without a stage write-set
-        lock retain the legacy additive behavior. Test helpers and runner
-        configs do not belong in the manifest and stay writable without being
-        declared.
+        lock retain the legacy additive behavior. Node-local helpers and
+        fixtures do not belong in the manifest. When the stage pipeline is
+        active, they must be in the current node's test namespace and declared
+        with ``declare_stage_write_set`` before writing; shared runner
+        configuration and fixtures are read-only in that mode.
         """
 
         if not isinstance(files, list) or not files:
@@ -347,8 +356,9 @@ def build_declare_test_manifest_tool(
                 errors.append(
                     f"Entry {index}: `{file_path}` does not look like a test file. "
                     "Manifest entries must be test files (`.test.`/`.spec.` in the "
-                    "name); helpers and runner configs are written without a "
-                    "manifest entry."
+                    "name); node-local helpers do not belong in the test-file manifest. "
+                    "In pipeline mode they need `declare_stage_write_set`; shared runner "
+                    "configuration is read-only in that mode."
                 )
                 continue
             if stage_write_set_lock is not None:

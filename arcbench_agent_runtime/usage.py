@@ -215,7 +215,9 @@ def aggregate_tool_usage(events_path: str | Path) -> dict[str, Any]:
     Returns ``{"totals", "by_node", "by_tool", "by_phase"}``. Every event
     counts as one tool round-trip; ``blocked`` counts discipline-refused
     calls, ``errors`` tool executions that failed, ``empty_results`` successful
-    calls that returned nothing (the ineffective-grep signal), and
+    calls that returned nothing — by character count or by being the known
+    empty-result sentinel texts (``No files found``/``No matches found``,
+    issue #296; the ineffective-grep signal), and
     ``unpaged_reads`` ``read_file`` attempts without an explicit ``limit``
     (the whole-file-read signal; the event's ``result_chars`` ranks them by
     size). Events of other types and unparseable lines are skipped.

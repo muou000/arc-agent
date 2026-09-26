@@ -57,6 +57,7 @@ _SHARED_TEST_RESOURCE_BASENAMES = frozenset(
 )
 _SHARED_TEST_RESOURCE_PATHS = frozenset(
     {
+        "frontend/vite.config.js",
         "frontend/test/setup.ts",
         "frontend/test/setup.js",
         "backend/src/database/test_harness.js",
@@ -207,11 +208,11 @@ def is_shared_test_resource(path: str) -> bool:
 
 
 def is_test_asset(path: str) -> bool:
-    """Whether a path is a test *asset*: anything the TestGenerator may write.
+    """Whether a path is a test *asset* for stage capability checks.
 
     Broader than :func:`is_test_file_path` — helpers and runner configs
-    (``setup-tests.ts``, ``playwright.config.js``) count, because the stage
-    must write them without a manifest entry.
+    (``setup-tests.ts``, ``playwright.config.js``) count, even though shared
+    resources are read-only and node-local helpers still need a write set.
     """
 
     normalized = path.replace("\\", "/").lower()
@@ -237,9 +238,9 @@ def is_test_file_path(path: str) -> bool:
 
     The manifest predicate: it governs which paths the TestGenerator must
     declare through ``declare_test_manifest`` before writing. Deliberately
-    narrower than :func:`is_test_asset` — helpers and runner configs are test
-    *assets* the stage may write freely, and locking them would only add
-    blocked-turn noise.
+    narrower than :func:`is_test_asset` — node-local helpers need a write-set
+    declaration but no test-file manifest entry; shared runner configs are
+    read-only.
 
     Files whose name marks them as tests — JavaScript-style ``.test.``/
     ``.spec.`` names plus the Python unittest conventions

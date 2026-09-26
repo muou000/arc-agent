@@ -54,8 +54,9 @@ def build_install_dependencies_tool(
         package name, e.g. package='cookie-parser', target='backend'.
 
         The install does not modify package.json or the lockfile; it only
-        fixes the workspace node_modules tree. Re-run run_tests afterwards to
-        validate the repair.
+        fixes the workspace node_modules tree. If the TDD layer is still open,
+        re-run run_tests to validate the repair. If ARC_TDD_HARD_STOP closed it,
+        do not retry; report the installation as unverified in this pass.
         """
 
         await _emit_log(
@@ -97,7 +98,9 @@ def build_install_dependencies_tool(
                 "STDERR:\n"
                 f"Package installation crashed: {type(exc).__name__}: {exc}\n"
                 "Treat the package as unavailable and fall back to a "
-                "standard-library or local implementation, then re-run run_tests.\n"
+                "standard-library or local implementation. If the TDD layer is "
+                "still open, re-run run_tests; if ARC_TDD_HARD_STOP closed it, "
+                "report the unverified repair without retrying.\n"
             )
 
     return install_dependencies

@@ -328,10 +328,17 @@ def test_repeated_fingerprint_without_progress_hard_stops_the_layer(tmp_path: Pa
     assert "Deterministic TDD Stop" in results[-1].output
     assert "no effective source/environment change" in results[-1].output
     assert "rotate your hypothesis" in results[-1].output
+    assert "environment repair after closure" in results[-1].output
+    assert "unverified in the failure report" in results[-1].output
 
     rejected = asyncio.run(executor.run_requested())
     assert "ARC_TDD_HARD_STOP" in rejected.output
     assert "Do not call run_tests again" in rejected.output
+    assert "environment repair" in rejected.output
+    assert "cannot be verified in this pass" in rejected.output
+    assert "failure report" in rejected.output
+    assert "node_modules" in rejected.output
+    assert "dist" in rejected.output
     assert len(runner.calls) == TDD_STALL_THRESHOLD
 
 

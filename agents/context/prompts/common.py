@@ -89,6 +89,19 @@ def code_quality_policy() -> str:
     )
 
 
+def test_generator_repair_policy() -> str:
+    return (
+        "TestGenerator repair timing: during the initial generation pass, a written test may receive a "
+        "same-pass targeted `edit_file` only when evidence already in context identifies a concrete "
+        "mechanical defect in that test (for example, a wrong literal, selector, or import). The shared "
+        "per-path budget covers these targeted edits and delete-rewrite cycles. Do not use the channel for "
+        "speculative polishing, semantic or behavioral test redesign, or another edit without new evidence; "
+        "those concerns wait for a later system validation or repair pass. A system-reported green-baseline "
+        "rejection is a separate later repair pass: use its listed evidence and repair only the rejected "
+        "manifest files."
+    )
+
+
 def app_runtime_contract() -> str:
     from app_type_handler import get_app_type_handler_class
 
@@ -109,17 +122,18 @@ def workspace_tool_policy() -> str:
     return section(
         "Tool Policy",
         [
-            "Use file tools only inside the virtual project root `/workspace`. The sole exception is a direct read of an attached skill at `/skills/<skill-name>/SKILL.md`.",
+            "Use file tools only inside the virtual project root `/workspace`. The exceptions are a direct read of an attached skill at `/skills/<skill-name>/SKILL.md`, and read-only access to evicted large tool results under `/large_tool_results/`: when a `Tool result too large` pointer names such a path, `read_file` it with `offset`/`limit` instead of re-running the tool; `grep` that directory only to locate an offloaded result whose exact path is unknown.",
             "Skills use progressive disclosure: their index already provides exact paths. When full instructions are needed, call `read_file` directly on the listed `SKILL.md`; never use `ls`, `glob`, `grep`, or shell commands under `/skills`.",
             "Do not call file tools on `/`, host paths, `.arc`, `.git`, `requirements`, environment files, dependency directories, generated outputs, or lockfiles. The only `.arc` exception is read-only: when a `run_tests` result points at `ARC_RUN_OUTPUT_LOG`, `read_file` that exact `.arc/tdd_runs/` log path for the complete filtered output of that attempt (formatting noise removed, nothing truncated) instead of re-running the tests; every other `.arc` path and every write stays denied.",
             "The requirement snapshot is already embedded in the task context; reads under `requirements/` are always denied by policy, so do not spend turns attempting them.",
             "Use dedicated file tools for file work: `glob` for file discovery, `grep` for content search, `read_file` for reading, `edit_file` for modifying existing files, and `write_file` only for new files.",
             "When the stage pipeline is active, call `declare_stage_write_set` before the first file mutation and include every path this stage may write, edit, append, or delete. The declaration is immutable for the pass; a path omitted from it is mechanically blocked.",
-            "Shared runner configuration and fixtures are coordinator/template-owned and read-only during staged execution. Read them for context, but keep node-specific helpers and fixtures inside the current node's stable `generated/<stable-node-id>/...` test namespace.",
+            "When the stage pipeline is active, shared runner configuration and fixtures are coordinator/template-owned and read-only. Read them for context, but keep node-specific helpers and fixtures inside the current node's stable `generated/<stable-node-id>/...` test namespace.",
             "`path` is a required argument of the `glob` tool itself, not a glob-syntax detail: always pass an explicit `path` (e.g. `/workspace` or a narrower subdirectory); a call without `path` is denied by the read policy and will not fall back to a default root.",
             "The generic `execute` tool is disabled. Use only the system-provided `run_tests`, `run_build`, or `install_dependencies` validation/repair tools when the current stage exposes them.",
             "`delete` is stage-scoped: TestGenerator may delete a declared test file it owns; TestDrivenDeveloper may delete a test-named file it wrote itself this session (e.g. a diagnostic probe like `diag.test.tsx`). Files you did not write in this session — registered manifest tests, product code, template files — can never be deleted; edit them instead.",
-            "TestGenerator's repair budget on a written test file: at most two repair attempts per path, spent by targeted `edit_file` fixes or delete-rewrite cycles — prefer the targeted edit. TestDrivenDeveloper has no budgeted edit channel: written files stay locked until a failing `run_tests`/`run_build` unlocks them for fixes.",
+            test_generator_repair_policy(),
+            "TestDrivenDeveloper has no budgeted edit channel: written files stay locked until a failing `run_tests`/`run_build` unlocks them for fixes.",
             "Start exploration with exact paths from the requirement, interface contract, test manifest, traceability records, or failure output.",
             "The `<project_structure>` block in the task context carries a live workspace map: file inventory with exported symbols, integration anchors (registered routes, mounted endpoints, database tables), and owning requirement IDs for files placed by earlier nodes. Consult that map before any discovery call; do not use `ls`, directory-wide `glob`, or broad `grep` to re-derive the layout it already shows. When you need a file's body for an edit, `read_file` the exact path directly.",
             "Avoid broad `grep`, broad `glob`, and directory inventory from `/workspace`; use at most one narrow discovery step before switching to exact path reads.",

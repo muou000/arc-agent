@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware.types import ToolCallRequest
@@ -99,6 +100,87 @@ def test_stage_write_set_rejects_sibling_test_and_shared_paths() -> None:
     assert lock.declare(
         [f"backend/tests/generated/{stable_node_path_segment('REQ-1')}/unit/current.test.ts"]
     ) is None
+
+
+def test_staged_test_helpers_require_write_set_but_not_manifest() -> None:
+    node_id = "REQ-1"
+    helper = f"backend/tests/generated/{stable_node_path_segment(node_id)}/unit/support.ts"
+    shared_paths = (
+        "backend/vitest.config.js",
+        "backend/playwright.config.js",
+        "frontend/vite.config.js",
+        "frontend/test/setup.ts",
+    )
+    for stage in ("test_generation", "implementation"):
+        write_set = StageWriteSetLock(stage=stage, node_id=node_id)
+        manifest = TestManifestLock(node_id=node_id, enforce_node_namespace=True)
+        middleware = StageDisciplineMiddleware(
+            stage=stage,
+            node_id=node_id,
+            enforce_node_test_domain=True,
+            stage_write_set_lock=write_set,
+            test_manifest_lock=manifest if stage == "test_generation" else None,
+        )
+
+        for shared in shared_paths:
+            assert "read-only" in (write_set.declare([shared]) or "")
+            assert "Shared test resource blocked" in _content(
+                middleware.wrap_tool_call(
+                    _request("write_file", {"file_path": f"/workspace/{shared}", "content": "x"}), _ok
+                )
+            )
+        assert "declare the complete stage write set" in _content(
+            middleware.wrap_tool_call(
+                _request("write_file", {"file_path": f"/workspace/{helper}", "content": "x"}), _ok
+            )
+        )
+        assert write_set.declare([helper]) is None
+        allowed = middleware.wrap_tool_call(
+            _request("write_file", {"file_path": f"/workspace/{helper}", "content": "x"}), _ok
+        )
+        assert _content(allowed) == "ok"
+
+        if stage == "test_generation":
+            tool = build_declare_test_manifest_tool(node_id=node_id, manifest_lock=manifest)
+            assert "does not look like a test file" in asyncio.run(
+                tool(files=[{"file_path": helper, "type": "Unit", "interface_ids": []}])
+            )
+            for shared in shared_paths:
+                assert '"status": "error"' in asyncio.run(
+                    tool(files=[{"file_path": shared, "type": "Unit", "interface_ids": []}])
+                )
+
+
+def test_tdd_prompt_and_repair_skill_hand_off_shared_config_failures() -> None:
+    system_prompt = test_driven_developer.get_system_prompt()
+    task_prompt = test_driven_developer.get_user_prompt(
+        node_id="REQ-1", dynamic_context="", test_files=[], test_type="Unit", node_tests=[]
+    )
+    skill = (
+        Path(__file__).resolve().parents[2] / "skills" / "tdd-test-failure-repair" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    for visible_text in (system_prompt, task_prompt, skill):
+        assert "pipeline" in visible_text.lower()
+        assert "shared runner configuration" in visible_text.lower()
+        assert "read-only" in visible_text
+        assert "coordinator/template" in visible_text
+        assert "failure fingerprint" in visible_text
+        assert "package scripts" in visible_text
+        assert "current node" in visible_text.lower()
+    assert "When the stage pipeline is active, shared runner configuration" in system_prompt
+    assert "in pipeline mode hand off faults" in task_prompt
+
+
+def test_legacy_manifest_rejection_does_not_require_unmounted_write_set_tool() -> None:
+    middleware = StageDisciplineMiddleware(
+        stage="test_generation", test_manifest_lock=TestManifestLock()
+    )
+    blocked = middleware.wrap_tool_call(
+        _request("write_file", {"file_path": "/workspace/tests/login.test.js", "content": "x"}), _ok
+    )
+    assert "Manifest-first blocked" in _content(blocked)
+    assert "stage write-set declaration" not in _content(blocked)
 
 
 def test_scheduler_fails_closed_for_invalid_test_write_sets() -> None:
