@@ -46,6 +46,58 @@ _ESM_SYNTAX = re.compile(
     r"\b(?:import\s+(?!\()|export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|\{|\*))"
 )
 _CJS_SYNTAX = re.compile(r"\b(?:require\s*\(|module\.exports\b|exports\.[A-Za-z_$])")
+_JS_REGEX_LITERAL = re.compile(
+    r"(?P<prefix>^|[\(\[\{=,:;!?&|+\-*~<>])(?P<gap>\s*)/"
+    r"(?:\\.|\[(?:\\.|[^\]\\\r\n])*\]|[^/\\\r\n])+/[A-Za-z]*",
+    re.MULTILINE,
+)
+
+
+def _mask_js_string_literals(code: str) -> str:
+    """Replace quoted JavaScript literals before scanning module syntax.
+
+    The preflight only needs to recognize top-level entry syntax. Matching
+    ``import``/``export`` inside a test title, accessible name, or template
+    string is a false positive, so preserve line boundaries while blanking
+    the contents of single-, double-, and backtick-quoted literals.
+    """
+
+    chars = list(code)
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(chars):
+        if quote is None:
+            if char in {"'", '"', "`"}:
+                quote = char
+                chars[index] = " "
+            continue
+        if char in {"\r", "\n"}:
+            # Keep line boundaries so diagnostics retain stable source shape.
+            escaped = False
+            continue
+        if escaped:
+            chars[index] = " "
+            escaped = False
+            continue
+        if char == "\\":
+            chars[index] = " "
+            escaped = True
+            continue
+        chars[index] = " "
+        if char == quote:
+            quote = None
+    return "".join(chars)
+
+
+def _mask_js_regex_literals(code: str) -> str:
+    """Blank regex literals that can contain words resembling module syntax."""
+
+    def replace(match: re.Match[str]) -> str:
+        prefix = match.group("prefix")
+        gap = match.group("gap")
+        return prefix + gap + (" " * (len(match.group(0)) - len(prefix) - len(gap)))
+
+    return _JS_REGEX_LITERAL.sub(replace, code)
 
 
 @dataclass(frozen=True)
@@ -429,7 +481,7 @@ def _deduplicate_issues(issues: list[PreflightIssue]) -> list[PreflightIssue]:
 def _check_module_syntax(
     asset: _TestAsset, content: str, package_type: str, *, config: bool
 ) -> list[PreflightIssue]:
-    code = strip_js_comments(content)
+    code = _mask_js_regex_literals(_mask_js_string_literals(strip_js_comments(content)))
     has_esm = bool(_ESM_SYNTAX.search(code))
     has_cjs = bool(_CJS_SYNTAX.search(code))
     if not has_esm and not has_cjs:

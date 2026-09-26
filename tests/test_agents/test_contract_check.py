@@ -1278,6 +1278,83 @@ def test_validate_http_status_contract_accepts_hackathon_sheet_workbooks_shape(
     ) == []
 
 
+def test_validate_http_status_contract_accepts_or_connected_status_clauses(
+    tmp_project_dir: Path,
+) -> None:
+    """Interface prose may connect alternative response clauses with ``or``.
+
+    The 2026-09-26 hackathon-sheet card used ``200 ... or 404 ...`` and
+    ``200 ... or 400 ... or 404 ...``.  The status gate must retain those
+    alternatives instead of reducing the interface-wide contract to only the
+    first arrow status.
+    """
+
+    routes_path = tmp_project_dir / "backend" / "src" / "routes" / "workbooks.js"
+    routes_path.parent.mkdir(parents=True)
+    routes_path.write_text(
+        "const router = require('express').Router();\n"
+        "router.get('/workbooks', (req, res) => {\n"
+        "  res.status(501).json({ code: 'NOT_IMPLEMENTED' });\n"
+        "});\n"
+        "router.get('/workbooks/:id', (req, res) => {\n"
+        "  res.status(501).json({ code: 'NOT_IMPLEMENTED' });\n"
+        "});\n"
+        "router.put('/workbooks/:id/worksheets/:worksheetName/cells', (req, res) => {\n"
+        "  res.status(501).json({ code: 'NOT_IMPLEMENTED' });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_project_dir / "integration" / "workbooks.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const list = await request.get('/api/workbooks');\n"
+        "expect(list.status).toBe(200);\n"
+        "const detail = await request.get('/api/workbooks/wb_q3_sales');\n"
+        "expect(detail.status).toBe(200);\n"
+        "const missing = await request.get('/api/workbooks/missing-workbook');\n"
+        "expect(missing.status).toBe(404);\n"
+        "const update = await request.put('/api/workbooks/wb_q3_sales/worksheets/Sheet1/cells');\n"
+        "expect(update.status).toBe(200);\n"
+        "const invalid = await request.put('/api/workbooks/wb_q3_sales/worksheets/Sheet1/cells');\n"
+        "expect(invalid.status).toBe(400);\n"
+        "const unknown = await request.put('/api/workbooks/unknown/worksheets/Sheet1/cells');\n"
+        "expect(unknown.status).toBe(404);\n",
+        encoding="utf-8",
+    )
+    interfaces = [
+        {
+            "interface_id": "REQ-1-1-1-API-Workbooks",
+            "type": "API",
+            "specification": (
+                "Mounted via app.use('/api', workbookRoutes). Routes and exact statuses: "
+                "GET /api/workbooks -> 200 {workbooks:[{id,name,lastUpdatedAt}]}; "
+                "GET /api/workbooks/:id -> 200 {workbook,activeWorksheetId,worksheets,cells,filterViews,validations,pivotTables} "
+                "or 404 {code:WORKBOOK_NOT_FOUND}; "
+                "PUT /api/workbooks/:id/worksheets/:worksheetName/cells body {updates:[{row,col,value}]} "
+                "-> 200 updated detail or 400 {code:VALIDATION_FAILED|CELL_OUT_OF_RANGE} "
+                "or 404 {code:WORKBOOK_NOT_FOUND|WORKSHEET_NOT_FOUND}."
+            ),
+            "file_path": "backend/src/routes/workbooks.js",
+        }
+    ]
+    manifest = [
+        {
+            "test_id": "REQ-1-1-1-INT-WorkbooksApi",
+            "req_id": "REQ-1-1-1",
+            "interface_ids": ["REQ-1-1-1-API-Workbooks"],
+            "type": "Integration",
+            "file_path": "integration/workbooks.test.js",
+        }
+    ]
+
+    assert validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "View and open a workbook."},
+        interfaces,
+        manifest,
+    ) == []
+
+
 def test_validate_http_status_contract_accepts_hackathon_sheet_create_shape(
     tmp_project_dir: Path,
 ) -> None:

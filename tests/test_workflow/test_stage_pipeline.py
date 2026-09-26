@@ -413,11 +413,16 @@ def test_serial_stage_pipeline_compile_uses_the_stage_drain(
     monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
     monkeypatch.delenv("ARC_NODE_WORKTREES", raising=False)
     tree = {"id": "A", "name": "A", "description": "A", "children": []}
+    logs: list[str] = []
+
+    def log_cb(_agent: str, message: str, *_args: Any) -> None:
+        logs.append(message)
+
     manager = ARCWorkflowManager(
         workspace_path=str(tmp_project_dir),
         requirement_path="",
         web_port=4000,
-        log_cb=lambda *_args, **_kwargs: None,
+        log_cb=log_cb,
     )
     manager.runtime = runtime
 
@@ -451,6 +456,7 @@ def test_serial_stage_pipeline_compile_uses_the_stage_drain(
 
     assert calls == ["stage"]
     assert result["ok"] is True
+    assert any(message.startswith("Execution mode: serial stage pipeline") for message in logs)
 
 
 def test_stage_pipeline_is_the_default_and_falsy_value_opts_out(

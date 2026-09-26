@@ -198,7 +198,11 @@ _STATUS_TEXT_PATTERNS = (
     # Status-body continuation: `; 400 { errors: ... }` (also line start /
     # text start). A clause boundary plus a bare status-sized number with an
     # opening body brace is the shape DESIGN writes after the primary arrow.
-    re.compile(r"(?:^|[;\n])[ \t]*(?P<code>[1-5]\d{2})[ \t]*\{"),
+    re.compile(
+        r"(?:^|[;\n]|\b(?:or|and)\b|(?:或|或者))[ \t]*"
+        r"(?P<code>[1-5]\d{2})[ \t]*\{",
+        re.IGNORECASE,
+    ),
 )
 _STATUS_FIELD_NAMES = {
     "status",

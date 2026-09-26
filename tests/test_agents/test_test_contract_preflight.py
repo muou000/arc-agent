@@ -133,6 +133,43 @@ def test_cjs_package_accepts_commonjs_playwright_entry(tmp_path: Path) -> None:
     assert report.can_start_tdd
 
 
+def test_module_syntax_scan_ignores_esm_words_inside_test_strings(tmp_path: Path) -> None:
+    root = _dual_config_backend(tmp_path)
+    _write_test_file(
+        root,
+        "backend/test-e2e/import-csv.e2e.spec.js",
+        """const { test, expect } = require('@playwright/test');
+test('import CSV flow', async ({ page }) => {
+  await expect(page.getByText('import data')).toBeVisible();
+  await expect(page.getByText('export complete')).toBeVisible();
+  await expect(page).toHaveText(/import failed/);
+});
+""",
+    )
+
+    report = _run(root, "backend/test-e2e/import-csv.e2e.spec.js", "E2E")
+
+    assert report.can_start_tdd
+    assert "mixed_module_syntax" not in {issue.kind for issue in report.issues}
+    assert not report.deterministic_errors
+
+
+def test_module_syntax_scan_still_blocks_real_mixed_entries(tmp_path: Path) -> None:
+    root = _dual_config_backend(tmp_path)
+    _write_test_file(
+        root,
+        "backend/test-e2e/mixed.e2e.spec.js",
+        "const { test } = require('@playwright/test');\n"
+        "test('import CSV', async () => {});\n"
+        "export const feature = /import failed/;\n",
+    )
+
+    report = _run(root, "backend/test-e2e/mixed.e2e.spec.js", "E2E")
+
+    assert not report.can_start_tdd
+    assert any(issue.kind == "mixed_module_syntax" for issue in report.deterministic_errors)
+
+
 @pytest.mark.parametrize("e2e_first", [True, False], ids=["e2e-first", "vitest-first"])
 def test_backend_dual_config_is_not_poisoned_by_manifest_order(tmp_path: Path, e2e_first: bool) -> None:
     root = _dual_config_backend(tmp_path)

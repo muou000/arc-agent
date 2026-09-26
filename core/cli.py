@@ -451,6 +451,8 @@ class _CliProgressView:
         if agent == "Compiler" and message.startswith("Loaded processing queue with"):
             match = re.search(r"with (\d+) task\(s\)", message)
             return self._emit_once(stage_line("Queue", f"{match.group(1) if match else '?'} task(s) scheduled"))
+        if agent == "Compiler" and message.startswith("Execution mode:"):
+            return self._emit_once(stage_line("Mode", message[len("Execution mode:"):].strip(), "info"))
         if agent == "Compiler" and message.startswith("Resuming from existing queue"):
             return self._emit_once(stage_line("Resume", "Continuing from saved queue", "warn"))
         if agent == "Compiler" and message.startswith("Running git checkpoint"):
