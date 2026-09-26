@@ -185,6 +185,12 @@ def test_arc_tdd_catalog_is_safe_on_the_real_implement_surface(
     assert "never remove product files" in skill_content.lower()
 
 
+def test_hard_stop_prompt_closes_environment_repair_path() -> None:
+    prompt = _prompt()
+    assert "record the repair as unverified in the failure report" in prompt
+    assert "Do not inspect node_modules or dist" in prompt
+
+
 def test_harness_skill_strictmode_section_pinned() -> None:
     skill = (SKILL_ROOT / "web-test-harness-skill" / "SKILL.md").read_text(encoding="utf-8")
     assert "## StrictMode and exact-call-count assertions" in skill

@@ -53,6 +53,10 @@ class ToolUsageRecord:
     offset: int | None
     limit: int | None
     result_chars: int
+    # The raw receipt text, so the SDK's ``result_empty`` classification can
+    # recognize the upstream empty-result sentinel texts (a character count
+    # cannot — "No files found" is 14 real characters).
+    result_text: str | None = None
     requested_path: str | None = None
     path_classification: str = ""
     execution_path: str | None = None
@@ -79,6 +83,7 @@ def record_tool_usage(
     offset: int | None = None,
     limit: int | None = None,
     result_chars: int = 0,
+    result_text: str | None = None,
     requested_path: str | None = None,
     path_classification: str = "",
     execution_path: str | None = None,
@@ -100,6 +105,7 @@ def record_tool_usage(
                 offset=offset,
                 limit=limit,
                 result_chars=int(result_chars or 0),
+                result_text=result_text,
                 requested_path=requested_path,
                 path_classification=str(path_classification or ""),
                 execution_path=execution_path,
@@ -142,6 +148,7 @@ def _record(request: ToolCallRequest, result: ToolMessage | Any) -> None:
         offset=_optional_int(args.get("offset")) if is_read else None,
         limit=_optional_int(args.get("limit")) if is_read else None,
         result_chars=len(str(getattr(result, "content", "") or "")),
+        result_text=str(getattr(result, "content", "") or "") or None,
         requested_path=requested_path if audit is not None else None,
         path_classification=audit.classification if audit is not None else "",
         execution_path=audit.execution_path if audit is not None else None,

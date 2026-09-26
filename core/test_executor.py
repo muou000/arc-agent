@@ -409,6 +409,10 @@ class TddTestExecutor:
             f"repeated_failures={stop['repetitions']}/{stop['threshold']}\n"
             f"budget_used={stop['used']}/{stop['budget']} run_tests calls\n"
             f"suggested_action={stop['suggested_action']}\n"
+            "An environment repair after closure cannot be verified in this pass; "
+            "record the repair as unverified in the failure report for a fresh TDD pass. "
+            "Do not inspect node_modules or dist to self-verify: a denied or empty "
+            "read is not evidence of absence.\n"
             "Do not call run_tests again in this pass; return a concise failure report.\n"
         )
 
@@ -846,6 +850,9 @@ class TddTestExecutor:
                 "- This layer is closed without spending the remaining run_tests budget.\n"
                 "- The same failure fingerprint repeated with no effective source/environment change.\n"
                 + stop_instruction
+                + "- Any environment repair after closure cannot be verified in this pass; "
+                "record the repair as unverified in the failure report for a fresh TDD pass. "
+                "Do not inspect node_modules or dist to self-verify.\n"
             )
         elif self._env_failure and self._usage[selected_type] >= TDD_RUN_TESTS_BUDGET:
             result.output += (

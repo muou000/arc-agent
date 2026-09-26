@@ -498,6 +498,55 @@ class TestToolUsageEvents:
         assert lines[0]["node_id"] == ""
         assert lines[0]["phase"] == ""
 
+    def test_known_empty_sentinel_texts_count_as_empty(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        """The upstream tools' empty-result sentinel texts must not count as
+        content: ``No files found`` is 14 real characters, which read the
+        easy-ticketbooking run's 109 ineffective globs as non-empty results.
+        Notes appended after the sentinel (withheld matches, grep guidance)
+        keep the sentinel as the first paragraph and stay empty."""
+
+        events.record_tool_usage(
+            node_id="REQ-1",
+            tool="glob",
+            status="ok",
+            result_chars=len("No files found"),
+            result_text="No files found",
+        )
+        events.record_tool_usage(
+            node_id="REQ-1",
+            tool="grep",
+            status="ok",
+            result_chars=120,
+            result_text="No matches found\n\nNote: no file contains that pattern as literal text.",
+        )
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["detail"]["result_chars"] == 14
+        assert lines[0]["detail"]["result_empty"] is True
+        assert lines[1]["detail"]["result_chars"] == 120
+        assert lines[1]["detail"]["result_empty"] is True
+
+    def test_non_sentinel_result_text_stays_non_empty(
+        self, events: EventClient, event_paths: RuntimePaths
+    ) -> None:
+        """Real content — including text that merely mentions the sentinel —
+        keeps the historical non-empty classification, and direct SDK callers
+        that pass no result_text keep the char-count-only semantics."""
+
+        events.record_tool_usage(
+            tool="read_file",
+            status="ok",
+            result_chars=40,
+            result_text="1\tthe grep answered No files found for it\n",
+        )
+        events.record_tool_usage(tool="glob", status="ok", result_chars=14)
+
+        lines = read_jsonl(event_paths.runner_events_path)
+        assert lines[0]["detail"]["result_empty"] is False
+        assert lines[1]["detail"]["result_empty"] is False
+
 
 class TestLayerReverifyEvents:
     """Pin the ``layer_reverify`` schema: trigger + outcome of the TDD
