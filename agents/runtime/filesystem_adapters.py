@@ -1050,6 +1050,10 @@ MAX_GREP_ALTERNATIVES = 8
 #: model writes stay denied and no host path is involved.
 LARGE_TOOL_RESULTS_PREFIX = "/large_tool_results"
 
+#: Where upstream evicts oversized human messages in the same agent-state
+#: backend. The replacement message points to this file for paginated reads.
+CONVERSATION_HISTORY_PREFIX = "/conversation_history"
+
 
 #: ARC's replacement for upstream's grep tool description. The stock text ends
 #: with "To match any of several strings, run a separate grep for each" — the

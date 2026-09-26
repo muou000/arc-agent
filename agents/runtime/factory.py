@@ -19,6 +19,7 @@ from agents.runtime.contracts import AgentRuntimeContext
 from agents.runtime.filesystem_adapters import (
     ARCFilesystemMiddleware,
     ArcCompositeBackend,
+    CONVERSATION_HISTORY_PREFIX,
     GlobGuidanceMiddleware,
     GrepGuidanceMiddleware,
     LARGE_TOOL_RESULTS_PREFIX,
@@ -616,16 +617,19 @@ def _build_filesystem_permissions(
             paths=[f"{WORKSPACE_PREFIX}/.arc/tdd_runs", f"{WORKSPACE_PREFIX}/.arc/tdd_runs/**"],
             mode="allow",
         ),
-        # Read-only escape hatch for upstream's eviction artifacts (issue #305):
-        # FilesystemMiddleware offloads oversized tool results (run_tests output,
-        # ...) to /large_tool_results/<tool_call_id> in the composite default
-        # (StateBackend — agent state, not a host path) and the replacement
-        # message points the model there; without this allow the pointer named
-        # a path the final /** deny refused. Writes stay denied, and the
-        # grep tool description advertising this root stays truthful.
+        # Read-only escape hatch for upstream's eviction artifacts (#305, #316):
+        # oversized tool results and human messages land in the composite
+        # default (StateBackend, not a host path). Their replacement messages
+        # point here; the final /** deny would otherwise make them unreadable.
+        # Writes remain denied on both roots.
         FilesystemPermission(
             operations=["read"],
-            paths=[LARGE_TOOL_RESULTS_PREFIX, f"{LARGE_TOOL_RESULTS_PREFIX}/**"],
+            paths=[
+                LARGE_TOOL_RESULTS_PREFIX,
+                f"{LARGE_TOOL_RESULTS_PREFIX}/**",
+                CONVERSATION_HISTORY_PREFIX,
+                f"{CONVERSATION_HISTORY_PREFIX}/**",
+            ],
             mode="allow",
         ),
         FilesystemPermission(

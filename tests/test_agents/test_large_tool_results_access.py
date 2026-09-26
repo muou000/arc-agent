@@ -1,4 +1,4 @@
-"""`/large_tool_results/` 的 grep 说明、公共策略与权限判断必须说同一套现实。
+"""Evicted tool results and human messages must remain readable through file tools.
 
 issue #305：ARC 挂载的 grep 工具描述沿用上游句子，建议模型在
 `/large_tool_results/` 下搜索被 offload 的大结果；但公共 prompt 声明文件工具
@@ -13,6 +13,8 @@ eviction（``tool_token_limit_before_evict`` 默认 20000 token）是真实开�
 前缀补一条最小只读 allow（写仍 deny），公共 prompt 与 grep 描述同步为真实语义。
 测试按验收口径同时钉住四个面：工具可见描述、公共 prompt、权限判断、明确的
 offload 指针回读；并默认拒绝任意宿主路径、权限拒绝不得渲染成「搜索无匹配」。
+issue #316 在同一个 StateBackend 默认路由下将过长的 human message 移到
+`/conversation_history/<uuid>.md`；模型收到的指针也必须可读，且不可写。
 """
 
 from __future__ import annotations
@@ -24,15 +26,18 @@ from typing import Any
 
 from deepagents.backends import CompositeBackend, StateBackend
 from deepagents.middleware.filesystem import _check_fs_permission
+from langchain.agents.middleware.types import ModelRequest, ModelResponse
+from langchain_core.messages import AIMessage, HumanMessage
 
 from agents.context.prompts.common import workspace_tool_policy
 from agents.runtime.filesystem_adapters import (
     ARC_GREP_TOOL_DESCRIPTION,
     ARCFilesystemMiddleware,
+    CONVERSATION_HISTORY_PREFIX,
     LARGE_TOOL_RESULTS_PREFIX,
     workspace_filesystem_backend,
 )
-from tests.helpers.faux import drive_scripted_tool_call
+from tests.helpers.faux import FauxChatModel, drive_scripted_tool_call
 
 
 # -- production-shaped adapter ---------------------------------------------------
@@ -115,6 +120,7 @@ def test_offload_prefix_constant_matches_the_middleware_reality(
     # the prefix upstream's eviction actually writes to (CompositeBackend's
     # default artifacts root is "/", so the prefix is fixed, not configurable).
     assert middleware._large_tool_results_prefix == LARGE_TOOL_RESULTS_PREFIX
+    assert middleware._conversation_history_prefix == CONVERSATION_HISTORY_PREFIX
 
 
 # -- common prompt policy ----------------------------------------------------------
@@ -123,18 +129,20 @@ def test_offload_prefix_constant_matches_the_middleware_reality(
 def test_tool_policy_names_the_offload_exception() -> None:
     policy = workspace_tool_policy()
 
-    # Two exceptions now: direct skill reads and the offload root.
+    # Direct skill reads and both eviction roots are explicit exceptions.
     assert "The sole exception" not in policy
     assert "/skills/<skill-name>/SKILL.md" in policy
     assert LARGE_TOOL_RESULTS_PREFIX in policy
-    # The offload access is stated as read-only, following the eviction pointer.
+    assert CONVERSATION_HISTORY_PREFIX in policy
+    # Both eviction roots are stated as read-only, following their pointers.
     assert "Tool result too large" in policy
+    assert "Message content too large" in policy
 
 
 # -- permission judgments ----------------------------------------------------------
 
 
-def test_permission_matrix_allows_only_reads_of_the_offload_root(
+def test_permission_matrix_allows_only_reads_of_the_offload_roots(
     tmp_project_dir: Path,
 ) -> None:
     permissions = _production_permissions(tmp_project_dir.resolve())
@@ -150,6 +158,10 @@ def test_permission_matrix_allows_only_reads_of_the_offload_root(
     # earlier, by path validation — pinned at tool level below; the pattern
     # matcher only ever sees virtual paths.)
     assert verdict("write", f"{LARGE_TOOL_RESULTS_PREFIX}/call-1") == "deny"
+    assert verdict("read", f"{CONVERSATION_HISTORY_PREFIX}/message.md") == "allow"
+    assert verdict("read", f"{CONVERSATION_HISTORY_PREFIX}/nested/message.md") == "allow"
+    assert verdict("write", f"{CONVERSATION_HISTORY_PREFIX}/message.md") == "deny"
+    assert verdict("read", "/conversation_history_other/message.md") == "deny"
     assert verdict("read", "/etc/passwd") == "deny"
     # The pre-existing grant surface is unchanged.
     assert verdict("read", "/workspace/src/a.py") == "allow"
@@ -265,6 +277,43 @@ def test_evicted_tool_result_pointer_is_readable_end_to_end(
         assert "permission denied" not in str(grep_message.content)
 
 
+# -- human-message eviction pointer round-trip ----------------------------------------
+
+
+def test_evicted_human_message_pointer_is_readable_end_to_end(
+    tmp_project_dir: Path,
+) -> None:
+    middleware = _make_middleware(tmp_project_dir)
+    marker = "HUMAN-HISTORY-MARKER-316"
+    content = "\n".join(f"history row {i} {marker}" for i in range(7000))
+    assert len(content) > 200_000  # upstream default human-message threshold
+    request = ModelRequest(
+        model=FauxChatModel(), messages=[HumanMessage(content=content, id="human-316")]
+    )
+    model_messages: list[Any] = []
+
+    def handler(model_request: ModelRequest[Any]) -> ModelResponse[Any]:
+        model_messages.extend(model_request.messages)
+        return ModelResponse(result=[AIMessage(content="ok")])
+
+    with _state_files_store() as files:
+        middleware.wrap_model_call(request, handler)
+        assert model_messages
+        pointer_match = re.search(
+            r"/conversation_history/[a-f0-9-]+\.md", str(model_messages[0].content)
+        )
+        assert pointer_match, model_messages[0].content
+        pointer_path = pointer_match.group(0)
+        assert pointer_path in files
+
+        read_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+        message = read_tool.func(
+            file_path=pointer_path, runtime=_runtime("call-human-316"), offset=6999, limit=1
+        )
+        assert f"history row 6999 {marker}" in str(message.content)
+        assert "permission denied" not in str(message.content)
+
+
 # -- build-path nails -----------------------------------------------------------------
 
 
@@ -312,6 +361,28 @@ def test_build_path_read_of_offload_root_is_allowed_but_missing(
 
     assert "permission denied" not in content
     assert "not found" in content
+
+
+def test_build_path_read_of_missing_human_history_is_not_denied(
+    tmp_project_dir: Path,
+) -> None:
+    (content,) = drive_scripted_tool_call(
+        tmp_project_dir,
+        "read_file",
+        {"file_path": f"{CONVERSATION_HISTORY_PREFIX}/never-offloaded.md"},
+    )
+    assert "permission denied" not in content
+    assert "not found" in content
+
+
+def test_write_into_human_history_stays_denied(tmp_project_dir: Path) -> None:
+    tool = _tools(tmp_project_dir)["write_file"]
+    message = tool.func(
+        file_path=f"{CONVERSATION_HISTORY_PREFIX}/model-written.md",
+        content="nope",
+        runtime=_runtime(),
+    )
+    assert "permission denied" in str(message.content)
 
 
 # -- simulated graph-state channel ------------------------------------------------------
