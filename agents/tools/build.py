@@ -43,7 +43,10 @@ def build_install_dependencies_tool(
     failures without any shell access: the tool performs one bounded
     ``npm install <pkg> --no-save`` inside the workspace through the app
     handler, so a missing runtime dependency becomes an ordinary
-    repair-and-revalidate cycle instead of a closed layer.
+    repair-and-revalidate cycle instead of a closed layer. The handler refuses
+    to reinstall a package that already resolves in ``node_modules``; when a
+    missing package has a lockfile entry, it installs that locked version
+    instead of resolving a new version.
     """
 
     async def install_dependencies(package: str, target: str = "backend") -> str:
@@ -52,6 +55,11 @@ def build_install_dependencies_tool(
         Use this only when run_tests reports a missing package (for example
         "Cannot find module 'x'" or "missing dependency: x"). Pass the bare
         package name, e.g. package='cookie-parser', target='backend'.
+        Already installed packages are not reinstalled; the returned failure
+        points out that the cause is not a missing package. Missing packages
+        recorded in the target package-lock.json are installed at the locked version.
+        A package absent from the lockfile is the only case that uses
+        the bare name for npm resolution.
 
         The install does not modify package.json or the lockfile; it only
         fixes the workspace node_modules tree. If the TDD layer is still open,

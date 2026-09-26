@@ -2542,6 +2542,14 @@ def test_install_tool_reaches_agent_without_shell() -> None:
     assert "not configured" in result
 
 
+def test_install_tool_description_preserves_package_version_guards() -> None:
+    tool = build_install_dependencies_tool(app_handler=FakeAppHandler(), node_id="REQ-X")
+    description = tool.__doc__ or ""
+    assert "already installed packages are not reinstalled" in description.lower()
+    assert "lockfile" in description.lower()
+    assert "locked version" in description.lower()
+
+
 def test_install_tool_converts_handler_crash_into_failed_install() -> None:
     """A handler exception must not escape into the agent graph.
 
@@ -2585,7 +2593,7 @@ def test_install_command_uses_argv_list() -> None:
     # And install_package builds a list command containing the bare name.
     install_source = inspect.getsource(web_mod.WebAppType.install_package)
     assert '"npm",' in install_source
-    assert 'name,' in install_source
+    assert 'package_spec,' in install_source
 
 
 def test_exec_argv_resolves_program_through_pathext() -> None:
