@@ -509,7 +509,10 @@ async def probe_backend_health(workspace_path: str, port: int | None = None) -> 
 
     Returns ``None`` on success. Workspaces without a backend ``start``
     command have nothing to verify and also return ``None``; a failed
-    teardown or any other failure returns a short reason string.
+    teardown or any other failure returns a reason string. A failed spawn
+    keeps the fixed verdict sentence as the leading line and appends the
+    captured process output, so a merge error in the debug log is
+    diagnosable without booting the quarantined worktree by hand.
 
     A stateless consumer of the backend_runtime module: it spawns and tears
     the probe process down through the module's mechanism functions and keeps
@@ -528,7 +531,11 @@ async def probe_backend_health(workspace_path: str, port: int | None = None) -> 
         web_port=resolved_port,
     )
     if spawn.handle is None:
-        return "backend runtime failed to start on the merged workspace"
+        failure = "backend runtime failed to start on the merged workspace"
+        detail = (spawn.detail or "").strip()
+        if detail:
+            return f"{failure}\n{detail}"
+        return failure
 
     health_url = f"http://127.0.0.1:{resolved_port}/api/health"
     last_error = "health endpoint did not respond"

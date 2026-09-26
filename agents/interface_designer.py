@@ -32,6 +32,39 @@ from agents.tools.traceability import build_traceability_tools
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
+# (workspace_root, port) -> None when the backend boots and serves, the
+# failure reason otherwise; the async twin of the merge gate's verify callback.
+BootProbe = Callable[[str, int], Awaitable[str | None]]
+
+# Bounded in-turn repair asks a DESIGN pass gets when its workspace fails the
+# boot smoke; each round costs one full agent turn, so the budget stays small.
+DESIGN_BOOT_SMOKE_REPAIR_ROUNDS = 2
+
+
+class DesignBootSmokeError(RuntimeError):
+    """The design pass's workspace backend does not boot after repair budget.
+
+    Raised by the DESIGN boot smoke once the same-thread repair rounds are
+    spent and the stage workspace still fails to start. Carries ``category``
+    so the stage-task executor maps it to a distinct failure category
+    instead of the generic worktree-infra one; the drain reads the same
+    attribute for task-level exceptions.
+    """
+
+    category = "design_boot_smoke"
+
+
+def design_boot_smoke_enabled() -> bool:
+    """``ARC_DESIGN_BOOT_SMOKE=0/false/no/off`` disables the DESIGN boot smoke.
+
+    On by default: a non-bootable design fails the node at the merge health
+    gate anyway, so the smoke only moves the same failure earlier into the
+    designing agent's own session where it can still be repaired.
+    """
+
+    flag = (os.environ.get("ARC_DESIGN_BOOT_SMOKE", "") or "").strip().lower()
+    return flag not in {"0", "false", "no", "off"}
+
 
 class InterfaceContractRecord(BaseModel):
     """One interface contract of the current node's design.
@@ -156,6 +189,7 @@ class InterfaceDesigner:
         app_type: str | None = None,
         context_workspace_root: str | None = None,
         rebase_gate_provider: Callable[[], Any | None] | None = None,
+        boot_probe: BootProbe | None = None,
         enforce_stage_domains: bool = False,
     ) -> None:
         self.log_cb = log_cb
@@ -171,6 +205,11 @@ class InterfaceDesigner:
         # Optional per-pass mid-phase replay gate (issue #127): called per
         # agent build so the repair flows' rebuilds share the pass's gate.
         self._rebase_gate_provider = rebase_gate_provider
+        # Optional override for the DESIGN boot smoke's backend probe; the
+        # default lazily resolves the web handler's stateless health probe
+        # (which self-guards to None on workspaces without a backend start
+        # command). Injectable so adapter tests can script boot outcomes.
+        self._boot_probe = boot_probe
         self.enforce_stage_domains = bool(enforce_stage_domains)
         # Write budget tier pinned by ``run()`` for the pass it is executing.
         # The repair flows rebuild agents mid-pass and read this instead of
@@ -308,11 +347,139 @@ class InterfaceDesigner:
         await self._repair_missing_interface_types(
             session, built, node_id=node_id, interfaces=bundle["interfaces"]
         )
+        if evidence_paths and design_boot_smoke_enabled():
+            # Stage-finish boot smoke: the pass's writes must leave a workspace
+            # whose backend still boots (the merge health gate will boot the
+            # merged tree later; catching the failure inside the designing
+            # session is the only point where the agent can still repair it).
+            # A write-less pass leaves the already-verified base tree, so the
+            # smoke is gated on write evidence.
+            bundle = await self._enforce_boot_smoke(
+                session, built, node_id=node_id, bundle=bundle
+            )
         await self._log(
             f"Interface design returned {len(bundle.get('interfaces', []))} interface(s).",
             node_id=node_id,
         )
         return bundle
+
+    async def _enforce_boot_smoke(
+        self,
+        session: StageSession,
+        built: StageAgentBuild,
+        *,
+        node_id: str,
+        bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Gate the pass on "the designed workspace boots", with in-turn repair.
+
+        The stage pipeline publishes this pass and only then boots the merged
+        tree at the merge health gate, so a skeleton whose wiring crashes the
+        backend at module load (a plain object of named handlers mounted as a
+        router, an unresolvable require on a shared surface) failed the node
+        terminally *after* the designing session was already over — the
+        2026-09-26 ticketbooking arc-output2 REQ-1 shape. The smoke runs the
+        same probe on the workspace the agent just wrote (the stage worktree
+        shares the main workspace's node_modules), and on failure spends a
+        bounded budget of same-thread repair asks carrying the backend's own
+        process output before failing the stage locally.
+        """
+
+        if not os.path.exists(
+            os.path.join(session.workspace_root, "backend", "package.json")
+        ):
+            # Nothing to boot in this workspace (non-web app types and
+            # backend-less fixtures); the merge gate has nothing to verify
+            # there either.
+            return bundle
+        probe = self._resolve_boot_probe()
+        failure = await self._probe_backend_boot(probe, session.workspace_root)
+        if failure is None:
+            await self._log(
+                "Boot smoke passed: the stage workspace's backend boots and serves /api/health.",
+                node_id=node_id,
+            )
+            return bundle
+        for round_index in range(1, DESIGN_BOOT_SMOKE_REPAIR_ROUNDS + 1):
+            await self._log(
+                "Boot smoke failed on the stage workspace; requesting in-turn repair "
+                f"(round {round_index} of {DESIGN_BOOT_SMOKE_REPAIR_ROUNDS}).\n{failure}",
+                status="warning",
+                node_id=node_id,
+            )
+            try:
+                payload = await session.invoke(built, message=self._boot_repair_message(failure))
+                repaired = await self._normalize_with_recovery(payload, node_id=node_id, built=built)
+            except Exception as exc:
+                raise DesignBootSmokeError(
+                    "The design pass's workspace backend does not boot and the boot repair "
+                    f"round failed with {type(exc).__name__} before the re-check.\n{failure}"
+                ) from exc
+            if repaired.get("interfaces"):
+                # Conservative merge, mirroring the other repair flows: only a
+                # non-empty repair payload replaces the recorded contracts.
+                bundle["interfaces"] = repaired["interfaces"]
+                if repaired.get("files_written"):
+                    bundle["files_written"] = repaired["files_written"]
+                if repaired.get("summary"):
+                    bundle["summary"] = repaired["summary"]
+            failure = await self._probe_backend_boot(probe, session.workspace_root)
+            if failure is None:
+                await self._log(
+                    f"Boot repair round {round_index} restored a bootable workspace.",
+                    node_id=node_id,
+                )
+                return bundle
+        raise DesignBootSmokeError(
+            "The design pass's workspace backend does not boot after "
+            f"{DESIGN_BOOT_SMOKE_REPAIR_ROUNDS} boot repair round(s).\n{failure}"
+        )
+
+    def _resolve_boot_probe(self) -> BootProbe:
+        """The boot smoke's backend probe: injected override or the web probe."""
+
+        if self._boot_probe is not None:
+            return self._boot_probe
+        # Lazy import keeps the web handler (and the template machinery behind
+        # it) out of adapter import time and out of non-web workspaces' paths.
+        from app_type_handler.web import probe_backend_health
+
+        return probe_backend_health
+
+    @staticmethod
+    async def _probe_backend_boot(probe: BootProbe, workspace_root: str) -> str | None:
+        """Boot the workspace backend on a throwaway port; None when healthy.
+
+        The throwaway port mirrors the merge gate's probe-port allocation: the
+        stage task's own port slot is held but unused during DESIGN, and the
+        smoke must not couple the adapter to slot bookkeeping.
+        """
+
+        import socket
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        return await probe(workspace_root, port)
+
+    @staticmethod
+    def _boot_repair_message(failure: str) -> str:
+        return "\n".join(
+            [
+                "A deterministic boot check just ran on this design workspace: the backend process must start and serve /api/health on the integrated tree, and it currently does not.",
+                "",
+                "=== Boot Check Failure ===",
+                failure,
+                "=== End of Boot Check Failure ===",
+                "",
+                "Repair the skeleton files of this pass so the backend's module graph loads again. The failure is wiring, not missing implementation: this is still the DESIGN stage — keep skeletons shape-only and do not implement validation, persistence, or business behavior. The recurring breakage mechanisms:",
+                "- a module mounted with `app.use('<path>', mod)` must itself be an Express Router (`const router = express.Router(); ... module.exports = router;`) or a middleware function — never a plain object of named handler functions;",
+                "- every `require(...)` line added to a shared surface (backend/src/app.js, backend/src/index.js) must resolve to an existing file exporting what the mount site expects;",
+                "- shared-surface edits must stay additive and leave the previously working wiring (health route, static serving, SPA fallback) loadable.",
+                "Fix the files within your declared write set, keep every interface contract identity unchanged (interface_id, file_path, responsibility), and return the same `InterfaceDesignResponse` payload again with the complete `interfaces` array and the updated `files_written`.",
+                "Return the structured fields themselves. Do NOT wrap the JSON in markdown code fences and do NOT nest the response JSON inside the `summary` string.",
+            ]
+        )
 
     def _build_agent(
         self,

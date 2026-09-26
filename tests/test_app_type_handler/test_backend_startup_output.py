@@ -92,6 +92,36 @@ def test_failed_startup_reports_placeholder_when_no_output(tmp_path) -> None:
 
 
 @pytest.mark.slow
+def test_probe_backend_health_echoes_backend_output(tmp_path) -> None:
+    """The merge gate's failure string must carry the crashed backend's output.
+
+    The gate used to answer a failed spawn with a fixed sentence and drop
+    ``spawn.detail``; the TypeError that killed the process never reached the
+    debug log, and diagnosing the merge failure required booting the
+    quarantined worktree by hand. The verdict sentence stays the leading
+    line (downstream tests and the arbiter prompt match on it), the captured
+    process output follows it.
+    """
+
+    _require_node()
+    workspace = _make_backend_workspace(
+        tmp_path,
+        "console.error('TypeError: argument handler must be a function'); process.exit(1);\n",
+    )
+
+    async def _run() -> str | None:
+        return await web_handler.probe_backend_health(str(workspace), _free_port())
+
+    failure = asyncio.run(_run())
+
+    assert failure is not None
+    assert failure.startswith("backend runtime failed to start on the merged workspace")
+    assert "=== Backend Process Output ===" in failure
+    assert "STDERR:" in failure
+    assert "TypeError: argument handler must be a function" in failure
+
+
+@pytest.mark.slow
 def test_successful_startup_survives_chatty_output(tmp_path) -> None:
     """A serving backend must not block on a full stdout pipe buffer later.
 

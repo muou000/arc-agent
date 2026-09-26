@@ -3292,7 +3292,11 @@ class ARCWorkflowManager:
                     await self._discard_stage_workspace(context)
             return {
                 "status": STAGE_FAILED,
-                "error_category": "stage_worktree",
+                # Domain failures that carry their own category (the DESIGN
+                # boot smoke's DesignBootSmokeError) keep it; everything else
+                # here is worktree machinery breakage. The drain reads the
+                # same attribute for task-level exceptions.
+                "error_category": str(getattr(exc, "category", None) or "stage_worktree"),
                 "error": f"{type(exc).__name__}: {exc}",
             }
 

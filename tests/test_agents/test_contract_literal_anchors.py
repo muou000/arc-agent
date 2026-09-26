@@ -170,6 +170,13 @@ def test_design_skills_shared_shell_literal_rules_pinned() -> None:
     # Visual-reference section titles are structural anchors: run 2 asserted
     # the register page's 账户信息 heading, which no requirement text mentions.
     assert "treat those section titles as structural anchors" in leaf_full
+    # Boot-safe skeleton wiring: the 2026-09-26 ticketbooking run failed REQ-1
+    # at the merge health gate because a plain object of named handlers was
+    # mounted as a router (Express 5 threw at module load). The rule survives
+    # skill edits verbatim.
+    assert "Boot-safe skeleton wiring" in leaf_full
+    assert "never a plain object of named handler functions" in leaf_full
+    assert "wiring that throws at boot fails the whole DESIGN stage" in leaf_full
 
     ui_only = (SKILL_ROOT / "non-leaf-ui-only-design" / "SKILL.md").read_text(encoding="utf-8")
     assert "Shell navigation and auth slots are assertion targets" in ui_only
