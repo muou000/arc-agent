@@ -116,7 +116,7 @@ def _run_isolation_guard_inner(
         )
     )
     pytester.syspathinsert(str(REPO_ROOT))
-    args = ["-p", "no:anyio", "-p", "no:xdist"]
+    args = ["-p", "no:anyio"]
     if with_conftest_plugin:
         args += ["-p", "tests.conftest"]
     args.append("inner.py")
