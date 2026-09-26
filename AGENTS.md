@@ -104,14 +104,45 @@ python -m pytest -p no:anyio
 python arc_main.py doctor
 ```
 
-测试默认通过 pytest 单进程串行运行。测试分层和新增测试规范见 [`tests/README.md`](tests/README.md)。一般要求：
+测试默认通过 pytest 单进程串行运行。测试分层和新增测试规范见 [`tests/README.md`](tests/README.md)。日常开发默认只运行与当前改动面相关的**最小充分测试集**，不要求每次修改后自动运行完整快速套件。
 
-- 修改代码后运行受影响的定向测试，再运行快速套件；
-- 修改模板、app-type、构建/测试执行器或依赖安装逻辑时，补跑相关 slow 测试；
-- 需要临时项目、Git 或 runtime 的测试使用现有 `tmp_project_dir`、`runtime` 和 faux fixture，不触碰宿主项目；
-- 普通单测不得因宿主环境变量（如存在 `OPENAI_API_KEY` 等凭据或真实 endpoint）而改变行为或自动激活集成路径；测试激活范围只由显式标记和 fixture 决定，需要真实凭据的验证按手工/集成验证处理；
-- slow 测试因环境不能运行时，报告为“未运行”，不要把 skip 当作通过；
-- 测试失败时保留完整失败原因，先修复隔离、契约或实现问题，再调整断言。
+### 测试分块与影响面选择
+
+先查看当前 diff，定位生产代码的 owner、直接消费者和已有对应测试，再按以下顺序扩大范围：
+
+1. 先运行新增或直接覆盖改动行为的测试，优先使用测试路径和节点 ID，必要时再用 `-k` 补充筛选：
+
+   ```text
+   python -m pytest -p no:anyio tests/test_workflow/test_parallel_scheduling_rules.py
+   python -m pytest -p no:anyio tests/test_workflow/test_parallel_scheduling_rules.py::test_affinity_map_groups_by_top_level_subtree
+   python -m pytest -p no:anyio tests/test_workflow -k "dependency or affinity"
+   ```
+
+2. 若改动影响直接消费者、适配器或契约测试，再运行对应测试目录，而不是只运行与生产文件同名的单个测试文件。目录映射以 `tests/README.md` 为准：`arcbench_agent_runtime/` 对应 `test_python_sdk/`，`agents/` 与 `skills/` 对应 `test_agents/`，`core/` 工作流与调度对应 `test_workflow/`，app-type 对应 `test_app_type_handler/`，模板对应 `test_template_contract/`，评测对应 `test_evals/`。
+
+3. 以下情况必须扩大到相关测试目录；若跨越两个以上测试层、涉及共享基建，或无法可靠判断影响面，则运行快速套件：
+
+   ```text
+   python -m pytest -p no:anyio -m "not slow"
+   ```
+
+   - 修改公共 API、事件字段、追溯表、队列状态、manifest、CLI 参数或配置；
+   - 修改 `conftest.py`、共享 fixture、测试执行器、runtime SDK 或跨目录 helper；
+   - 修改工作流、合并/worktree、阶段纪律等跨模块行为；
+   - 定向测试失败后，修复涉及原测试范围之外的代码；
+   - 改动无法被明确归入一个测试层。
+
+4. 修改模板、app-type、构建/测试执行器、依赖安装逻辑或 lockfile 时，至少运行相关快测试并补跑相关 `slow` 测试。完整套件命令为：
+
+   ```text
+   python -m pytest -p no:anyio
+   ```
+
+pytest 支持按目录、文件、测试节点 ID、`-k` 表达式和 marker 分块；优先使用路径或节点 ID，因为它们更稳定、更易审计。`-k` 只作补充筛选，不能替代影响面判断；`--lf` 只用于同一故障的快速复现，不能作为覆盖证据；`-m "not slow"` 只表示排除 slow 测试，不表示已经覆盖所有相关测试。
+
+需要临时项目、Git 或 runtime 的测试使用现有 `tmp_project_dir`、`runtime` 和 faux fixture，不触碰宿主项目。普通单测不得因宿主环境变量（如存在 `OPENAI_API_KEY` 等凭据或真实 endpoint）而改变行为或自动激活集成路径；测试激活范围只由显式标记和 fixture 决定，需要真实凭据的验证按手工/集成验证处理。slow 测试因环境不能运行时，报告为“未运行”，不要把 skip 当作通过。测试失败时保留完整失败原因，先修复隔离、契约或实现问题，再调整断言。
+
+每次验证都要记录实际运行的命令、通过/失败/跳过结果，以及未运行的测试和原因；不能把“未运行”写成“通过”。准备提交或用户要求完整验证时，至少运行快速套件；命中模板、依赖或其他 slow 门禁时，再运行完整套件。
 
 `make test` 和 `make test-slow` 是上述测试的快捷入口；在没有可用 `make` 的环境中直接使用 Python 命令。
 
