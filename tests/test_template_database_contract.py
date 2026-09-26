@@ -166,3 +166,27 @@ def test_patched_spa_fallback_opts_into_dotfile_serving(
     # The bare pre-fix shape must be gone, so a re-run classifies as already
     # applied instead of re-patching.
     assert "res.sendFile(path.join(frontendDistPath, 'index.html'));\n" not in app_module
+
+
+def test_patched_appjs_states_the_router_mount_contract(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The workspace's app.js states the mount contract at the registration seam.
+
+    The 2026-09-26 easy-ticketbooking arc-output2 run failed REQ-1 at the
+    merge health gate: the design skeleton exported named handler functions
+    while its app.js glue mounted the module as a router, and Express 5 threw
+    at boot ("argument handler must be a function"). The anchor comment puts
+    the canonical mount idiom exactly where that glue gets written, so the
+    shared-surface edit carries its own contract."""
+
+    workspace = tmp_path_factory.mktemp("patched-mount-guard-") / "workspace"
+    shutil.copytree(TEMPLATE_ROOT, workspace)
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+    assert all(outcome.status in {APPLIED, ALREADY_APPLIED} for outcome in outcomes), outcomes
+    app_module = (workspace / "backend" / "src" / "app.js").read_text(encoding="utf-8")
+
+    assert "// Mounting route modules:" in app_module
+    assert "must itself be an Express Router" in app_module
+    assert "module.exports = router;" in app_module
+    assert "Mounting a plain object of named handler functions" in app_module

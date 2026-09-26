@@ -508,6 +508,41 @@ TEMPLATE_PATCHES: tuple[TemplatePatch, ...] = (
             ),
         ),
     ),
+    # The 2026-09-26 easy-ticketbooking arc-output2 run died at the merge
+    # health gate: REQ-1's design skeleton exported named handler functions
+    # while its app.js glue mounted the module as a router, and Express 5
+    # threw "argument handler must be a function" at boot - a stage-terminal
+    # failure the designing agent could still have fixed had it seen it. The
+    # anchor comment puts the canonical mount idiom exactly where the glue
+    # gets written, so the shared-surface edit carries its own contract.
+    TemplatePatch(
+        name="appjs-router-mount-guard",
+        template_id="web-react-express",
+        summary=(
+            "app.js route-registration anchor states the mount contract: "
+            "app.use()-mounted modules must be Express Routers or middleware "
+            "functions, never plain objects of named handlers"
+        ),
+        edits=(
+            TemplateEdit(
+                relative_path=_BACKEND_APP_PATH,
+                search=(
+                    "// register routes\n"
+                    "app.get('/api/health', (req, res) => {\n"
+                ),
+                replace=(
+                    "// register routes\n"
+                    "// Mounting route modules: a module imported under `// route modules imports`\n"
+                    "// and mounted with app.use('<path>', mod) must itself be an Express Router\n"
+                    "// (`const router = express.Router(); ...; module.exports = router;`) or a\n"
+                    "// middleware function. Mounting a plain object of named handler functions\n"
+                    "// throws at boot and fails the stage's backend health gate.\n"
+                    "app.get('/api/health', (req, res) => {\n"
+                ),
+                applied_marker="// Mounting route modules:",
+            ),
+        ),
+    ),
 )
 
 
