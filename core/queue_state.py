@@ -157,6 +157,19 @@ NODE_CONVERGED: NodeState = "CONVERGED"
 NODE_CONVERGED_WITH_FAILED_CHILDREN: NodeState = "CONVERGED_WITH_FAILED_CHILDREN"
 NODE_FAILED: NodeState = "FAILED"
 NODE_BLOCKED_BY_DEPENDENCY: NodeState = "BLOCKED_BY_DEPENDENCY"
+_NODE_STATE_VALUES = frozenset(
+    {
+        NODE_UNSEEN,
+        NODE_DESIGNING,
+        NODE_DESIGNED,
+        NODE_IMPLEMENTING,
+        NODE_PASSED,
+        NODE_CONVERGED,
+        NODE_CONVERGED_WITH_FAILED_CHILDREN,
+        NODE_FAILED,
+        NODE_BLOCKED_BY_DEPENDENCY,
+    }
+)
 
 # States that imply the node's DESIGN finished (terminal success, or mid-
 # flight IMPLEMENT). FAILED/BLOCKED nodes instead read node_design_done.
@@ -187,6 +200,17 @@ def node_state(queue_state: dict[str, Any], node_id: str) -> str:
 
     raw = (queue_state.get("node_states") or {}).get(node_id)
     return str(raw or "").strip().upper() or NODE_UNSEEN
+
+
+def node_state_is_known(queue_state: dict[str, Any], node_id: str) -> bool:
+    """Whether the node's persisted state is in the known vocabulary.
+
+    A corrupted, unknown, or future state marks the node quarantined: no
+    scheduler may treat its work as ordinary pending work (the load-time
+    quarantine reports the original value in ``invalid_state_entries``).
+    """
+
+    return node_state(queue_state, node_id) in _NODE_STATE_VALUES
 
 
 def outage_is_open(queue_state: dict[str, Any]) -> bool:
@@ -289,7 +313,10 @@ def task_status(queue_state: dict[str, Any], task: dict[str, Any]) -> str:
     IMPLEMENT, so DESIGNING/IMPLEMENTING identify exactly which phase is
     in flight. For a FAILED or BLOCKED node, ``node_design_done`` keeps
     the completed DESIGN readable (its artifacts stay landed in the
-    workspace and an implement-only retry must remain possible).
+    workspace and an implement-only retry must remain possible). Only
+    UNSEEN reads as unstarted pending work: a corrupted, unknown, or
+    future node state reads FAILED, so it is never scheduled as pending
+    (the load-time quarantine reports it in ``invalid_state_entries``).
     """
 
     state = node_state(queue_state, str(task.get("node_id", "")))
@@ -310,7 +337,9 @@ def task_status(queue_state: dict[str, Any], task: dict[str, Any]) -> str:
         if phase == PHASE_DESIGN and design_done(queue_state, str(task.get("node_id", ""))):
             return TASK_COMPLETED
         return TASK_BLOCKED
-    return TASK_PENDING
+    if state == NODE_UNSEEN:
+        return TASK_PENDING
+    return TASK_FAILED
 
 
 def stage_task_status(queue_state: dict[str, Any], task: dict[str, Any]) -> str:
@@ -319,12 +348,13 @@ def stage_task_status(queue_state: dict[str, Any], task: dict[str, Any]) -> str:
     Stage task status is intentionally independent from the legacy aggregate
     task projection. The aggregate DESIGN/IMPLEMENT tasks remain the
     compatibility surface until the stage scheduler adopts this list.
-    Unknown values from a hand-edited or future queue are treated as pending
-    so the queue cannot silently claim a stage completed.
+    Unknown values from a hand-edited or future queue are returned verbatim
+    (upper-cased): they match no known status, so they are never schedulable
+    pending work and can never silently claim a stage completed - the
+    load-time quarantine reports them in ``invalid_state_entries``.
     """
 
-    raw = str(task.get("status", "") or "").strip().upper()
-    return raw if raw in _STAGE_STATUS_VALUES else STAGE_PENDING
+    return str(task.get("status", "") or "").strip().upper()
 
 
 def stage_task_of(
@@ -372,6 +402,10 @@ def aggregate_phase_status(
     if any(status is None for status in statuses):
         return fallback
     normalized = [str(status) for status in statuses]
+    if any(status not in _STAGE_STATUS_VALUES for status in normalized):
+        # A quarantined stage row must not project its node back to
+        # schedulable aggregate work either.
+        return TASK_FAILED
     if any(status == STAGE_FAILED for status in normalized):
         return TASK_FAILED
     if any(status == STAGE_BLOCKED for status in normalized):
@@ -408,6 +442,11 @@ def transition_stage_task(
     if next_status not in _STAGE_STATUS_VALUES:
         raise ValueError(f"Unknown stage status: {status}")
     current = stage_task_status(queue_state, task)
+    if current not in _STAGE_STATUS_VALUES:
+        raise ValueError(
+            f"Stage task {node_id}:{stage} carries an invalid persisted status {current!r}; "
+            "repair or remove the value in the processing queue before retrying this stage."
+        )
     if next_status != current and next_status not in _STAGE_ALLOWED_TRANSITIONS[current]:
         raise ValueError(f"Invalid stage transition {current} -> {next_status} for {node_id}:{stage}")
 
@@ -562,13 +601,21 @@ def _set_stage_status_if_present(
     stage: str,
     status: str,
 ) -> None:
-    """Best-effort projection for the legacy aggregate transitions."""
+    """Best-effort projection for the legacy aggregate transitions.
+
+    A quarantined stage row (unknown persisted status) is left untouched:
+    the aggregate flow proceeds around it, the row is never scheduled as
+    stage work, and the run's result stays non-accepted via
+    ``invalid_state_entries``.
+    """
 
     task = stage_task_of(queue_state, node_id, stage)
     if task is None:
         return
     current = stage_task_status(queue_state, task)
     if current == status or current in _STAGE_TERMINAL_SUCCESS:
+        return
+    if current not in _STAGE_STATUS_VALUES:
         return
     if status not in _STAGE_ALLOWED_TRANSITIONS[current]:
         return
@@ -1225,6 +1272,10 @@ def load_or_create_queue(
         else:
             queue_state.setdefault("dependencies", dependencies)
             queue_state["dropped_dependency_edges"] = dropped_dependency_edges
+        # Quarantine corrupted/unknown/future persisted states after all
+        # migrations have run: the entries keep the original values for
+        # diagnostics while the projections keep the work unschedulable.
+        queue_state["invalid_state_entries"] = collect_invalid_state_entries(queue_state)
         _sync_all_task_statuses(queue_state)
         return queue_state
     if require_compatible_existing_queue:
@@ -1244,6 +1295,7 @@ def load_or_create_queue(
         "affinity": affinity,
         "dependencies": dependencies,
         "dropped_dependency_edges": dropped_dependency_edges,
+        "invalid_state_entries": [],
         "last_task_id": None,
         "run_status": RUN_STATUS_RUNNING,
         "provider_outage": None,
@@ -1282,6 +1334,10 @@ def _legacy_stage_status(
     if not applicable:
         return STAGE_SKIPPED
     state = node_state(queue_state, node_id)
+    if state not in _NODE_STATE_VALUES:
+        # A corrupted/unknown aggregate state cannot seed schedulable stage
+        # work; the load-time quarantine reports the original value.
+        return STAGE_FAILED
     design_finished = design_done(queue_state, node_id)
     if state in {NODE_PASSED, NODE_CONVERGED, NODE_CONVERGED_WITH_FAILED_CHILDREN}:
         return STAGE_PUBLISHED
@@ -1334,11 +1390,12 @@ def _migrate_stage_tasks(
         else:
             current = {**template, **current}
             current["applicable"] = bool(template.get("applicable", True))
-            raw_status = str(current.get("status", "") or "").strip().upper()
             if not current["applicable"]:
                 current["status"] = STAGE_SKIPPED
-            elif raw_status not in _STAGE_STATUS_VALUES:
-                current["status"] = STAGE_PENDING
+            # An unknown persisted status is left verbatim: the load-time
+            # quarantine records it and the projections keep the stage
+            # unschedulable, instead of coercing corruption into fresh
+            # pending work.
         current.setdefault("attempt_count", 0)
         current.setdefault("retry_at", None)
         current.setdefault("declared_write_set", None)
@@ -1357,6 +1414,61 @@ def _is_compatible_queue(
     if not queue_state or queue_state.get("root_id") != root_id:
         return False
     return [task.get("task_id") for task in queue_state.get("tasks", [])] == expected_task_ids
+
+
+def collect_invalid_state_entries(queue_state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Report persisted node/stage states the queue vocabulary does not know.
+
+    A corrupted, unknown, or future status must not read as unstarted work,
+    so the load path records each offending value here (mirroring
+    ``dropped_dependency_edges``): the entry carries the normalized value
+    for display while the byte-exact original stays in place in the queue's
+    ``node_states`` map / ``stage_tasks`` rows, and the projections keep the
+    affected work unschedulable. Derived ``tasks[*].status`` fields are
+    deliberately not scanned - they are a never-trusted projection of the
+    node states.
+    """
+
+    entries: list[dict[str, Any]] = []
+    for node_id, raw_value in (queue_state.get("node_states") or {}).items():
+        if node_state(queue_state, str(node_id)) in _NODE_STATE_VALUES:
+            continue
+        entries.append(
+            {
+                "kind": "node_state",
+                "node_id": str(node_id),
+                "stage": None,
+                "value": str(raw_value),
+            }
+        )
+    for task in queue_state.get("stage_tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        status = stage_task_status(queue_state, task)
+        if status in _STAGE_STATUS_VALUES:
+            continue
+        entries.append(
+            {
+                "kind": "stage_status",
+                "node_id": str(task.get("node_id", "") or ""),
+                "stage": str(task.get("stage", "") or "") or None,
+                "value": status,
+            }
+        )
+    return entries
+
+
+def describe_invalid_state_entry(entry: dict[str, Any]) -> str:
+    """One-line human-readable form of a quarantined state entry."""
+
+    kind = str(entry.get("kind", ""))
+    value = str(entry.get("value", "") or "")
+    if kind == "stage_status":
+        return (
+            f"stage task {entry.get('node_id', '')}:{entry.get('stage', '')} has "
+            f"unknown persisted status {value!r}"
+        )
+    return f"node {entry.get('node_id', '')} has unknown persisted state {value!r}"
 
 
 # ---------------------------------------------------------------------------
