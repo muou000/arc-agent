@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from agents.runtime.capabilities import is_test_file_path, normalize_manifest_path
+from agents.tools.stage_write_set import StageWriteSetLock, build_declare_stage_write_set_tool
 from agents.tools.test_manifest import (
     DeclaredTestFile,
     TestManifestLock,
@@ -260,12 +261,146 @@ def test_declaration_rejects_empty_coverage_when_current_interfaces_exist() -> N
 
 
 def test_second_declaration_extends_the_lock_without_reset() -> None:
+    """Legacy callers keep the pre-pipeline additive declaration behavior."""
+
     lock = TestManifestLock()
     tool = build_declare_test_manifest_tool(node_id="REQ-X", manifest_lock=lock)
     first = _parse(str(asyncio.run(tool(files=[{"file_path": "tests/unit/a.test.ts", "type": "Unit", "interface_ids": []}]))))
     assert [row["file_path"] for row in first["manifest"]] == ["tests/unit/a.test.ts"]
     second = _parse(str(asyncio.run(tool(files=[{"file_path": "tests/unit/b.test.ts", "type": "Unit", "interface_ids": []}]))))
     assert [row["file_path"] for row in second["manifest"]] == ["tests/unit/a.test.ts", "tests/unit/b.test.ts"]
+
+
+def test_existing_manifest_row_must_be_redeclared_without_metadata_drift() -> None:
+    write_set = StageWriteSetLock(stage="test_generation")
+    write_set.declare(["tests/unit/a.test.ts"])
+    lock = TestManifestLock()
+    tool = build_declare_test_manifest_tool(
+        node_id="REQ-X",
+        manifest_lock=lock,
+        stage_write_set_lock=write_set,
+    )
+    first = _parse(
+        str(
+            asyncio.run(
+                tool(
+                    files=[
+                        {
+                            "file_path": "tests/unit/a.test.ts",
+                            "type": "Unit",
+                            "coverage_scope": "owned",
+                            "interface_ids": ["IF-A"],
+                        }
+                    ]
+                )
+            )
+        )
+    )
+    assert first["status"] == "locked"
+
+    drifted = _parse(
+        str(
+            asyncio.run(
+                tool(
+                    files=[
+                        {
+                            "file_path": "tests/unit/a.test.ts",
+                            "type": "Integration",
+                            "coverage_scope": "owned",
+                            "interface_ids": ["IF-A"],
+                        }
+                    ]
+                )
+            )
+        )
+    )
+    assert drifted["status"] == "error"
+    assert "exactly re-declare" in drifted["error"]
+    assert lock.declared_files["tests/unit/a.test.ts"].test_type == "Unit"
+
+
+def test_staged_manifest_rejects_new_path_after_success() -> None:
+    write_set = StageWriteSetLock(stage="test_generation")
+    manifest = TestManifestLock()
+    write_set_tool = build_declare_stage_write_set_tool(stage="test_generation", lock=write_set)
+    manifest_tool = build_declare_test_manifest_tool(
+        node_id="REQ-X",
+        manifest_lock=manifest,
+        stage_write_set_lock=write_set,
+    )
+
+    assert _parse(
+        str(asyncio.run(manifest_tool(files=[{"file_path": "tests/unit/a.test.ts", "type": "Unit"}])))
+    )["status"] == "error"
+    assert "complete stage write set is locked" in _parse(
+        str(asyncio.run(manifest_tool(files=[{"file_path": "tests/unit/a.test.ts", "type": "Unit"}])))
+    )["error"]
+
+    assert '"status": "locked"' in asyncio.run(
+        write_set_tool(paths=["tests/unit/a.test.ts", "tests/unit/b.test.ts"])
+    )
+    first = _parse(
+        str(asyncio.run(manifest_tool(files=[{"file_path": "tests/unit/a.test.ts", "type": "Unit"}])))
+    )
+    assert first["status"] == "locked"
+
+    second = _parse(
+        str(asyncio.run(manifest_tool(files=[{"file_path": "tests/unit/b.test.ts", "type": "Unit"}])))
+    )
+    assert second["status"] == "error"
+    assert "successful declaration already locked" in second["error"]
+    assert sorted(manifest.declared_files) == ["tests/unit/a.test.ts"]
+
+    reaffirmed = _parse(
+        str(asyncio.run(manifest_tool(files=[{"file_path": "tests/unit/a.test.ts", "type": "Unit"}])))
+    )
+    assert reaffirmed["status"] == "locked"
+    assert sorted(manifest.declared_files) == ["tests/unit/a.test.ts"]
+    assert "were added" not in reaffirmed.get("note", "")
+
+
+def test_staged_manifest_allows_correction_after_rejected_declaration() -> None:
+    write_set = StageWriteSetLock(stage="test_generation")
+    manifest = TestManifestLock()
+    write_set_tool = build_declare_stage_write_set_tool(stage="test_generation", lock=write_set)
+    manifest_tool = build_declare_test_manifest_tool(
+        node_id="REQ-X",
+        manifest_lock=manifest,
+        stage_write_set_lock=write_set,
+    )
+    assert '"status": "locked"' in asyncio.run(
+        write_set_tool(paths=["tests/unit/a.test.ts", "tests/unit/b.test.ts"])
+    )
+
+    rejected = _parse(
+        str(
+            asyncio.run(
+                manifest_tool(
+                    files=[
+                        {"file_path": "tests/unit/a.test.ts", "type": "Unit"},
+                        {"file_path": "tests/unit/b.test.ts", "type": "not-a-test-type"},
+                    ]
+                )
+            )
+        )
+    )
+    assert rejected["status"] == "error"
+    assert not manifest.locked
+
+    corrected = _parse(
+        str(
+            asyncio.run(
+                manifest_tool(
+                    files=[
+                        {"file_path": "tests/unit/a.test.ts", "type": "Unit"},
+                        {"file_path": "tests/unit/b.test.ts", "type": "Unit"},
+                    ]
+                )
+            )
+        )
+    )
+    assert corrected["status"] == "locked"
+    assert sorted(manifest.declared_files) == ["tests/unit/a.test.ts", "tests/unit/b.test.ts"]
 
 
 def test_tool_description_documents_redeclaration_merge() -> None:
@@ -281,7 +416,7 @@ def test_tool_description_documents_redeclaration_merge() -> None:
     doc = " ".join((tool.__doc__ or "").split())
     assert "exactly once" not in doc
     assert "re-declare" in doc
-    assert "the lock merges, adding only paths whose earlier declaration failed" in doc
+    assert "the lock merges, adding only paths from the rejected attempt" in doc
 
 
 def test_declaration_rejects_empty_list() -> None:

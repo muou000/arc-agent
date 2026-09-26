@@ -208,6 +208,53 @@ def test_manifest_ownership_claims_are_atomic_and_cross_node() -> None:
     assert '"status": "locked"' in asyncio.run(second(files=declaration))
 
 
+def test_staged_manifest_receipt_matches_the_actual_write_gate() -> None:
+    node_id = "REQ-303"
+    current = f"backend/tests/generated/{stable_node_path_segment(node_id)}/unit/current.test.ts"
+    outside = f"backend/tests/generated/{stable_node_path_segment(node_id)}/unit/outside.test.ts"
+    write_set = StageWriteSetLock(stage="test_generation", node_id=node_id)
+    manifest = TestManifestLock(node_id=node_id, enforce_node_namespace=True)
+    write_set_tool = build_declare_stage_write_set_tool(stage="test_generation", lock=write_set)
+    manifest_tool = build_declare_test_manifest_tool(
+        node_id=node_id,
+        manifest_lock=manifest,
+        stage_write_set_lock=write_set,
+    )
+
+    before_write_set = asyncio.run(
+        manifest_tool(files=[{"file_path": current, "type": "Unit"}])
+    )
+    assert '"status": "error"' in before_write_set
+    assert "complete stage write set is locked" in before_write_set
+
+    assert '"status": "locked"' in asyncio.run(write_set_tool(paths=[current]))
+    accepted = asyncio.run(manifest_tool(files=[{"file_path": current, "type": "Unit"}]))
+    assert '"status": "locked"' in accepted
+
+    proposed = asyncio.run(manifest_tool(files=[{"file_path": outside, "type": "Unit"}]))
+    assert '"status": "error"' in proposed
+    assert "not in the locked stage write set" in proposed
+    assert outside not in manifest.declared_files
+
+    middleware = StageDisciplineMiddleware(
+        stage="test_generation",
+        node_id=node_id,
+        enforce_node_test_domain=True,
+        test_manifest_lock=manifest,
+        stage_write_set_lock=write_set,
+    )
+    allowed = middleware.wrap_tool_call(
+        _request("write_file", {"file_path": f"/workspace/{current}", "content": "test;\n"}),
+        _ok,
+    )
+    assert not isinstance(allowed, ToolMessage) or allowed.status != "error"
+    blocked = middleware.wrap_tool_call(
+        _request("write_file", {"file_path": f"/workspace/{outside}", "content": "test;\n"}),
+        _ok,
+    )
+    assert "was not declared for this stage" in _content(blocked)
+
+
 def test_strict_manifest_rejects_shared_and_sibling_paths() -> None:
     lock = TestManifestLock(node_id="REQ-1", enforce_node_namespace=True)
     tool = build_declare_test_manifest_tool(node_id="REQ-1", manifest_lock=lock)
