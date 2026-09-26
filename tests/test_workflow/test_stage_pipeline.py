@@ -26,6 +26,7 @@ from core.scheduling import (
     stage_write_sets_disjoint,
 )
 from core.workflow import ARCWorkflowManager
+from tests.helpers.jsonl import read_jsonl
 
 
 def _stage(
@@ -607,3 +608,135 @@ def test_stage_pipeline_is_the_default_and_falsy_value_opts_out(
     assert off._stage_pipeline is False
     assert off._stage_worktree_manager is None
     assert off.phase_runner.enforce_stage_domains is False
+
+
+def test_stage_pipeline_availability_probe_failure_is_actionable(
+    tmp_project_dir: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_project_dir),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+
+    def fail_probe() -> bool:
+        raise OSError("git executable unavailable")
+
+    assert manager._stage_worktree_manager is not None
+    monkeypatch.setattr(manager._stage_worktree_manager, "is_available", fail_probe)
+
+    result = asyncio.run(
+        manager.compile_requirement_tree(
+            {"id": "A", "name": "A", "description": "A", "children": []}
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["execution_mode"] == "serial stage pipeline unavailable (initialization failed)"
+    assert result["diagnostics"] == [
+        {
+            "code": "stage_pipeline_availability_probe_failed",
+            "message": (
+                "Stage pipeline was requested, but its stage-worktree availability probe "
+                "failed with OSError: git executable unavailable. Repair the Git/worktree "
+                "environment or set ARC_STAGE_PIPELINE=0 to explicitly use legacy execution."
+            ),
+        }
+    ]
+
+
+def test_start_compilation_records_stage_pipeline_probe_failure(
+    tmp_project_dir: Path, runtime, monkeypatch
+) -> None:
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_project_dir),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = runtime
+
+    async def load_tree() -> dict[str, Any]:
+        return {"id": "A", "name": "A", "description": "A", "children": []}
+
+    async def initialize() -> bool:
+        return True
+
+    manager.load_requirement_tree = load_tree
+    manager.initialize_project = initialize
+
+    def fail_probe() -> bool:
+        raise OSError("git executable unavailable")
+
+    assert manager._stage_worktree_manager is not None
+    monkeypatch.setattr(manager._stage_worktree_manager, "is_available", fail_probe)
+
+    result = asyncio.run(manager.start_compilation())
+    events = read_jsonl(Path(runtime.paths.runner_events_path))
+
+    assert result["ok"] is False
+    assert result["diagnostics"][0]["code"] == "stage_pipeline_availability_probe_failed"
+    assert any(
+        event.get("type") == "runner_state"
+        and event.get("state") == "failed"
+        and "Execution mode: serial stage pipeline unavailable (initialization failed)." in str(
+            event.get("message")
+        )
+        and "git executable unavailable" in str(event.get("message"))
+        for event in events
+    )
+
+
+def test_stage_pipeline_unavailable_workspace_is_visible_without_silent_fallback(
+    tmp_project_dir: Path, runtime, monkeypatch
+) -> None:
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "1")
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_project_dir),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = runtime
+
+    result = asyncio.run(
+        manager.compile_requirement_tree(
+            {"id": "A", "name": "A", "description": "A", "children": []}
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["execution_mode"] == (
+        "serial stage pipeline (legacy stage executor; stage worktrees unavailable)"
+    )
+    assert result["diagnostics"][0]["code"] == "stage_pipeline_worktrees_unavailable"
+    assert "ARC_STAGE_PIPELINE=0" in result["diagnostics"][0]["message"]
+    assert manager._stage_worktrees_enabled() is False
+
+
+def test_explicit_stage_pipeline_opt_out_skips_availability_probe(
+    tmp_project_dir: Path, runtime, monkeypatch
+) -> None:
+    monkeypatch.setenv("ARC_STAGE_PIPELINE", "0")
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_project_dir),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = runtime
+    manager._drain_runnable_tasks = lambda _queue: asyncio.sleep(0)
+    manager._reconcile_call_edges = lambda: asyncio.sleep(0)
+
+    result = asyncio.run(
+        manager.compile_requirement_tree(
+            {"id": "A", "name": "A", "description": "A", "children": []}
+        )
+    )
+
+    assert result["execution_mode"] == "legacy strict serial"
+    assert result["diagnostics"] == []
+    assert manager._stage_worktree_availability_checked is False

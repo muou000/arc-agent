@@ -214,10 +214,17 @@ def _stage_pipeline_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
-def _execution_mode_label(*, stage_pipeline: bool, parallel_mode: bool) -> str:
+def _execution_mode_label(
+    *,
+    stage_pipeline: bool,
+    parallel_mode: bool,
+    stage_worktrees_available: bool | None = None,
+) -> str:
     """Describe the independent scheduler switches for human logs."""
 
     if stage_pipeline and not parallel_mode:
+        if stage_worktrees_available is False:
+            return "serial stage pipeline (legacy stage executor; stage worktrees unavailable)"
         return "serial stage pipeline (stage worktrees + serial merge queue)"
     if stage_pipeline and parallel_mode:
         return "node-worktree parallel with stage gates (stage merge queue disabled)"
@@ -288,6 +295,12 @@ class _StageTaskWorkspace:
     phase_runner: WorkflowPhaseRunner
 
 
+class StagePipelineAvailabilityError(RuntimeError):
+    """The requested stage pipeline could not probe its Git worktree rail."""
+
+    category = "stage_pipeline_availability"
+
+
 class ARCWorkflowManager:
     """Manage the ARC requirement-tree compilation queue."""
 
@@ -318,6 +331,10 @@ class ARCWorkflowManager:
         # at manager construction makes one compile run internally consistent
         # if the host environment changes while a run is in flight.
         self._stage_pipeline = _stage_pipeline_enabled()
+        self._stage_worktrees_available: bool | None = None
+        self._stage_worktree_availability_checked = False
+        self._stage_pipeline_diagnostics: list[dict[str, str]] = []
+        self._stage_pipeline_availability_error: str | None = None
         # Captured once per process like ARC_NODE_WORKTREES: one CLI run, one
         # grouping; a mid-run flip would put queued tasks in two groups' files.
         self._affinity_depth = _affinity_depth()
@@ -503,7 +520,34 @@ class ARCWorkflowManager:
             if not init_ok:
                 await self._log("Compiler", "Project initialization failed.", "error")
                 return {"ok": False, "failed_nodes": []}
-            self.runtime.events.mark_run_started("ARC compilation run started.")
+            try:
+                self._ensure_stage_pipeline_availability()
+            except StagePipelineAvailabilityError as exc:
+                message = str(exc)
+                await self._log("Compiler", message, "error")
+                self.runtime.events.mark_run_failed(
+                    f"Execution mode: {self._execution_mode()}. {message}"
+                )
+                return self._build_initialization_failure_result()
+            mode = self._execution_mode()
+            diagnostics = self._execution_diagnostics()
+            start_message = f"ARC compilation run started. Execution mode: {mode}."
+            if diagnostics:
+                start_message += " Diagnostic: " + "; ".join(
+                    item["message"] for item in diagnostics
+                )
+            self.runtime.events.mark_run_started(start_message)
+
+        if resume_from_queue:
+            try:
+                self._ensure_stage_pipeline_availability()
+            except StagePipelineAvailabilityError as exc:
+                message = str(exc)
+                await self._log("Compiler", message, "error")
+                self.runtime.events.mark_run_failed(
+                    f"Execution mode: {self._execution_mode()}. {message}"
+                )
+                return self._build_initialization_failure_result()
 
         result = await self.compile_requirement_tree(
             requirement_tree,
@@ -522,7 +566,15 @@ class ARCWorkflowManager:
                 "warning",
             )
         else:
-            self.runtime.events.mark_run_failed("ARC compilation finished with failures.")
+            failure_message = "ARC compilation finished with failures."
+            diagnostics = result.get("diagnostics") or []
+            if diagnostics:
+                failure_message += " Diagnostic: " + "; ".join(
+                    str(item.get("message") or "")
+                    for item in diagnostics
+                    if isinstance(item, dict) and item.get("message")
+                )
+            self.runtime.events.mark_run_failed(failure_message)
             failed_nodes = result.get("failed_nodes", [])
             blocked_nodes = result.get("blocked_nodes", [])
             blocked_stages = result.get("blocked_stages", [])
@@ -565,6 +617,13 @@ class ARCWorkflowManager:
             await self._log("Compiler", f"Invalid requirement tree: {exc}", "error")
             return {"ok": False, "failed_nodes": []}
 
+        try:
+            self._ensure_stage_pipeline_availability()
+        except StagePipelineAvailabilityError as exc:
+            message = str(exc)
+            await self._log("Compiler", message, "error")
+            return self._build_initialization_failure_result()
+
         self.runtime.traceability.store_requirement_tree(requirement_tree)
         retry_requested = retry_failed or bool(retry_node_ids)
         try:
@@ -591,12 +650,12 @@ class ARCWorkflowManager:
                 ),
                 "error",
             )
-            return self._build_compile_result(queue_state)
+            return self._build_execution_result(queue_state)
         had_provider_outage = outage_is_open(queue_state)
         if resume_from_queue:
             if not await self._resume_provider_outage(queue_state):
                 self._save_processing_queue(queue_state)
-                return self._build_compile_result(queue_state)
+                return self._build_execution_result(queue_state)
             if not had_provider_outage:
                 # An earlier run may have observed an outage without reaching
                 # its threshold before the drain ran out of independent work.
@@ -669,8 +728,10 @@ class ARCWorkflowManager:
         )
         await self._log(
             "Compiler",
-            f"Execution mode: {_execution_mode_label(stage_pipeline=self._stage_pipeline, parallel_mode=self._parallel_mode)}.",
+            f"Execution mode: {self._execution_mode()}.",
         )
+        for diagnostic in self._execution_diagnostics():
+            await self._log("Compiler", diagnostic["message"], "warning")
 
         if self._stage_pipeline:
             await self._prepare_visual_ready_tasks(requirement_tree, queue_state)
@@ -715,7 +776,7 @@ class ARCWorkflowManager:
 
         await self._reconcile_call_edges()
 
-        return self._build_compile_result(queue_state)
+        return self._build_execution_result(queue_state)
 
     async def _precompute_visual_references(self, requirement_tree: dict[str, Any]) -> None:
         """Analyze all reference images concurrently before the queue drains.
@@ -1452,16 +1513,91 @@ class ARCWorkflowManager:
                 f"Removed {len(removed)} reusable worktree(s) after the drain.",
             )
 
+    def _ensure_stage_pipeline_availability(self) -> None:
+        """Probe the requested stage worktree rail exactly once per run.
+
+        A non-Git workspace is retained as a direct-test compatibility seam,
+        but its actual fallback is recorded. A probe exception is different:
+        it indicates broken runtime infrastructure and must not turn into a
+        silent legacy execution.
+        """
+
+        if not self._stage_pipeline or self._parallel_mode:
+            return
+        if self._stage_worktree_availability_checked:
+            if self._stage_pipeline_availability_error:
+                raise StagePipelineAvailabilityError(self._stage_pipeline_availability_error)
+            return
+
+        self._stage_worktree_availability_checked = True
+        manager = self._stage_worktree_manager
+        if manager is None:
+            available = False
+        else:
+            try:
+                available = bool(manager.is_available())
+            except Exception as exc:  # noqa: BLE001 - convert infra errors to a run diagnostic
+                message = (
+                    "Stage pipeline was requested, but its stage-worktree availability probe "
+                    f"failed with {type(exc).__name__}: {exc}. Repair the Git/worktree "
+                    "environment or set ARC_STAGE_PIPELINE=0 to explicitly use legacy execution."
+                )
+                self._stage_worktrees_available = False
+                self._stage_pipeline_availability_error = message
+                self._stage_pipeline_diagnostics = [
+                    {
+                        "code": "stage_pipeline_availability_probe_failed",
+                        "message": message,
+                    }
+                ]
+                raise StagePipelineAvailabilityError(message) from exc
+
+        self._stage_worktrees_available = available
+        if not available:
+            message = (
+                "Stage pipeline was requested, but stage worktrees are unavailable in this "
+                "workspace. Initialize a Git checkout with worktree support, or set "
+                "ARC_STAGE_PIPELINE=0 to explicitly use legacy execution."
+            )
+            self._stage_pipeline_diagnostics = [
+                {
+                    "code": "stage_pipeline_worktrees_unavailable",
+                    "message": message,
+                }
+            ]
+            # A clean `False` probe is an expected compatibility condition for
+            # direct/faux workspaces. It is surfaced in the selected mode and
+            # diagnostics, but it is not the runtime exception covered above.
+
+    def _execution_mode(self) -> str:
+        if self._stage_pipeline_availability_error and self._stage_pipeline and not self._parallel_mode:
+            return "serial stage pipeline unavailable (initialization failed)"
+        return _execution_mode_label(
+            stage_pipeline=self._stage_pipeline,
+            parallel_mode=self._parallel_mode,
+            stage_worktrees_available=self._stage_worktrees_available,
+        )
+
+    def _execution_diagnostics(self) -> list[dict[str, str]]:
+        return [dict(item) for item in self._stage_pipeline_diagnostics]
+
+    def _build_initialization_failure_result(self) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "FAIL",
+            "run_status": "FAILED",
+            "failed_nodes": [],
+            "execution_mode": self._execution_mode(),
+            "diagnostics": self._execution_diagnostics(),
+        }
+
     def _stage_worktrees_enabled(self) -> bool:
         """Whether this run can use the stage-specific Git merge rail."""
 
-        manager = self._stage_worktree_manager
-        if self._parallel_mode or manager is None:
+        if self._parallel_mode:
             return False
-        try:
-            return manager.is_available()
-        except Exception:  # noqa: BLE001 - a legacy/faux workspace falls back safely
-            return False
+        self._ensure_stage_pipeline_availability()
+        return self._stage_worktrees_available is True
 
     def _max_stage_concurrent_tasks(self, queue_state: dict[str, Any]) -> int:
         """Resolve stage worktree capacity independently of node worktrees."""
@@ -3508,6 +3644,12 @@ class ARCWorkflowManager:
             "invalid_state_entries": invalid_state_entries,
             "provider_outage": dict(provider_outage) if isinstance(provider_outage, dict) else None,
         }
+
+    def _build_execution_result(self, queue_state: dict[str, Any]) -> dict[str, Any]:
+        result = self._build_compile_result(queue_state)
+        result["execution_mode"] = self._execution_mode()
+        result["diagnostics"] = self._execution_diagnostics()
+        return result
 
     async def _reconcile_call_edges(self) -> None:
         """Compile-wrap-up dangling-reference reconciliation (issue #238).
