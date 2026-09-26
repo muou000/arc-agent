@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 @dataclass
@@ -349,12 +349,17 @@ def _extract_status_codes_from_value(value: Any, *, key_hint: str = "") -> list[
     return _extract_status_codes_from_text(value)
 
 
-def _read_workspace_text(workspace_root: str | Path, raw_path: str) -> str:
-    root = Path(workspace_root).expanduser().resolve()
+def _workspace_relative_path(raw_path: str) -> str:
     relative = str(raw_path or "").strip().replace("\\", "/")
     if relative.startswith("/workspace/"):
         relative = relative[len("/workspace/") :]
-    candidate = (root / relative.lstrip("/")).resolve()
+    return relative.lstrip("/")
+
+
+def _read_workspace_text(workspace_root: str | Path, raw_path: str) -> str:
+    root = Path(workspace_root).expanduser().resolve()
+    relative = _workspace_relative_path(raw_path)
+    candidate = (root / relative).resolve()
     try:
         candidate.relative_to(root)
     except ValueError:
@@ -502,6 +507,23 @@ def _leading_comment_block(content: str, position: int) -> str:
     return "".join(lines[index:])
 
 
+def _route_declaration_keys(content: str) -> set[tuple[str, str]]:
+    """Return method/path pairs for executable route declarations."""
+
+    routes: set[tuple[str, str]] = set()
+    for match in _ROUTE_DECLARATION_RE.finditer(content):
+        line = content[content.rfind("\n", 0, match.start()) + 1 : match.start()].strip()
+        if line.startswith(("//", "/*", "*")):
+            continue
+        routes.add(
+            (
+                match.group("method").upper(),
+                _normalize_api_path(match.group("path")),
+            )
+        )
+    return routes
+
+
 def _extract_route_records(workspace_root: str | Path, interface: dict[str, Any]) -> list[dict[str, Any]]:
     file_path = str(interface.get("file_path") or "").strip()
     content = _read_workspace_text(workspace_root, file_path)
@@ -610,8 +632,16 @@ def find_unregistered_api_routes(
     workspace_root: str | Path,
     materialized_paths: list[str],
     interfaces: list[dict[str, Any]],
+    *,
+    baseline_contents: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
-    """Find materialized API routes lacking a method/path contract card."""
+    """Find newly materialized API routes lacking a method/path contract card.
+
+    ``materialized_paths`` includes edits to shared template surfaces. The
+    optional baseline snapshot lets callers exclude route declarations that
+    already existed before this DESIGN pass, while keeping new declarations
+    on the same shared file fail-closed.
+    """
 
     contracts = [
         route
@@ -620,17 +650,23 @@ def find_unregistered_api_routes(
         for route in _extract_interface_route_paths(interface)
         if route["method"]
     ]
+    baselines = baseline_contents or {}
     missing: list[dict[str, str]] = []
     for file_path in dict.fromkeys(materialized_paths):
         content = _read_workspace_text(workspace_root, file_path)
         if not content:
             continue
+        baseline_routes = _route_declaration_keys(
+            baselines.get(_workspace_relative_path(file_path), "")
+        )
         for match in _ROUTE_DECLARATION_RE.finditer(content):
             line = content[content.rfind("\n", 0, match.start()) + 1:match.start()].strip()
             if line.startswith(("//", "/*", "*")):
                 continue
             method = match.group("method").upper()
             relative_path = _normalize_api_path(match.group("path"))
+            if (method, relative_path) in baseline_routes:
+                continue
             # A router-relative '/' cannot identify its mount without the
             # app's wiring; a specific path or a route-table comment can.
             declared = [

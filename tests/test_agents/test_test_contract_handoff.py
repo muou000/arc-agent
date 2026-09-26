@@ -15,6 +15,7 @@ the node session plus the pipeline output.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -437,6 +438,70 @@ def test_import_route_requires_api_card_before_test_generation_and_reaches_tdd_a
     assert asyncio.run(runner.run_test_generation_stage(node_id, {})) is True
     assert sessions.load_node_session(node_id)["interface_design_diagnostics"] == []
     assert runner.app_handler.calls == [("E2E", [E2E_TEST_FILE])]
+
+
+def test_design_route_gate_ignores_template_health_from_git_baseline(
+    tmp_project_dir: Path, arc_runtime
+) -> None:
+    node_id = "REQ-HOOK-STATUS"
+    arc_runtime.traceability.store_requirement_tree(
+        {"id": node_id, "name": "List workbooks", "description": "List workbooks."}
+    )
+
+    app_path = tmp_project_dir / "backend/src/app.js"
+    app_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline = (
+        "const app = express();\n"
+        "app.get('/api/health', (req, res) => {\n"
+        "  res.json({ code: 200, message: 'Backend Ready' });\n"
+        "});\n"
+    )
+    app_path.write_text(baseline, encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=tmp_project_dir, check=True, capture_output=True)
+    subprocess.run(["git", "add", "backend/src/app.js"], cwd=tmp_project_dir, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "template baseline",
+        ],
+        cwd=tmp_project_dir,
+        check=True,
+        capture_output=True,
+    )
+    app_path.write_text(
+        baseline
+        + "app.get('/api/workbooks', (req, res) => {\n"
+        + "  res.json({ workbooks: [] });\n"
+        + "});\n",
+        encoding="utf-8",
+    )
+
+    runner, logs = _make_status_runner(tmp_project_dir, 200)
+    runner.interface_designer.payload = {
+        "summary": "List workbooks API.",
+        "interfaces": [
+            {
+                "interface_id": "IF-WORKBOOKS",
+                "type": "API",
+                "name": "workbooks-route",
+                "responsibility": "Lists workbooks.",
+                "specification": "GET /api/workbooks -> 200 { workbooks }.",
+                "file_path": "backend/src/app.js",
+                "first_line": "app.get('/api/workbooks'",
+            }
+        ],
+        "files_written": ["backend/src/app.js"],
+        "materialized_paths": ["/workspace/backend/src/app.js"],
+    }
+
+    assert asyncio.run(runner.run_interface_design_stage(node_id, {})) is True
+    assert not any("GET /api/health" in message for _, message, _, _ in logs)
 
 
 def test_dependency_status_check_resolves_named_foreign_api_card(tmp_project_dir: Path, arc_runtime) -> None:

@@ -314,6 +314,29 @@ def _tdd_retry_fresh_thread_attempt(node_session: dict[str, Any]) -> int:
         return 0
 
 
+def _read_git_head_contents(workspace_path: str, paths: list[str]) -> dict[str, str]:
+    """Read the stage worktree baseline for the supplied workspace paths."""
+
+    baseline: dict[str, str] = {}
+    for raw_path in paths:
+        relative = normalize_workspace_relative_path(raw_path, workspace_path)
+        if not relative:
+            continue
+        try:
+            result = subprocess.run(
+                ["git", "show", f"HEAD:{relative}"],
+                cwd=workspace_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return {}
+        if result.returncode == 0:
+            baseline[relative] = result.stdout
+    return baseline
+
+
 class WorkflowPhaseRunner:
     """Run ARC DESIGN and IMPLEMENT phases using the agent adapters."""
 
@@ -595,10 +618,12 @@ class WorkflowPhaseRunner:
                 continue
             if isinstance(content, dict):
                 known_interfaces.append({**content, "type": stored.get("type")})
+        materialized_route_paths = list(interface_result.get("materialized_paths") or files_written)
         missing_routes = find_unregistered_api_routes(
             self.workspace_path,
-            list(interface_result.get("materialized_paths") or files_written),
+            materialized_route_paths,
             known_interfaces,
+            baseline_contents=_read_git_head_contents(self.workspace_path, materialized_route_paths),
         )
         if missing_routes:
             diagnostics = [

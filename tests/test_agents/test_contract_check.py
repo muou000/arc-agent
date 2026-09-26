@@ -21,6 +21,7 @@ from agents.tools.test_contract_check import (
     collect_manifest_hooks,
     extract_http_status_assertions,
     extract_test_hooks,
+    find_unregistered_api_routes,
     format_test_contract_context,
     validate_http_status_contracts,
 )
@@ -1532,3 +1533,68 @@ def test_import_route_comment_supplies_only_its_own_declared_statuses(tmp_projec
     assert len(diagnostics) == 1
     assert diagnostics[0]["code"] == "status_code_conflict"
     assert diagnostics[0]["contract_status_codes"] == [201, 400]
+
+
+def test_find_unregistered_api_routes_ignores_unchanged_baseline_routes(
+    tmp_project_dir: Path,
+) -> None:
+    app_path = tmp_project_dir / "backend/src/app.js"
+    app_path.parent.mkdir(parents=True)
+    baseline = (
+        "app.get('/api/health', (req, res) => {\n"
+        "  res.json({ code: 200, message: 'Backend Ready' });\n"
+        "});\n"
+    )
+    app_path.write_text(
+        baseline
+        + "app.get('/api/workbooks', (req, res) => {\n"
+        + "  res.json({ workbooks: [] });\n"
+        + "});\n",
+        encoding="utf-8",
+    )
+
+    missing = find_unregistered_api_routes(
+        tmp_project_dir,
+        ["backend/src/app.js"],
+        [
+            {
+                "interface_id": "IF-WORKBOOKS",
+                "type": "API",
+                "specification": "GET /api/workbooks -> 200 { workbooks }.",
+                "file_path": "backend/src/app.js",
+            }
+        ],
+        baseline_contents={"backend/src/app.js": baseline},
+    )
+
+    assert missing == []
+
+
+def test_find_unregistered_api_routes_still_rejects_new_unregistered_routes(
+    tmp_project_dir: Path,
+) -> None:
+    app_path = tmp_project_dir / "backend/src/app.js"
+    app_path.parent.mkdir(parents=True)
+    baseline = (
+        "app.get('/api/health', (req, res) => {\n"
+        "  res.json({ code: 200, message: 'Backend Ready' });\n"
+        "});\n"
+    )
+    app_path.write_text(
+        baseline
+        + "app.get('/api/workbooks', (req, res) => {\n"
+        + "  res.json({ workbooks: [] });\n"
+        + "});\n",
+        encoding="utf-8",
+    )
+
+    missing = find_unregistered_api_routes(
+        tmp_project_dir,
+        ["backend/src/app.js"],
+        [],
+        baseline_contents={"backend/src/app.js": baseline},
+    )
+
+    assert missing == [
+        {"file_path": "backend/src/app.js", "method": "GET", "path": "/api/workbooks"}
+    ]
