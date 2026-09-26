@@ -143,12 +143,21 @@ class StageWorktreeManager(NodeWorktreeManager):
     def __init__(self, workspace_path: str) -> None:
         super().__init__(workspace_path)
         self.worktrees_root = Path(self.main_workspace) / ".arc" / "stage-worktrees"
+        # Probed on every stage scheduling decision; the workspace's
+        # git-ness cannot flip during a run, so memoize the spawn.
+        self._available: bool | None = None
 
     def is_available(self) -> bool:
         """Whether the workspace is a Git checkout ready for stage worktrees."""
 
-        result = self._git(["rev-parse", "--is-inside-work-tree"], cwd=self.main_workspace, check=False)
-        return result.returncode == 0 and result.stdout.strip().lower() == "true"
+        if self._available is None:
+            result = self._git(
+                ["rev-parse", "--is-inside-work-tree"], cwd=self.main_workspace, check=False
+            )
+            self._available = (
+                result.returncode == 0 and result.stdout.strip().lower() == "true"
+            )
+        return self._available
 
     def prepare_stage(
         self,
@@ -179,6 +188,14 @@ class StageWorktreeManager(NodeWorktreeManager):
         with self.integration_gate.reader():
             if worktree_path.exists() and not self._is_registered(worktree_path):
                 _remove_unregistered_stage_path(worktree_path, self.worktrees_root)
+            registered = self._is_registered(worktree_path)
+            if registered and not worktree_path.exists():
+                # Stale registration: the directory is already gone, and a
+                # plain ``worktree add`` refuses "missing but already
+                # registered" paths. Prune clears the residue (same
+                # self-heal as ``NodeWorktreeManager.prepare``).
+                self._git(["worktree", "prune"], cwd=self.main_workspace, check=False)
+                registered = False
 
             integration_branch = self._integration_branch()
             integration_head = _git_text(
@@ -186,7 +203,7 @@ class StageWorktreeManager(NodeWorktreeManager):
                 f"rev-parse {integration_branch}",
             )
             if restart_failed_attempt:
-                if self._is_registered(worktree_path):
+                if registered:
                     # The existing removal helper unlinks shared node_modules
                     # before Git recurses through the worktree on Windows.
                     handle = StageWorktreeHandle(
@@ -202,7 +219,7 @@ class StageWorktreeManager(NodeWorktreeManager):
                     cwd=self.main_workspace,
                 )
                 base_commit = integration_head
-            elif self._is_registered(worktree_path):
+            elif registered:
                 if self._branch_exists(branch):
                     self._git(["checkout", branch], cwd=str(worktree_path))
                 else:

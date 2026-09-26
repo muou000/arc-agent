@@ -356,6 +356,44 @@ def test_prune_clears_stale_registrations(tmp_path: Path) -> None:
     assert not manager._is_registered(Path(handle.path))
 
 
+def test_prepare_self_heals_when_a_registered_directory_vanished(tmp_path: Path) -> None:
+    """A registration whose directory is already gone (crash between the
+    directory deletion and ``worktree prune``) must not wedge the next
+    prepare: a missing directory reads as unregistered, so prepare falls
+    through to a fresh add from the surviving branch instead of failing a
+    checkout inside a directory that no longer exists."""
+
+    repo, manager = _init_repo(tmp_path)
+    handle = manager.prepare("REQ-1.1")
+    shutil.rmtree(handle.path)
+
+    recovered = manager.prepare("REQ-1.1")
+
+    assert Path(recovered.path) == Path(handle.path)
+    assert manager._is_registered(Path(recovered.path))
+    assert (Path(recovered.path) / "backend" / "src.js").exists()
+
+
+def test_registered_path_cache_follows_prepare_and_settle(tmp_path: Path) -> None:
+    """The manager's registered-worktree cache must stay coherent across
+    mutations: a later prepare sees earlier registrations, and a settle that
+    removes a worktree clears it (the cache is only an optimization; the
+    observable contract is the registration state)."""
+
+    repo, manager = _init_repo(tmp_path)
+    first = manager.prepare("REQ-1.1")
+    second = manager.prepare("REQ-1.2")
+
+    assert manager._is_registered(Path(first.path))
+    assert manager._is_registered(Path(second.path))
+
+    manager.settle(second, result=WorktreeTaskResult.MERGED)
+
+    assert manager._is_registered(Path(first.path))
+    assert not manager._is_registered(Path(second.path))
+    assert manager._branch_exists(second.branch), "branch kept for audit"
+
+
 def test_git_failure_raises_worktree_error(tmp_path: Path) -> None:
     # A directory that is not a git repository: worktree registration fails.
     plain = tmp_path / "plain"

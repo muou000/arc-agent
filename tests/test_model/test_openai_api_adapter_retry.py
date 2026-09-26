@@ -1023,9 +1023,15 @@ def test_endpoint_key_normalizes_explicit_and_env_credentials(
 # ---------------------------------------------------------------------------
 
 
-def test_arc_chat_openai_agenerate_retries_transient_failures() -> None:
+def test_arc_chat_openai_agenerate_retries_transient_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from langchain_core.outputs import ChatResult
 
+    # The model class wires the real sleeper; without the env override this
+    # test pays two 5s retry delays on the wall clock (delay semantics are
+    # covered by the engine tests that capture the injected sleeper).
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "0")
     errors = [_status_error(429), _status_error(503)]
     calls = {"count": 0}
 
@@ -1047,9 +1053,14 @@ def test_arc_chat_openai_agenerate_retries_transient_failures() -> None:
     assert isinstance(result, ChatResult)
 
 
-def test_arc_compatible_chat_openai_agenerate_retries_transient_failures() -> None:
+def test_arc_compatible_chat_openai_agenerate_retries_transient_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from langchain_core.outputs import ChatResult
 
+    # Same as the ARCChatOpenAI variant: the model class sleeps for real
+    # unless the delay env is zeroed here.
+    monkeypatch.setenv("ARC_MODEL_RETRY_DELAY", "0")
     errors = [_status_error(503), _status_error(503)]
     calls = {"count": 0}
 
