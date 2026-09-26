@@ -137,3 +137,32 @@ def test_patched_gitignore_excludes_playwright_artifacts(
     lines = (workspace / "backend" / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "test-results" in lines
     assert "playwright-report" in lines
+
+
+def test_patched_spa_fallback_opts_into_dotfile_serving(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The workspace's SPA fallback serves the shell from a dot-directory path.
+
+    send (express 5's file server) applies its dotfile policy to the absolute
+    target path of a root-less ``res.sendFile`` and its default policy 404s any
+    target crossing a dot-directory before touching the filesystem. Per-stage
+    worktrees always live under ``.arc/stage-worktrees/...``, so the unpatched
+    fallback 404s every SPA page navigation there (seen 2026-09-26: five
+    120s Playwright batches killed with zero output in the easy-ticketbooking
+    run). The patch pins the fixed target to ``dotfiles: 'allow'``; the request
+    path never reaches sendFile, so the traversal concern does not apply."""
+
+    workspace = tmp_path_factory.mktemp("patched-spa-fallback-") / "workspace"
+    shutil.copytree(TEMPLATE_ROOT, workspace)
+    outcomes = apply_template_patches(str(workspace), "web-react-express")
+    assert all(outcome.status in {APPLIED, ALREADY_APPLIED} for outcome in outcomes), outcomes
+    app_module = (workspace / "backend" / "src" / "app.js").read_text(encoding="utf-8")
+
+    assert (
+        "res.sendFile(path.join(frontendDistPath, 'index.html'), { dotfiles: 'allow' });"
+        in app_module
+    )
+    # The bare pre-fix shape must be gone, so a re-run classifies as already
+    # applied instead of re-patching.
+    assert "res.sendFile(path.join(frontendDistPath, 'index.html'));\n" not in app_module

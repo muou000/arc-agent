@@ -80,6 +80,7 @@ _INIT_DB_PATH = "backend/src/database/init_db.js"
 _TEST_HARNESS_PATH = "backend/src/database/test_harness.js"
 _README_PATH = "README.md"
 _BACKEND_GITIGNORE_PATH = "backend/.gitignore"
+_BACKEND_APP_PATH = "backend/src/app.js"
 
 # PR #28 fixed two defects in the template's database bootstrap, and this
 # chain also carries the earlier handle-return fix (a15ad24) the provisioned
@@ -463,6 +464,47 @@ TEMPLATE_PATCHES: tuple[TemplatePatch, ...] = (
                     "playwright-report\n"
                 ),
                 applied_marker="playwright-report",
+            ),
+        ),
+    ),
+    # The Web SPA fallback serves the built shell with
+    # `res.sendFile(<absolute dist path>/index.html)`. send (express's file
+    # server) applies its dotfile policy to the *absolute* target path of a
+    # root-less sendFile, and its default policy (`dotfiles: 'ignore'`)
+    # rejects any target crossing a dot-directory with a synchronous 404 -
+    # before the filesystem is ever consulted. Per-stage worktrees always
+    # live under `.arc/stage-worktrees/...`, so every SPA page navigation in
+    # such a workspace 404s: each E2E test burns its full timeout waiting for
+    # a UI that never mounts and the batch dies at the runner cap with its
+    # output discarded (the 2026-09-26 easy-ticketbooking run paid five
+    # 120s Playwright batches this way). `express.static` is unaffected -
+    # its root-based path only checks the request-path segments - so the
+    # defect is invisible until an agent-driven page navigation hits the
+    # fallback. `dotfiles: 'allow'` re-enables exactly this fixed target;
+    # the request path never reaches sendFile, so the traversal concern the
+    # policy guards against does not apply.
+    TemplatePatch(
+        name="spa-fallback-dotfile-policy",
+        template_id="web-react-express",
+        summary=(
+            "SPA fallback sendFile opts into send's dotfiles:'allow' so the "
+            "fixed index.html target still serves when the workspace path "
+            "crosses a dot-directory (.arc/stage-worktrees/...)"
+        ),
+        edits=(
+            TemplateEdit(
+                relative_path=_BACKEND_APP_PATH,
+                search=(
+                    "    res.sendFile(path.join(frontendDistPath, 'index.html'));\n"
+                ),
+                replace=(
+                    "    // `dotfiles: 'allow'` is load-bearing: send applies its dotfile policy\n"
+                    "    // to the absolute target path of a root-less sendFile, and its default\n"
+                    "    // policy 404s any target crossing a dot-directory - the workspace lives\n"
+                    "    // under `.arc/stage-worktrees/...` in per-stage worktree runs.\n"
+                    "    res.sendFile(path.join(frontendDistPath, 'index.html'), { dotfiles: 'allow' });\n"
+                ),
+                applied_marker="{ dotfiles: 'allow' }",
             ),
         ),
     ),

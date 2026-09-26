@@ -94,9 +94,17 @@ def installed_backend(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     ``app_type_handler/template_patches``, so a scratch copy without the
     patches would test a bootstrap no generated workspace ever sees. The whole
     template root is copied, exactly like ``copy_template`` does.
+
+    The workspace lives under a dot-directory on purpose: per-stage worktrees
+    sit under ``.arc/stage-worktrees/...``, and send (express's file server)
+    applies its dotfile policy to the absolute target of a root-less
+    ``res.sendFile`` - so only a dot-directory workspace exercises the SPA
+    fallback contract the ``spa-fallback-dotfile-policy`` patch repairs.
     """
 
-    workspace = tmp_path_factory.mktemp("template-backend-") / "workspace"
+    workspace = (
+        tmp_path_factory.mktemp("template-backend-") / ".arc-spa-check" / "workspace"
+    )
     shutil.copytree(TEMPLATE_ROOT, workspace)
     outcomes = apply_template_patches(str(workspace), "web-react-express")
     assert all(outcome.status in {APPLIED, ALREADY_APPLIED} for outcome in outcomes), outcomes
@@ -215,6 +223,56 @@ class TestBackendContract:
             ) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             assert payload == {"code": 200, "message": "Backend Ready"}
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def test_spa_fallback_serves_the_shell_from_a_dot_directory_workspace(
+        self, installed_backend: Path
+    ) -> None:
+        """A page navigation must reach the SPA shell, not send's dotfile 404.
+
+        The fixture workspace sits under a dot-directory (like the per-stage
+        worktrees under ``.arc/stage-worktrees/...``). send applies its dotfile
+        policy to the absolute target of the fallback's root-less
+        ``res.sendFile``, so without the ``spa-fallback-dotfile-policy`` patch
+        every non-root page navigation 404s here before the filesystem is
+        consulted - the 2026-09-26 failure shape that burned five 120s
+        Playwright batches.
+        """
+
+        dist = installed_backend.parent / "frontend" / "dist"
+        (dist / "assets").mkdir(parents=True, exist_ok=True)
+        (dist / "index.html").write_text(
+            "<!doctype html><title>spa-shell-check</title>", encoding="utf-8"
+        )
+        (dist / "assets" / "app-check.js").write_text("console.log('ok');\n", encoding="utf-8")
+
+        port = _free_port()
+        proc = subprocess.Popen(
+            [_NODE_BIN, "src/index.js"],
+            cwd=str(installed_backend),
+            env={**os.environ, "PORT": str(port)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert _wait_for_health(port), "backend never responded to /api/health"
+            import urllib.request
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/register", timeout=2
+            ) as resp:
+                assert resp.status == 200
+                assert "spa-shell-check" in resp.read().decode("utf-8")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/assets/app-check.js", timeout=2
+            ) as resp:
+                assert resp.status == 200
         finally:
             proc.terminate()
             try:
