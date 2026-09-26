@@ -45,7 +45,11 @@ from core.test_types import canonical_test_type  # noqa: F401
 from core.visual_analysis import analyze_and_attach_visual_references
 from app_type_handler.test_results import TestRunResult
 from agents.runtime.capabilities import is_test_file_path
-from agents.runtime.test_contract_preflight import run_test_contract_preflight
+from agents.runtime.test_contract_preflight import (
+    PreflightIssue,
+    TestContractPreflightReport,
+    run_test_contract_preflight,
+)
 from agents.tools.test_manifest import normalize_coverage_scope
 
 
@@ -1844,16 +1848,23 @@ class WorkflowPhaseRunner:
                 app_type=self.app_type,
                 tests=tests,
             )
-        except Exception as exc:  # pragma: no cover - defensive fail-open boundary
-            await self._log(
-                "TestDrivenDeveloper",
-                f"Test contract preflight was unavailable; continuing to the normal TDD runner: {exc}",
-                status="warning",
-                node_id=node_id,
+        except Exception as exc:  # pragma: no cover - exercised through the public gate test
+            preflight = TestContractPreflightReport(
+                applicable=True,
+                issues=[
+                    PreflightIssue(
+                        "internal",
+                        "internal_error",
+                        (
+                            "The deterministic test-contract preflight could not complete "
+                            f"before TDD started: {type(exc).__name__}: {exc}."
+                        ),
+                        suggestion="Repair the preflight failure and rerun the implementation stage.",
+                    )
+                ],
             )
-            preflight = None
 
-        if preflight is not None and preflight.applicable:
+        if preflight.applicable:
             diagnostic = preflight.to_dict()
             self._update_node_session(node_id, {"test_contract_preflight": diagnostic})
             try:
