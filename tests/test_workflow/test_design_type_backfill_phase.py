@@ -260,10 +260,12 @@ def test_design_phase_recovery_channel_rows_still_reach_the_repair_ask_and_judgm
 
     assert ok is False
     # main(1) + the repair ask's stream attempt: tool call(2), decode-retry(3)
-    # exhausting the queue, then the stream wrapper's ainvoke fallback(4).
-    assert model.call_count == 4
+    # exhausting the queue. A stream-side failure after that work is terminal;
+    # the wrapper must not replay the full agent session.
+    assert model.call_count == 3
     errors = [entry[1] for entry in logs if entry[2] == "error"]
     assert any("invalid `type`" in message and orphan_id in message for message in errors)
+    assert any("agent stream failed" in message for message in errors)
 
 
 def test_design_phase_still_fails_when_no_backfill_source(tmp_project_dir, arc_runtime) -> None:
