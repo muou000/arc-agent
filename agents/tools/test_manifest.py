@@ -160,6 +160,14 @@ class TestManifestLock:
     declared_files: dict[str, DeclaredTestFile] = field(default_factory=dict)
     node_id: str = ""
     enforce_node_namespace: bool = False
+    _successful_declaration: bool = field(init=False, default=False, repr=False)
+    _retryable_paths: set[str] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # A lock seeded from a previously published manifest is already in the
+        # successful state. The staged repair pass may re-declare those rows,
+        # but must not use the seed as permission to invent another path.
+        self._successful_declaration = bool(self.declared_files)
 
     @property
     def locked(self) -> bool:
@@ -168,6 +176,21 @@ class TestManifestLock:
     def declare(self, declared_files: list[DeclaredTestFile]) -> None:
         for item in declared_files:
             self.declared_files.setdefault(item.file_path, item)
+            self._retryable_paths.discard(item.file_path)
+        if declared_files:
+            self._successful_declaration = True
+
+    @property
+    def has_successful_declaration(self) -> bool:
+        return self._successful_declaration
+
+    def remember_rejected_paths(self, paths: set[str]) -> None:
+        self._retryable_paths.update(
+            normalize_manifest_path(path) for path in paths if normalize_manifest_path(path)
+        )
+
+    def was_rejected(self, file_path: str) -> bool:
+        return normalize_manifest_path(file_path) in self._retryable_paths
 
     def contains(self, file_path: str) -> bool:
         return normalize_manifest_path(file_path) in self.declared_files
@@ -202,6 +225,7 @@ def build_declare_test_manifest_tool(
     require_interface_coverage: bool = False,
     ownership_registry: TestManifestOwnershipRegistry | None = None,
     existing_owner_for_path: Callable[[str], str | None] | None = None,
+    stage_write_set_lock: Any | None = None,
 ):
     """Build the ``declare_test_manifest`` tool for the current stage run.
 
@@ -223,6 +247,12 @@ def build_declare_test_manifest_tool(
     file. ``existing_owner_for_path`` checks already-published traceability
     rows, which keeps the in-memory claim registry from being the only source
     of ownership after a stage has published.
+
+    ``stage_write_set_lock`` is supplied only by the stage-pipeline path. When
+    present, the write set is authoritative for manifest paths: it must already
+    be locked, every manifest path must be in it, and a successful declaration
+    cannot be extended with a fresh path. Calls without this lock retain the
+    legacy additive declaration behavior.
     """
 
     staged_interface_ids = {
@@ -253,12 +283,16 @@ def build_declare_test_manifest_tool(
         Python `test_*.py`/`*_test.py` name, or any source file under a
         `test-e2e` directory. Include every planned test file in the first
         call; if the declaration is rejected, fix the reported issues and
-        re-declare — the lock merges, adding only paths whose earlier
-        declaration failed. Node-local helpers and fixtures do not belong in
-        the manifest. When the stage pipeline is active, they must be in the
-        current node's test namespace and declared with
-        ``declare_stage_write_set`` before writing; shared runner configuration
-        and fixtures are read-only in that mode.
+        re-declare — the lock merges, adding only paths from the rejected
+        attempt. In staged execution, call `declare_stage_write_set` first:
+        after a successful manifest declaration, only exact re-declarations of
+        existing rows are accepted; a fresh path is rejected even when it was
+        omitted from the manifest by mistake. Calls without a stage write-set
+        lock retain the legacy additive behavior. Node-local helpers and
+        fixtures do not belong in the manifest. When the stage pipeline is
+        active, they must be in the current node's test namespace and declared
+        with ``declare_stage_write_set`` before writing; shared runner
+        configuration and fixtures are read-only in that mode.
         """
 
         if not isinstance(files, list) or not files:
@@ -276,6 +310,12 @@ def build_declare_test_manifest_tool(
         rows: list[DeclaredTestFile] = []
         errors: list[str] = []
         known_paths: set[str] = set()
+        candidate_paths: set[str] = set()
+        stage_write_set_outside_paths: set[str] = set()
+        sealed_new_paths: set[str] = set()
+        stage_write_set_is_locked = bool(
+            stage_write_set_lock is not None and stage_write_set_lock.locked
+        )
         for index, item in enumerate(files, start=1):
             if not isinstance(item, dict):
                 errors.append(f"Entry {index} is not an object.")
@@ -293,6 +333,8 @@ def build_declare_test_manifest_tool(
             if not file_path:
                 errors.append(f"Entry {index} is missing `file_path`.")
                 continue
+            if is_test_file_path(file_path):
+                candidate_paths.add(file_path)
             if file_path in known_paths:
                 errors.append(f"Entry {index} duplicates the path `{file_path}`.")
                 continue
@@ -319,6 +361,21 @@ def build_declare_test_manifest_tool(
                     "configuration is read-only in that mode."
                 )
                 continue
+            if stage_write_set_lock is not None:
+                if not stage_write_set_is_locked:
+                    errors.append(
+                        "The manifest declaration is blocked until the complete stage write set is "
+                        "locked; call `declare_stage_write_set` before declaring test files."
+                    )
+                    continue
+                if not bool(stage_write_set_lock.contains(file_path)):
+                    errors.append(
+                        f"`{file_path}` is not in the locked stage write set; it cannot be added "
+                        "after the stage write set was locked. Declare only test files in the "
+                        "locked write set."
+                    )
+                    stage_write_set_outside_paths.add(file_path)
+                    continue
             namespace_error = manifest_lock.namespace_error(file_path)
             if namespace_error:
                 errors.append(f"Entry {index} (`{file_path}`): {namespace_error}")
@@ -386,7 +443,36 @@ def build_declare_test_manifest_tool(
             if ownership_error:
                 errors.append(ownership_error)
 
+        if not errors:
+            for row in rows:
+                existing = manifest_lock.declared_files.get(row.file_path)
+                if existing is not None:
+                    if stage_write_set_lock is not None and existing != row:
+                        errors.append(
+                            f"`{row.file_path}` is already declared with different manifest metadata; "
+                            "exactly re-declare the existing row instead of changing its type, "
+                            "coverage scope, or interface ids."
+                        )
+                    continue
+                if (
+                    stage_write_set_lock is not None
+                    and manifest_lock.has_successful_declaration
+                    and not manifest_lock.was_rejected(row.file_path)
+                ):
+                    errors.append(
+                        f"The successful declaration already locked the manifest; `{row.file_path}` "
+                        "is a new test path and cannot be added now. Only exact re-declarations of "
+                        "existing rows or correction of a path from a rejected declaration may be retried."
+                    )
+                    sealed_new_paths.add(row.file_path)
+
         if errors:
+            if stage_write_set_lock is not None:
+                manifest_lock.remember_rejected_paths(
+                    candidate_paths
+                    - stage_write_set_outside_paths
+                    - sealed_new_paths
+                )
             return _tool_error(
                 _rejection(
                     rejection_budget,
@@ -398,6 +484,7 @@ def build_declare_test_manifest_tool(
 
         rejection_budget.record_acceptance()
         first_declaration = not manifest_lock.locked
+        added_paths = [row.file_path for row in rows if not manifest_lock.contains(row.file_path)]
         manifest_lock.declare(rows)
         await _emit_log(
             log_cb,
@@ -428,8 +515,8 @@ def build_declare_test_manifest_tool(
                 )
                 + (
                     ""
-                    if first_declaration
-                    else " (Rows that failed an earlier declaration attempt were added.)"
+                    if first_declaration or not added_paths
+                    else " (Rows from the rejected declaration attempt were added.)"
                 ),
             },
             ensure_ascii=False,

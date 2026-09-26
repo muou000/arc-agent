@@ -134,6 +134,7 @@ class TestGenerator:
                 existing_owner_for_path=(
                     self._existing_manifest_owner if self.enforce_stage_domains else None
                 ),
+                stage_write_set_lock=stage_write_set_lock,
             )
         ]
         if stage_write_set_lock is not None:
@@ -453,6 +454,7 @@ class TestGenerator:
                 existing_owner_for_path=(
                     self._existing_manifest_owner if self.enforce_stage_domains else None
                 ),
+                stage_write_set_lock=stage_write_set_lock,
             )
         ]
         if stage_write_set_lock is not None:
