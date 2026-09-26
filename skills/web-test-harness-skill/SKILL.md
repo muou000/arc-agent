@@ -15,7 +15,7 @@ The template ships the complete test infrastructure. Treat these as fixed contra
 - Playwright: `backend/playwright.config.js` runs `backend/test-e2e/**` with `baseURL` from `PLAYWRIGHT_BASE_URL` / `ARC_WEB_BASE_URL` (default `http://127.0.0.1:3000`).
 - Frontend Vitest: `frontend/vite.config.js` embeds jsdom, `globals: true`, and `frontend/test/setup.ts` (jest-dom matchers plus automatic cleanup).
 - Isolated test database: `backend/src/database/test_harness.js` exports `createTestDatabaseHarness`.
-- All runner libraries (`vitest`, `supertest`, `@testing-library/*`, `@playwright/test`) are already declared in both `package.json` files.
+- Runner libraries are declared per package, not duplicated: `backend/package.json` provides `vitest`, `supertest`, and `@playwright/test`; `frontend/package.json` provides `vitest` and the `@testing-library/*` helpers. Both manifests are injected as `<scaffold_files>` — check them before importing a runner instead of assuming it exists in the other package.
 
 These files are injected into your context as `<scaffold_files>`. The bullets above are starting anchors, not the contract itself: the durable contract is the usage pattern (setup -> operate -> cleanup lifecycle, import ordering, placement rules below). When a recipe references a path, export, or option that does not match the actual scaffold file contents, trust the file and adapt the recipe to it — never invent the missing piece, and never rebuild infrastructure to match the recipe.
 
@@ -92,7 +92,7 @@ afterAll(async () => {
 ```
 
 11. The ordering contract is `harness.setup()` before any import or call that can trigger database initialization. In the Integration recipe above that means a dynamic `await import('../../../../src/app.js')`, because the example file is under `backend/tests/generated/<stable-segment>/integration/` and `backend/src/app.js` initializes the database at module load. Recalculate that relative path for any other directory. If initialization ever becomes explicit or lazy, the contract still applies and only the mechanism changes. A static top-level import is the canonical failure — the app binds to the wrong database file and tests silently write outside the isolated database.
-12. Assert `response.status`, the response envelope, and user-visible messages in the requirement's language (for Chinese requirements match `/中文关键词/`), never raw error stack text.
+12. Assert the response envelope and user-visible messages in the requirement's language (for Chinese requirements match `/中文关键词/`), never raw error stack text. `response.status` is contract-bound: when the requirement, the current API interface contract, or a verifiable route contract declares the status, assert that exact code verbatim — including 201 or another non-default 2xx. When no reliable status source exists, do not write `toBe(200)`, a broad 2xx matcher, or any other guessed value; record `needs-info` in the summary instead, matching the TestGenerator HTTP status protocol.
 13. For cookie flows, extract once and replay it: `const cookie = res.headers['set-cookie'].find((c) => c.includes('<cookie-name>=')).split(';')[0];` then `.set('Cookie', cookie)`.
 
 ## Recipe — frontend component test
