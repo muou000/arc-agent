@@ -102,6 +102,7 @@ from core.provider_outage import (
     provider_outage_threshold,
     provider_outage_window_seconds,
 )
+from core.runtime_config import runtime_config_warnings, validate_compile_config
 from core.scheduling import (
     next_affinity_task,
     next_runnable_stage_task,
@@ -298,6 +299,9 @@ class ARCWorkflowManager:
         web_port: int = 3301,
         log_cb: LogCallback | None = None,
     ) -> None:
+        config_errors = validate_compile_config(app_type=app_type, web_port=web_port)
+        if config_errors:
+            raise ValueError("Invalid runtime configuration: " + " ".join(config_errors))
         self.workspace_path = str(Path(workspace_path).expanduser().resolve())
         self.requirement_path = str(Path(requirement_path).expanduser().resolve()) if requirement_path else ""
         self.app_type = normalize_app_type(app_type)
@@ -484,6 +488,16 @@ class ARCWorkflowManager:
         retry_failed: bool = False,
         retry_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
+        config_errors = validate_compile_config(web_port=self.web_port)
+        if config_errors:
+            await self._log(
+                "Compiler",
+                "Invalid runtime configuration: " + " | ".join(config_errors),
+                "error",
+            )
+            return {"ok": False, "failed_nodes": [], "config_errors": config_errors}
+        for warning in runtime_config_warnings():
+            await self._log("Compiler", warning, "warning")
         await self._log("Compiler", "ARC compilation started.")
         if clear_all:
             cleaned = await self.cleanup_workspace()
@@ -548,6 +562,16 @@ class ARCWorkflowManager:
         retry_failed: bool = False,
         retry_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
+        config_errors = validate_compile_config(web_port=self.web_port)
+        if config_errors:
+            await self._log(
+                "Compiler",
+                "Invalid runtime configuration: " + " | ".join(config_errors),
+                "error",
+            )
+            return {"ok": False, "failed_nodes": [], "config_errors": config_errors}
+        for warning in runtime_config_warnings():
+            await self._log("Compiler", warning, "warning")
         root_id = str(requirement_tree.get("id") or "").strip()
         if not root_id:
             await self._log("Compiler", "Requirement root node id is missing.", "error")

@@ -809,21 +809,24 @@ def test_slot_ports_are_base_plus_offset(tmp_path, monkeypatch) -> None:
     assert manager._port_slots == {0: "RC", 1: "RB"}
 
 
-def test_max_concurrent_tasks_clamps_and_defaults(monkeypatch) -> None:
+def test_max_concurrent_tasks_rejects_out_of_range_and_defaults(monkeypatch) -> None:
+    import pytest
     monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
     monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "999")
+    with pytest.raises(ValueError, match="ARC_MAX_CONCURRENT_TASKS"):
+        ARCWorkflowManager(workspace_path=".", requirement_path="", web_port=4000, log_cb=lambda *a, **k: None)
+
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "0")
+    with pytest.raises(ValueError, match="ARC_MAX_CONCURRENT_TASKS"):
+        ARCWorkflowManager(workspace_path=".", requirement_path="", web_port=4000, log_cb=lambda *a, **k: None)
+
+    monkeypatch.delenv("ARC_MAX_CONCURRENT_TASKS")
     manager = ARCWorkflowManager(
         workspace_path=".",
         requirement_path="",
         web_port=4000,
         log_cb=lambda *a, **k: None,
     )
-    assert manager._max_concurrent_tasks() == 8
-
-    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "0")
-    assert manager._max_concurrent_tasks() == 1
-
-    monkeypatch.delenv("ARC_MAX_CONCURRENT_TASKS")
     assert manager._max_concurrent_tasks() == PARALLEL_DEFAULT_MAX_CONCURRENT_TASKS, (
         "parallel mode without a level uses the default"
     )

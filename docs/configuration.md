@@ -2,6 +2,8 @@
 
 arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FILE`（缺省 `.env`，从项目根目录加载）→ 进程环境变量。运行 `python arc_main.py doctor` 可验证配置健康。
 
+编译启动时会先用统一规则校验已知的数值、布尔和枚举配置，再定位需求文件或执行 `--clean`。非法值会明确报告变量名和原始输入，不会静默回退为另一套策略；`doctor` 使用同一套校验。历史兼容别名（例如 `ARC_OPENAI_API_MODE=true/chat`、`ARC_MODEL_STREAM_TRANSPORT=retry-only`）会归一化为对应的有效策略。
+
 ## 速查表
 
 | 变量 | 默认值 | 一句话 |
@@ -52,7 +54,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 超时、重试与熔断（`agents/model/openai_api_adapter.py`）：
 
 - `ARC_MODEL_TIMEOUT`：单次请求的读超时。非流式请求的 read 超时等于完整生成时长——基准中 DESIGN 大调用实测可达 ~580s，故默认保持 600s。
-- `ARC_MODEL_CONNECT_TIMEOUT`：连接建立超时；连接被静默丢弃时快速失败，不必等满读超时。
+- `ARC_MODEL_CONNECT_TIMEOUT`：连接建立超时；连接被静默丢弃时快速失败，不必等满读超时。若显式值高于 `ARC_MODEL_TIMEOUT`，运行时仍按总请求超时生效，并在启动校验中报告实际上限。
 - `ARC_MODEL_MAX_RETRIES` / `ARC_MODEL_RETRY_DELAY` / `ARC_MODEL_RETRY_MAX_DELAY`：适配器重试循环。固定短延迟起步，服务端 `Retry-After` 头优先，间隔钳制在上限内。
 - `ARC_MODEL_MAX_CONSECUTIVE_FAILURES`：跨调用熔断。同一端点连续 N 次模型调用失败后，后续调用立即失败并提示 `--resume`；任一成功即重置计数。设 0 关闭。
 - `ARC_PROVIDER_OUTAGE_THRESHOLD` / `ARC_PROVIDER_OUTAGE_WINDOW_SECONDS`：运行级 outage gate 按 provider、base URL 和错误类别聚合明确的 `EndpointUnreachable` 错误；达到阈值后暂停新的模型任务，将当前任务恢复为可续跑状态，并把 provider 信息、命中次数和时间戳写入 `.arc/processing_queue.json`。`--resume` 会先对保存的 base URL 做 `/models` 可达性检查，检查通过后才继续，已完成节点不会重复执行。设 threshold 为 0 可关闭该运行级 gate。
@@ -60,7 +62,7 @@ arc-agent 的全部配置通过环境变量表达，读取顺序为 `ARC_ENV_FIL
 流式传输三开关：
 
 - `ARC_MODEL_STREAM_TRANSPORT`：`stream`（默认，首次尝试即流式——SSE chunk 持续流动，可穿过网关对非流式响应的 ~120s 空闲切断；端点对流式请求回 400/404/405/415/422 这类证明拒绝流式请求形状的状态码时，自动回退纯非流式并进程内记住该端点；认证（401/403）与瞬时（408/409/429）状态不算流式能力证据，走常规重试分类，不写该缓存）/ `retry`（首次非流式，仅连接类失败后的重试切流式）/ `0/false/no/off`（完全关闭）。
-- `ARC_MODEL_STREAM_CHUNK_TIMEOUT`：流式看门狗。流中途静默卡死（TCP 存活但零字节）在该时限内被发现并按连接类失败换传输方式重试，而不是等到读超时或把整个 agent 会话回退重放；有效值钳制到 `ARC_MODEL_TIMEOUT`。设 0 关闭。
+- `ARC_MODEL_STREAM_CHUNK_TIMEOUT`：流式看门狗。流中途静默卡死（TCP 存活但零字节）在该时限内被发现并按连接类失败换传输方式重试，而不是等到读超时或把整个 agent 会话回退重放；有效值钳制到 `ARC_MODEL_TIMEOUT`。设 0 关闭；编译启动时显式高于 `ARC_MODEL_TIMEOUT` 的值会保留兼容钳制，并报告实际有效上限。
 - `ARC_MODEL_STREAM_USAGE`：开启后流式 chat.completions 请求携带 `include_usage`，末个 SSE chunk 携带端点真实 usage（含缓存命中），token 用量从 tiktoken 估算转为 reported 口径。某网关 4xx 拒绝该选项时设 0 恢复旧行为（端点会整体回退纯非流式——非流式响应自带 usage，计费不受影响，只失去流式对网关空闲切断的防护）。
 
 结构化输出：

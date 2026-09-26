@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from arcbench_agent_runtime import AgentRuntime
+from core.runtime_config import RUNTIME_CONFIG_ENV_VARS
 from core.scheduling_switches import SCHEDULING_SWITCH_ENV_VARS
 
 
@@ -69,7 +70,7 @@ MODEL_ENV_VARS_TO_CLEAR = (
 def isolate_model_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Keep the repository `.env` from leaking provider settings into tests."""
 
-    for key in MODEL_ENV_VARS_TO_CLEAR:
+    for key in (*MODEL_ENV_VARS_TO_CLEAR, *RUNTIME_CONFIG_ENV_VARS):
         monkeypatch.delenv(key, raising=False)
     yield
 

@@ -9,11 +9,12 @@ from typing import Any
 from colorama import Fore, Style
 
 from agents.context.pipeline import set_context_config
+from core.runtime_config import runtime_config_warnings, validate_runtime_config
 
 
 _workspace_root = Path(os.environ.get("ARC_WORKSPACE_ROOT", ".")).expanduser().resolve()
 _app_type = os.environ.get("ARC_APP_TYPE", "web").strip().lower() or "web"
-_web_port = int(os.environ.get("ARC_WEB_PORT", "3301") or 3301)
+_web_port = 3301
 _android_package = os.environ.get("ARC_ANDROID_PACKAGE", "com.example.template").strip() or "com.example.template"
 
 
@@ -62,6 +63,9 @@ def get_abs_path(path: str | os.PathLike[str]) -> str:
 
 def set_app_type(app_type: str) -> None:
     global _app_type
+    errors = validate_runtime_config({"ARC_APP_TYPE": app_type})
+    if errors:
+        raise ValueError("Invalid app type configuration: " + " ".join(errors))
     _app_type = (app_type or "web").strip().lower() or "web"
     os.environ["ARC_APP_TYPE"] = _app_type
     set_context_config(app_type=_app_type)
@@ -73,6 +77,9 @@ def get_app_type() -> str:
 
 def set_web_port(port: int | str) -> None:
     global _web_port
+    errors = validate_runtime_config({"ARC_WEB_PORT": str(port)})
+    if errors:
+        raise ValueError("Invalid web port configuration: " + " ".join(errors))
     _web_port = int(port)
     os.environ["ARC_WEB_PORT"] = str(_web_port)
     set_context_config(web_port=_web_port)
@@ -143,8 +150,9 @@ def check_config() -> dict[str, Any]:
             errors.append(f"Missing required variable: {var} ({description})")
         elif var == "OPENAI_API_KEY" and value.startswith("sk-your-"):
             errors.append(f"{var} still contains placeholder value")
-        elif var == "ARC_OPENAI_API_MODE" and value not in {"responses", "chat_completions"}:
-            errors.append(f"{var} must be 'responses' or 'chat_completions', got: {value}")
+
+    errors.extend(validate_runtime_config())
+    warnings.extend(runtime_config_warnings())
 
     # Check optional visual model
     visual_key = os.environ.get("VISUAL_API_KEY", "").strip()
@@ -153,67 +161,6 @@ def check_config() -> dict[str, Any]:
         warnings.append("VISUAL_API_KEY is set but VISUAL_MODEL is empty")
     elif visual_model and not visual_key:
         warnings.append("VISUAL_MODEL is set but VISUAL_API_KEY is empty")
-
-    # Check debug flag
-    debug = os.environ.get("ARC_DEBUG", "0").strip().lower()
-    if debug not in {"0", "1", "false", "true", "no", "yes", "off", "on", ""}:
-        warnings.append(f"ARC_DEBUG has unexpected value: {debug} (expected 0 or 1)")
-
-    # Check model retry/timeout knobs (adapters fall back to defaults on
-    # invalid values, but surfacing the typo here is cheaper than wondering
-    # why the override did not apply mid-run)
-    numeric_env_checks = {
-        "ARC_MODEL_TIMEOUT": (1, 3600),
-        "ARC_MODEL_CONNECT_TIMEOUT": (1, 600),
-        "ARC_MODEL_MAX_RETRIES": (0, 10),
-        "ARC_MODEL_RETRY_DELAY": (0, 3600),
-        "ARC_MODEL_RETRY_MAX_DELAY": (0, 3600),
-        "ARC_MODEL_MAX_CONSECUTIVE_FAILURES": (0, 100),
-        "ARC_PROVIDER_OUTAGE_THRESHOLD": (0, 100),
-        "ARC_PROVIDER_OUTAGE_WINDOW_SECONDS": (1, 86400),
-    }
-    for name, (low, high) in numeric_env_checks.items():
-        raw = os.environ.get(name, "").strip()
-        if not raw:
-            continue
-        try:
-            value = int(raw) if name in {
-                "ARC_MODEL_MAX_RETRIES",
-                "ARC_MODEL_MAX_CONSECUTIVE_FAILURES",
-                "ARC_PROVIDER_OUTAGE_THRESHOLD",
-                "ARC_PROVIDER_OUTAGE_WINDOW_SECONDS",
-            } else float(raw)
-        except ValueError:
-            warnings.append(f"{name} must be a number, got: {raw}")
-            continue
-        if value < low or value > high:
-            warnings.append(f"{name}={raw} is outside the sane range {low}-{high}")
-
-    # Enum-style knobs: a typo silently falls back to a default instead of
-    # erroring, so surface it here rather than mid-run.
-    stream_transport = os.environ.get("ARC_MODEL_STREAM_TRANSPORT", "").strip().lower()
-    if stream_transport and stream_transport not in {
-        "stream",
-        "retry",
-        "retry-only",
-        "on-failure",
-        "on_failure",
-        "0",
-        "false",
-        "no",
-        "off",
-    }:
-        warnings.append(
-            f"ARC_MODEL_STREAM_TRANSPORT has unexpected value: {stream_transport} "
-            "(expected stream, retry, or 0/false/no/off)"
-        )
-
-    stream_usage = os.environ.get("ARC_MODEL_STREAM_USAGE", "").strip().lower()
-    if stream_usage and stream_usage not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
-        warnings.append(
-            f"ARC_MODEL_STREAM_USAGE has unexpected value: {stream_usage} "
-            "(expected 1/true/yes/on or 0/false/no/off)"
-        )
 
     # Check .env file presence
     env_file = get_project_env_path()
