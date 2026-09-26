@@ -109,7 +109,7 @@ def workspace_tool_policy() -> str:
     return section(
         "Tool Policy",
         [
-            "Use file tools only inside the virtual project root `/workspace`. The sole exception is a direct read of an attached skill at `/skills/<skill-name>/SKILL.md`.",
+            "Use file tools only inside the virtual project root `/workspace`. The exceptions are a direct read of an attached skill at `/skills/<skill-name>/SKILL.md`, and read-only access to evicted large tool results under `/large_tool_results/`: when a `Tool result too large` pointer names such a path, `read_file` it with `offset`/`limit` instead of re-running the tool; `grep` that directory only to locate an offloaded result whose exact path is unknown.",
             "Skills use progressive disclosure: their index already provides exact paths. When full instructions are needed, call `read_file` directly on the listed `SKILL.md`; never use `ls`, `glob`, `grep`, or shell commands under `/skills`.",
             "Do not call file tools on `/`, host paths, `.arc`, `.git`, `requirements`, environment files, dependency directories, generated outputs, or lockfiles. The only `.arc` exception is read-only: when a `run_tests` result points at `ARC_RUN_OUTPUT_LOG`, `read_file` that exact `.arc/tdd_runs/` log path for the complete filtered output of that attempt (formatting noise removed, nothing truncated) instead of re-running the tests; every other `.arc` path and every write stays denied.",
             "The requirement snapshot is already embedded in the task context; reads under `requirements/` are always denied by policy, so do not spend turns attempting them.",

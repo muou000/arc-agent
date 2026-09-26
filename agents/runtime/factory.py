@@ -21,6 +21,7 @@ from agents.runtime.filesystem_adapters import (
     ArcCompositeBackend,
     GlobGuidanceMiddleware,
     GrepGuidanceMiddleware,
+    LARGE_TOOL_RESULTS_PREFIX,
     MAX_GREP_ALTERNATIVES,
     PermissionDeniedHintMiddleware,
     workspace_filesystem_backend,
@@ -613,6 +614,18 @@ def _build_filesystem_permissions(
         FilesystemPermission(
             operations=["read"],
             paths=[f"{WORKSPACE_PREFIX}/.arc/tdd_runs", f"{WORKSPACE_PREFIX}/.arc/tdd_runs/**"],
+            mode="allow",
+        ),
+        # Read-only escape hatch for upstream's eviction artifacts (issue #305):
+        # FilesystemMiddleware offloads oversized tool results (run_tests output,
+        # ...) to /large_tool_results/<tool_call_id> in the composite default
+        # (StateBackend — agent state, not a host path) and the replacement
+        # message points the model there; without this allow the pointer named
+        # a path the final /** deny refused. Writes stay denied, and the
+        # grep tool description advertising this root stays truthful.
+        FilesystemPermission(
+            operations=["read"],
+            paths=[LARGE_TOOL_RESULTS_PREFIX, f"{LARGE_TOOL_RESULTS_PREFIX}/**"],
             mode="allow",
         ),
         FilesystemPermission(

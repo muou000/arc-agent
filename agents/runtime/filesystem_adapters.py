@@ -1040,6 +1040,15 @@ def workspace_filesystem_backend(root_dir: str) -> FilesystemBackend:
 MAX_GREP_ALTERNATIVES = 8
 
 
+#: Where upstream's FilesystemMiddleware evicts oversized tool results. ARC's
+#: composite keeps the default artifacts root ("/"), so the prefix is fixed —
+#: evicted content lands in the composite default (StateBackend, agent state),
+#: and the replacement `Tool result too large` message hands the model this
+#: path. The permission layer grants reads of exactly this prefix (issue #305);
+#: model writes stay denied and no host path is involved.
+LARGE_TOOL_RESULTS_PREFIX = "/large_tool_results"
+
+
 #: ARC's replacement for upstream's grep tool description. The stock text ends
 #: with "To match any of several strings, run a separate grep for each" — the
 #: per-keyword call loop issue #218 removes — and denies the `|` expansion the
@@ -1050,7 +1059,7 @@ ARC_GREP_TOOL_DESCRIPTION = f"""Search for a LITERAL text pattern across files (
 
 The pattern is matched verbatim: regex metacharacters are ordinary characters, not operators (`.*`, `\\.`, `^`, `$` are searched as plain text). A pattern containing `|` is expanded into literal alternatives: `grep(pattern="foo|bar")` matches files containing `foo` OR `bar` (at most {MAX_GREP_ALTERNATIVES} alternatives per call; write `\\|` to search for a literal `|` instead). Do not enumerate keyword guesses one grep at a time — when a search misses, read the candidate file (`read_file` with offset/limit) or search one distinctive literal copied from earlier tool output.
 
-Returns matching files or content per `output_mode`. Offloaded large tool results live under the artifacts root (`/large_tool_results/` by default); grep that directory to search them when you do not know the exact path."""
+Returns matching files or content per `output_mode`. Large tool results evicted from context are readable under {LARGE_TOOL_RESULTS_PREFIX}/ (a `Tool result too large` pointer names the exact path); grep that directory to search them when you do not know the exact path."""
 
 #: Upstream renders an empty grep result as exactly this sentinel line.
 _GREP_NO_MATCH_SENTINEL = "No matches found"
