@@ -807,6 +807,30 @@ def _static_path_matches(candidate: str, requested: str) -> bool:
     return right.endswith(left)
 
 
+def _path_match_specificity(candidate: str, requested: str) -> tuple[int, int, int]:
+    """Rank an interface path match without changing matching semantics.
+
+    Exact mounted paths are more specific than router-relative suffixes, and
+    longer literal/parameterized paths are more specific than shorter ones.
+    The rank is only used to narrow a competing candidate set: candidates
+    with the same rank still go through the existing status-set ambiguity
+    check.
+    """
+
+    left = _normalize_api_path(candidate)
+    right = _normalize_api_path(requested)
+    if not left or not right:
+        return (-1, -1, -1)
+    segments = len(left.strip("/").split("/")) if left != "/" else 0
+    if left == right:
+        return (3, segments, len(left))
+    if _static_path_matches(left, right):
+        return (2, segments, len(left))
+    if _parameterized_path_matches(left, right):
+        return (1, segments, len(left))
+    return (-1, -1, -1)
+
+
 def _assertion_status_codes(
     item: dict[str, Any], path: str, method: str
 ) -> tuple[list[int], list[int]]:
@@ -1063,6 +1087,31 @@ def validate_http_status_contracts(
                     ]
                     if method_matched:
                         candidates = method_matched
+                if len(candidates) > 1:
+                    # A full mounted path owns the assertion over a
+                    # router-relative suffix match (for example,
+                    # ``/api/workbooks`` over ``/workbooks``). This keeps a
+                    # mislabeled FUNC card from competing with its API card
+                    # while preserving ambiguity between equally specific
+                    # API contracts.
+                    specificity = [
+                        max(
+                            (
+                                _path_match_specificity(route.get("path", ""), path)
+                                for route in item["paths"]
+                                if not method or not route.get("method") or route.get("method") == method
+                            ),
+                            default=(-1, -1, -1),
+                        )
+                        for item in candidates
+                    ]
+                    best_specificity = max(specificity)
+                    if best_specificity >= (0, 0, 0):
+                        candidates = [
+                            item
+                            for item, rank in zip(candidates, specificity)
+                            if rank == best_specificity
+                        ]
                 if len(candidates) > 1:
                     # Candidates whose registered status sets are identical
                     # are interchangeable: any choice yields the same
