@@ -294,6 +294,100 @@ def build_test_edit_stall_hint(
     )
 
 
+# ---------------------------------------------------------------------------
+# Failure-class repair hints
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _RepairHintClass:
+    """One failure mechanism class: its error-line shape and repair direction."""
+
+    key: str
+    pattern: re.Pattern[str]
+    hint: str
+
+
+#: Mechanism classes behind recurring repair loops, matched as shapes against
+#: the digest's error lines and the failure fingerprint. Each hint names the
+#: evidence channel and the ownership question - never the concrete fix,
+#: which depends on runtime context the digest does not have. The
+#: UNKNOWN-SYMBOL ownership classification deliberately stays open for the
+#: same reason: a missing third-party module means an install, a misspelled
+#: API means resolving the real name from authoritative callers, and a shape
+#: match cannot tell them apart. Classes only grow when a new failure
+#: MECHANISM shows up in real runs - not per example.
+_REPAIR_HINT_CLASSES: tuple[_RepairHintClass, ...] = (
+    _RepairHintClass(
+        "UNKNOWN-SYMBOL",
+        re.compile(
+            r"is not a function|is not defined|is not a constructor|has no exported member"
+            r"|cannot find module|cannot find package",
+            re.IGNORECASE,
+        ),
+        "the symbol as written does not resolve in this environment - that alone does not "
+        "say whose fault it is, so classify the owner before editing: a misspelled or "
+        "absent API name -> resolve the real name from working in-repo callers, template "
+        "helpers, or the dependency's declared interface (package.json/lockfile; "
+        "node_modules is read-forbidden) and fix the call site - the installed version may "
+        "genuinely lack the API, in which case use what it offers; `Cannot find module` "
+        "naming a third-party package -> one install_dependencies call, then run_tests, "
+        "not a rename or a hand-rolled replacement; the object not being the type you "
+        "assumed -> fix the object's source; a missing test-env global/polyfill -> fix "
+        "the test setup, not product code. A repeated identical search is never new "
+        "evidence.",
+    ),
+    _RepairHintClass(
+        "WAIT-TIMEOUT",
+        re.compile(
+            r"timeout of \d+ms? exceeded|timeout exceeded|test timed out"
+            r"|error: element\(s\) not found|unable to find element",
+            re.IGNORECASE,
+        ),
+        "the awaited element never appeared, so the failure is upstream of the locator. "
+        "Before touching selectors, verify what should have rendered it: the page/app "
+        "actually loaded (no 404, blank page, or crashed server), the route mounted, the "
+        "async data arrived, the element renders under the test's own conditions. "
+        "Retrying selector variants against an unrendered element is not evidence.",
+    ),
+    _RepairHintClass(
+        "MULTI-MATCH",
+        re.compile(
+            r"strict mode violation|resolved to \d+ elements?|found multiple elements",
+            re.IGNORECASE,
+        ),
+        "more than one element matched the query - disambiguate semantically (distinct "
+        "accessible names, an exact role, a scoped region) instead of widening or "
+        "weakening the matcher to force a single match.",
+    ),
+)
+
+
+def repair_hints_for_failure(
+    digest: dict[str, Any],
+    *,
+    fingerprint: str = "",
+) -> list[str]:
+    """Repair-direction hints for every mechanism class the failure evidence hits.
+
+    Scans the digest's per-test error lines plus the failure fingerprint
+    against the class shapes and returns one hint per matched class, in table
+    order. Strategy-level on purpose: each hint names the evidence channel and
+    the ownership question, never the concrete fix - the digest cannot know
+    which owner applies. Empty when no class matches (the common case), so a
+    rendered digest stays byte-identical to the pre-hint contract.
+    """
+
+    haystacks = [fingerprint]
+    for item in digest.get("failed_tests") or []:
+        haystacks.extend(str(line) for line in (item or {}).get("error_lines") or [])
+    hints: list[str] = []
+    for cls in _REPAIR_HINT_CLASSES:
+        if any(cls.pattern.search(text) for text in haystacks if text):
+            hints.append(f"REPAIR HINT ({cls.key}): {cls.hint}")
+    return hints
+
+
 def digest_failed_test_names(digest: dict[str, Any]) -> list[str]:
     """Return the non-empty failed-test names a parsed digest carries, in order.
 
@@ -356,6 +450,11 @@ def format_failure_digest(
             f"- full raw output of this run: `{raw_output_path}` — read this file "
             "for the complete output instead of re-running tests."
         )
+    # Failure-class repair hints trail like the edit-stall hint below:
+    # appended only when a class shape matches, so digests that hit no class
+    # keep the exact pre-hint contract (jsonl scan fields included).
+    for hint in repair_hints_for_failure(digest, fingerprint=fingerprint):
+        blocks.append(f"- {hint}")
     if test_edit_hint:
         # Trailing on purpose: existing bullet order and the jsonl scan fields
         # stay byte-identical when no hint fires.

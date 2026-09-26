@@ -654,3 +654,109 @@ def test_format_without_hint_matches_previous_shape() -> None:
     digest = build_failure_digest(VITEST_FAILURE)
     text = format_failure_digest(digest, test_type="Unit", fingerprint="1|Error: x")
     assert "TEST-EDIT STALL" not in text
+
+
+# ---------------------------------------------------------------------------
+# Failure-class repair hints
+# ---------------------------------------------------------------------------
+
+UNKNOWN_SYMBOL_FAILURE = """Exit Code: 1
+
+ FAIL tests/generated/req_2/LoginPage.test.tsx > LoginPage > shows the generic error
+TypeError: screen.getByLabel is not a function
+ at /workspace/frontend/tests/generated/req_2/LoginPage.test.tsx:31:26
+"""
+
+PLAYWRIGHT_STRICT_VIOLATION = """Exit Code: 1
+
+  1) test-e2e\register.e2e.spec.js:53:3 › REQ-1 注册 (E2E) › 提交注册 ─────
+
+    Error: strict mode violation: getByLabel('用户名') resolved to 2 elements
+"""
+
+
+def test_unknown_symbol_failure_receives_the_ownership_hint() -> None:
+    """The getByLabel shape classifies as UNKNOWN-SYMBOL with owner options.
+
+    Distilled from the 2026-09-26 arc-output1 REQ-2 loop: four failed Unit
+    attempts on one fingerprint, then 106 greps hunting the API name. The
+    hint opens the ownership question instead of asserting a single fix.
+    """
+
+    digest = build_failure_digest(UNKNOWN_SYMBOL_FAILURE)
+    text = format_failure_digest(
+        digest,
+        test_type="Unit",
+        fingerprint="1|TypeError: screen.getByLabel is not a function",
+    )
+    assert "REPAIR HINT (UNKNOWN-SYMBOL):" in text
+    assert "does not say whose fault it is" in text
+    # The four owners stay open, each with its evidence channel.
+    assert "install_dependencies" in text
+    assert "node_modules is read-forbidden" in text
+    assert "the object's source" in text
+    assert "test setup" in text
+    assert "repeated identical search is never new evidence" in text
+
+
+def test_missing_module_failure_receives_the_install_channel() -> None:
+    """A fingerprint-only match works: no per-test structure is required."""
+
+    text = format_failure_digest(
+        build_failure_digest("Exit Code: 1\nError: Cannot find module 'cookie-parser'\n"),
+        test_type="Integration",
+        fingerprint="1|Error: Cannot find module 'cookie-parser'",
+    )
+    assert "REPAIR HINT (UNKNOWN-SYMBOL):" in text
+    assert "install_dependencies" in text
+
+
+def test_wait_timeout_failure_receives_the_upstream_hint() -> None:
+    digest = build_failure_digest(PLAYWRIGHT_FAILURE)
+    text = format_failure_digest(
+        digest,
+        test_type="E2E",
+        fingerprint="1|Error: expect(locator).toBeVisible() failed",
+    )
+    assert "REPAIR HINT (WAIT-TIMEOUT):" in text
+    assert "upstream of the locator" in text
+    assert "no 404, blank page, or crashed server" in text
+
+
+def test_multi_match_failure_receives_the_disambiguation_hint() -> None:
+    digest = build_failure_digest(PLAYWRIGHT_STRICT_VIOLATION)
+    text = format_failure_digest(
+        digest,
+        test_type="E2E",
+        fingerprint="1|Error: strict mode violation: getByLabel('用户名') resolved to 2 elements",
+    )
+    assert "REPAIR HINT (MULTI-MATCH):" in text
+    assert "disambiguate semantically" in text
+
+
+def test_digest_without_a_matching_class_stays_hint_free() -> None:
+    """Plain assertion failures carry no hint: the common path is unchanged."""
+
+    text = format_failure_digest(
+        build_failure_digest(VITEST_FAILURE),
+        test_type="Integration",
+        fingerprint="1|AssertionError: expected",
+    )
+    assert "REPAIR HINT" not in text
+
+
+def test_each_matched_class_renders_once_in_table_order() -> None:
+    """Two classes hit by one failure render as two bullets, table order."""
+
+    output = (
+        "Exit Code: 1\n"
+        " FAIL tests/a.test.tsx > A > case\n"
+        "TypeError: screen.getByLabel is not a function\n"
+        "Error: strict mode violation: getByRole('alert') resolved to 3 elements\n"
+    )
+    text = format_failure_digest(build_failure_digest(output), test_type="Unit")
+    unknown = text.find("REPAIR HINT (UNKNOWN-SYMBOL):")
+    multi = text.find("REPAIR HINT (MULTI-MATCH):")
+    assert unknown != -1 and multi != -1
+    assert unknown < multi
+    assert text.count("REPAIR HINT") == 2

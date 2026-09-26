@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import posixpath
 import re
+from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
@@ -71,6 +73,32 @@ _PROBE_TOOLS = frozenset({"read_file", "grep", "glob", "ls"})
 _WRITE_FAMILY_TOOLS = frozenset({"write_file", "edit_file", "append_file", "delete"})
 _MAX_PROBES_PER_TARGET = 20
 MAX_PROBES_PER_TARGET = _MAX_PROBES_PER_TARGET
+
+# Repeated-probe mirror (steering, not a gate): a stage agent that re-runs an
+# IDENTICAL search keeps getting back text it already has. The 2026-09-26
+# arc-output1 REQ-2 loop spent 106 greps alternating two patterns
+# (`getByLabelText` / `getByLabelText\(`) and died on the step budget without
+# ever acting on the evidence its own results carried; the #217 nudge counts
+# per target and the #218 no-match ladder resets on any hit, so an alternating
+# hit/miss pair slips past both. Counting per probe fingerprint closes that
+# gap: once one exact search has executed this many times since the last
+# write, further repeats are answered with the CACHED result plus an
+# escalating directive that demands an edit or a different evidence channel.
+# The session is never terminated here - the recursion ceiling stays the last
+# resort - because the goal is to make the model confront evidence it already
+# retrieved, not to stop the task. Search tools only: read_file repeats
+# already sit under two deterministic gates (the written-path read block and
+# the #242 cumulative re-read budget), and reordering those settled contracts
+# buys no extra steering. Counts and cache reset when a write lands - the
+# same no-write-no-change assumption the re-read budget makes - so the
+# fail -> edit -> verify rhythm never replays a stale result.
+_PROBE_MIRROR_TOOLS = frozenset({"grep", "glob", "ls"})
+#: Identical executions answered from cache afterwards (occurrence 3+).
+_PROBE_REPEAT_EXECUTIONS = 2
+#: Cached result texts kept per session; evicted least-recently-cached first.
+#: Oversized search outputs are already bounded upstream (evicted to
+#: /large_tool_results with a pointer message), so entries stay small.
+_PROBE_REPLAY_CACHE_SIZE = 16
 
 
 def append_line_limit_message(received_lines: int) -> str:
@@ -370,6 +398,12 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         # zero-write window's nudge already fired.
         self._probe_counts: dict[str, int] = {}
         self._probe_nudge_fired = False
+        # Repeated-probe mirror ledger (see _PROBE_MIRROR_TOOLS): per-
+        # fingerprint execution counts since the last successful write, and
+        # the result content each fingerprint last returned for replays.
+        self._probe_executions: dict[str, int] = {}
+        self._probe_replay_cache: dict[str, str] = {}
+        self._probe_replay_order: deque[str] = deque()
 
     def wrap_tool_call(self, request: ToolCallRequest, handler: Any) -> ToolMessage | Any:
         blocked = self._validate_tool_call(request)
@@ -377,8 +411,12 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return self._blocked(request, blocked)
         request = self._with_bounded_read(request)
         nudge = self._track_probe(request)
+        replay = self._probe_replay(request)
+        if replay is not None:
+            return self._append_probe_stall(replay, nudge)
         result = handler(request)
         self._record_result(request, result)
+        self._cache_probe_result(request, result)
         result = self._annotate_pending_contract(request, result)
         return self._append_probe_stall(result, nudge)
 
@@ -388,8 +426,12 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
             return self._blocked(request, blocked)
         request = self._with_bounded_read(request)
         nudge = self._track_probe(request)
+        replay = self._probe_replay(request)
+        if replay is not None:
+            return self._append_probe_stall(replay, nudge)
         result = await handler(request)
         self._record_result(request, result)
+        self._cache_probe_result(request, result)
         result = self._annotate_pending_contract(request, result)
         return self._append_probe_stall(result, nudge)
 
@@ -1170,6 +1212,108 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
         )
         return probe_stall_hint(target=target, target_probes=count)
 
+    def _probe_fingerprint(self, request: ToolCallRequest) -> str:
+        """Canonical identity of one search probe, or "" for non-search tools.
+
+        The args serialize with sorted keys, so any argument change - a
+        different pattern, scope, or output mode - is a different probe,
+        while the exact same call is always the same fingerprint regardless
+        of the model's call id. Search tools only (:data:`_PROBE_MIRROR_TOOLS`):
+        read_file repeats are governed by their own deterministic budgets.
+        """
+
+        name = str(request.tool_call.get("name", ""))
+        if name not in _PROBE_MIRROR_TOOLS:
+            return ""
+        args = request.tool_call.get("args", {}) or {}
+        return f"{name}|{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+
+    def _probe_replay(self, request: ToolCallRequest) -> ToolMessage | None:
+        """Answer a repeated identical search from cache with a directive.
+
+        Counts the round trip first (a replay burns one just like an
+        execution), then replays once this fingerprint has executed
+        :data:`_PROBE_REPEAT_EXECUTIONS` times since the last write. A cold
+        cache - evicted, or never populated because the earlier runs were
+        blocked or replayed themselves - falls through to execution: the
+        mirror only ever substitutes a result the model has actually seen,
+        never a fabricated one.
+        """
+
+        fingerprint = self._probe_fingerprint(request)
+        if not fingerprint:
+            return None
+        executions = self._probe_executions.get(fingerprint, 0)
+        self._probe_executions[fingerprint] = executions + 1
+        if executions < _PROBE_REPEAT_EXECUTIONS:
+            return None
+        cached = self._probe_replay_cache.get(fingerprint)
+        if cached is None:
+            return None
+        directive = self._replay_directive(executions + 1)
+        logging.getLogger(__name__).info(
+            "probe mirror replay: identical search repeated %d time(s): %s",
+            executions + 1,
+            fingerprint,
+        )
+        return ToolMessage(
+            content=f"{cached}\n[{directive}]",
+            name=str(request.tool_call.get("name", "tool")),
+            tool_call_id=str(request.tool_call.get("id", "")),
+        )
+
+    @staticmethod
+    def _replay_directive(occurrence: int) -> str:
+        """The steering text riding a cached replay, escalating by occurrence.
+
+        Every tier names the two real exits - an edit or a different evidence
+        channel - and none terminates the session; the point is to make the
+        model act on evidence it already retrieved, not to stop the task.
+        """
+
+        if occurrence <= _PROBE_REPEAT_EXECUTIONS + 2:
+            return (
+                f"ARC REPEATED PROBE: this exact search has already run {occurrence} times since your "
+                "last edit; replaying your earlier result above instead of re-running it. That output "
+                "is already everything this query can tell you - act on it (make the edit it points at) "
+                "or change evidence channel (read the file, run the tests). A repeated identical query "
+                "never produces new information."
+            )
+        if occurrence <= _PROBE_REPEAT_EXECUTIONS + 4:
+            return (
+                f"ARC REPEATED PROBE: replayed from cache again ({occurrence} identical runs, no repair "
+                "landed in between). Before the next tool call, state in one line which file you will "
+                "change and what the change is - then make it. Further repeats of this query return the "
+                "same replay."
+            )
+        return (
+            "ARC REPEATED PROBE: replayed from cache. Every further repeat of this query returns this "
+            "same reply. The only ways forward are an edit that addresses the failure or a different "
+            "evidence channel; if neither exists, end the pass with a failure report."
+        )
+
+    def _cache_probe_result(self, request: ToolCallRequest, result: ToolMessage | Any) -> None:
+        """Remember the content a search probe returned, for later replays.
+
+        Only string ToolMessage content is cached (everything the model can
+        see verbatim); a refresh of an already-cached fingerprint keeps its
+        original eviction position so a hot probe is not dropped for a storm
+        of new ones.
+        """
+
+        fingerprint = self._probe_fingerprint(request)
+        content = getattr(result, "content", None)
+        if not fingerprint or not isinstance(content, str):
+            return
+        if fingerprint in self._probe_replay_cache:
+            self._probe_replay_cache[fingerprint] = content
+            return
+        if len(self._probe_replay_order) >= _PROBE_REPLAY_CACHE_SIZE:
+            stale = self._probe_replay_order.popleft()
+            self._probe_replay_cache.pop(stale, None)
+        self._probe_replay_cache[fingerprint] = content
+        self._probe_replay_order.append(fingerprint)
+
     @staticmethod
     def _append_probe_stall(result: ToolMessage | Any, nudge: str) -> ToolMessage | Any:
         """Ride the convergence nudge on the probe's own tool result.
@@ -1188,10 +1332,16 @@ class StageDisciplineMiddleware(AgentMiddleware[StageDisciplineState, Any, Any])
     def _close_probe_window(self) -> None:
         """Close the zero-write window: a write landed, so probing that
         target again starts a fresh count - and a fresh storm is nudged
-        again rather than suppressed by an earlier window's nudge."""
+        again rather than suppressed by an earlier window's nudge. The
+        mirror ledger resets with it: written files invalidate both the
+        repeat counts and the cached results (the same no-write-no-change
+        assumption the re-read budget makes)."""
 
         self._probe_counts.clear()
         self._probe_nudge_fired = False
+        self._probe_executions.clear()
+        self._probe_replay_cache.clear()
+        self._probe_replay_order.clear()
 
     def _record_result(self, request: ToolCallRequest, result: ToolMessage | Any) -> None:
         name = str(request.tool_call.get("name", ""))

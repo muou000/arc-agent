@@ -371,11 +371,13 @@ def test_build_path_budget_hint_on_third_consecutive_miss(
     tmp_project_dir: Path,
 ) -> None:
     (tmp_project_dir / "alpha.txt").write_text("alpha\n", encoding="utf-8")
-    miss_args = {"pattern": "zzz", "path": "/workspace"}
-    # One grep per assistant turn: within a single parallel batch the budget
-    # hint lands on exactly one result but which one depends on resumption
-    # order (see drive_scripted_tool_turns); a retry loop is turn-serial.
-    miss_turns = [[("grep", miss_args)]] * 3
+    # Varied patterns: the ladder's domain is keyword enumeration. Three
+    # identical misses are the repeated-probe mirror's domain instead (stage
+    # discipline replays the third one with its own directive).
+    miss_turns = [
+        [("grep", {"pattern": f"zzz-{index}", "path": "/workspace"})]
+        for index in range(3)
+    ]
 
     contents = [turn[0] for turn in drive_scripted_tool_turns(tmp_project_dir, miss_turns)]
 

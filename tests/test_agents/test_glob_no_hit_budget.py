@@ -210,11 +210,13 @@ def test_budget_note_states_the_withheld_matches_fact() -> None:
 
 def test_build_path_budget_hint_on_third_consecutive_miss(tmp_project_dir: Path) -> None:
     (tmp_project_dir / "alpha.txt").write_text("alpha\n", encoding="utf-8")
-    miss_args = {"pattern": "zzz/**/cli*", "path": "/workspace"}
-    # One glob per assistant turn: within a single parallel batch the budget
-    # hint lands on exactly one result but which one depends on resumption
-    # order (see drive_scripted_tool_turns); a retry loop is turn-serial.
-    miss_turns = [[("glob", miss_args)]] * 3
+    # Varied patterns: the ladder's domain is keyword enumeration. Three
+    # identical globs are the repeated-probe mirror's domain instead (stage
+    # discipline replays the third one with its own directive).
+    miss_turns = [
+        [("glob", {"pattern": f"zzz-{index}/**/cli*", "path": "/workspace"})]
+        for index in range(3)
+    ]
 
     contents = [turn[0] for turn in drive_scripted_tool_turns(tmp_project_dir, miss_turns)]
 
@@ -228,11 +230,22 @@ def test_build_path_withheld_disclosure_keeps_budget_truthful(tmp_project_dir: P
     cli = tmp_project_dir / "backend" / "node_modules" / "vitest" / "dist" / "cli.js"
     cli.parent.mkdir(parents=True, exist_ok=True)
     cli.write_text("// hidden\n", encoding="utf-8")
-    args = {"pattern": "**/vitest/dist/**/cli*", "path": "/workspace"}
+    # Varied patterns for the same reason as the budget-hint test above:
+    # identical repeats belong to the stage discipline's mirror. Every
+    # variant still matches the withheld cli.js, so the deny disclosure
+    # stays truthful on each turn.
+    miss_turns = [
+        [("glob", {"pattern": pattern, "path": "/workspace"})]
+        for pattern in (
+            "**/vitest/dist/**/cli*",
+            "**/vitest/**/cli.js",
+            "**/dist/**/cli.js",
+        )
+    ]
 
     contents = [
         turn[0]
-        for turn in drive_scripted_tool_turns(tmp_project_dir, [[("glob", args)]] * 3)
+        for turn in drive_scripted_tool_turns(tmp_project_dir, miss_turns)
     ]
 
     assert all("1 match withheld by read-deny" in content for content in contents)

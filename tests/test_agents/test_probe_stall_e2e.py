@@ -152,3 +152,36 @@ def test_normal_read_write_rhythm_never_trips_the_nudge(tmp_project_dir: Path) -
     _invoke(built, tmp_project_dir, "REQ-PROBE-STALL:rhythm")
 
     assert all("PROBE STALL" not in result for result in _tool_results(model))
+
+
+def test_identical_grep_replays_cached_result_through_the_real_chain(
+    tmp_project_dir: Path,
+) -> None:
+    """The third identical grep is answered from cache with the directive.
+
+    End-to-end through ``build_stage_agent``'s middleware chain: the first
+    two greps execute the real search, the third returns the model's own
+    earlier evidence plus the ARC REPEATED PROBE directive - the session
+    stays alive, only the wasted re-execution disappears.
+    """
+
+    _seed_probe_log(tmp_project_dir)
+    responses = [
+        faux_tool_call(
+            "grep",
+            {"pattern": "line 3:", "path": PROBE_LOG_VIRTUAL, "output_mode": "content"},
+            call_id=f"same-{index}",
+        )
+        for index in range(3)
+    ] + [faux_text("done")]
+    model, built = _build(tmp_project_dir, responses)
+
+    _invoke(built, tmp_project_dir, "REQ-PROBE-STALL:mirror")
+
+    results = _tool_results(model)
+    assert len(results) == 3
+    assert "ARC REPEATED PROBE" not in results[0]
+    assert "ARC REPEATED PROBE" not in results[1]
+    assert results[2].startswith("/workspace")
+    assert "ARC REPEATED PROBE" in results[2]
+    assert "never produces new information" in results[2]

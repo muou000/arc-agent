@@ -2149,6 +2149,215 @@ def test_probe_stall_blocked_repeated_reads_still_count_toward_the_storm() -> No
 
 
 # ---------------------------------------------------------------------------
+# Repeated-probe mirror: cached replay with escalating directives
+# ---------------------------------------------------------------------------
+
+GREP_ARGS = {"path": PROBE_LOG, "pattern": "same-evidence", "output_mode": "content"}
+
+
+def _counting_handler(counter: dict[str, int]) -> Any:
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        counter["n"] += 1
+        return ToolMessage(
+            content=f"search result {counter['n']}",
+            name=request.tool_call["name"],
+            tool_call_id=request.tool_call["id"],
+        )
+
+    return handler
+
+
+def test_identical_grep_executes_twice_then_replays_from_cache() -> None:
+    """Occurrence 3 of one exact search returns the cached result + directive.
+
+    The 2026-09-26 arc-output1 REQ-2 loop re-ran the same greps 50+ times
+    each; the mirror substitutes the model's own earlier result so the burn
+    stops while the session (and its context) stays alive.
+    """
+
+    middleware = make("implementation")
+    counter = {"n": 0}
+    handler = _counting_handler(counter)
+    results = [
+        run(middleware, make_request("grep", GREP_ARGS, call_id=f"g-{index}"), handler)
+        for index in range(5)
+    ]
+    # Exactly two real executions; everything after replays the cache.
+    assert counter["n"] == 2
+    assert "ARC REPEATED PROBE" not in results[0].content
+    assert "ARC REPEATED PROBE" not in results[1].content
+    for index, replay in enumerate(results[2:], start=3):
+        # The replay carries the evidence the model already saw (occurrence
+        # 2's cached result), plus the steering directive - never fresh or
+        # fabricated content - under the replaying call's own id.
+        assert replay.content.startswith("search result 2")
+        assert "ARC REPEATED PROBE" in replay.content
+        assert replay.tool_call_id == f"g-{index - 1}"
+    # Occurrences 3-4 inform; the escalation ladder takes over from 5
+    # (pinned separately in test_replay_directive_escalates_and_demands_a_plan).
+    assert "never produces new information" in results[2].content
+    assert "state in one line which file you will change" in results[4].content
+
+
+def test_replay_directive_escalates_and_demands_a_plan() -> None:
+    """Occurrences 3-4 inform, 5-6 demand a stated plan, 7+ offer two exits."""
+
+    middleware = make("implementation")
+    counter = {"n": 0}
+    handler = _counting_handler(counter)
+    texts = [
+        run(middleware, make_request("grep", GREP_ARGS, call_id=f"e-{index}"), handler).content
+        for index in range(7)
+    ]
+    assert all("act on it" in text for text in texts[2:4])
+    assert all("state in one line which file you will change" in text for text in texts[4:6])
+    assert "end the pass with a failure report" in texts[6]
+
+
+def test_alternating_probe_pair_replays_each_fingerprint() -> None:
+    """A hit/miss alternation cannot outrun the mirror via streak resets.
+
+    The observed loop alternated `getByLabelText` (a hit - resetting the #218
+    no-match ladder) with `getByLabelText\\(` (a miss); per-fingerprint
+    counts accumulate across the alternation, so each side replays on its
+    third run and the loop burns four executions, not four hundred.
+    """
+
+    middleware = make("implementation")
+    counter = {"n": 0}
+    handler = _counting_handler(counter)
+    hit = {"path": PROBE_LOG, "pattern": "getByLabelText", "output_mode": "content"}
+    miss = {"path": PROBE_LOG, "pattern": "getByLabelText\\(", "output_mode": "content"}
+    for index in range(3):
+        run(middleware, make_request("grep", hit, call_id=f"h-{index}"), handler)
+        run(middleware, make_request("grep", miss, call_id=f"m-{index}"), handler)
+    assert counter["n"] == 4
+
+
+def test_successful_write_resets_the_mirror_ledger() -> None:
+    """An edit invalidates repeat counts and cached results together.
+
+    The no-write-no-change assumption the re-read budget makes applies here
+    too: after a write, the same search executes fresh again so the verify
+    step sees the new file state.
+    """
+
+    middleware = make("implementation")
+    counter = {"n": 0}
+    handler = _counting_handler(counter)
+    for index in range(4):
+        run(middleware, make_request("grep", GREP_ARGS, call_id=f"pre-{index}"), handler)
+    assert counter["n"] == 2
+
+    successful_write(middleware, "src/pages/LoginPage.tsx")
+    post = run(middleware, make_request("grep", GREP_ARGS, call_id="post-write"), handler)
+    assert "ARC REPEATED PROBE" not in post.content
+    assert counter["n"] == 3
+
+
+def test_different_args_are_different_probes() -> None:
+    """Varying the pattern or scope never trips the mirror - only exact repeats."""
+
+    middleware = make("implementation")
+    counter = {"n": 0}
+    handler = _counting_handler(counter)
+    for index in range(6):
+        args = dict(GREP_ARGS, pattern=f"probe-{index}")
+        result = run(middleware, make_request("grep", args, call_id=f"v-{index}"), handler)
+        assert "ARC REPEATED PROBE" not in result.content
+    assert counter["n"] == 6
+
+
+def test_glob_is_mirrored_and_read_file_stays_with_its_own_budget() -> None:
+    """Search tools mirror; read_file stays under its deterministic budgets.
+
+    The #242 cumulative re-read budget hard-blocks the third overlapping
+    re-read; reordering that settled contract for a replay would churn tested
+    behavior without adding steering.
+    """
+
+    middleware = make("implementation")
+    counter = {"n": 0}
+    handler = _counting_handler(counter)
+    glob_args = {"pattern": "same-evidence", "path": PROBE_LOG}
+    globs = [
+        run(middleware, make_request("glob", glob_args, call_id=f"gl-{index}"), handler)
+        for index in range(3)
+    ]
+    assert counter["n"] == 2
+    assert "ARC REPEATED PROBE" in globs[2].content
+
+    counter["n"] = 0
+    read_args = {"file_path": PROBE_LOG, "offset": 0, "limit": 100}
+    reads = [
+        run(middleware, make_request("read_file", read_args, call_id=f"r-{index}"), handler)
+        for index in range(4)
+    ]
+    # The re-read budget, not the mirror, owns read_file repeats: the block
+    # check runs before its own counting, so the third overlapping read still
+    # executes and the fourth is hard-blocked.
+    assert counter["n"] == 3
+    assert reads[3].content.startswith(BLOCKED_RESULT_PREFIX)
+    assert all("ARC REPEATED PROBE" not in str(r.content) for r in reads)
+
+
+def test_cold_cache_falls_through_to_execution() -> None:
+    """A cache miss on an over-threshold fingerprint executes for real.
+
+    The mirror only substitutes results the model has actually seen: when
+    eviction has dropped the cached content, the next repeat executes and
+    repopulates the cache instead of replaying a fabricated result.
+    """
+
+    from agents.runtime import stage_discipline
+
+    middleware = make("implementation")
+    counter = {"n": 0}
+    handler = _counting_handler(counter)
+    for index in range(2):
+        run(middleware, make_request("grep", GREP_ARGS, call_id=f"pre-{index}"), handler)
+    assert counter["n"] == 2
+    # Evict the original search from the bounded cache with fresh probes.
+    for index in range(stage_discipline._PROBE_REPLAY_CACHE_SIZE):
+        run(
+            middleware,
+            make_request("grep", dict(GREP_ARGS, pattern=f"filler-{index}"), call_id=f"f-{index}"),
+            handler,
+        )
+    # Occurrence 3: over the repeat threshold, but its cached content was
+    # evicted - execute and re-cache instead of replaying. The counter is
+    # cumulative: 2 originals + 16 fillers + this execution.
+    cold = run(middleware, make_request("grep", GREP_ARGS, call_id="cold"), handler)
+    assert counter["n"] == 19
+    assert "ARC REPEATED PROBE" not in cold.content
+    # Occurrence 4 replays the fresh cache entry (content of the 19th and
+    # latest real execution - the counter is cumulative across fillers).
+    warm = run(middleware, make_request("grep", GREP_ARGS, call_id="warm"), handler)
+    assert counter["n"] == 19
+    assert "ARC REPEATED PROBE" in warm.content
+    assert warm.content.startswith("search result 19")
+
+
+def test_mirror_keeps_counting_toward_the_probe_stall_nudge() -> None:
+    """Replays are still round trips: the #217 target count keeps advancing.
+
+    The nudge's storm accounting counts every probe round trip (the e2e pin
+    relies on 20 greps crossing the threshold), so a replayed call must not
+    hide from it.
+    """
+
+    middleware = make("implementation")
+    results = [
+        run(middleware, make_request("grep", GREP_ARGS, call_id=f"s-{index}"))
+        for index in range(20)
+    ]
+    stalls = [result for result in results if "PROBE STALL" in result.content]
+    assert len(stalls) == 1
+    assert stalls[0] is results[-1]
+    assert "20 read-only lookups" in stalls[0].content
+
+
+# ---------------------------------------------------------------------------
 # Contract pin: core.tdd_retry's tool-name classification (issue #219)
 # ---------------------------------------------------------------------------
 
