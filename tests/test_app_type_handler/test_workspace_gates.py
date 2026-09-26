@@ -134,15 +134,134 @@ def test_install_falls_back_to_legacy_peer_deps(tmp_path, monkeypatch) -> None:
     assert calls[0][1] < calls[1][1]
 
 
-def test_install_fails_when_npm_exits_zero_without_installing(tmp_path, monkeypatch) -> None:
-    """This is the exact bug that made a blank workspace look healthy."""
+@pytest.mark.parametrize(
+    "returncode,stdout,stderr",
+    [
+        (1, "", "npm error ERESOLVE unable to resolve dependency tree"),
+        (1, "", "TypeError: Cannot read properties of null (reading 'edgesOut')"),
+    ],
+)
+def test_install_retries_known_peer_resolution_failures(
+    tmp_path, monkeypatch, returncode, stdout, stderr
+) -> None:
+    calls: list[str] = []
 
     async def fake_run(command: str, target_dir: str, timeout: float = 0.0):
-        return 0, "up to date in 3s", ""
+        calls.append(command)
+        if web_handler.LEGACY_PEER_DEPS_FLAG in command:
+            _install_packages(Path(target_dir))
+            return 0, "installed", ""
+        return returncode, stdout, stderr
+
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run)
+
+    assert asyncio.run(web_handler.run_npm_install(str(tmp_path), _noop_log)) is True
+    assert calls == [
+        "npm install",
+        f"npm install {web_handler.LEGACY_PEER_DEPS_FLAG}",
+    ]
+
+
+@pytest.mark.parametrize(
+    "returncode,stdout,stderr",
+    [
+        (1, "", "npm error EACCES permission denied"),
+        (1, "", "npm error ECONNRESET registry connection lost"),
+        (1, "", "npm error EJSONPARSE malformed package.json"),
+        (127, "", "npm: command not found"),
+        (1, "", "npm error unknown install failure"),
+    ],
+)
+def test_install_does_not_retry_unrelated_failures(
+    tmp_path, monkeypatch, returncode, stdout, stderr
+) -> None:
+    calls: list[str] = []
+
+    async def fake_run(command: str, target_dir: str, timeout: float = 0.0):
+        calls.append(command)
+        return returncode, stdout, stderr
 
     monkeypatch.setattr(web_handler, "_run_npm_command", fake_run)
 
     assert asyncio.run(web_handler.run_npm_install(str(tmp_path), _noop_log)) is False
+    assert calls == ["npm install"]
+
+
+def test_install_does_not_retry_when_npm_cannot_be_spawned(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_run(command: str, target_dir: str, timeout: float = 0.0):
+        calls.append(command)
+        raise FileNotFoundError("npm executable missing")
+
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run)
+
+    assert asyncio.run(web_handler.run_npm_install(str(tmp_path), _noop_log)) is False
+    assert calls == ["npm install"]
+
+
+def test_final_install_failure_preserves_both_attempt_diagnostics(tmp_path, monkeypatch) -> None:
+    messages: list[tuple] = []
+    calls: list[str] = []
+
+    def recording_log(agent_name, message, status=None, node_id=None):
+        messages.append((agent_name, message, status))
+
+    async def fake_run(command: str, target_dir: str, timeout: float = 0.0):
+        calls.append(command)
+        if len(calls) == 1:
+            return 1, "primary stdout details", "ERESOLVE unable to resolve dependency tree"
+        return 23, "fallback stdout details", "fallback diagnostic"
+
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run)
+
+    assert asyncio.run(web_handler.run_npm_install(str(tmp_path), recording_log)) is False
+    assert calls == [
+        "npm install",
+        f"npm install {web_handler.LEGACY_PEER_DEPS_FLAG}",
+    ]
+    failure = next(m[1] for m in messages if "NPM install failed" in m[1])
+    assert "npm install exited 1" in failure
+    assert "primary stdout details" in failure
+    assert "ERESOLVE unable to resolve dependency tree" in failure
+    assert f"npm install {web_handler.LEGACY_PEER_DEPS_FLAG} exited 23" in failure
+    assert "fallback stdout details" in failure
+    assert "fallback diagnostic" in failure
+
+
+def test_install_uses_at_most_one_legacy_peer_retry(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_run(command: str, target_dir: str, timeout: float = 0.0):
+        calls.append(command)
+        return 1, "", "ERESOLVE unable to resolve dependency tree"
+
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run)
+
+    assert asyncio.run(web_handler.run_npm_install(str(tmp_path), _noop_log)) is False
+    assert calls == [
+        "npm install",
+        f"npm install {web_handler.LEGACY_PEER_DEPS_FLAG}",
+    ]
+
+
+def test_install_fails_when_npm_exits_zero_without_installing(tmp_path, monkeypatch) -> None:
+    """This is the exact bug that made a blank workspace look healthy."""
+    messages: list[tuple] = []
+
+    def recording_log(agent_name, message, status=None, node_id=None):
+        messages.append((agent_name, message, status))
+
+    async def fake_run(command: str, target_dir: str, timeout: float = 0.0):
+        return 0, "up to date in 3s", "npm notice diagnostic"
+
+    monkeypatch.setattr(web_handler, "_run_npm_command", fake_run)
+
+    assert asyncio.run(web_handler.run_npm_install(str(tmp_path), recording_log)) is False
+    failure = next(m[1] for m in messages if "NPM install failed" in m[1])
+    assert "npm install exited 0" in failure
+    assert "up to date in 3s" in failure
+    assert "npm notice diagnostic" in failure
 
 
 def test_install_failure_message_keeps_the_npm_error(tmp_path, monkeypatch) -> None:
