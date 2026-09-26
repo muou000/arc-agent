@@ -103,6 +103,8 @@ from core.path_compat import (
     normalize_windows_extended_prefix_text,
 )
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
 
