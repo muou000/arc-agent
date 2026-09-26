@@ -213,6 +213,18 @@ def _stage_pipeline_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _execution_mode_label(*, stage_pipeline: bool, parallel_mode: bool) -> str:
+    """Describe the independent scheduler switches for human logs."""
+
+    if stage_pipeline and not parallel_mode:
+        return "serial stage pipeline (stage worktrees + serial merge queue)"
+    if stage_pipeline and parallel_mode:
+        return "node-worktree parallel with stage gates (stage merge queue disabled)"
+    if parallel_mode:
+        return "node-worktree parallel"
+    return "legacy strict serial"
+
+
 def _affinity_depth() -> int:
     """Subtree depth at which the affinity grouping splits.
 
@@ -620,6 +632,10 @@ class ARCWorkflowManager:
         await self._log(
             "Compiler",
             f"Loaded processing queue with {len(queue_state['tasks'])} task(s) for root node {root_id}.",
+        )
+        await self._log(
+            "Compiler",
+            f"Execution mode: {_execution_mode_label(stage_pipeline=self._stage_pipeline, parallel_mode=self._parallel_mode)}.",
         )
 
         if self._stage_pipeline:
