@@ -16,6 +16,7 @@ import pytest
 
 from agents.tools.test_contract_check import (
     _path_matches,
+    _route_status_declarations,
     build_satisfiability_universe,
     classify_test_hooks,
     collect_manifest_hooks,
@@ -1003,6 +1004,59 @@ def test_path_matches_parameterized_routes() -> None:
     assert not _path_matches("/:id", "/")
 
 
+def test_path_matches_relative_dynamic_route_does_not_reinterpret_static_tail() -> None:
+    """A relative ``/:id`` route must not swallow a static route tail.
+
+    The 2026-09-26 hackathon-sheet REQ-1-1-1 run matched the router-relative
+    detail declaration ``router.get('/:id')`` (skeleton status 404) against
+    the list assertion path ``GET /api/workbooks``, manufacturing a
+    "interface declares 200, but the matched route declares 404" conflict on
+    an assertion the contract fully allowed.
+    """
+
+    assert not _path_matches("/:id", "/api/workbooks")
+    assert not _path_matches("/:id", "/api/workbooks/")
+    # The router-relative detail route still owns concrete ids under its
+    # mount, and deeper parameterized shapes are unaffected.
+    assert _path_matches("/:id", "/api/workbooks/123")
+    assert _path_matches("/:id/state", "/api/workbooks/q3-sales/state")
+
+
+def test_route_status_declarations_parse_pipe_separated_statuses() -> None:
+    """DESIGN cards connect alternative response statuses with ``|``.
+
+    The 2026-09-26 hackathon-sheet card wrote ``-> 200 detail | 404
+    WORKBOOK_NOT_FOUND`` and ``-> 200 { ok: true } | 404 { error } | 400
+    { error } ; 500 { error }``; the parser kept only the arrow status and
+    the ``; {`` continuation, so the detail 404 and the PUT 400 vanished and
+    every assertion on them was rejected as a conflict.
+    """
+
+    specification = (
+        "Added POST /api/workbooks -> 201 { id, name } ; "
+        "400 { error: 'WORKBOOK_NAME_REQUIRED' } ; 500 { error }. "
+        "Existing GET /api/workbooks -> 200 { workbooks } ; "
+        "GET /api/workbooks/:id -> 200 detail | 404 WORKBOOK_NOT_FOUND unchanged. "
+        "PUT /api/workbooks/:id/worksheets/:worksheetId/cells/:rowIndex/:colIndex "
+        "body { value } -> 200 { ok: true } | 404 { error: 'WORKBOOK_NOT_FOUND' } "
+        "| 400 { error: 'INVALID_VALUE' } ; 500 { error }. Non-numeric ids -> 404."
+    )
+
+    routes = {
+        (route["method"], route["path"]): route["status_codes"]
+        for route in _route_status_declarations(specification)
+    }
+
+    assert routes[("GET", "/api/workbooks")] == [200]
+    assert routes[("GET", "/api/workbooks/:id")] == [200, 404]
+    assert set(routes[("POST", "/api/workbooks")]) == {201, 400, 500}
+    assert set(
+        routes[
+            ("PUT", "/api/workbooks/:id/worksheets/:worksheetId/cells/:rowIndex/:colIndex")
+        ]
+    ) == {200, 404, 400, 500}
+
+
 def test_validate_http_status_contract_parameterized_route_card_matches_concrete_paths(
     tmp_project_dir: Path,
 ) -> None:
@@ -1598,3 +1652,263 @@ def test_find_unregistered_api_routes_still_rejects_new_unregistered_routes(
     assert missing == [
         {"file_path": "backend/src/app.js", "method": "GET", "path": "/api/workbooks"}
     ]
+
+
+HACKATHON_WORKBOOKS_SKELETON = """\
+const express = require('express');
+const { listWorkbooks, getWorkbookDetail, setCell } = require('../services/workbook_service');
+
+const router = express.Router();
+
+// Route table (statuses are the API contract):
+// GET  /api/workbooks -> 200 { workbooks: [...] } ; 500 { error }
+// GET  /api/workbooks/:id -> 200 WorkbookDetail ; 404 { error: 'WORKBOOK_NOT_FOUND' } ; 500 { error }
+// PUT  /api/workbooks/:id/worksheets/:worksheetId/cells/:rowIndex/:colIndex
+//      body { value } -> 200 { ok: true } ; 400 { error: 'INVALID_VALUE' } ;
+//      404 { error: 'WORKBOOK_NOT_FOUND' } ; 500 { error }
+// TODO(TDD): implement the three handlers mapping service results/errors to
+// the statuses above; workbook ids are integers, non-numeric -> 404.
+
+router.get('/', async (req, res) => {
+  // TODO(TDD): 200 { workbooks }
+  res.json({ workbooks: await listWorkbooks() });
+});
+
+router.get('/:id', async (req, res) => {
+  // TODO(TDD): 200 detail | 404 WORKBOOK_NOT_FOUND
+  const detail = await getWorkbookDetail(Number(req.params.id));
+  if (!detail) {
+    res.status(404).json({ error: 'WORKBOOK_NOT_FOUND' });
+    return;
+  }
+  res.json(detail);
+});
+
+router.put('/:id/worksheets/:worksheetId/cells/:rowIndex/:colIndex', async (req, res) => {
+  // TODO(TDD): 200 { ok: true } | 404 WORKBOOK_NOT_FOUND
+  await setCell({
+    workbookId: Number(req.params.id),
+    worksheetId: Number(req.params.worksheetId),
+    rowIndex: Number(req.params.rowIndex),
+    colIndex: Number(req.params.colIndex),
+    value: req.body?.value,
+  });
+  res.json({ ok: true });
+});
+
+module.exports = router;
+"""
+
+HACKATHON_WORKBOOKS_INTEGRATION = """\
+const res = await request(app).get('/api/workbooks');
+expect(res.status).toBe(200);
+const detail = await request(app).get('/api/workbooks/1');
+expect(detail.status).toBe(200);
+const missing = await request(app).get('/api/workbooks/9999');
+expect(missing.status).toBe(404);
+const nonNumeric = await request(app).get('/api/workbooks/not-a-number');
+expect(nonNumeric.status).toBe(404);
+const updated = await request(app)
+  .put('/api/workbooks/1/worksheets/s1/cells/1/1')
+  .send({ value: '1200' });
+expect(updated.status).toBe(200);
+const unknownSheet = await request(app)
+  .put('/api/workbooks/1/worksheets/9999/cells/0/0')
+  .send({ value: 'x' });
+expect(unknownSheet.status).toBe(404);
+const invalid = await request(app)
+  .put('/api/workbooks/1/worksheets/s1/cells/0/0')
+  .send({});
+expect(invalid.status).toBe(400);
+const root = await request(app).get('/');
+expect(root.status).toBe(200);
+"""
+
+HACKATHON_WORKBOOKS_CARD_SPEC = (
+    "Added POST /api/workbooks -> 201 { id, name } ; "
+    "400 { error: 'WORKBOOK_NAME_REQUIRED' } ; 500 { error }. "
+    "Existing GET /api/workbooks -> 200 { workbooks } ; "
+    "GET /api/workbooks/:id -> 200 detail | 404 WORKBOOK_NOT_FOUND unchanged. "
+    "PUT /api/workbooks/:id/worksheets/:worksheetId/cells/:rowIndex/:colIndex "
+    "body { value } -> 200 { ok: true } | 404 { error: 'WORKBOOK_NOT_FOUND' } "
+    "| 400 { error: 'INVALID_VALUE' } ; 500 { error }. Non-numeric ids -> 404."
+)
+
+
+def _hackathon_workbooks_interfaces() -> list[dict]:
+    return [
+        {
+            "interface_id": "REQ-1-1-1-API-Workbooks",
+            "type": "API",
+            "name": "Workbooks REST router",
+            "file_path": "backend/src/routes/workbooks.js",
+            "first_line": "router.post('/', async (req, res) => {",
+            "responsibility": "REST boundary extended with blank workbook creation.",
+            "specification": HACKATHON_WORKBOOKS_CARD_SPEC,
+        },
+        {
+            "interface_id": "REQ-1-1-1-FUNC-App",
+            "type": "FUNC",
+            "name": "Backend app entry",
+            "file_path": "backend/src/app.js",
+            "responsibility": (
+                "Shared app entry serving the workbooks router and frontend dist on port 3301."
+            ),
+            "specification": (
+                "app.use('/api/workbooks', workbooksRouter) before SPA fallback; "
+                "static serving untouched."
+            ),
+        },
+    ]
+
+
+def test_validate_http_status_contract_accepts_pipe_status_card_replay(tmp_project_dir: Path) -> None:
+    """Inline replay of the 2026-09-26 hackathon-sheet REQ-1-1-1 rejection.
+
+    The real run rejected every assertion in this exact shape with seven
+    diagnostics: the card's ``|``-separated statuses were dropped (detail
+    404, PUT 400), the router-relative ``/:id`` skeleton record (404) was
+    matched against the list assertion, and the SPA root assertion had no
+    API contract. Every assertion matches the declared contract.
+    """
+
+    routes_path = tmp_project_dir / "backend" / "src" / "routes" / "workbooks.js"
+    routes_path.parent.mkdir(parents=True)
+    routes_path.write_text(HACKATHON_WORKBOOKS_SKELETON, encoding="utf-8")
+    test_path = (
+        tmp_project_dir
+        / "backend"
+        / "tests"
+        / "generated"
+        / "req_1_1_1_ff92cc72"
+        / "integration"
+        / "workbooksApi.test.js"
+    )
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(HACKATHON_WORKBOOKS_INTEGRATION, encoding="utf-8")
+    manifest = [
+        {
+            "test_id": "REQ-1-1-1-INT-WorkbooksApi",
+            "req_id": "REQ-1-1-1",
+            "type": "Integration",
+            "coverage_scope": "owned",
+            "interface_ids": ["REQ-1-1-1-API-Workbooks", "REQ-1-1-1-FUNC-App"],
+            "file_path": str(test_path.relative_to(tmp_project_dir)).replace("\\", "/"),
+        }
+    ]
+
+    assert validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "View and open a workbook; edit a cell value."},
+        _hackathon_workbooks_interfaces(),
+        manifest,
+    ) == []
+
+
+def test_validate_http_status_contract_root_assertion_without_non_api_owner_stays_needs_info(
+    tmp_project_dir: Path,
+) -> None:
+    """The root-path skip is bound to a declared non-API owner.
+
+    When the manifest names only API interfaces, a bare ``GET /`` assertion
+    has no API contract and stays a needs-info diagnostic instead of being
+    silently accepted.
+    """
+
+    test_path = tmp_project_dir / "tests" / "root.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const root = await request(app).get('/');\n"
+        "expect(root.status).toBe(200);\n",
+        encoding="utf-8",
+    )
+    manifest = [
+        {
+            "type": "Integration",
+            "file_path": "tests/root.test.js",
+            "interface_ids": ["REQ-1-1-1-API-Workbooks"],
+        }
+    ]
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "View and open a workbook."},
+        [
+            {
+                "interface_id": "REQ-1-1-1-API-Workbooks",
+                "type": "API",
+                "specification": "GET /api/workbooks -> 200 { workbooks }.",
+                "file_path": "backend/src/routes/workbooks.js",
+            }
+        ],
+        manifest,
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_needs_info"
+
+
+def test_validate_http_status_contract_static_declared_path_beats_relative_dynamic_record(
+    tmp_project_dir: Path,
+) -> None:
+    """A statically declared route owns its assertions; sibling ``/:id`` records don't.
+
+    The same misattribution class as the REQ-1-1-1 list-route conflict, one
+    mount deeper: the dynamic record's swallowed tail is a sibling STATIC
+    route (``/:id`` vs ``/api/auth/register``). The static routes here
+    declare their statuses on the card only (placeholder skeleton bodies),
+    so without the precedence rule the ``/:id`` record's 404 is the only
+    matched route code and both assertions are rejected as conflicts.
+    """
+
+    routes_path = tmp_project_dir / "backend" / "src" / "routes" / "auth.js"
+    routes_path.parent.mkdir(parents=True)
+    routes_path.write_text(
+        "const router = require('express').Router();\n"
+        "router.get('/register', (req, res) => {\n"
+        "  res.status(501).json({ code: 'NOT_IMPLEMENTED' });\n"
+        "});\n"
+        "router.get('/session', (req, res) => {\n"
+        "  res.status(501).json({ code: 'NOT_IMPLEMENTED' });\n"
+        "});\n"
+        "router.get('/:id', (req, res) => {\n"
+        "  if (!req.params.id) {\n"
+        "    res.status(404).json({ error: 'NOT_FOUND' });\n"
+        "    return;\n"
+        "  }\n"
+        "  res.status(501).json({ code: 'NOT_IMPLEMENTED' });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    test_path = tmp_project_dir / "tests" / "auth.test.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const register = await request(app).get('/api/auth/register');\n"
+        "expect(register.status).toBe(201);\n"
+        "const session = await request(app).get('/api/auth/session');\n"
+        "expect(session.status).toBe(200);\n",
+        encoding="utf-8",
+    )
+    card = {
+        "interface_id": "REQ-1-API-Auth",
+        "type": "API",
+        "specification": (
+            "GET /api/auth/register -> 201 { user }. "
+            "GET /api/auth/session -> 200 { user }."
+        ),
+        "file_path": "backend/src/routes/auth.js",
+    }
+    manifest = [
+        {
+            "type": "Integration",
+            "file_path": "tests/auth.test.js",
+            "interface_ids": [card["interface_id"]],
+        }
+    ]
+
+    assert validate_http_status_contracts(
+        tmp_project_dir,
+        {"description": "Register a traveler account."},
+        [card],
+        manifest,
+    ) == []
