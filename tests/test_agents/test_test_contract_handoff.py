@@ -382,3 +382,79 @@ def test_design_phase_reports_needs_info_when_status_contract_is_missing(
     assert "needs-info" in diagnostics[0]["message"]
     assert any("not enough HTTP status" in message for _, message, _, _ in logs)
     assert runner.app_handler.calls == []
+
+
+def test_import_route_requires_api_card_before_test_generation_and_reaches_tdd_after_fix(
+    tmp_project_dir: Path, arc_runtime,
+) -> None:
+    node_id = "REQ-HOOK-STATUS"
+    arc_runtime.traceability.store_requirement_tree(
+        {"id": node_id, "name": "Import workbook", "description": "Import CSV."}
+    )
+    route = tmp_project_dir / "backend/src/routes/workbooks.js"
+    route.parent.mkdir(parents=True)
+    route.write_text(
+        "const router = require('express').Router();\n"
+        "// POST /api/workbooks/import -> 201 {workbook}, 400 {errors}\n"
+        "router.post('/import', (req, res) => {\n"
+        "  res.status(501).json({code: 'NOT_IMPLEMENTED'});\n"
+        "});\n", encoding="utf-8",
+    )
+    test_file = tmp_project_dir / E2E_TEST_FILE
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text(
+        "const res = await request.post('/api/workbooks/import');\n"
+        "expect(res.status).toBe(201);\n"
+        "expect(res.status).toBe(400);\n", encoding="utf-8",
+    )
+    runner, logs = _make_status_runner(tmp_project_dir, 201)
+    runner.interface_designer.payload = {
+        "interfaces": [{"interface_id": "IF-IMPORT-UI", "type": "UI",
+                        "file_path": "frontend/src/components/ImportCsvButton.jsx",
+                        "specification": "CSV upload button."}],
+        "files_written": ["backend/src/routes/workbooks.js"],
+        "materialized_paths": ["/workspace/backend/src/routes/workbooks.js"],
+    }
+    assert asyncio.run(runner.run_interface_design_stage(node_id, {})) is False
+    diagnostics = sessions.load_node_session(node_id)["interface_design_diagnostics"]
+    assert diagnostics[0]["code"] == "api_contract_missing"
+    assert diagnostics[0]["path"] == "/api/workbooks/import"
+    assert any("before TEST_GENERATION" in message for _, message, _, _ in logs)
+    assert runner.app_handler.calls == []
+
+    runner.interface_designer.payload["interfaces"].append({
+        "interface_id": "IF-IMPORT-API", "type": "API",
+        "file_path": "backend/src/routes/workbooks.js",
+        "specification": "POST /api/workbooks/import -> 201 {workbook}, 400 {errors}.",
+    })
+    runner.test_generator._manifest = [{
+        "test_id": "T-IMPORT", "req_id": node_id,
+        "interface_ids": ["IF-IMPORT-API", "IF-IMPORT-UI"],
+        "coverage_scope": "owned", "type": "E2E",
+        "file_path": E2E_TEST_FILE, "first_line": "const res = await request.post",
+    }]
+    assert asyncio.run(runner.run_interface_design_stage(node_id, {})) is True
+    assert asyncio.run(runner.run_test_generation_stage(node_id, {})) is True
+    assert sessions.load_node_session(node_id)["interface_design_diagnostics"] == []
+    assert runner.app_handler.calls == [("E2E", [E2E_TEST_FILE])]
+
+
+def test_dependency_status_check_resolves_named_foreign_api_card(tmp_project_dir: Path, arc_runtime) -> None:
+    arc_runtime.traceability.upsert_interface(
+        interface_id="IF-WORKBOOKS", req_ids=["REQ-PREREQ"], type="API",
+        file_path="backend/src/routes/workbooks.js",
+        content='{"specification": "GET /api/workbooks returns 200 {workbooks}."}',
+    )
+    test = tmp_project_dir / E2E_TEST_FILE
+    test.parent.mkdir(parents=True, exist_ok=True)
+    test.write_text(
+        "const res = await request.get('/api/workbooks');\n"
+        "expect(res.status).toBe(200);\n", encoding="utf-8",
+    )
+    runner, _ = _make_status_runner(tmp_project_dir, 201)
+    sessions.merge_node_session("REQ-HOOK-STATUS", {"interfaces": []})
+    assert asyncio.run(runner._validate_http_status_contracts(
+        node_id="REQ-HOOK-STATUS", requirement_data={},
+        tests=[{"type": "E2E", "file_path": E2E_TEST_FILE,
+                "interface_ids": ["IF-WORKBOOKS"], "coverage_scope": "dependency"}],
+    )) is True

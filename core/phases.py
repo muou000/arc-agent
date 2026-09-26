@@ -17,6 +17,7 @@ from agents.tools.test_contract_check import (
     build_satisfiability_universe,
     classify_test_hooks,
     collect_manifest_hooks,
+    find_unregistered_api_routes,
     format_http_status_diagnostics,
     validate_http_status_contracts,
 )
@@ -451,6 +452,7 @@ class WorkflowPhaseRunner:
                 "result_state": "",
                 "coverage_reuse": None,
                 "test_contract_diagnostics": [],
+                "interface_design_diagnostics": [],
             },
         )
 
@@ -578,6 +580,46 @@ class WorkflowPhaseRunner:
                 node_id=node_id,
             )
         if prepare_error is not None:
+            return False
+        # A shared router can gain a new endpoint while the response only
+        # re-serializes its old card or a UI card. Check written route files
+        # before publishing a design that TestGenerator cannot target.
+        known_interfaces = list(prepared_interfaces)
+        current_ids = {item["interface_id"] for item in prepared_interfaces}
+        for stored in self.traceability.list_interfaces():
+            if stored.get("interface_id") in current_ids:
+                continue
+            try:
+                content = json.loads(str(stored.get("content") or "{}"))
+            except (ValueError, TypeError):
+                continue
+            if isinstance(content, dict):
+                known_interfaces.append({**content, "type": stored.get("type")})
+        missing_routes = find_unregistered_api_routes(
+            self.workspace_path,
+            list(interface_result.get("materialized_paths") or files_written),
+            known_interfaces,
+        )
+        if missing_routes:
+            diagnostics = [
+                {
+                    "code": "api_contract_missing",
+                    **route,
+                    "message": (
+                        f"DESIGN failed: {route['method']} {route['path']} in {route['file_path']} "
+                        "has no matching API interface card. Register its method/path and "
+                        "declared response statuses in `interfaces` before TEST_GENERATION."
+                    ),
+                }
+                for route in missing_routes
+            ]
+            self._update_node_session(node_id, {"interface_design_diagnostics": diagnostics})
+            await self._log(
+                "InterfaceDesigner",
+                "\n".join(item["message"] for item in diagnostics),
+                status="error",
+                node_id=node_id,
+            )
             return False
         context_pipeline.cache.invalidate_file_layers(node_id)
         context_pipeline.cache.invalidate_db_layers(node_id)
@@ -1218,6 +1260,23 @@ class WorkflowPhaseRunner:
 
         interfaces = sessions.load_node_session(node_id).get("interfaces") or []
         try:
+            # Dependency/shared regression tests may name API cards owned by
+            # another node; resolve only their explicit manifest references.
+            known_ids = {str(item.get("interface_id") or "") for item in interfaces}
+            interfaces = list(interfaces)
+            for test in tests:
+                if normalize_coverage_scope(test.get("coverage_scope")) not in {"dependency", "shared"}:
+                    continue
+                for interface_id in normalize_string_list(test.get("interface_ids")):
+                    if interface_id in known_ids:
+                        continue
+                    stored = self.traceability.get_interface(interface_id)
+                    if not stored or str(stored.get("type") or "").upper() != "API":
+                        continue
+                    content = json.loads(str(stored.get("content") or "{}"))
+                    if isinstance(content, dict):
+                        interfaces.append({**content, "interface_id": interface_id, "type": "API"})
+                        known_ids.add(interface_id)
             diagnostics = validate_http_status_contracts(
                 self.workspace_path,
                 requirement_data,
