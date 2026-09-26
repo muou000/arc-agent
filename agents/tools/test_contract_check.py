@@ -73,10 +73,23 @@ _URL_HOOK = re.compile(
 )
 #: test-id selectors (``getByTestId('submit-btn')``, ``locator('[data-testid="x"]')``).
 _TEST_ID = re.compile(r"(?:getByTestId\(\s*|\[data-testid\s*=\s*)(['\"])([\w.-]+)\1")
+#: The quoted URL argument of an HTTP request call. Besides the plain literal
+#: (``'/api/auth/register'``), web-test-harness E2E specs drive APIs with
+#: template literals whose literal path follows a ``${...}`` prefix
+#: (`` `${BASE_URL}/api/auth/register` ``): the interpolation prefix is
+#: consumed so both forms attribute the same literal path. A template with no
+#: literal path after its interpolations (`` `${BASE_URL}${path}` ``) matches
+#: nothing — the assertion stays needs-info instead of guessing an owner.
+_QUOTED_API_PATH = (
+    r"(?P<quote>['\"`])"
+    r"(?:[^'\"`/]*?\$\{[^}]*\})*(?P<path>/[^'\"`\n]*)"
+)
 #: Integration/API calls: ``fetch('/api/auth/register'...)``,
-#: ``request.get('/api/auth/me')``, supertest ``agent.post('/api/auth/register')``.
+#: ``request.get('/api/auth/me')``, supertest ``agent.post('/api/auth/register')``
+#: and the `` `${BASE_URL}/api/...` `` E2E template form — the same URL shapes
+#: the status-contract request extractor accepts.
 _API_HOOK = re.compile(
-    r"\.(?:get|post|put|patch|delete)\(\s*(['\"`])(/[^'\"`]+)\1",
+    r"\.(?:get|post|put|patch|delete)\(\s*" + _QUOTED_API_PATH + r"(?P=quote)",
 )
 
 _ROLE_NAMES = {"link", "button", "checkbox", "textbox", "combobox", "heading", "banner", "navigation", "img", "radio", "option", "listbox", "dialog"}
@@ -110,7 +123,7 @@ _REQUEST_CALL_RE = re.compile(
     rf"(?:(?:const|let|var)\s+(?P<variable>{_IDENTIFIER})\s*=\s*)?"
     rf"(?:await\s+)?(?:(?:{_IDENTIFIER})\s*\.\s*)+"
     rf"(?P<method>{_HTTP_METHODS})\s*\(\s*"
-    rf"(?P<quote>['\"`])(?P<path>/[^'\"`\n]*)",
+    rf"{_QUOTED_API_PATH}",
     re.IGNORECASE,
 )
 _STATUS_PROPERTY_ASSERTION_RE = re.compile(
@@ -127,7 +140,7 @@ _REVERSED_STATUS_CONTAINS_RE = re.compile(
 )
 _REQUEST_EXPECT_RE = re.compile(
     rf"(?P<full>(?:await\s+)?(?:{_IDENTIFIER}(?:\([^\n)]*\))?\s*\.\s*)+"
-    rf"(?P<method>{_HTTP_METHODS})\s*\(\s*(?P<quote>['\"`])(?P<path>/[^'\"`\n]*)"
+    rf"(?P<method>{_HTTP_METHODS})\s*\(\s*{_QUOTED_API_PATH}"
     rf"[^\n;]*?\)\s*\.\s*expect\(\s*(?P<expected>[^)\n]+)\))",
     re.IGNORECASE,
 )
@@ -135,12 +148,12 @@ _CHAIN_REQUEST_CALL_RE = re.compile(
     rf"(?:(?:const|let|var)\s+(?P<variable>{_IDENTIFIER})\s*=\s*)?"
     rf"(?:await\s+)?{_IDENTIFIER}\s*\([^)]*\)\s*\.\s*"
     rf"(?P<method>{_HTTP_METHODS})\s*\(\s*"
-    rf"(?P<quote>['\"`])(?P<path>/[^'\"`\n]*)",
+    rf"{_QUOTED_API_PATH}",
     re.IGNORECASE,
 )
 _FETCH_CALL_RE = re.compile(
     rf"(?:(?:const|let|var)\s+(?P<variable>{_IDENTIFIER})\s*=\s*)?"
-    rf"(?:await\s+)?fetch\(\s*(?P<quote>['\"])(?P<path>/[^'\"\n]*)",
+    rf"(?:await\s+)?fetch\(\s*{_QUOTED_API_PATH}",
     re.IGNORECASE,
 )
 _ROUTE_DECLARATION_RE = re.compile(
@@ -1262,7 +1275,7 @@ def extract_test_hooks(file_path: str, content: str) -> list[dict[str, str]]:
             # prompt shows is the real path.
             add("url", target.replace("\\/", "/").strip("$^"))
     for match in _API_HOOK.finditer(content):
-        add("api", match.group(2))
+        add("api", match.group("path"))
     return hooks
 
 

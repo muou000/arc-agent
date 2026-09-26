@@ -226,6 +226,16 @@ def test_extract_hooks_goto_new_url_form() -> None:
     assert ("url", "/login") in {(h["kind"], h["value"]) for h in hooks}
 
 
+def test_extract_hooks_base_url_template_api_call() -> None:
+    """The hook list sees the same literal path the request extractor sees."""
+
+    hooks = extract_test_hooks(
+        "e2e/auth.spec.js",
+        "const me = await page.request.get(`${BASE_URL}/api/auth/me`);\n",
+    )
+    assert ("api", "/api/auth/me") in {(h["kind"], h["value"]) for h in hooks}
+
+
 def test_normalize_strips_origin_to_path() -> None:
     """Full origins reduce to their path; a bare origin reduces to nothing.
 
@@ -273,6 +283,66 @@ expect(response.status).toBe(201);
     assert assertions[0]["path"] == "/api/notes"
     assert assertions[0]["method"] == "POST"
     assert assertions[0]["expected_status_codes"] == [201]
+
+
+def test_extract_http_status_assertions_supports_base_url_template_prefix() -> None:
+    """web-test-harness E2E specs drive APIs with `` `${BASE_URL}/api/...` ``.
+
+    The literal path after the ``${...}`` prefix attributes exactly like the
+    equivalent quoted literal; the prefix itself is not part of the API
+    surface.
+    """
+
+    content = (
+        "const created = await page.request.post(`${BASE_URL}/api/auth/register`, { data });\n"
+        "expect(created.status()).toBe(201);\n"
+    )
+
+    assertions = extract_http_status_assertions("e2e/auth.spec.js", content)
+
+    assert assertions == [
+        {
+            "file_path": "e2e/auth.spec.js",
+            "line": 2,
+            "path": "/api/auth/register",
+            "method": "POST",
+            "assertion": "expect(created.status()).toBe(201)",
+            "expected_status_codes": [201],
+            "matcher": "toBe",
+        }
+    ]
+
+
+def test_extract_http_status_assertions_template_path_keeps_parameter_segments() -> None:
+    """`` ${BASE_URL}/api/x/${id} `` keeps the dynamic tail so parameterized
+    cards (``/api/x/:id``) match while literal siblings do not."""
+
+    content = (
+        "const found = await page.request.get(`${BASE_URL}/api/workbooks/${id}`);\n"
+        "expect(found.status()).toBe(200);\n"
+    )
+
+    assertions = extract_http_status_assertions("e2e/workbooks.spec.js", content)
+
+    assert len(assertions) == 1
+    assert assertions[0]["path"] == "/api/workbooks/${id}"
+    assert assertions[0]["method"] == "GET"
+
+
+def test_extract_http_status_assertions_supports_fetch_template_url() -> None:
+    """`` fetch(`${BASE_URL}/api/...`) `` attributes like the quoted literal."""
+
+    content = (
+        "const response = await fetch(`${BASE_URL}/api/auth/me`);\n"
+        "expect(response.status).toBe(200);\n"
+    )
+
+    assertions = extract_http_status_assertions("e2e/auth.spec.js", content)
+
+    assert len(assertions) == 1
+    assert assertions[0]["path"] == "/api/auth/me"
+    assert assertions[0]["method"] == "GET"
+    assert assertions[0]["expected_status_codes"] == [200]
 
 
 @pytest.mark.parametrize(
@@ -431,6 +501,99 @@ def test_validate_http_status_contract_accepts_arc_output2_auth_shapes(
         assert validate_http_status_contracts(
             tmp_project_dir, {"description": "Authentication."}, [partial], manifest
         ) == []
+
+
+def test_validate_http_status_contract_accepts_base_url_template_e2e_requests(
+    tmp_project_dir: Path,
+) -> None:
+    """E2E specs quoting URLs as `` `${BASE_URL}/api/...` `` attribute like literals.
+
+    With several API interfaces in one manifest, an unextracted template URL
+    left every assertion unattributed and reported needs-info against
+    contract-consistent tests; the literal path after the ``${...}`` prefix
+    must pick the unique owning interface. Real conflicts stay rejected.
+    """
+
+    interfaces = [
+        {
+            "interface_id": "IF-AUTH",
+            "type": "API",
+            "specification": "POST /api/auth/register -> 201 { user }; 400 { errors }.",
+            "file_path": "backend/src/routes/auth.js",
+        },
+        {
+            "interface_id": "IF-NOTES",
+            "type": "API",
+            "specification": "GET /api/notes -> 200 { notes }.",
+            "file_path": "backend/src/routes/notes.js",
+        },
+    ]
+    manifest = [{"type": "E2E", "file_path": "e2e/flows.spec.js"}]
+    test_path = tmp_project_dir / "e2e" / "flows.spec.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const created = await page.request.post(`${BASE_URL}/api/auth/register`);\n"
+        "expect(created.status()).toBe(201);\n"
+        "const list = await page.request.get(`${BASE_URL}/api/notes`);\n"
+        "expect(list.status()).toBe(200);\n",
+        encoding="utf-8",
+    )
+
+    assert validate_http_status_contracts(
+        tmp_project_dir, {"description": "Auth and notes."}, interfaces, manifest
+    ) == []
+
+    test_path.write_text(
+        "const created = await page.request.post(`${BASE_URL}/api/auth/register`);\n"
+        "expect(created.status()).toBe(200);\n",
+        encoding="utf-8",
+    )
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir, {"description": "Auth and notes."}, interfaces, manifest
+    )
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_conflict"
+    assert diagnostics[0]["interface_id"] == "IF-AUTH"
+
+
+def test_validate_http_status_contract_unresolvable_template_url_stays_needs_info(
+    tmp_project_dir: Path,
+) -> None:
+    """A template with no literal path after its interpolations owns nothing.
+
+    `` `${BASE_URL}${dynamicPath}` `` must not attribute to whichever
+    interface happens to match a guessed prefix — the assertion stays
+    needs-info.
+    """
+
+    interfaces = [
+        {
+            "interface_id": "IF-AUTH",
+            "type": "API",
+            "specification": "POST /api/auth/register -> 201 { user }.",
+            "file_path": "backend/src/routes/auth.js",
+        },
+        {
+            "interface_id": "IF-NOTES",
+            "type": "API",
+            "specification": "GET /api/notes -> 200 { notes }.",
+            "file_path": "backend/src/routes/notes.js",
+        },
+    ]
+    manifest = [{"type": "E2E", "file_path": "e2e/dynamic.spec.js"}]
+    test_path = tmp_project_dir / "e2e" / "dynamic.spec.js"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "const response = await page.request.get(`${BASE_URL}${dynamicPath}`);\n"
+        "expect(response.status()).toBe(200);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = validate_http_status_contracts(
+        tmp_project_dir, {"description": "Auth and notes."}, interfaces, manifest
+    )
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "status_code_needs_info"
 
 
 def test_validate_http_status_contract_route_comments_are_scoped_and_placeholder_is_not_a_contract(
