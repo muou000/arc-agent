@@ -19,6 +19,21 @@ from langgraph.errors import GraphRecursionError
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
 
+
+class StreamCompatibilityError(RuntimeError):
+    """Explicit marker for a stream transport incompatibility.
+
+    Only failures carrying this marker, or a narrowly recognized equivalent
+    from the stream API itself, may fall back to ``ainvoke``. A generic
+    exception is never safe to replay because the stream may already have
+    invoked tools or changed files.
+    """
+
+
+class StageAgentStreamError(RuntimeError):
+    """Terminal failure raised when a stage stream cannot produce a result."""
+
+
 # Empirical ceiling for one stage-agent session (one ``ainvoke`` call). Healthy
 # sessions on the 12306 benchmark stay under ~150 graph steps; a runaway repair
 # loop (the model re-editing a file it just corrupted) blew past 450 steps and
@@ -463,21 +478,34 @@ async def _try_astream_stage_agent(
     logger: Any | None,
 ) -> dict[str, Any] | None:
     if not hasattr(agent, "astream_events"):
-        await _emit_log(log_cb, run_label, "agent streaming is unavailable; falling back to ainvoke.", node_id=context.node_id)
+        message = "agent streaming is unavailable; falling back to ainvoke once."
+        await _emit_log(log_cb, run_label, message, status="warning", node_id=context.node_id)
+        log_to_logger(
+            logger,
+            "AGENT_STREAM_COMPATIBILITY_FALLBACK",
+            label=run_label,
+            thread_id=thread_id,
+            body="reason=missing_astream_events",
+        )
         return None
 
     await _emit_log(log_cb, run_label, "agent stream start.", node_id=context.node_id)
     final_state: dict[str, Any] | None = None
+    stream_event_seen = False
+    stream_side_effect_seen = False
+    config = build_agent_config(thread_id)
     try:
         event_stream = agent.astream_events(
             {"messages": [{"role": "user", "content": message}]},
             context=context,
-            config=build_agent_config(thread_id),
+            config=config,
             version=os.environ.get("ARC_AGENT_STREAM_VERSION", "v2"),
         )
         if inspect.isawaitable(event_stream):
             event_stream = await event_stream
         async for event in event_stream:
+            stream_event_seen = True
+            stream_side_effect_seen = stream_side_effect_seen or _stream_event_has_side_effect(event)
             maybe_state = await _log_stream_event(
                 log_cb,
                 event,
@@ -486,10 +514,29 @@ async def _try_astream_stage_agent(
             )
             if isinstance(maybe_state, dict):
                 final_state = maybe_state
-    except GraphRecursionError:
+    except GraphRecursionError as exc:
         # The step budget is exhausted; a full ainvoke retry would burn the
-        # same budget again on a fresh session. Let the failure propagate.
-        raise
+        # same budget again on a fresh session. Let the failure propagate and
+        # leave an explicit terminal diagnostic for the run record.
+        budget_error = GraphRecursionError(
+            f"stage agent session hit its step budget (recursion_limit={config['recursion_limit']}). "
+            "If this node legitimately needs more steps, raise ARC_AGENT_RECURSION_LIMIT for the run."
+        )
+        await _emit_log(
+            log_cb,
+            run_label,
+            f"agent stream failed on the step budget; surfacing the error. error={budget_error}",
+            status="error",
+            node_id=context.node_id,
+        )
+        log_to_logger(
+            logger,
+            "AGENT_STREAM_STEP_BUDGET",
+            label=run_label,
+            thread_id=thread_id,
+            body=str(budget_error),
+        )
+        raise budget_error from exc
     except ARCModelAPIError as exc:
         # The model API call already exhausted its adapter-level retry chain
         # (or tripped the consecutive-failure budget). The ainvoke fallback
@@ -521,28 +568,81 @@ async def _try_astream_stage_agent(
         log_to_logger(logger, "AGENT_STREAM_STRUCTURED_ERROR", label=run_label, thread_id=thread_id, body=str(exc))
         raise
     except Exception as exc:
-        await _emit_log(
-            log_cb,
-            run_label,
-            f"agent stream failed; falling back to ainvoke. error={exc}",
-            status="warning",
-            node_id=context.node_id,
+        compatibility_reason = _stream_compatibility_failure_reason(exc)
+        if not stream_event_seen and compatibility_reason:
+            message = (
+                "agent stream hit a classified transport compatibility failure before any event; "
+                f"falling back to ainvoke once. reason={compatibility_reason} error={exc}"
+            )
+            await _emit_log(log_cb, run_label, message, status="warning", node_id=context.node_id)
+            log_to_logger(
+                logger,
+                "AGENT_STREAM_COMPATIBILITY_FALLBACK",
+                label=run_label,
+                thread_id=thread_id,
+                body=f"reason={compatibility_reason}; error={exc}",
+            )
+            return None
+
+        message = (
+            "agent stream failed; surfacing the terminal error. "
+            f"event_seen={stream_event_seen} side_effect_seen={stream_side_effect_seen} error={exc}"
         )
-        log_to_logger(logger, "AGENT_STREAM_FALLBACK", label=run_label, thread_id=thread_id, body=str(exc))
-        return None
+        await _emit_log(log_cb, run_label, message, status="error", node_id=context.node_id)
+        log_to_logger(
+            logger,
+            "AGENT_STREAM_FAILURE",
+            label=run_label,
+            thread_id=thread_id,
+            body=(
+                f"event_seen={stream_event_seen}; side_effect_seen={stream_side_effect_seen}; "
+                f"error={exc}"
+            ),
+        )
+        raise
 
     if final_state is None:
-        await _emit_log(
-            log_cb,
-            run_label,
-            "agent stream ended without final state; falling back to ainvoke.",
-            status="warning",
-            node_id=context.node_id,
+        error = StageAgentStreamError(
+            "agent stream ended without final state; surfacing the terminal error. "
+            f"event_seen={stream_event_seen} side_effect_seen={stream_side_effect_seen}"
         )
-        return None
+        await _emit_log(log_cb, run_label, str(error), status="error", node_id=context.node_id)
+        log_to_logger(
+            logger,
+            "AGENT_STREAM_FAILURE",
+            label=run_label,
+            thread_id=thread_id,
+            body=str(error),
+        )
+        raise error
 
     await _log_agent_trace(log_cb, final_state, label=run_label, thread_id=thread_id, node_id=context.node_id)
     return extract_payload(final_state)
+
+
+def _stream_compatibility_failure_reason(exc: BaseException) -> str | None:
+    """Classify only failures known to mean the event transport is unsupported."""
+
+    if isinstance(exc, StreamCompatibilityError):
+        return "explicit_marker"
+    return None
+
+
+def _stream_event_has_side_effect(event: Any) -> bool:
+    """Conservatively mark tool/file events before their output is parsed."""
+
+    if not isinstance(event, dict):
+        return False
+    event_name = str(event.get("event", "") or "").strip().lower()
+    if event_name in {"on_tool_start", "on_tool_end"} or event_name.startswith("on_file_"):
+        return True
+    name = str(event.get("name", "") or "").strip().lower().replace("-", "_")
+    return event_name in {"on_custom_event", "on_event"} and name in {
+        "append_file",
+        "delete_file",
+        "edit_file",
+        "write_file",
+    }
 
 
 async def _log_stream_event(

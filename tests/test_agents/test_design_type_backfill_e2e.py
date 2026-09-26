@@ -164,9 +164,11 @@ def test_typeless_rows_via_recovery_channel_reach_the_type_repair(tmp_project_di
     assert not by_id["REQ-2-UI-LoginPage"].get("type")
     assert not by_id["REQ-2-SeedService"].get("type")
     # main(1) + the repair ask's stream attempt: structured tool call(2),
-    # decode-retry turn(3) exhausting the queue, then the stream wrapper's
-    # ainvoke fallback failing again(4) before the adapter catches.
-    assert model.call_count == 4
+    # decode-retry turn(3) exhausting the queue. A stream-side failure after
+    # that work is terminal; it must not replay the full agent session.
+    assert model.call_count == 3
     warnings = [message for _, message, status, _ in logs if status == "warning"]
     assert any("no resolvable `type`" in message for message in warnings)
     assert any("Type re-serialization pass failed" in message for message in warnings)
+    errors = [message for _, message, status, _ in logs if status == "error"]
+    assert any("agent stream failed" in message for message in errors)
