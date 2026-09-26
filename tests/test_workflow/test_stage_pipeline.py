@@ -152,6 +152,7 @@ def test_only_approved_disjoint_stage_windows_can_overlap() -> None:
 
     assert stage_write_sets_disjoint(test_generation, interface_design)
     assert stage_overlap_allowed(test_generation, interface_design)
+    assert stage_overlap_allowed(test_generation, next_test_generation)
     assert stage_overlap_allowed(implementation, next_test_generation)
     assert not stage_overlap_allowed(interface_design, other_stage)
     assert not stage_overlap_allowed(test_generation, conflicting_design)
@@ -184,11 +185,70 @@ def test_first_pass_approved_pairs_overlap_without_declared_write_sets() -> None
     next_test_generation = _stage("N+1", STAGE_TEST_GENERATION, 3)
 
     assert stage_overlap_allowed(test_generation, interface_design)
+    assert stage_overlap_allowed(test_generation, next_test_generation)
     assert stage_overlap_allowed(implementation, next_test_generation)
     # The structural proof licenses only the approved cross-node windows.
     assert not stage_overlap_allowed(interface_design, _stage("N+1", STAGE_IMPLEMENTATION, 4))
     assert not stage_overlap_allowed(test_generation, _stage("N", STAGE_INTERFACE_DESIGN, 5))
     assert not stage_overlap_allowed(interface_design, _stage("N", STAGE_INTERFACE_DESIGN, 6))
+
+
+def test_adjacent_test_generators_require_disjoint_write_sets() -> None:
+    prefix = node_test_namespace_prefixes("N")[1]
+    left = _stage("N", STAGE_TEST_GENERATION, 0, writes=[f"{prefix}/api.test.js"])
+    right = _stage("N+1", STAGE_TEST_GENERATION, 1, writes=[f"{prefix}/api.test.js"])
+
+    assert not stage_overlap_allowed(left, right)
+
+
+def test_adjacent_test_generators_reject_a_write_outside_the_declaring_namespace() -> None:
+    left = _stage(
+        "N",
+        STAGE_TEST_GENERATION,
+        0,
+        writes=[f"{node_test_namespace_prefixes('N+1')[1]}/api.test.js"],
+    )
+    right = _stage("N+1", STAGE_TEST_GENERATION, 1)
+
+    assert not stage_overlap_allowed(left, right)
+
+
+def test_stage_selector_opens_adjacent_test_generation_window() -> None:
+    running_generation = _stage("A", STAGE_TEST_GENERATION, 2, "RUNNING", node_order=0)
+    candidate_generation = _stage("B", STAGE_TEST_GENERATION, 6, node_order=1)
+    queue = _queue(
+        _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_PUBLISHED, node_order=0),
+        running_generation,
+        _stage("B", STAGE_VISUAL_ANALYSIS, 4, STAGE_PUBLISHED, node_order=1),
+        _stage("B", STAGE_INTERFACE_DESIGN, 5, STAGE_PUBLISHED, node_order=1),
+        candidate_generation,
+    )
+
+    assert next_runnable_stage_task(
+        queue,
+        [running_generation],
+        max_in_flight=2,
+    ) is candidate_generation
+
+
+def test_stage_selector_rejects_non_adjacent_test_generation_window() -> None:
+    running_generation = _stage("A", STAGE_TEST_GENERATION, 2, "RUNNING", node_order=0)
+    candidate_generation = _stage("C", STAGE_TEST_GENERATION, 10, node_order=2)
+    queue = _queue(
+        _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_PUBLISHED, node_order=0),
+        running_generation,
+        _stage("C", STAGE_VISUAL_ANALYSIS, 8, STAGE_PUBLISHED, node_order=2),
+        _stage("C", STAGE_INTERFACE_DESIGN, 9, STAGE_PUBLISHED, node_order=2),
+        candidate_generation,
+    )
+
+    assert next_runnable_stage_task(
+        queue,
+        [running_generation],
+        max_in_flight=2,
+    ) is None
 
 
 def test_generator_namespace_declaration_keeps_the_window_open() -> None:
@@ -404,6 +464,44 @@ def test_stage_drain_opens_the_first_pass_window_without_declared_write_sets(
     asyncio.run(manager._drain_stage_tasks(queue, execute))
 
     assert peak == 2, "the first-pass overlap window must open without declared write sets"
+    assert all(task["status"] == STAGE_PUBLISHED for task in queue["stage_tasks"])
+
+
+def test_stage_drain_opens_adjacent_test_generation_window_without_declared_write_sets(
+    tmp_project_dir: Path, runtime, monkeypatch
+) -> None:
+    monkeypatch.setenv("ARC_NODE_WORKTREES", "1")
+    monkeypatch.setenv("ARC_MAX_CONCURRENT_TASKS", "2")
+    manager = ARCWorkflowManager(
+        workspace_path=str(tmp_project_dir),
+        requirement_path="",
+        web_port=4000,
+        log_cb=lambda *_args, **_kwargs: None,
+    )
+    manager.runtime = runtime
+    manager._save_processing_queue = lambda _queue: None
+    queue = _queue(
+        _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_TEST_GENERATION, 2, node_order=0),
+        _stage("B", STAGE_VISUAL_ANALYSIS, 4, STAGE_PUBLISHED, node_order=1),
+        _stage("B", STAGE_INTERFACE_DESIGN, 5, STAGE_PUBLISHED, node_order=1),
+        _stage("B", STAGE_TEST_GENERATION, 6, node_order=1),
+    )
+    active: set[str] = set()
+    peak = 0
+
+    async def execute(stage_task: dict[str, Any]) -> dict[str, Any]:
+        nonlocal peak
+        active.add(stage_task["stage_task_id"])
+        peak = max(peak, len(active))
+        await asyncio.sleep(0)
+        active.remove(stage_task["stage_task_id"])
+        return {"status": STAGE_PUBLISHED}
+
+    asyncio.run(manager._drain_stage_tasks(queue, execute))
+
+    assert peak == 2, "adjacent TestGenerator stages should share the first-pass window"
     assert all(task["status"] == STAGE_PUBLISHED for task in queue["stage_tasks"])
 
 
