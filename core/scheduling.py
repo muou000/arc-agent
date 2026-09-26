@@ -49,6 +49,7 @@ from core.queue_state import (
     design_status_of,
     implement_status_of,
     node_state,
+    node_state_is_known,
     stage_task_of,
     stage_task_status,
     task_status,
@@ -327,6 +328,10 @@ def stage_task_dependencies_met(
     if not node_id or stage not in STAGE_PIPELINE:
         return False
     if not bool(stage_task.get("applicable", True)):
+        return False
+    if not node_state_is_known(queue_state, node_id):
+        # A quarantined node state is never ordinary schedulable work, even
+        # when its persisted stage rows still read pending.
         return False
     if _stage_status(queue_state, stage_task) != STAGE_PENDING:
         return False

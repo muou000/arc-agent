@@ -58,6 +58,7 @@ from core.queue_state import (
     apply_retry_plan,
     begin_task,
     complete_task,
+    describe_invalid_state_entry,
     fail_task,
     fail_stage_task,
     has_phase_tasks,
@@ -526,6 +527,7 @@ class ARCWorkflowManager:
             blocked_nodes = result.get("blocked_nodes", [])
             blocked_stages = result.get("blocked_stages", [])
             unvalidated_tasks = result.get("unvalidated_tasks", [])
+            invalid_state_entries = result.get("invalid_state_entries", [])
             details = [f"failed: {', '.join(failed_nodes)}"] if failed_nodes else []
             if blocked_nodes:
                 details.append(f"blocked: {', '.join(blocked_nodes)}")
@@ -533,6 +535,11 @@ class ARCWorkflowManager:
                 details.append(f"blocked stages: {', '.join(blocked_stages)}")
             if unvalidated_tasks:
                 details.append(f"unvalidated tasks: {', '.join(unvalidated_tasks)}")
+            if invalid_state_entries:
+                details.append(
+                    "invalid persisted states: "
+                    + self._describe_invalid_state_entries(invalid_state_entries)
+                )
             await self._log(
                 "Compiler",
                 "Compilation finished without an accepted result (" + "; ".join(details) + ")",
@@ -568,6 +575,23 @@ class ARCWorkflowManager:
         except ValueError as exc:
             await self._log("Compiler", str(exc), "error")
             return {"ok": False, "failed_nodes": []}
+        invalid_entries = queue_state.get("invalid_state_entries") or []
+        if invalid_entries and (resume_from_queue or retry_requested):
+            # A corrupted, unknown, or future persisted state must not be
+            # rescheduled as unstarted work: report the original values and
+            # stop before any recovery, retry reset, or scheduling runs.
+            await self._log(
+                "Compiler",
+                (
+                    "Resume aborted: the persisted queue contains invalid state value(s) that must not "
+                    f"be scheduled as pending work: {self._describe_invalid_state_entries(invalid_entries)}. "
+                    "Repair or remove the invalid value(s) in "
+                    f"{self.queue_path} (the original values are preserved in the queue's "
+                    "invalid_state_entries), or delete the queue file to rebuild it from scratch."
+                ),
+                "error",
+            )
+            return self._build_compile_result(queue_state)
         had_provider_outage = outage_is_open(queue_state)
         if resume_from_queue:
             if not await self._resume_provider_outage(queue_state):
@@ -610,6 +634,16 @@ class ARCWorkflowManager:
                 f"Queued node {node_id} for retry using the existing workspace and traceability artifacts.",
                 status="warning",
                 node_id=node_id,
+            )
+        for entry in queue_state.get("invalid_state_entries") or []:
+            await self._log(
+                "Compiler",
+                (
+                    f"Quarantined invalid persisted state ({describe_invalid_state_entry(entry)}); "
+                    "the affected work is not schedulable until the queue is repaired."
+                ),
+                status="warning",
+                node_id=str(entry.get("node_id") or "") or None,
             )
         for dependent_id, dependency_id, reason in queue_state.get("dropped_dependency_edges") or []:
             if reason == "cycle":
@@ -3414,6 +3448,12 @@ class ARCWorkflowManager:
             self.runtime.traceability.upsert_node_state(node_id, normalized_state)
 
     @staticmethod
+    def _describe_invalid_state_entries(entries: list[dict[str, Any]]) -> str:
+        """Render quarantined state entries into one diagnostic line."""
+
+        return "; ".join(describe_invalid_state_entry(entry) for entry in entries)
+
+    @staticmethod
     def _build_compile_result(queue_state: dict[str, Any]) -> dict[str, Any]:
         failed_nodes = sorted(
             node_id for node_id, state in queue_state["node_states"].items() if state == NODE_FAILED
@@ -3442,7 +3482,14 @@ class ARCWorkflowManager:
         ]
         provider_outage = queue_state.get("provider_outage")
         paused = outage_is_open(queue_state)
-        accepted = all_completed and not failed_nodes and not blocked_nodes and not paused
+        invalid_state_entries = list(queue_state.get("invalid_state_entries") or [])
+        accepted = (
+            all_completed
+            and not failed_nodes
+            and not blocked_nodes
+            and not paused
+            and not invalid_state_entries
+        )
         run_status = RUN_STATUS_PROVIDER_OUTAGE if paused else ("COMPLETED" if accepted else "FAILED")
         return {
             "ok": accepted,
@@ -3454,6 +3501,7 @@ class ARCWorkflowManager:
             "unvalidated_tasks": pending_tasks,
             "visit_order": completed_tasks,
             "states": dict(queue_state["node_states"]),
+            "invalid_state_entries": invalid_state_entries,
             "provider_outage": dict(provider_outage) if isinstance(provider_outage, dict) else None,
         }
 
