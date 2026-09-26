@@ -55,14 +55,8 @@ python -m pytest -p no:anyio
 
 `-p no:anyio` 用于禁用本环境中加载会失败的可选插件，与被测代码无关。
 
-测试默认通过 `pytest-xdist` 多进程并行运行（`pytest.ini` 的 `addopts` 含 `-n8`）。
-8 是实测拐点：全量快速套件在 16 核开发机上串行 6:21，`-n2`/`-n4` 约 3:13，
-`-n8` 起 2:48，8 以上不再有收益（长尾重测试钉死 makespan）。需要回到单进程
-串行时追加 `-n0`：
-
-```bash
-python -m pytest -p no:anyio -n0 -m "not slow"   # 串行运行快速路径
-```
+测试默认通过 pytest 单进程串行运行，不隐式启用多进程 worker。工作流测试
+仍在测试进程内验证并发任务、独立 worktree 和合并契约。
 
 invalid escape 序列（如 `"\d"`、`"\/"`）由 `pytest.ini` 的 `filterwarnings =
 error::SyntaxWarning` 全局拦截，测试模块在收集期直接报错，不再依赖逐模块

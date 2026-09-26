@@ -150,6 +150,7 @@ def test_sibling_implements_run_concurrently_in_separate_worktrees(
     active: set[str] = set()
     seen_ports: dict[str, int | None] = {}
     seen_worktrees: dict[str, str] = {}
+    both_started = asyncio.Event()
     overlap = False
 
     async def fake_run_task(task: dict[str, Any], ctx: Any = None) -> bool:
@@ -165,7 +166,16 @@ def test_sibling_implements_run_concurrently_in_separate_worktrees(
             Path(ctx.handle.path, f"{task['node_id']}.feature.js").write_text(
                 f"feature {task['node_id']};\n", encoding="utf-8"
             )
-        await asyncio.sleep(0.05)
+        if len(active) == 2:
+            both_started.set()
+        # A fixed sleep is too short to prove overlap reliably on a loaded
+        # Windows test process: real worktree preparation can consume it
+        # before the sibling enters the runner. The bounded barrier makes a
+        # real scheduling regression fail without allowing the test to hang.
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
         active.discard(task["task_id"])
         return True
 

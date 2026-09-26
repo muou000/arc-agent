@@ -104,7 +104,7 @@ python -m pytest -p no:anyio
 python arc_main.py doctor
 ```
 
-测试默认通过 pytest-xdist 并行运行（`pytest.ini` addopts 含 `-n8`）；需要串行时追加 `-n0`。测试分层和新增测试规范见 [`tests/README.md`](tests/README.md)。一般要求：
+测试默认通过 pytest 单进程串行运行。测试分层和新增测试规范见 [`tests/README.md`](tests/README.md)。一般要求：
 
 - 修改代码后运行受影响的定向测试，再运行快速套件；
 - 修改模板、app-type、构建/测试执行器或依赖安装逻辑时，补跑相关 slow 测试；
