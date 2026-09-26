@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 
+from agents.context.prompts import common as common_prompts
 from agents.context.prompts import interface_designer, test_driven_developer, test_generator
 from agents.runtime.capabilities import (
     capability_for,
@@ -18,6 +20,7 @@ from agents.runtime.capabilities import (
     stable_node_path_segment,
 )
 from agents.runtime.stage_discipline import StageDisciplineMiddleware
+from agents.runtime.factory import StageAgentBuild
 from agents.tools.declaration_budget import ESCALATION_THRESHOLD
 from agents.tools.stage_write_set import StageWriteSetLock, build_declare_stage_write_set_tool
 from agents.tools.test_manifest import (
@@ -59,10 +62,16 @@ def test_node_namespace_is_stable_and_collision_resistant() -> None:
     assert stable_node_path_segment("REQ-1") != stable_node_path_segment("req-1")
 
 
-def test_stage_write_set_must_be_declared_and_is_immutable() -> None:
-    lock = StageWriteSetLock(stage="implementation")
+def test_stage_write_set_must_be_declared_and_tdd_can_append_test_assets() -> None:
+    node_id = "REQ-1"
+    current_test = (
+        f"backend/tests/generated/{stable_node_path_segment(node_id)}/unit/current.test.ts"
+    )
+    lock = StageWriteSetLock(stage="implementation", node_id=node_id)
     middleware = StageDisciplineMiddleware(
         stage="implementation",
+        node_id=node_id,
+        enforce_node_test_domain=True,
         stage_write_set_lock=lock,
     )
 
@@ -82,15 +91,80 @@ def test_stage_write_set_must_be_declared_and_is_immutable() -> None:
     )
     assert not isinstance(allowed, ToolMessage) or allowed.status != "error"
 
-    drift = asyncio.run(tool(paths=["src/other.py"]))
+    receipt = asyncio.run(tool(paths=["src/app.py", current_test]))
+    assert '"status": "locked"' in receipt
+    assert json.loads(receipt)["declared_write_set"] == sorted(["src/app.py", current_test])
+
+    test_write = middleware.wrap_tool_call(
+        _request("write_file", {"file_path": f"/workspace/{current_test}", "content": "test;\n"}),
+        _ok,
+    )
+    assert not isinstance(test_write, ToolMessage) or test_write.status != "error"
+
+    drift = asyncio.run(tool(paths=["src/app.py", "src/other.py"]))
     assert '"status": "error"' in drift
     assert "already locked" in drift
+    assert "append" in drift.lower()
 
     outside = middleware.wrap_tool_call(
         _request("write_file", {"file_path": "/workspace/src/other.py", "content": "pass\n"}),
         _ok,
     )
     assert "was not declared" in _content(outside)
+
+
+def test_tdd_write_set_append_rejects_product_removal_shared_and_sibling_paths() -> None:
+    node_id = "REQ-1"
+    current_test = (
+        f"backend/tests/generated/{stable_node_path_segment(node_id)}/unit/current.test.ts"
+    )
+    sibling_test = (
+        f"backend/tests/generated/{stable_node_path_segment('REQ-2')}/unit/sibling.test.ts"
+    )
+    lock = StageWriteSetLock(stage="implementation", node_id=node_id)
+    tool = build_declare_stage_write_set_tool(stage="implementation", lock=lock)
+    assert '"status": "locked"' in asyncio.run(tool(paths=["src/app.py"]))
+
+    removed = asyncio.run(tool(paths=[]))
+    assert '"status": "error"' in removed
+    assert "remove" in removed.lower()
+    assert "append" in removed.lower()
+
+    renamed = asyncio.run(tool(paths=[current_test]))
+    assert '"status": "error"' in renamed
+    assert "rename" in renamed.lower()
+    assert "append" in renamed.lower()
+
+    product = asyncio.run(tool(paths=["src/app.py", "src/other.py"]))
+    assert '"status": "error"' in product
+    assert "product paths" in product
+    assert "append" in product.lower()
+
+    shared = asyncio.run(tool(paths=["src/app.py", "backend/vitest.config.js"]))
+    assert '"status": "error"' in shared
+    assert "read-only" in shared
+    assert "append" in shared.lower()
+
+    sibling = asyncio.run(tool(paths=["src/app.py", sibling_test]))
+    assert '"status": "error"' in sibling
+    assert "outside node" in sibling
+    assert "append" in sibling.lower()
+
+    assert lock.paths == ("src/app.py",)
+
+
+def test_stage_write_set_append_remains_immutable_outside_implementation() -> None:
+    node_id = "REQ-1"
+    current_test = (
+        f"backend/tests/generated/{stable_node_path_segment(node_id)}/unit/current.test.ts"
+    )
+    for stage in ("interface_design", "test_generation"):
+        lock = StageWriteSetLock(stage=stage, node_id=node_id)
+        tool = build_declare_stage_write_set_tool(stage=stage, lock=lock)
+        assert '"status": "locked"' in asyncio.run(tool(paths=[current_test]))
+        rejected = asyncio.run(tool(paths=[current_test, "src/other.py"]))
+        assert '"status": "error"' in rejected
+        assert "already locked" in rejected
 
 
 def test_stage_write_set_rejects_sibling_test_and_shared_paths() -> None:
@@ -170,6 +244,19 @@ def test_tdd_prompt_and_repair_skill_hand_off_shared_config_failures() -> None:
         assert "current node" in visible_text.lower()
     assert "When the stage pipeline is active, shared runner configuration" in system_prompt
     assert "in pipeline mode hand off faults" in task_prompt
+
+
+def test_tdd_prompts_describe_late_test_asset_write_set_append() -> None:
+    tdd_prompt = test_driven_developer.get_system_prompt()
+    common_policy = common_prompts.workspace_tool_policy()
+
+    assert "append that test path" in tdd_prompt
+    assert "product paths, shared resources, sibling paths, removals, and renames remain blocked" in tdd_prompt
+    assert "TestDrivenDeveloper may call it again to append newly discovered test assets" in common_policy
+
+
+def test_runtime_write_set_description_allows_implementation_append() -> None:
+    assert "may append current-node test assets" in (StageAgentBuild.declared_write_set.__doc__ or "")
 
 
 def test_legacy_manifest_rejection_does_not_require_unmounted_write_set_tool() -> None:
@@ -407,6 +494,27 @@ def test_write_set_rejection_and_description_disclose_concrete_namespace() -> No
     assert "outside node `REQ-1`'s stable test namespace" in rejected
     assert segment in rejected
     assert "<stable-node-id>" not in rejected
+
+
+def test_write_set_tool_description_is_stage_specific() -> None:
+    node_id = "REQ-1"
+    implementation = build_declare_stage_write_set_tool(
+        stage="implementation",
+        lock=StageWriteSetLock(stage="implementation", node_id=node_id),
+    )
+    test_generation = build_declare_stage_write_set_tool(
+        stage="test_generation",
+        lock=StageWriteSetLock(stage="test_generation", node_id=node_id),
+    )
+
+    assert "may append" in (implementation.__doc__ or "")
+    assert "remains fixed" in (test_generation.__doc__ or "")
+    assert "may append" not in (test_generation.__doc__ or "")
+
+    implementation_receipt = asyncio.run(implementation(paths=["src/app.py"]))
+    test_generation_receipt = asyncio.run(test_generation(paths=["src/app.py"]))
+    assert "may append" in implementation_receipt
+    assert "remains fixed" in test_generation_receipt
 
 
 def test_manifest_rejection_budget_escalates_then_resets_on_success() -> None:

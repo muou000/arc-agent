@@ -98,7 +98,11 @@ class StageAgentBuild:
             return []
 
     def declared_write_set(self) -> list[str]:
-        """Return the stage's immutable declared write set, when enabled."""
+        """Return the stage's current declared write set, when enabled.
+
+        The implementation stage may append current-node test assets after its
+        initial declaration; other stages keep their declaration fixed.
+        """
 
         try:
             return list(self.stage_discipline.declared_write_set())
