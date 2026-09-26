@@ -232,7 +232,10 @@ def test_stage_selector_opens_adjacent_test_generation_window() -> None:
     ) is candidate_generation
 
 
-def test_stage_selector_rejects_non_adjacent_test_generation_window() -> None:
+def test_stage_selector_opens_non_adjacent_test_generation_window() -> None:
+    # The window's safety rests on per-node test-namespace confinement, not
+    # on queue position: a TestGenerator two pre-order slots away may co-run
+    # with the running one.
     running_generation = _stage("A", STAGE_TEST_GENERATION, 2, "RUNNING", node_order=0)
     candidate_generation = _stage("C", STAGE_TEST_GENERATION, 10, node_order=2)
     queue = _queue(
@@ -248,7 +251,7 @@ def test_stage_selector_rejects_non_adjacent_test_generation_window() -> None:
         queue,
         [running_generation],
         max_in_flight=2,
-    ) is None
+    ) is candidate_generation
 
 
 def test_generator_namespace_declaration_keeps_the_window_open() -> None:
@@ -307,7 +310,7 @@ def test_stage_selector_skips_conflicting_earlier_work_and_keeps_later_work_fair
     assert pick is ready_test_generation
 
 
-def test_stage_selector_rejects_non_adjacent_overlap_even_when_writes_are_disjoint() -> None:
+def test_stage_selector_opens_non_adjacent_overlap_when_writes_are_disjoint() -> None:
     active_design = _stage(
         "A", STAGE_INTERFACE_DESIGN, 1, STAGE_READY_TO_MERGE,
         writes=["src/a.ts"], node_order=0,
@@ -321,7 +324,9 @@ def test_stage_selector_rejects_non_adjacent_overlap_even_when_writes_are_disjoi
         candidate,
     )
 
-    assert next_runnable_stage_task(queue, [active_design], max_in_flight=2) is None
+    pick = next_runnable_stage_task(queue, [active_design], max_in_flight=2)
+
+    assert pick is candidate
 
 
 def test_stage_selector_opens_the_first_pass_test_generation_window() -> None:
@@ -353,6 +358,27 @@ def test_stage_selector_opens_the_first_pass_implementation_window() -> None:
         running_implementation,
         _stage("B", STAGE_VISUAL_ANALYSIS, 4, STAGE_PUBLISHED, node_order=1),
         _stage("B", STAGE_INTERFACE_DESIGN, 6, STAGE_PUBLISHED, node_order=1),
+        candidate_generation,
+    )
+
+    pick = next_runnable_stage_task(queue, [running_implementation], max_in_flight=2)
+
+    assert pick is candidate_generation
+
+
+def test_stage_selector_opens_the_first_pass_implementation_window_without_adjacency() -> None:
+    # Same first-pass proof as the adjacent window, now across a pre-order
+    # gap: the running IMPLEMENTATION carries no declared_write_set and the
+    # distant TestGenerator candidate has none either.
+    running_implementation = _stage("A", STAGE_IMPLEMENTATION, 3, "RUNNING", node_order=0)
+    candidate_generation = _stage("D", STAGE_TEST_GENERATION, 7, node_order=3)
+    queue = _queue(
+        _stage("A", STAGE_VISUAL_ANALYSIS, 0, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_INTERFACE_DESIGN, 1, STAGE_PUBLISHED, node_order=0),
+        _stage("A", STAGE_TEST_GENERATION, 2, STAGE_PUBLISHED, node_order=0),
+        running_implementation,
+        _stage("D", STAGE_VISUAL_ANALYSIS, 4, STAGE_PUBLISHED, node_order=3),
+        _stage("D", STAGE_INTERFACE_DESIGN, 5, STAGE_PUBLISHED, node_order=3),
         candidate_generation,
     )
 

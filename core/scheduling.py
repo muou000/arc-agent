@@ -189,9 +189,9 @@ _STAGE_PRODUCT_WORK = frozenset(
 )
 _APPROVED_STAGE_OVERLAPS = frozenset(
     {
-        # Adjacent nodes own disjoint stable test namespaces, so two
-        # TestGenerator stages may run together as long as the queue proves
-        # their node-order adjacency.
+        # Distinct nodes own disjoint stable test namespaces, so two
+        # TestGenerator stages may run together wherever their own gates are
+        # open; node-order adjacency is not part of the proof.
         frozenset({STAGE_TEST_GENERATION}),
         frozenset({STAGE_INTERFACE_DESIGN, STAGE_TEST_GENERATION}),
         frozenset({STAGE_TEST_GENERATION, STAGE_IMPLEMENTATION}),
@@ -512,10 +512,12 @@ def stage_overlap_allowed(left: Mapping[str, Any], right: Mapping[str, Any]) -> 
 
     Visual analysis does not write a product worktree, so it is independent of
     every formal stage. All other overlap is limited to the ADR-approved
-    adjacent windows, including adjacent TestGenerator stages, and requires
-    provably disjoint writes: explicit declarations when both sides are
-    visible, otherwise the pipeline's structural write confinement for the
-    approved cross-node pairs.
+    windows - the TestGenerator-involving pairs - and requires provably
+    disjoint writes: explicit declarations when both sides are visible,
+    otherwise the pipeline's structural write confinement for the approved
+    cross-node pairs. Node-order adjacency is not part of the proof: the
+    confinement holds for any distinct-node pair, so the queue never gates
+    these windows on queue position.
     """
 
     left_stage = _stage_name(left)
@@ -533,43 +535,6 @@ def stage_overlap_allowed(left: Mapping[str, Any], right: Mapping[str, Any]) -> 
     if left_set is not None and right_set is not None:
         return left_set.isdisjoint(right_set)
     return _approved_pair_structurally_disjoint(left, right, left_set, right_set)
-
-
-def _stage_node_order(task: Mapping[str, Any]) -> int | None:
-    if "node_order" not in task or task.get("node_order") is None:
-        return None
-    try:
-        return int(task["node_order"])
-    except (TypeError, ValueError):
-        return None
-
-
-def _approved_stage_overlap_for_queue(
-    candidate: Mapping[str, Any], blocker: Mapping[str, Any]
-) -> bool:
-    """Apply the n/n+1 adjacency rule when queue metadata can prove it."""
-
-    if not stage_overlap_allowed(candidate, blocker):
-        return False
-    candidate_order = _stage_node_order(candidate)
-    blocker_order = _stage_node_order(blocker)
-    if candidate_order is None or blocker_order is None:
-        # An incomplete persisted queue must fail closed rather than guessing
-        # its adjacency relationship.
-        return False
-    first, second = (
-        (candidate, blocker)
-        if candidate_order < blocker_order
-        else (blocker, candidate)
-    )
-    return abs(candidate_order - blocker_order) == 1 and (
-        (_stage_name(first), _stage_name(second))
-        in {
-            (STAGE_TEST_GENERATION, STAGE_TEST_GENERATION),
-            (STAGE_TEST_GENERATION, STAGE_INTERFACE_DESIGN),
-            (STAGE_IMPLEMENTATION, STAGE_TEST_GENERATION),
-        }
-    )
 
 
 def _configured_stage_capacity(
@@ -744,10 +709,7 @@ def next_runnable_stage_task(
         )
         if stage_counts.get(stage, 0) >= capacity:
             continue
-        if any(
-            not _approved_stage_overlap_for_queue(candidate, blocker)
-            for blocker in blockers
-        ):
+        if any(not stage_overlap_allowed(candidate, blocker) for blocker in blockers):
             continue
         return candidate
     return None
