@@ -133,6 +133,33 @@ def test_repair_skill_literal_rules_pinned() -> None:
     assert "repair the error presentation path, not the assertion" in skill
 
 
+def test_repair_skill_batch_timeout_rules_pinned() -> None:
+    """The E2E batch-timeout playbook must survive skill edits verbatim.
+
+    The 2026-09-26 easy-ticketbooking run burned five run_tests calls (three
+    blind 120s runner-cap kills) on failures whose evidence survived in
+    `backend/test-results/` and whose root cause was a trailing-label-colon
+    accessible-name mismatch against `exact: true` locators. These rules are
+    the codified playbook; the pins turn an accidental rewording into a local
+    test failure.
+    """
+
+    skill = (SKILL_ROOT / "tdd-test-failure-repair" / "SKILL.md").read_text(encoding="utf-8")
+    assert "24." in skill
+    assert "Command timed out after N seconds." in skill
+    assert "not a test verdict" in skill
+    assert "discards partial output on timeout" in skill
+    assert "backend/test-results/<failed-test>/" in skill
+    assert "diagnostic probe" in skill
+    assert "25." in skill
+    assert "test.describe.configure({ mode: 'serial' })" in skill
+    assert "the layer still closes on a green full run" in skill
+    assert "26." in skill
+    assert "frozen in its initial state" in skill
+    assert "a trailing colon" in skill
+    assert "Repair direction follows 21a" in skill
+
+
 def test_design_skills_shared_shell_literal_rules_pinned() -> None:
     leaf_full = (SKILL_ROOT / "leaf-full-design" / "SKILL.md").read_text(encoding="utf-8")
     assert "Carry requirement-stated UI anchors into the interface contract verbatim" in leaf_full
